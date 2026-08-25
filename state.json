@@ -1,6 +1,6 @@
 {
   "next_display_id": 1143,
-  "next_comment_id": 1640,
+  "next_comment_id": 1641,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -21783,11 +21783,20 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T22:27:55.729393206Z",
-      "updated_at": "2026-08-25T22:28:33.158353557Z",
+      "updated_at": "2026-08-25T22:29:24.298117871Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "377009a9-7dfb-4808-b9ec-4a802c761d6c": {
+          "display_id": 1640,
+          "author": "6Vw9",
+          "content": "Exact-head publication remains externally pending after three checks. Local signed S-066 head is 6934cfb2ae0f411ca65de38cc8b633b0ab75c3b1; origin and draft PR #66 still point to a5102b7b2e2f24fc1ba2a5c9fbd094c7fcda9e7e. CI cannot provide evidence for S-066 until Laurelai runs git push origin agent/refactor-agent-system-remediation.",
+          "created_at": "2026-08-25T22:29:24.295642122Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAAffZMzbu4RcOcrlopuI4rC0YrUPcYYeO0G0iDZOq7ReM24YsO5breecaQ0y5rXUQAN92qCTHKiXW6X6OCHlBBg=="
+        },
         "6d7bbb7f-276b-4286-94aa-6b65c92bb626": {
           "display_id": 1638,
           "author": "6Vw9",
@@ -41498,11 +41507,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1705,
       "timestamp": "2026-08-25T22:28:33.158353557Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1706,
+      "timestamp": "2026-08-25T22:29:24.298117871Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T22:28:33.158353557Z",
+    "timestamp": "2026-08-25T22:29:24.298117871Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1705
+    "agent_seq": 1706
   }
 }
