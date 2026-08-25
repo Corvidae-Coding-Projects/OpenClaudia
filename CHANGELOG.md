@@ -174,6 +174,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 - Eliminate background-job job.json generation conflicts in Linux CI (#1138)
+- Eliminate background-job job.json generation conflicts in Linux CI (#1138)
 - S-035: Make notebook editing transactional (#1137)
 - S-035: Make notebook editing transactional (#1137)
 - S-034: Implement typed multimodal and partial reads (#1136)
