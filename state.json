@@ -1,6 +1,6 @@
 {
   "next_display_id": 1140,
-  "next_comment_id": 1608,
+  "next_comment_id": 1609,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -16222,7 +16222,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T09:21:03.171579016Z",
-      "updated_at": "2026-08-25T11:07:51.631905246Z",
+      "updated_at": "2026-08-25T11:07:56.105630736Z",
       "labels": [
         "remediation"
       ],
@@ -16235,6 +16235,15 @@
           "kind": "handoff",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAYXrmsk8WusPIxTvy9Vrs1o5MSDwohZ3ObHBf+vZK0Xe13cIjeOIyOOsWvQ7hqRPgcQheHSEqql+DytOhOB65DQ=="
+        },
+        "26e59bb6-8d3b-46b4-a6de-3dbf271287aa": {
+          "display_id": 1608,
+          "author": "6Vw9",
+          "content": "[action] Committed signed S-036 Windows TokenOwner repair as 45ccd9e7; waiting for user push, then will monitor every PR #66 runner to terminal and fix any real failure.",
+          "created_at": "2026-08-25T11:07:56.103028588Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAhiDA4jsv8zsAsCRCDpZlk4aZEFfQ6z/Zl98vhqRpqL/fA0AWP/E1ln49H9/1LCpvjRcIejsxh3ZBxIHOTcm0Cg=="
         },
         "2758a356-c5cb-4b8b-accc-e1c83e7f79e9": {
           "display_id": 1601,
@@ -40897,11 +40906,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1654,
       "timestamp": "2026-08-25T11:07:51.631905246Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1655,
+      "timestamp": "2026-08-25T11:07:56.105630736Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T11:07:51.631905246Z",
+    "timestamp": "2026-08-25T11:07:56.105630736Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1654
+    "agent_seq": 1655
   }
 }
