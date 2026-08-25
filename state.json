@@ -1,6 +1,6 @@
 {
   "next_display_id": 1140,
-  "next_comment_id": 1598,
+  "next_comment_id": 1599,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -16211,7 +16211,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T09:21:03.171579016Z",
-      "updated_at": "2026-08-25T10:44:44.410818646Z",
+      "updated_at": "2026-08-25T10:45:04.822260069Z",
       "labels": [
         "remediation"
       ],
@@ -16281,6 +16281,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABATZvhcafX3x6awqnDwYoxKIik3mFn0//kg6Q2KC9SzlBHEtCg5LMDWna9g6gLwwz1qAvFXXca2vrhXXszrLzQDQ=="
+        },
+        "f0b73f5c-9fcc-4f4d-aa2c-a0a041652491": {
+          "display_id": 1598,
+          "author": "6Vw9",
+          "content": "Use pinned handle-relative Windows capabilities so Windows can provide the same containment and generation semantics as the existing Unix backend; preserve Unix behavior, reject unsupported namespace roots during composition, and defer completion until real hosted Windows execution proves the NT/ACL paths.",
+          "created_at": "2026-08-25T10:45:04.819762622Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA4QWrm95Fo0muD1w/ibkO+bMtEECK7j3xvhO0YofH6lWeLHtGpNcn2rPQAUoYWrlbfxkmpKNi8N5gKIkNYEmfAg=="
         }
       }
     },
@@ -40747,11 +40756,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1643,
       "timestamp": "2026-08-25T10:44:44.410818646Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1644,
+      "timestamp": "2026-08-25T10:45:04.822260069Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T10:44:44.410818646Z",
+    "timestamp": "2026-08-25T10:45:04.822260069Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1643
+    "agent_seq": 1644
   }
 }
