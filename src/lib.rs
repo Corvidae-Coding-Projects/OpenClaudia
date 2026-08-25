@@ -36,6 +36,7 @@ pub mod mcp;
 pub mod mcp_elicitation;
 pub mod mcp_inprocess;
 pub mod mcp_oauth;
+mod mcp_protocol;
 pub mod memdir;
 pub mod memory;
 pub mod migrations;

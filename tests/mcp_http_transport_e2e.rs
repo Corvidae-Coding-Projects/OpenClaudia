@@ -148,6 +148,40 @@ fn tools_list_result_body() -> Value {
     })
 }
 
+fn current_discover_result_body() -> Value {
+    json!({
+        "resultType": "complete",
+        "supportedVersions": ["2026-07-28"],
+        "capabilities": {"tools": {"listChanged": false}},
+        "ttlMs": 0,
+        "cacheScope": "private",
+        "_meta": {
+            "io.modelcontextprotocol/serverInfo": {
+                "name": "current-http-fixture",
+                "version": "1.0.0"
+            }
+        }
+    })
+}
+
+fn current_tools_list_result_body() -> Value {
+    json!({
+        "resultType": "complete",
+        "ttlMs": 0,
+        "cacheScope": "private",
+        "tools": [{
+            "name": "echo",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "trace": {"type": "string", "x-mcp-header": "Trace-Id"}
+                },
+                "required": ["trace"]
+            }
+        }]
+    })
+}
+
 fn call_tool_success_result(text: &str) -> Value {
     json!({
         "content": [
@@ -233,6 +267,76 @@ async fn handshake_and_tools_list_round_trip_against_wiremock() {
     // get_server_info returns the NAME we registered the server
     // under (not the remote serverInfo.name). Pin that contract.
     assert_eq!(registered_name, "test-server");
+}
+
+#[tokio::test]
+async fn legacy_http_json_rpc_method_not_found_at_200_enters_initialize_adapter() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("\"method\":\"server/discover\""))
+        .respond_with(echo_error(json!({
+            "code": -32601,
+            "message": "Method not found"
+        })))
+        .mount(&mock)
+        .await;
+    mount_handshake(&mock).await;
+
+    let manager = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
+    manager
+        .__test_connect_http_unchecked("legacy-200", &mock.uri())
+        .await
+        .expect("HTTP 200 method-not-found must select the legacy initialize adapter");
+    assert!(manager.is_connected("legacy-200").await);
+}
+
+#[tokio::test]
+async fn s065_current_http_round_trip_sends_required_routing_headers() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(header("MCP-Protocol-Version", "2026-07-28"))
+        .and(header("Mcp-Method", "server/discover"))
+        .and(body_string_contains(
+            "io.modelcontextprotocol/protocolVersion",
+        ))
+        .and(body_string_contains(
+            "io.modelcontextprotocol/clientCapabilities",
+        ))
+        .respond_with(echo_result(current_discover_result_body()))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(header("MCP-Protocol-Version", "2026-07-28"))
+        .and(header("Mcp-Method", "tools/list"))
+        .and(body_string_contains("progressToken"))
+        .respond_with(echo_result(current_tools_list_result_body()))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(header("MCP-Protocol-Version", "2026-07-28"))
+        .and(header("Mcp-Method", "tools/call"))
+        .and(header("Mcp-Name", "echo"))
+        .and(header("Mcp-Param-Trace-Id", "trace-value"))
+        .respond_with(echo_result(json!({
+            "resultType": "complete",
+            "content": [{"type": "text", "text": "CURRENT"}],
+            "structuredContent": {"ok": true}
+        })))
+        .mount(&mock)
+        .await;
+
+    let manager = manager_with_allowed_tool("current", "echo");
+    manager
+        .__test_connect_http_unchecked("current", &mock.uri())
+        .await
+        .expect("current HTTP discovery");
+    let result = manager
+        .call_tool("mcp__current__echo", json!({"trace": "trace-value"}))
+        .await
+        .expect("current HTTP tool call");
+    assert_eq!(result["content"][0]["text"], "CURRENT");
+    assert_eq!(result["structuredContent"]["ok"], true);
 }
 
 #[tokio::test]

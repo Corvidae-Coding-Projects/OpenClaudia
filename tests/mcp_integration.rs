@@ -28,7 +28,8 @@
 //! |               | `manager_marks_server_disconnected_after_transport_error` (fix #629) |
 
 use openclaudia::mcp::{
-    HttpTransport, McpError, McpManager, McpServer, McpServerConfig, StdioTransport,
+    HttpTransport, McpContentBlock, McpError, McpManager, McpProtocolVersion, McpResourceContents,
+    McpServer, McpServerConfig, StdioTransport,
 };
 use openclaudia::plugins::PluginManager;
 use openclaudia::proxy::connect_mcp_servers_with_trust;
@@ -38,7 +39,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::RwLock;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -77,6 +78,19 @@ fn spawn_echo_transport() -> StdioTransport {
         &[path.to_str().expect("utf-8 path")],
     )
     .expect("spawn echo server")
+}
+
+/// Spawn the same real subprocess fixture in the discovery-era 2026-07-28
+/// profile. The server rejects any request missing the required per-request
+/// metadata, so a successful flow proves more than response deserialization.
+fn spawn_current_echo_transport() -> StdioTransport {
+    let path = fixture_path();
+    StdioTransport::spawn(
+        support::shared_run_context(),
+        "env",
+        &["MCP_CURRENT=1", "python3", path.to_str().expect("utf-8")],
+    )
+    .expect("spawn current echo server")
 }
 
 /// Spawn the echo server with no `tools` capability in the `initialize`
@@ -134,6 +148,54 @@ async fn handshake_sends_correct_protocol_version() {
     );
 }
 
+#[tokio::test]
+async fn s065_current_stdio_round_trip_uses_discovery_and_typed_features() {
+    let transport = spawn_current_echo_transport();
+    let server = McpServer::new("current", Box::new(transport))
+        .await
+        .expect("current stdio discovery must succeed");
+
+    assert_eq!(server.protocol_version(), McpProtocolVersion::V2026_07_28);
+    assert_eq!(server.tools().len(), 4);
+
+    let call = server
+        .call_tool("echo", json!({"message": "hello"}))
+        .await
+        .expect("current tools/call");
+    assert_eq!(call["resultType"], "complete");
+    assert_eq!(call["structuredContent"]["message"], "hello");
+
+    let resources = server
+        .list_resources()
+        .await
+        .expect("current resources/list");
+    assert_eq!(resources[0].uri, "echo://hello");
+    let resource = server
+        .read_resource_typed("echo://hello")
+        .await
+        .expect("current resources/read");
+    assert!(matches!(
+        resource.contents[1],
+        McpResourceContents::Blob { .. }
+    ));
+
+    let prompts = server.list_prompts().await.expect("current prompts/list");
+    assert_eq!(prompts[0].name, "echo_prompt");
+    let prompt = server
+        .get_prompt(
+            "echo_prompt",
+            std::collections::BTreeMap::from([("message".to_string(), "typed".to_string())]),
+        )
+        .await
+        .expect("current prompts/get");
+    assert!(matches!(
+        &prompt.messages[0].content,
+        McpContentBlock::Text { text, .. } if text == "typed"
+    ));
+
+    server.close().await.expect("close current fixture");
+}
+
 /// B1 — OC declares `elicitation` in the `initialize` capabilities.
 ///
 /// We test this via a stdio fixture that inspects the initialize request and
@@ -148,6 +210,10 @@ def respond(req_id, result):
     sys.stdout.write(json.dumps({"jsonrpc":"2.0","id":req_id,"result":result}) + "\n")
     sys.stdout.flush()
 
+discover = json.loads(sys.stdin.readline())
+sys.stdout.write(json.dumps({"jsonrpc":"2.0","id":discover["id"],"error":{"code":-32601,"message":"Method not found"}}) + "\n")
+sys.stdout.flush()
+
 init = json.loads(sys.stdin.readline())
 caps = init.get("params", {}).get("capabilities", {})
 cap_ok = "roots" in caps and "elicitation" in caps
@@ -157,8 +223,7 @@ respond(init["id"], {
     "serverInfo": {"name": "mock", "version": "0.0.1"},
 })
 
-initialized = json.loads(sys.stdin.readline())
-respond(initialized["id"], None)
+json.loads(sys.stdin.readline())
 
 tools = json.loads(sys.stdin.readline())
 tool_name = "client_caps_ok" if cap_ok else "client_caps_missing"
@@ -498,13 +563,14 @@ def reply(i, result):
     print(json.dumps({{"jsonrpc":"2.0","id":i,"result":result}}), flush=True)
 
 request = json.loads(sys.stdin.readline())
+print(json.dumps({{"jsonrpc":"2.0","id":request["id"],"error":{{"code":-32601,"message":"Method not found"}}}}), flush=True)
+request = json.loads(sys.stdin.readline())
 reply(request["id"], {{
     "protocolVersion":"2024-11-05",
     "capabilities":{{"tools":{{"listChanged":False}}}},
     "serverInfo":{{"name":"sandbox-probe","version":"1"}}
 }})
 request = json.loads(sys.stdin.readline())
-reply(request["id"], None)
 request = json.loads(sys.stdin.readline())
 name = "sandbox_blocked" if blocked_file and blocked_network else "sandbox_escaped"
 reply(request["id"], {{"tools":[{{"name":name,"inputSchema":{{"type":"object"}}}}]}})
@@ -646,22 +712,28 @@ async fn call_tool_missing_server_returns_not_connected() {
 /// underlying call exceeds the deadline.
 ///
 /// `HttpTransport` uses a sequential `AtomicU64` counter starting at 1.
-/// `McpServer::new` makes exactly three sequential requests:
-///   id=1  `initialize`
-///   id=2  `notifications/initialized`  (via `transport.request`, result `.ok()`'d)
-///   id=3  `tools/list`
+/// `McpServer::new` first probes current discovery, then explicitly falls back
+/// after a legacy 404. Request ids remain sequential for requests; the
+/// `notifications/initialized` notification has no id.
 /// The subsequent `tools/call` gets id=4.  Each wiremock mock is registered
-/// `up_to_n_times(1)` so they serve in registration order, consuming one
-/// request each.  The fourth mock hangs for 10 s; the 50 ms timeout fires.
+/// by method body so the 50 ms timeout deterministically reaches the tool call.
 #[tokio::test]
 async fn call_tool_with_timeout_returns_timeout_error() {
     let mock_server = MockServer::start().await;
 
-    // id=1: initialize
     Mock::given(method("POST"))
         .and(path("/"))
+        .and(body_string_contains("\"method\":\"server/discover\""))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mock_server)
+        .await;
+
+    // id=2: initialize
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_string_contains("\"method\":\"initialize\""))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "jsonrpc": "2.0", "id": 1,
+            "jsonrpc": "2.0", "id": 2,
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": { "tools": { "listChanged": false } },
@@ -672,12 +744,13 @@ async fn call_tool_with_timeout_returns_timeout_error() {
         .mount(&mock_server)
         .await;
 
-    // id=2: notifications/initialized (OC calls transport.request for this)
+    // Notification: deliberately no JSON-RPC id or response body.
     Mock::given(method("POST"))
         .and(path("/"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "jsonrpc": "2.0", "id": 2, "result": {}
-        })))
+        .and(body_string_contains(
+            "\"method\":\"notifications/initialized\"",
+        ))
+        .respond_with(ResponseTemplate::new(202))
         .up_to_n_times(1)
         .mount(&mock_server)
         .await;
@@ -686,6 +759,7 @@ async fn call_tool_with_timeout_returns_timeout_error() {
     // and the ToolNotFound pre-check in call_tool passes.
     Mock::given(method("POST"))
         .and(path("/"))
+        .and(body_string_contains("\"method\":\"tools/list\""))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "jsonrpc": "2.0", "id": 3,
             "result": {
@@ -703,6 +777,7 @@ async fn call_tool_with_timeout_returns_timeout_error() {
     // id=4: tools/call — hangs for 10 s; the 50 ms timeout fires first.
     Mock::given(method("POST"))
         .and(path("/"))
+        .and(body_string_contains("\"method\":\"tools/call\""))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(json!({"jsonrpc":"2.0","id":4,"result":{}}))
@@ -809,8 +884,7 @@ async fn list_resources_calls_wire_when_cap_present() {
 
 // ─── B5: Unknown error code surfacing ───────────────────────────────────────
 
-/// B5 — Stdio transport: unknown JSON-RPC error code is surfaced in the error
-/// message string AND includes the `data` field.
+/// B5 — Stdio transport preserves an unknown JSON-RPC error as typed fields.
 #[tokio::test]
 async fn stdio_rpc_error_with_data_included_in_message() {
     use openclaudia::mcp::McpTransport;
@@ -820,28 +894,19 @@ async fn stdio_rpc_error_with_data_included_in_message() {
     let transport = spawn_echo_transport();
     let result = transport.request("rpc_error_with_data", None).await;
 
-    assert!(result.is_err(), "should return Err for a JSON-RPC error");
-    let err = result.unwrap_err();
-    let msg = err.to_string();
-
-    // Code is present
-    assert!(
-        msg.contains("-32099"),
-        "error code must appear in message: {msg}"
-    );
-    // Message text is present
-    assert!(
-        msg.contains("custom server error"),
-        "error message must appear: {msg}"
-    );
-    // data field is present
-    assert!(
-        msg.contains("extra context") || msg.contains("data"),
-        "stdio transport must include data field in error message: {msg}"
-    );
+    let err = result.expect_err("should return Err for a JSON-RPC error");
+    assert!(matches!(
+        err,
+        McpError::Rpc {
+            code: -32099,
+            ref message,
+            data: Some(ref data),
+            http_status: None,
+        } if message == "custom server error" && data["detail"] == "extra context"
+    ));
 }
 
-/// B5 — HTTP transport preserves `data` in JSON-RPC error messages.
+/// B5 — HTTP transport preserves `data` and HTTP status as typed fields.
 #[tokio::test]
 async fn http_rpc_error_preserves_data_field() {
     use openclaudia::mcp::{HttpTransport, McpTransport};
@@ -864,20 +929,16 @@ async fn http_rpc_error_preserves_data_field() {
     let transport = HttpTransport::__test_new_unchecked(&mock_server.uri());
     let result = transport.request("anything", None).await;
 
-    assert!(result.is_err(), "must return Err for JSON-RPC error");
-    let msg = result.unwrap_err().to_string();
-
-    // Code and message are present
-    assert!(msg.contains("-32099"), "error code must appear: {msg}");
-    assert!(
-        msg.contains("custom server error"),
-        "error msg must appear: {msg}"
-    );
-
-    assert!(
-        msg.contains("extra context") || msg.contains("data"),
-        "HTTP transport must preserve data field (fix #626) — msg: {msg}"
-    );
+    let err = result.expect_err("must return Err for JSON-RPC error");
+    assert!(matches!(
+        err,
+        McpError::Rpc {
+            code: -32099,
+            ref message,
+            data: Some(ref data),
+            http_status: Some(200),
+        } if message == "custom server error" && data["detail"] == "extra context"
+    ));
 }
 
 // ─── B6: Mid-call disconnect ─────────────────────────────────────────────────
@@ -980,8 +1041,8 @@ async fn call_tool_underscored_names_parse_correctly() {
     );
 }
 
-/// B5 — Any unknown/non-standard JSON-RPC error code does not panic; it is
-/// wrapped in `McpError::Protocol` and returned as `Err`.
+/// B5 — Any unknown/non-standard JSON-RPC error code does not panic and keeps
+/// its machine-readable value in `McpError::Rpc`.
 #[tokio::test]
 async fn arbitrary_unknown_error_codes_do_not_panic() {
     use openclaudia::mcp::{HttpTransport, McpTransport};
@@ -1001,15 +1062,15 @@ async fn arbitrary_unknown_error_codes_do_not_panic() {
 
         let transport = HttpTransport::__test_new_unchecked(&mock_server.uri());
         let result = transport.request("test", None).await;
-        assert!(
-            matches!(result, Err(McpError::Protocol(_))),
-            "code {code} must yield McpError::Protocol, got {result:?}"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains(&code.to_string()),
-            "error code {code} must appear in message: {msg}"
-        );
+        assert!(matches!(
+            result,
+            Err(McpError::Rpc {
+                code: actual,
+                ref message,
+                data: None,
+                http_status: Some(200),
+            }) if actual == *code && message == "test error"
+        ));
     }
     drop(mock_server); // suppress unused warning for outer binding
 }

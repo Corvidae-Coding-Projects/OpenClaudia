@@ -3043,54 +3043,117 @@ impl ToolHandler for ReadMcpResourceHandler {
             }
         })
     }
+    fn execute(
+        &self,
+        _permit: &ToolDispatchPermit,
+        args: &HashMap<String, Value>,
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolHandlerResult {
+        match dispatch_typed_mcp_resource_read(args, ctx) {
+            Ok(resource) => mcp_resource_handler_result(&resource),
+            Err(error) => ToolHandlerResult::error(ToolFailure::new(
+                ToolFailureCode::External,
+                error,
+                ToolRetryability::Unknown,
+            )),
+        }
+    }
     fn execute_legacy(
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        let server = match required_registry_string_arg(args, "read_mcp_resource", "server") {
-            Ok(server) => server,
-            Err(result) => return result,
-        };
-        let uri = match required_registry_string_arg(args, "read_mcp_resource", "uri") {
-            Ok(uri) => uri,
-            Err(result) => return result,
-        };
-        let Some(mgr) = crate::mcp::registered_manager(ctx.run) else {
-            return (
-                "No MCP manager has been installed for this session. \
-                 Configure MCP servers under `mcp.servers` in \
-                 `.openclaudia/config.yaml` and re-launch."
-                    .to_string(),
-                true,
-            );
-        };
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return (
-                "read_mcp_resource requires an active tokio runtime to \
-                 dispatch into the async MCP manager."
-                    .to_string(),
-                true,
-            );
-        };
-        let server_owned = server.to_string();
-        let uri_owned = uri.to_string();
-        let caller_run = std::sync::Arc::clone(ctx.run);
-        let result = handle.block_on(async move {
-            let guard = mgr.read().await;
-            if !guard.matches_run(&caller_run) {
-                return Err(anyhow::anyhow!(
-                    "MCP manager capability binding does not match the calling run"
-                ));
-            }
-            guard.read_resource(&server_owned, &uri_owned).await
-        });
-        match result {
-            Ok(content) => (content, false),
-            Err(e) => (format!("read_mcp_resource failed: {e}"), true),
+        match dispatch_typed_mcp_resource_read(args, ctx) {
+            Ok(resource) => (mcp_resource_text_projection(&resource), false),
+            Err(error) => (error, true),
         }
     }
+}
+
+fn dispatch_typed_mcp_resource_read(
+    args: &HashMap<String, Value>,
+    ctx: &ToolContext<'_>,
+) -> Result<crate::mcp::McpReadResourceResult, String> {
+    let server = required_registry_string_arg(args, "read_mcp_resource", "server")
+        .map_err(|(error, _)| error)?;
+    let uri = required_registry_string_arg(args, "read_mcp_resource", "uri")
+        .map_err(|(error, _)| error)?;
+    let Some(manager) = crate::mcp::registered_manager(ctx.run) else {
+        return Err(
+            "No MCP manager has been installed for this session. Configure MCP servers under \
+             `mcp.servers` in `.openclaudia/config.yaml` and re-launch."
+                .to_string(),
+        );
+    };
+    let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+        "read_mcp_resource requires an active tokio runtime to dispatch into the async MCP manager."
+            .to_string()
+    })?;
+    let server = server.to_string();
+    let uri = uri.to_string();
+    let caller_run = std::sync::Arc::clone(ctx.run);
+    handle.block_on(async move {
+        let guard = manager.read().await;
+        if !guard.matches_run(&caller_run) {
+            return Err(
+                "MCP manager capability binding does not match the calling run".to_string(),
+            );
+        }
+        guard
+            .read_resource_typed(&server, &uri)
+            .await
+            .map_err(|error| format!("read_mcp_resource failed: {error}"))
+    })
+}
+
+fn mcp_resource_text_projection(resource: &crate::mcp::McpReadResourceResult) -> String {
+    resource
+        .contents
+        .iter()
+        .map(|content| match content {
+            crate::mcp::McpResourceContents::Text { text, .. } => text.clone(),
+            crate::mcp::McpResourceContents::Blob { uri, mime_type, .. } => format!(
+                "Binary MCP resource {uri} ({}) retained as native typed content",
+                mime_type.as_deref().unwrap_or("application/octet-stream")
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn mcp_resource_handler_result(resource: &crate::mcp::McpReadResourceResult) -> ToolHandlerResult {
+    use base64::Engine as _;
+
+    let text = mcp_resource_text_projection(resource);
+    let structured = serde_json::to_value(resource).unwrap_or_else(|error| {
+        json!({
+            "serializationError": error.to_string(),
+            "contents": []
+        })
+    });
+    let mut result = ToolHandlerResult::success_structured(text, structured);
+    for content in &resource.contents {
+        let crate::mcp::McpResourceContents::Blob {
+            blob,
+            mime_type: Some(mime_type),
+            ..
+        } = content
+        else {
+            continue;
+        };
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(blob) else {
+            continue;
+        };
+        if let Ok(attachment) = super::register_transient_attachment(
+            mime_type,
+            bytes,
+            super::ToolSensitivity::Workspace,
+        ) {
+            result = result.with_attachment(attachment);
+        }
+    }
+    result
 }
 
 fn optional_registry_string_arg<'a>(
@@ -3559,5 +3622,29 @@ mod dispatch_permit_tests {
         let (message, is_error) = result.into_legacy();
         assert!(is_error);
         assert!(message.contains("does not match the exact tool invocation"));
+    }
+
+    #[test]
+    fn s065_mcp_resource_handler_preserves_blob_as_native_attachment() {
+        let resource: crate::mcp::McpReadResourceResult = serde_json::from_value(json!({
+            "resultType": "complete",
+            "ttlMs": 0,
+            "cacheScope": "private",
+            "contents": [
+                {"uri": "fixture://text", "text": "hello"},
+                {"uri": "fixture://image", "blob": "d29ybGQ=", "mimeType": "image/png"}
+            ]
+        }))
+        .expect("typed MCP resource");
+
+        let result = mcp_resource_handler_result(&resource);
+        assert!(result.content().contains("hello"));
+        assert!(result.content().contains("native typed content"));
+        assert_eq!(result.attachments.len(), 1);
+        let metadata = serde_json::to_value(&result.attachments).expect("attachment metadata");
+        let resolved = super::super::resolve_tool_attachments(Some(&metadata))
+            .expect("provider-ready MCP resource attachment");
+        assert_eq!(resolved[0].media_type, "image/png");
+        assert_eq!(&*resolved[0].bytes, b"world");
     }
 }

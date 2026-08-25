@@ -7,6 +7,7 @@
 //! Handles tool discovery, schema translation, and request routing.
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use reqwest::header::{HeaderMap, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -23,6 +24,19 @@ use tokio::process::{Child, ChildStderr, Command};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
+
+#[doc(hidden)]
+pub use crate::mcp_protocol::McpRequestContext;
+use crate::mcp_protocol::{
+    parse_notification, McpNotification, McpProtocolAdapter, McpProtocolEra,
+    CURRENT_PROTOCOL_VERSION, PREFERRED_LEGACY_PROTOCOL_VERSION,
+};
+pub use crate::mcp_protocol::{
+    McpAnnotations, McpCallToolResult, McpCapabilities, McpContentBlock, McpGetPromptResult,
+    McpIcon, McpListCapability, McpPrompt, McpPromptArgument, McpPromptMessage, McpProtocolVersion,
+    McpReadResourceResult, McpResource, McpResourceContents, McpResourcesCapability, McpRole,
+    McpServerInfo, McpTask, McpTaskStatus, McpTool, McpToolsCapability,
+};
 
 // Fix #490 — per-request HTTP timeout cap. Stdio caps responses at 10 MiB
 // (`MAX_RESPONSE_SIZE`); the HTTP transport now caps wall-clock time at 60s
@@ -59,6 +73,7 @@ const STDERR_SNIPPET_BYTES: usize = 4096;
 // Fix #445 point 2 — bound BEFORE allocation on the response line.
 const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
 const MAX_STDIO_INTERMEDIATE_MESSAGES: usize = 1000;
+const MAX_MCP_CATALOG_PAGES: usize = 100;
 
 /// Errors that can occur during MCP operations
 #[derive(Error, Debug)]
@@ -68,6 +83,28 @@ pub enum McpError {
 
     #[error("Protocol error: {0}")]
     Protocol(String),
+
+    /// A structurally valid JSON-RPC error. Keeping its machine fields typed
+    /// is required for modern-version negotiation and provider recovery.
+    #[error("MCP RPC error {code}: {message}")]
+    Rpc {
+        code: i64,
+        message: String,
+        data: Option<Value>,
+        http_status: Option<u16>,
+    },
+
+    #[error("Unsupported MCP protocol version '{requested}' (server supports: {supported:?})")]
+    UnsupportedProtocolVersion {
+        requested: String,
+        supported: Vec<String>,
+    },
+
+    #[error("Unsupported MCP capability combination: {0}")]
+    UnsupportedCapability(String),
+
+    #[error("MCP HTTP endpoint returned status {status} without a recognized protocol error")]
+    HttpStatus { status: u16 },
 
     #[error("Tool not found: {0}")]
     ToolNotFound(String),
@@ -204,14 +241,78 @@ struct JsonRpcError {
     data: Option<Value>,
 }
 
-/// MCP tool definition
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct McpTool {
-    pub name: String,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default, rename = "inputSchema")]
-    pub input_schema: Option<Value>,
+fn sanitize_json_value(value: Value, sanitize: &impl Fn(&str) -> String) -> Value {
+    match value {
+        Value::String(value) => Value::String(sanitize(&value)),
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(|value| sanitize_json_value(value, sanitize))
+                .collect(),
+        ),
+        Value::Object(values) => Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, sanitize_json_value(value, sanitize)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn typed_rpc_error(
+    error: JsonRpcError,
+    http_status: Option<u16>,
+    sanitize: &impl Fn(&str) -> String,
+) -> McpError {
+    McpError::Rpc {
+        code: error.code,
+        message: sanitize(&error.message),
+        data: error.data.map(|data| sanitize_json_value(data, sanitize)),
+        http_status,
+    }
+}
+
+fn emit_mcp_notification(notification: McpNotification, sanitize: &impl Fn(&str) -> String) {
+    match notification {
+        McpNotification::Progress {
+            token,
+            progress,
+            total,
+            message,
+        } => {
+            let message = message.as_deref().map(sanitize);
+            debug!(
+                progress_token = %token,
+                progress,
+                total,
+                message,
+                "MCP request progress"
+            );
+        }
+        McpNotification::Log {
+            level,
+            logger,
+            data,
+        } => {
+            let data = sanitize(&data.to_string());
+            let logger = logger.as_deref().map(sanitize);
+            match level.as_str() {
+                "emergency" | "alert" | "critical" | "error" => {
+                    error!(logger, data, "MCP server log");
+                }
+                "warning" => warn!(logger, data, "MCP server log"),
+                "notice" | "info" => info!(logger, data, "MCP server log"),
+                _ => debug!(logger, data, "MCP server log"),
+            }
+        }
+        McpNotification::CatalogueChanged { method } => {
+            debug!(method, "MCP server catalogue changed");
+        }
+        McpNotification::ResourceUpdated { uri } => {
+            debug!(uri = %sanitize(&uri), "MCP server resource updated");
+        }
+    }
 }
 
 /// One discovered MCP identity that was deliberately not made model-visible.
@@ -250,41 +351,14 @@ impl McpServerTrust {
     }
 }
 
-/// MCP resource definition
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct McpResource {
-    pub uri: String,
-    pub name: String,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default, rename = "mimeType")]
-    pub mime_type: Option<String>,
-}
+/// Historical public name retained for callers that imported it directly.
+pub type ToolsCapability = McpToolsCapability;
 
-/// MCP server capabilities
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct McpCapabilities {
-    #[serde(default)]
-    pub tools: Option<ToolsCapability>,
-    #[serde(default)]
-    pub resources: Option<Value>,
-    #[serde(default)]
-    pub prompts: Option<Value>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ToolsCapability {
-    #[serde(default)]
-    pub list_changed: bool,
-}
-
-/// MCP server info from initialize response
-#[derive(Debug, Clone, Deserialize)]
-pub struct McpServerInfo {
-    pub name: String,
-    #[serde(default)]
-    pub version: Option<String>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpTransportBinding {
+    Stdio,
+    StreamableHttp,
+    InProcess,
 }
 
 /// Transport trait for MCP communication.
@@ -307,8 +381,30 @@ pub trait McpTransport: Send + Sync {
         json!({})
     }
 
+    /// Wire binding used by the dual-era negotiation rules.
+    fn binding(&self) -> McpTransportBinding {
+        McpTransportBinding::InProcess
+    }
+
     /// Send a request and receive a response
     async fn request(&self, method: &str, params: Option<Value>) -> Result<Value, McpError>;
+
+    /// Send a request with the exact version/routing metadata selected by the
+    /// protocol adapter. Non-HTTP transports carry all metadata in the body.
+    async fn request_with_context(
+        &self,
+        context: McpRequestContext,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Value, McpError> {
+        let _ = context;
+        self.request(method, params).await
+    }
+
+    /// Send a JSON-RPC notification without waiting for a response.
+    async fn notify(&self, method: &str, params: Option<Value>) -> Result<(), McpError> {
+        self.request(method, params).await.map(|_| ())
+    }
 
     /// Close the transport
     async fn close(&self) -> Result<(), McpError>;
@@ -627,11 +723,29 @@ impl StdioTransport {
             return Ok(false);
         };
 
-        if let Some(id) = value.get("id").and_then(Value::as_u64) {
+        if value.get("id").is_none() {
+            if let Some(notification) = parse_notification(value).map_err(McpError::Protocol)? {
+                emit_mcp_notification(notification, &|text| {
+                    self.run_context.sanitize_diagnostic(text).to_string()
+                });
+            } else {
+                debug!(method = %method, "Ignoring unsupported MCP server notification");
+            }
+            return Ok(true);
+        }
+
+        let id = value.get("id").expect("checked above");
+        let valid_id = id.is_string()
+            || id
+                .as_number()
+                .is_some_and(|number| number.is_i64() || number.is_u64());
+        if valid_id {
             let response = build_client_feature_response(&self.run_context, id, method);
             self.write_json_line(&response).await?;
         } else {
-            debug!(method = %method, "Ignoring MCP server notification while awaiting response");
+            return Err(McpError::Protocol(format!(
+                "MCP server request '{method}' has an invalid JSON-RPC id"
+            )));
         }
 
         Ok(true)
@@ -704,18 +818,9 @@ impl StdioTransport {
         }
 
         if let Some(error) = response.error {
-            let data_info = error
-                .data
-                .as_ref()
-                .map(|data| format!(" (data: {data})"))
-                .unwrap_or_default();
-            let raw = zeroize::Zeroizing::new(format!(
-                "RPC error {}: {}{}",
-                error.code, error.message, data_info
-            ));
-            return Err(McpError::Protocol(
-                self.run_context.sanitize_diagnostic(&raw).to_string(),
-            ));
+            return Err(typed_rpc_error(error, None, &|text| {
+                self.run_context.sanitize_diagnostic(text).to_string()
+            }));
         }
 
         Ok(response.result.unwrap_or(Value::Null))
@@ -1016,7 +1121,7 @@ fn verify_trusted_executable_ancestry(_path: &Path) -> Result<(), McpError> {
 
 fn build_client_feature_response(
     run: &crate::tools::ToolRunContext,
-    id: u64,
+    id: &Value,
     method: &str,
 ) -> Value {
     match method {
@@ -1064,6 +1169,10 @@ fn current_roots_result(run: &crate::tools::ToolRunContext) -> Value {
 
 #[async_trait]
 impl McpTransport for StdioTransport {
+    fn binding(&self) -> McpTransportBinding {
+        McpTransportBinding::Stdio
+    }
+
     fn client_capabilities(&self) -> Value {
         json!({
             "roots": { "listChanged": false },
@@ -1095,6 +1204,25 @@ impl McpTransport for StdioTransport {
         in_flight.disarm();
         checkpoint?;
         result
+    }
+
+    async fn request_with_context(
+        &self,
+        _context: McpRequestContext,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Value, McpError> {
+        self.request(method, params).await
+    }
+
+    async fn notify(&self, method: &str, params: Option<Value>) -> Result<(), McpError> {
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params.unwrap_or_else(|| json!({})),
+        });
+        let _request_guard = self.request_lock.lock().await;
+        self.write_json_line(&notification).await
     }
 
     async fn close(&self) -> Result<(), McpError> {
@@ -1336,6 +1464,7 @@ fn content_type_value_is_event_stream(value: &str) -> bool {
 
 async fn parse_http_json_rpc_response(
     response: reqwest::Response,
+    sanitize: &(impl Fn(&str) -> String + Sync),
 ) -> Result<JsonRpcResponse, McpError> {
     let is_event_stream = response_content_type_is_event_stream(response.headers());
     let body = zeroize::Zeroizing::new(response.text().await.map_err(|err| {
@@ -1347,7 +1476,7 @@ async fn parse_http_json_rpc_response(
     })?);
 
     if is_event_stream || body_looks_like_sse(&body) {
-        parse_sse_json_rpc_response(&body)
+        parse_sse_json_rpc_response(&body, sanitize)
     } else {
         serde_json::from_str(&body)
             .map_err(|err| McpError::Protocol(format!("Failed to parse response: {err}")))
@@ -1367,13 +1496,18 @@ fn body_looks_like_sse(body: &str) -> bool {
         })
 }
 
-fn parse_sse_json_rpc_response(body: &str) -> Result<JsonRpcResponse, McpError> {
+fn parse_sse_json_rpc_response(
+    body: &str,
+    sanitize: &impl Fn(&str) -> String,
+) -> Result<JsonRpcResponse, McpError> {
     let mut event_name: Option<String> = None;
     let mut data_lines: Vec<String> = Vec::new();
 
     for line in body.lines() {
         if line.is_empty() {
-            if let Some(response) = parse_sse_json_rpc_event(event_name.as_deref(), &data_lines)? {
+            if let Some(response) =
+                parse_sse_json_rpc_event(event_name.as_deref(), &data_lines, sanitize)?
+            {
                 return Ok(response);
             }
             event_name = None;
@@ -1397,7 +1531,8 @@ fn parse_sse_json_rpc_response(body: &str) -> Result<JsonRpcResponse, McpError> 
         }
     }
 
-    if let Some(response) = parse_sse_json_rpc_event(event_name.as_deref(), &data_lines)? {
+    if let Some(response) = parse_sse_json_rpc_event(event_name.as_deref(), &data_lines, sanitize)?
+    {
         return Ok(response);
     }
 
@@ -1409,6 +1544,7 @@ fn parse_sse_json_rpc_response(body: &str) -> Result<JsonRpcResponse, McpError> 
 fn parse_sse_json_rpc_event(
     event_name: Option<&str>,
     data_lines: &[String],
+    sanitize: &impl Fn(&str) -> String,
 ) -> Result<Option<JsonRpcResponse>, McpError> {
     if data_lines.is_empty() || event_name.is_some_and(|name| name != "message") {
         return Ok(None);
@@ -1417,6 +1553,11 @@ fn parse_sse_json_rpc_event(
     let data = data_lines.join("\n");
     let value: Value = serde_json::from_str(&data)
         .map_err(|err| McpError::Protocol(format!("Failed to parse SSE event JSON: {err}")))?;
+
+    if let Some(notification) = parse_notification(&value).map_err(McpError::Protocol)? {
+        emit_mcp_notification(notification, sanitize);
+        return Ok(None);
+    }
 
     if !value
         .get("id")
@@ -1430,9 +1571,63 @@ fn parse_sse_json_rpc_event(
         .map_err(|err| McpError::Protocol(format!("Failed to parse SSE JSON-RPC response: {err}")))
 }
 
+fn encode_mcp_header_value(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value.is_ascii()
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'\t' | 0x20..=0x7e))
+        && value.trim() == value
+        && !(value.starts_with("=?base64?") && value.ends_with("?="));
+    if plain {
+        value.to_string()
+    } else {
+        format!(
+            "=?base64?{}?=",
+            base64::engine::general_purpose::STANDARD.encode(value.as_bytes())
+        )
+    }
+}
+
+fn should_fall_back_to_legacy(binding: McpTransportBinding, error: &McpError) -> bool {
+    match error {
+        McpError::Rpc {
+            code, http_status, ..
+        } => match binding {
+            McpTransportBinding::Stdio | McpTransportBinding::InProcess => *code == -32601,
+            McpTransportBinding::StreamableHttp => {
+                *code == -32601
+                    && http_status.is_some_and(|status| matches!(status, 200 | 400 | 404 | 405))
+            }
+        },
+        McpError::HttpStatus { status } if binding == McpTransportBinding::StreamableHttp => {
+            matches!(status, 400 | 404 | 405)
+        }
+        _ => false,
+    }
+}
+
 #[async_trait]
 impl McpTransport for HttpTransport {
+    fn binding(&self) -> McpTransportBinding {
+        McpTransportBinding::StreamableHttp
+    }
+
     async fn request(&self, method: &str, params: Option<Value>) -> Result<Value, McpError> {
+        self.request_with_context(
+            McpRequestContext::legacy(McpProtocolVersion::V2024_11_05),
+            method,
+            params,
+        )
+        .await
+    }
+
+    async fn request_with_context(
+        &self,
+        context: McpRequestContext,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Value, McpError> {
         let id = self.request_id.fetch_add(1, Ordering::SeqCst);
 
         let request = JsonRpcRequest {
@@ -1463,7 +1658,17 @@ impl McpTransport for HttpTransport {
             .header("Accept", "application/json, text/event-stream")
             .header("Content-Type", "application/json")
             .json(&request);
-        if let Some(sid) = self.session_id() {
+        if context.version.era() == McpProtocolEra::Modern {
+            builder = builder
+                .header("MCP-Protocol-Version", context.version.as_str())
+                .header("Mcp-Method", method);
+            if let Some(name) = context.routing_name.as_deref() {
+                builder = builder.header("Mcp-Name", encode_mcp_header_value(name));
+            }
+            for (name, value) in &context.parameter_headers {
+                builder = builder.header(name, encode_mcp_header_value(value));
+            }
+        } else if let Some(sid) = self.session_id() {
             builder = builder.header("Mcp-Session-Id", sid);
         }
         let response = builder.send().await.map_err(|e| {
@@ -1481,28 +1686,37 @@ impl McpTransport for HttpTransport {
             }
         })?;
 
-        if !response.status().is_success() {
-            return Err(McpError::Transport(format!(
-                "HTTP error: {}",
-                response.status()
-            )));
-        }
+        let status = response.status();
 
         // Capture `Mcp-Session-Id` if the server set one. Per spec the
         // server MAY emit it on the initialize response; once set, all
         // subsequent POSTs MUST echo it (handled above on the next call).
-        if let Some(sid) = response
-            .headers()
-            .get("Mcp-Session-Id")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned)
-        {
-            if let Some(mut guard) = self.session_id_write_guard("request.store_session_id") {
-                *guard = Some(sid);
+        if context.version.era() == McpProtocolEra::Legacy {
+            if let Some(sid) = response
+                .headers()
+                .get("Mcp-Session-Id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+            {
+                if let Some(mut guard) = self.session_id_write_guard("request.store_session_id") {
+                    *guard = Some(sid);
+                }
             }
         }
 
-        let response = parse_http_json_rpc_response(response).await?;
+        let response = match parse_http_json_rpc_response(response, &|text| {
+            self.headers.sanitize_diagnostic(text).to_string()
+        })
+        .await
+        {
+            Ok(response) => response,
+            Err(_error) if !status.is_success() => {
+                return Err(McpError::HttpStatus {
+                    status: status.as_u16(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
 
         // Fix #701 — JSON-RPC §5 requires response.id == request.id.
         // The pre-fix HTTP transport parsed `id` into the struct and
@@ -1519,27 +1733,46 @@ impl McpTransport for HttpTransport {
         }
 
         if let Some(error) = response.error {
-            // Fix #626 — preserve JSON-RPC `error.data` in the surfaced
-            // message. The pre-fix HTTP transport formatted only
-            // `{code, message}` and dropped `data`, while
-            // `StdioTransport` already appended `(data: ...)`. Mirror
-            // the stdio formatting verbatim so operators get the same
-            // structured debugging context regardless of transport.
-            let data_info = error
-                .data
-                .as_ref()
-                .map(|d| format!(" (data: {d})"))
-                .unwrap_or_default();
-            let raw = zeroize::Zeroizing::new(format!(
-                "RPC error {}: {}{}",
-                error.code, error.message, data_info
-            ));
-            return Err(McpError::Protocol(
-                self.headers.sanitize_diagnostic(&raw).to_string(),
-            ));
+            return Err(typed_rpc_error(error, Some(status.as_u16()), &|text| {
+                self.headers.sanitize_diagnostic(text).to_string()
+            }));
+        }
+        if !status.is_success() {
+            return Err(McpError::Transport(format!("HTTP error: {status}")));
         }
 
         Ok(response.result.unwrap_or(Value::Null))
+    }
+
+    async fn notify(&self, method: &str, params: Option<Value>) -> Result<(), McpError> {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params.unwrap_or_else(|| json!({})),
+        });
+        let mut builder = self
+            .headers
+            .apply(Self::client()?.post(&self.base_url))
+            .map_err(|error| McpError::Transport(format!("Invalid MCP HTTP header: {error}")))?
+            .timeout(HTTP_REQUEST_TIMEOUT)
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json")
+            .json(&request);
+        if let Some(session_id) = self.session_id() {
+            builder = builder.header("Mcp-Session-Id", session_id);
+        }
+        let response = builder
+            .send()
+            .await
+            .map_err(|error| McpError::Transport(format!("HTTP notification failed: {error}")))?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(McpError::Transport(format!(
+                "HTTP notification error: {}",
+                response.status()
+            )))
+        }
     }
 
     async fn close(&self) -> Result<(), McpError> {
@@ -1611,6 +1844,7 @@ impl Default for McpServerConfig {
 pub struct McpServer {
     name: String,
     transport: Box<dyn McpTransport>,
+    adapter: McpProtocolAdapter,
     info: Option<McpServerInfo>,
     capabilities: McpCapabilities,
     tools: Vec<McpTool>,
@@ -1656,6 +1890,7 @@ impl McpServer {
         let mut server = Self {
             name: name.to_string(),
             transport,
+            adapter: McpProtocolAdapter::current(),
             info: None,
             capabilities: McpCapabilities::default(),
             tools: Vec::new(),
@@ -1707,10 +1942,150 @@ impl McpServer {
         Ok(server)
     }
 
-    /// Initialize the MCP connection
+    /// Negotiate the server era, using modern discovery first and an explicit
+    /// initialization-based adapter only when the binding's fallback rules
+    /// identify a legacy server.
     async fn initialize(&mut self) -> Result<(), McpError> {
+        match self.discover_current().await {
+            Ok(()) => self.log_connected("discovered"),
+            Err(error) if should_fall_back_to_legacy(self.transport.binding(), &error) => {
+                debug!(server = %self.name, error = %error, "MCP server is legacy; using initialize adapter");
+                self.initialize_legacy().await?;
+                self.log_connected("initialized");
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)] // One negotiation transaction validates one authoritative profile.
+    async fn discover_current(&mut self) -> Result<(), McpError> {
+        let adapter = McpProtocolAdapter::current();
+        let params = adapter
+            .request_params(None, self.transport.client_capabilities())
+            .map_err(McpError::Protocol)?;
+        let result = self
+            .transport
+            .request_with_context(
+                adapter.request_context(None),
+                "server/discover",
+                Some(params),
+            )
+            .await
+            .map_err(|error| match error {
+                McpError::Rpc {
+                    code: -32022,
+                    data: Some(data),
+                    ..
+                } => {
+                    let requested = data
+                        .get("requested")
+                        .and_then(Value::as_str)
+                        .unwrap_or(CURRENT_PROTOCOL_VERSION)
+                        .to_string();
+                    let supported = data
+                        .get("supported")
+                        .and_then(Value::as_array)
+                        .map(|versions| {
+                            versions
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    McpError::UnsupportedProtocolVersion {
+                        requested,
+                        supported,
+                    }
+                }
+                other => other,
+            })?;
+        adapter
+            .require_complete_result("server/discover", &result)
+            .map_err(McpError::UnsupportedCapability)?;
+
+        let supported = result
+            .get("supportedVersions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                McpError::Protocol(format!(
+                    "MCP server '{}' discovery response is missing supportedVersions",
+                    self.name
+                ))
+            })?
+            .iter()
+            .map(|version| {
+                version.as_str().map(str::to_string).ok_or_else(|| {
+                    McpError::Protocol(format!(
+                        "MCP server '{}' discovery returned a non-string protocol version",
+                        self.name
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !supported
+            .iter()
+            .any(|version| version == CURRENT_PROTOCOL_VERSION)
+        {
+            return Err(McpError::UnsupportedProtocolVersion {
+                requested: CURRENT_PROTOCOL_VERSION.to_string(),
+                supported,
+            });
+        }
+
+        let capabilities = result.get("capabilities").ok_or_else(|| {
+            McpError::Protocol(format!(
+                "MCP server '{}' discovery response is missing capabilities",
+                self.name
+            ))
+        })?;
+        if !capabilities.is_object() {
+            return Err(McpError::Protocol(format!(
+                "MCP server '{}' discovery response has non-object capabilities",
+                self.name
+            )));
+        }
+        self.capabilities = serde_json::from_value(capabilities.clone()).map_err(|error| {
+            McpError::Protocol(format!(
+                "MCP server '{}' discovery capabilities are invalid: {error}",
+                self.name
+            ))
+        })?;
+
+        if let Some(info) = result.pointer("/_meta/io.modelcontextprotocol~1serverInfo") {
+            let info: McpServerInfo = serde_json::from_value(info.clone()).map_err(|error| {
+                McpError::Protocol(format!(
+                    "MCP server '{}' discovery serverInfo is invalid: {error}",
+                    self.name
+                ))
+            })?;
+            if info.version.as_deref().is_none_or(str::is_empty) {
+                return Err(McpError::Protocol(format!(
+                    "MCP server '{}' discovery serverInfo is missing version",
+                    self.name
+                )));
+            }
+            self.info = Some(info);
+        }
+        if !result.get("ttlMs").is_some_and(Value::is_u64)
+            || !matches!(
+                result.get("cacheScope").and_then(Value::as_str),
+                Some("private" | "public")
+            )
+        {
+            return Err(McpError::Protocol(format!(
+                "MCP server '{}' discovery response has invalid cache metadata",
+                self.name
+            )));
+        }
+        self.adapter = adapter;
+        Ok(())
+    }
+
+    async fn initialize_legacy(&mut self) -> Result<(), McpError> {
         let params = json!({
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": PREFERRED_LEGACY_PROTOCOL_VERSION,
             "capabilities": self.transport.client_capabilities(),
             "clientInfo": {
                 "name": "openclaudia",
@@ -1719,6 +2094,20 @@ impl McpServer {
         });
 
         let result = self.transport.request("initialize", Some(params)).await?;
+
+        let selected = result
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .and_then(McpProtocolVersion::parse)
+            .filter(|version| version.era() == McpProtocolEra::Legacy)
+            .unwrap_or_else(|| {
+                warn!(
+                    server = %self.name,
+                    "Legacy MCP initialize omitted a supported protocolVersion; preserving the bounded 2024-11-05 compatibility path"
+                );
+                McpProtocolVersion::V2024_11_05
+            });
+        self.adapter = McpProtocolAdapter::new(selected);
 
         // Parse server info and capabilities
         if let Some(info) = result.get("serverInfo") {
@@ -1753,12 +2142,18 @@ impl McpServer {
             })?;
         }
 
-        // Send initialized notification
-        self.transport
-            .request("notifications/initialized", None)
+        if let Err(error) = self
+            .transport
+            .notify("notifications/initialized", Some(json!({})))
             .await
-            .ok();
+        {
+            warn!(server = %self.name, error = %error, "MCP initialized notification was not accepted");
+        }
 
+        Ok(())
+    }
+
+    fn log_connected(&self, lifecycle: &'static str) {
         // Log server info with name and version
         let server_name = self.info.as_ref().map_or("unknown", |i| i.name.as_str());
         let server_version = self
@@ -1779,10 +2174,87 @@ impl McpServer {
             has_tools = has_tools,
             has_resources = has_resources,
             has_prompts = has_prompts,
-            "MCP server initialized"
+            protocol_version = %self.adapter.version(),
+            lifecycle,
+            "MCP server connected"
         );
+    }
 
-        Ok(())
+    async fn request(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        routing_name: Option<String>,
+        parameter_headers: Vec<(String, String)>,
+    ) -> Result<Value, McpError> {
+        let params = self
+            .adapter
+            .request_params(params, self.transport.client_capabilities())
+            .map_err(McpError::Protocol)?;
+        let mut params = params;
+        if self.adapter.era() == McpProtocolEra::Modern {
+            if let Some(meta) = params.get_mut("_meta").and_then(Value::as_object_mut) {
+                meta.insert(
+                    "progressToken".to_string(),
+                    Value::String(uuid::Uuid::new_v4().to_string()),
+                );
+            }
+        }
+        let mut context = self.adapter.request_context(routing_name);
+        context.parameter_headers = parameter_headers;
+        self.transport
+            .request_with_context(context, method, Some(params))
+            .await
+    }
+
+    async fn list_paginated<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &'static str,
+        field: &'static str,
+    ) -> Result<Vec<T>, McpError> {
+        let mut items = Vec::new();
+        let mut cursor: Option<String> = None;
+        for page in 0..MAX_MCP_CATALOG_PAGES {
+            let params = cursor
+                .as_ref()
+                .map_or_else(|| json!({}), |cursor| json!({"cursor": cursor}));
+            let result = self.request(method, Some(params), None, Vec::new()).await?;
+            self.adapter
+                .require_complete_result(method, &result)
+                .map_err(McpError::UnsupportedCapability)?;
+            self.adapter
+                .require_cache_metadata(method, &result)
+                .map_err(McpError::Protocol)?;
+            items.extend(parse_array_field(&self.name, method, field, &result)?);
+            let next = result
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .filter(|next| !next.is_empty())
+                .map(str::to_string);
+            if next.is_none() {
+                return Ok(items);
+            }
+            if page + 1 == MAX_MCP_CATALOG_PAGES {
+                return Err(McpError::Protocol(format!(
+                    "MCP server '{}' {method} exceeded {MAX_MCP_CATALOG_PAGES} pages",
+                    self.name
+                )));
+            }
+            if next == cursor {
+                return Err(McpError::Protocol(format!(
+                    "MCP server '{}' {method} repeated its pagination cursor",
+                    self.name
+                )));
+            }
+            cursor = next;
+        }
+        Ok(items)
+    }
+
+    /// Exact wire profile selected for this server.
+    #[must_use]
+    pub const fn protocol_version(&self) -> McpProtocolVersion {
+        self.adapter.version()
     }
 
     /// Whether the server advertised the `tools` capability during the
@@ -1822,9 +2294,34 @@ impl McpServer {
             return Ok(());
         }
 
-        let result = self.transport.request("tools/list", None).await?;
-
-        self.tools = parse_mcp_tools_list_response(&self.name, &result)?;
+        let mut tools: Vec<McpTool> = self.list_paginated("tools/list", "tools").await?;
+        if self.adapter.era() == McpProtocolEra::Modern
+            && tools.iter().any(|tool| tool.input_schema.is_none())
+        {
+            return Err(McpError::Protocol(format!(
+                "MCP server '{}' returned a current tool without inputSchema",
+                self.name
+            )));
+        }
+        if self.adapter.era() == McpProtocolEra::Modern
+            && self.transport.binding() == McpTransportBinding::StreamableHttp
+        {
+            tools.retain(
+                |tool| match extract_mcp_parameter_headers(tool, &json!({})) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        warn!(
+                            server = %self.name,
+                            tool = %tool.name,
+                            error = %error,
+                            "Excluding MCP tool with invalid HTTP header annotations"
+                        );
+                        false
+                    }
+                },
+            );
+        }
+        self.tools = tools;
 
         // Check if server supports tool list change notifications
         let supports_list_changed = self
@@ -1874,6 +2371,7 @@ impl McpServer {
     /// `McpError::ToolReportedError` if the server reported a
     /// tool-execution failure via `isError: true`, or a
     /// transport/protocol error if the request fails.
+    #[allow(clippy::too_many_lines)] // Dispatch, typed validation, and tool-error interpretation are one boundary.
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, McpError> {
         if !self.tools.iter().any(|t| t.name == name) {
             return Err(McpError::ToolNotFound(name.to_string()));
@@ -1886,7 +2384,87 @@ impl McpServer {
 
         debug!(server = %self.name, tool = %name, "Calling MCP tool");
 
-        let result = self.transport.request("tools/call", Some(params)).await?;
+        let parameter_headers = if self.transport.binding() == McpTransportBinding::StreamableHttp
+            && self.adapter.era() == McpProtocolEra::Modern
+        {
+            let tool = self
+                .tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .ok_or_else(|| McpError::ToolNotFound(name.to_string()))?;
+            extract_mcp_parameter_headers(tool, &arguments)?
+        } else {
+            Vec::new()
+        };
+        let result = self
+            .request(
+                "tools/call",
+                Some(params),
+                Some(name.to_string()),
+                parameter_headers,
+            )
+            .await?;
+        self.adapter
+            .require_complete_result("tools/call", &result)
+            .map_err(McpError::UnsupportedCapability)?;
+        if self.adapter.era() == McpProtocolEra::Modern
+            && !result.get("content").is_some_and(Value::is_array)
+        {
+            return Err(McpError::Protocol(format!(
+                "MCP server '{}' current tools/call result for '{name}' is missing content",
+                self.name
+            )));
+        }
+
+        let typed: McpCallToolResult = serde_json::from_value(result.clone()).map_err(|error| {
+            McpError::Protocol(format!(
+                "MCP server '{}' tools/call result for '{name}' is invalid: {error}",
+                self.name
+            ))
+        })?;
+        for block in &typed.content {
+            if let Some((encoded, media_type)) = block.encoded_media() {
+                if media_type.is_empty() || !media_type.is_ascii() {
+                    return Err(McpError::Protocol(format!(
+                        "MCP tool '{name}' returned media with an invalid MIME type"
+                    )));
+                }
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .map_err(|_| {
+                        McpError::Protocol(format!(
+                            "MCP tool '{name}' returned invalid base64 media content"
+                        ))
+                    })?;
+            }
+        }
+        if let Some(output_schema) = self
+            .tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .and_then(|tool| tool.output_schema.as_ref())
+        {
+            let Some(structured) = typed.structured_content.as_ref() else {
+                return Err(McpError::Protocol(format!(
+                    "MCP tool '{name}' advertised outputSchema but returned no structuredContent"
+                )));
+            };
+            let validator = if output_schema.get("$schema").is_some() {
+                jsonschema::validator_for(output_schema)
+            } else {
+                jsonschema::draft202012::new(output_schema)
+            }
+            .map_err(|_| {
+                McpError::Protocol(format!(
+                    "MCP tool '{name}' advertised an invalid outputSchema"
+                ))
+            })?;
+            if !validator.is_valid(structured) {
+                return Err(McpError::Protocol(format!(
+                    "MCP tool '{name}' structuredContent does not satisfy outputSchema"
+                )));
+            }
+        }
 
         // Fix #625 — per MCP spec, a tool result of the shape
         // `{"content": [...], "isError": true}` signals tool-level
@@ -1896,18 +2474,11 @@ impl McpServer {
         // `text` field in the content array) as the error message,
         // falling back to a generic placeholder if the server emitted
         // `isError: true` with no usable content block.
-        if result
-            .get("isError")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            let message = result
-                .get("content")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|arr| {
-                    arr.iter()
-                        .find_map(|item| item.get("text").and_then(|t| t.as_str()))
-                })
+        if typed.is_error {
+            let message = typed
+                .content
+                .iter()
+                .find_map(McpContentBlock::text)
                 .map_or_else(
                     || format!("MCP tool '{name}' returned isError with no content"),
                     ToString::to_string,
@@ -1942,12 +2513,8 @@ impl McpServer {
             return Ok(Vec::new());
         }
 
-        let result = self
-            .transport
-            .request("resources/list", Some(json!({})))
-            .await?;
-
-        let resources = parse_mcp_resources_list_response(&self.name, &result)?;
+        let resources: Vec<McpResource> =
+            self.list_paginated("resources/list", "resources").await?;
 
         debug!(
             server = %self.name,
@@ -1963,37 +2530,112 @@ impl McpServer {
     /// # Errors
     ///
     /// Returns an `McpError` if the resources/read request fails.
-    pub async fn read_resource(&self, uri: &str) -> Result<String, McpError> {
+    pub async fn read_resource_typed(&self, uri: &str) -> Result<McpReadResourceResult, McpError> {
         let params = json!({ "uri": uri });
 
         debug!(server = %self.name, uri = %uri, "Reading MCP resource");
 
         let result = self
-            .transport
-            .request("resources/read", Some(params))
+            .request(
+                "resources/read",
+                Some(params),
+                Some(uri.to_string()),
+                Vec::new(),
+            )
             .await?;
-
-        // The MCP spec returns contents as an array of content items
-        if let Some(contents) = result.get("contents").and_then(|c| c.as_array()) {
-            let text: Vec<&str> = contents
-                .iter()
-                .filter_map(|c| c.get("text").and_then(|t| t.as_str()))
-                .collect();
-            if !text.is_empty() {
-                return Ok(text.join("\n"));
-            }
-            // Check for blob content (base64-encoded)
-            let blobs: Vec<&str> = contents
-                .iter()
-                .filter_map(|c| c.get("blob").and_then(|b| b.as_str()))
-                .collect();
-            if !blobs.is_empty() {
-                return Ok(blobs.join("\n"));
+        self.adapter
+            .require_complete_result("resources/read", &result)
+            .map_err(McpError::UnsupportedCapability)?;
+        self.adapter
+            .require_cache_metadata("resources/read", &result)
+            .map_err(McpError::Protocol)?;
+        let typed: McpReadResourceResult = serde_json::from_value(result).map_err(|error| {
+            McpError::Protocol(format!(
+                "MCP server '{}' resources/read result for '{uri}' is invalid: {error}",
+                self.name
+            ))
+        })?;
+        for content in &typed.contents {
+            if let McpResourceContents::Blob { blob, .. } = content {
+                base64::engine::general_purpose::STANDARD
+                    .decode(blob)
+                    .map_err(|_| {
+                        McpError::Protocol(format!(
+                            "MCP resource '{uri}' returned invalid base64 blob content"
+                        ))
+                    })?;
             }
         }
+        Ok(typed)
+    }
 
-        // Fallback: return the raw result as string
-        Ok(result.to_string())
+    /// Compatibility projection for existing text-only resource callers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `McpError` when the resource request or typed decoding fails.
+    pub async fn read_resource(&self, uri: &str) -> Result<String, McpError> {
+        let result = self.read_resource_typed(uri).await?;
+        let content = result
+            .contents
+            .iter()
+            .map(|content| match content {
+                McpResourceContents::Text { text, .. } => text.clone(),
+                McpResourceContents::Blob { uri, mime_type, .. } => format!(
+                    "Binary MCP resource {uri} ({}) retained as typed content",
+                    mime_type.as_deref().unwrap_or("application/octet-stream")
+                ),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(content)
+    }
+
+    /// List prompt templates when the negotiated server advertises them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `McpError` when prompt pagination or decoding fails.
+    pub async fn list_prompts(&self) -> Result<Vec<McpPrompt>, McpError> {
+        if self.capabilities.prompts.is_none() {
+            return Ok(Vec::new());
+        }
+        self.list_paginated("prompts/list", "prompts").await
+    }
+
+    /// Resolve one prompt without flattening its typed content blocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `McpError` when prompts are unsupported or resolution fails.
+    pub async fn get_prompt(
+        &self,
+        name: &str,
+        arguments: BTreeMap<String, String>,
+    ) -> Result<McpGetPromptResult, McpError> {
+        if self.capabilities.prompts.is_none() {
+            return Err(McpError::UnsupportedCapability(format!(
+                "server '{}' did not advertise prompts",
+                self.name
+            )));
+        }
+        let result = self
+            .request(
+                "prompts/get",
+                Some(json!({"name": name, "arguments": arguments})),
+                Some(name.to_string()),
+                Vec::new(),
+            )
+            .await?;
+        self.adapter
+            .require_complete_result("prompts/get", &result)
+            .map_err(McpError::UnsupportedCapability)?;
+        serde_json::from_value(result).map_err(|error| {
+            McpError::Protocol(format!(
+                "MCP server '{}' prompts/get result for '{name}' is invalid: {error}",
+                self.name
+            ))
+        })
     }
 
     /// Get server name
@@ -2012,59 +2654,182 @@ impl McpServer {
     }
 }
 
-fn parse_mcp_tools_list_response(
+fn parse_array_field<T: serde::de::DeserializeOwned>(
     server_name: &str,
+    operation: &str,
+    field: &str,
     result: &Value,
-) -> Result<Vec<McpTool>, McpError> {
-    let tools = result
-        .get("tools")
+) -> Result<Vec<T>, McpError> {
+    result
+        .get(field)
         .and_then(Value::as_array)
         .ok_or_else(|| {
             McpError::Protocol(format!(
-                "MCP server '{server_name}' tools/list response missing 'tools' array: {result}"
+                "MCP server '{server_name}' {operation} response missing '{field}' array: {result}"
             ))
-        })?;
-
-    tools
+        })?
         .iter()
         .enumerate()
-        .map(|(index, tool)| {
-            serde_json::from_value::<McpTool>(tool.clone()).map_err(|e| {
+        .map(|(index, item)| {
+            serde_json::from_value(item.clone()).map_err(|error| {
                 McpError::Protocol(format!(
-                    "MCP server '{server_name}' tools/list entry at index {index} is invalid: \
-                     {e}; entry: {tool}"
+                    "MCP server '{server_name}' {operation} entry at index {index} is invalid: {error}; entry: {item}"
                 ))
             })
         })
         .collect()
 }
 
-fn parse_mcp_resources_list_response(
-    server_name: &str,
-    result: &Value,
-) -> Result<Vec<McpResource>, McpError> {
-    let resources = result
-        .get("resources")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            McpError::Protocol(format!(
-                "MCP server '{server_name}' resources/list response missing 'resources' array: \
-                 {result}"
-            ))
-        })?;
-
-    resources
-        .iter()
-        .enumerate()
-        .map(|(index, resource)| {
-            serde_json::from_value::<McpResource>(resource.clone()).map_err(|e| {
-                McpError::Protocol(format!(
-                    "MCP server '{server_name}' resources/list entry at index {index} is \
-                     invalid: {e}; entry: {resource}"
-                ))
-            })
+fn valid_mcp_header_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
         })
-        .collect()
+}
+
+fn extract_mcp_parameter_headers(
+    tool: &McpTool,
+    arguments: &Value,
+) -> Result<Vec<(String, String)>, McpError> {
+    let Some(schema) = tool.input_schema.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let mut headers = BTreeMap::<String, (String, Option<String>)>::new();
+    inspect_mcp_header_schema(
+        &tool.name,
+        schema,
+        arguments,
+        &mut Vec::new(),
+        false,
+        true,
+        &mut headers,
+    )?;
+    Ok(headers
+        .into_values()
+        .filter_map(|(name, value)| value.map(|value| (format!("Mcp-Param-{name}"), value)))
+        .collect())
+}
+
+fn inspect_mcp_header_schema(
+    tool_name: &str,
+    schema: &Value,
+    arguments: &Value,
+    argument_path: &mut Vec<String>,
+    is_reachable_property: bool,
+    static_chain: bool,
+    headers: &mut BTreeMap<String, (String, Option<String>)>,
+) -> Result<(), McpError> {
+    let Some(object) = schema.as_object() else {
+        return Ok(());
+    };
+    if let Some(annotation) = object.get("x-mcp-header") {
+        if !is_reachable_property || !static_chain {
+            return Err(McpError::InvalidToolSchema {
+                tool: tool_name.to_string(),
+                reason: "x-mcp-header appears outside a statically reachable property".to_string(),
+            });
+        }
+        let name = annotation
+            .as_str()
+            .filter(|name| valid_mcp_header_token(name))
+            .ok_or_else(|| McpError::InvalidToolSchema {
+                tool: tool_name.to_string(),
+                reason: "x-mcp-header must be a non-empty HTTP field-name token".to_string(),
+            })?;
+        let value_type = object.get("type").and_then(Value::as_str);
+        if !matches!(value_type, Some("string" | "integer" | "boolean")) {
+            return Err(McpError::InvalidToolSchema {
+                tool: tool_name.to_string(),
+                reason: "x-mcp-header is allowed only on string, integer, or boolean properties"
+                    .to_string(),
+            });
+        }
+        let key = name.to_ascii_lowercase();
+        if headers.contains_key(&key) {
+            return Err(McpError::InvalidToolSchema {
+                tool: tool_name.to_string(),
+                reason: format!("duplicate x-mcp-header name '{name}'"),
+            });
+        }
+        let instance = argument_path
+            .iter()
+            .try_fold(arguments, |value, component| value.get(component));
+        if let Some(instance) = instance.filter(|value| !value.is_null()) {
+            let value = match (value_type, instance) {
+                (Some("string"), Value::String(value)) => value.clone(),
+                (Some("integer"), Value::Number(value)) => {
+                    let integer = value
+                        .as_i64()
+                        .ok_or_else(|| McpError::InvalidToolArguments {
+                            tool: tool_name.to_string(),
+                        })?;
+                    if !(-9_007_199_254_740_991..=9_007_199_254_740_991).contains(&integer) {
+                        return Err(McpError::InvalidToolArguments {
+                            tool: tool_name.to_string(),
+                        });
+                    }
+                    integer.to_string()
+                }
+                (Some("boolean"), Value::Bool(value)) => value.to_string(),
+                _ => {
+                    return Err(McpError::InvalidToolArguments {
+                        tool: tool_name.to_string(),
+                    });
+                }
+            };
+            headers.insert(key, (name.to_string(), Some(value)));
+        } else {
+            headers.insert(key, (name.to_string(), None));
+        }
+    }
+
+    for (keyword, child) in object {
+        if keyword == "properties" {
+            if let Some(properties) = child.as_object() {
+                for (property, property_schema) in properties {
+                    argument_path.push(property.clone());
+                    inspect_mcp_header_schema(
+                        tool_name,
+                        property_schema,
+                        arguments,
+                        argument_path,
+                        true,
+                        static_chain,
+                        headers,
+                    )?;
+                    argument_path.pop();
+                }
+            }
+        } else if keyword != "x-mcp-header" {
+            inspect_mcp_header_schema(
+                tool_name,
+                child,
+                arguments,
+                argument_path,
+                false,
+                false,
+                headers,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Named MCP transports that do not have standalone builders here.
@@ -3204,7 +3969,10 @@ impl McpManager {
             server.call_tool(tool_name, arguments).await
         };
         if let Err(ref e) = outcome {
-            if matches!(e, McpError::Transport(_) | McpError::Timeout { .. }) {
+            if matches!(
+                e,
+                McpError::Transport(_) | McpError::HttpStatus { .. } | McpError::Timeout { .. }
+            ) {
                 entry.mark_disconnected();
                 self.bump_catalog_epoch();
             }
@@ -3276,7 +4044,7 @@ impl McpManager {
                     Ok(())
                 }
                 Err(e) => {
-                    if matches!(e, McpError::Transport(_)) {
+                    if matches!(e, McpError::Transport(_) | McpError::HttpStatus { .. }) {
                         entry.mark_disconnected();
                         self.bump_catalog_epoch();
                     }
@@ -3304,7 +4072,7 @@ impl McpManager {
                         }
                     }
                     Err(e) => {
-                        if matches!(e, McpError::Transport(_)) {
+                        if matches!(e, McpError::Transport(_) | McpError::HttpStatus { .. }) {
                             entry.mark_disconnected();
                             self.bump_catalog_epoch();
                         }
@@ -3341,13 +4109,129 @@ impl McpManager {
         };
         let outcome = server.read_resource(uri).await;
         if let Err(ref e) = outcome {
-            if matches!(e, McpError::Transport(_)) {
+            if matches!(e, McpError::Transport(_) | McpError::HttpStatus { .. }) {
                 entry.mark_disconnected();
                 self.bump_catalog_epoch();
             }
         }
         drop(guard);
         Ok(outcome?)
+    }
+
+    /// Read a resource without collapsing binary/text variants or cache
+    /// metadata. This is the canonical API for new frontends.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `McpError` when the server is unavailable or the read fails.
+    pub async fn read_resource_typed(
+        &self,
+        server_name: &str,
+        uri: &str,
+    ) -> Result<McpReadResourceResult, McpError> {
+        let mut guard = self.servers.lock().await;
+        let entry = guard
+            .get_mut(server_name)
+            .ok_or_else(|| McpError::NotConnected(server_name.to_string()))?;
+        if Self::ensure_connected(&self.run_context, entry, server_name).await? {
+            self.bump_catalog_epoch();
+        }
+        let Some(server) = entry.server.as_ref() else {
+            return Err(McpError::ServerUnreachable(server_name.to_string()));
+        };
+        let outcome = server.read_resource_typed(uri).await;
+        if matches!(
+            &outcome,
+            Err(McpError::Transport(_) | McpError::HttpStatus { .. })
+        ) {
+            entry.mark_disconnected();
+            self.bump_catalog_epoch();
+        }
+        drop(guard);
+        outcome
+    }
+
+    /// List typed prompts across all live servers or one named server.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `McpError` when a named server is unavailable or listing fails.
+    pub async fn list_prompts(
+        &self,
+        server_name: Option<&str>,
+    ) -> Result<Vec<(String, McpPrompt)>, McpError> {
+        let mut prompts = Vec::new();
+        let mut guard = self.servers.lock().await;
+        let names = server_name.map_or_else(
+            || guard.keys().cloned().collect::<Vec<_>>(),
+            |name| vec![name.to_string()],
+        );
+        for name in names {
+            let entry = guard
+                .get_mut(&name)
+                .ok_or_else(|| McpError::NotConnected(name.clone()))?;
+            if let Err(error) = Self::ensure_connected(&self.run_context, entry, &name).await {
+                if server_name.is_some() {
+                    return Err(error);
+                }
+                continue;
+            }
+            let Some(server) = entry.server.as_ref() else {
+                continue;
+            };
+            match server.list_prompts().await {
+                Ok(server_prompts) => prompts.extend(
+                    server_prompts
+                        .into_iter()
+                        .map(|prompt| (name.clone(), prompt)),
+                ),
+                Err(error) => {
+                    if matches!(&error, McpError::Transport(_) | McpError::HttpStatus { .. }) {
+                        entry.mark_disconnected();
+                        self.bump_catalog_epoch();
+                    }
+                    if server_name.is_some() {
+                        return Err(error);
+                    }
+                    warn!(server = %name, error = %error, "Failed to list MCP prompts");
+                }
+            }
+        }
+        drop(guard);
+        Ok(prompts)
+    }
+
+    /// Resolve a typed prompt from one named server.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `McpError` when the server is unavailable or resolution fails.
+    pub async fn get_prompt(
+        &self,
+        server_name: &str,
+        prompt_name: &str,
+        arguments: BTreeMap<String, String>,
+    ) -> Result<McpGetPromptResult, McpError> {
+        let mut guard = self.servers.lock().await;
+        let entry = guard
+            .get_mut(server_name)
+            .ok_or_else(|| McpError::NotConnected(server_name.to_string()))?;
+        if Self::ensure_connected(&self.run_context, entry, server_name).await? {
+            self.bump_catalog_epoch();
+        }
+        let Some(server) = entry.server.as_ref() else {
+            return Err(McpError::ServerUnreachable(server_name.to_string()));
+        };
+        let outcome = server.get_prompt(prompt_name, arguments).await;
+        if matches!(
+            &outcome,
+            Err(McpError::Transport(_) | McpError::HttpStatus { .. })
+        ) {
+            entry.mark_disconnected();
+            self.bump_catalog_epoch();
+        }
+        drop(guard);
+        outcome
     }
 
     /// Disconnect from a server.
@@ -3477,6 +4361,11 @@ mod tests {
                 },
                 "required": ["path"]
             })),
+            title: None,
+            output_schema: None,
+            annotations: None,
+            icons: Vec::new(),
+            meta: BTreeMap::new(),
         };
 
         let json = serde_json::to_value(&tool).unwrap();
@@ -3884,6 +4773,11 @@ mod tests {
             name: "main.rs".to_string(),
             description: Some("Main entry point".to_string()),
             mime_type: Some("text/x-rust".to_string()),
+            title: None,
+            size: None,
+            annotations: None,
+            icons: Vec::new(),
+            meta: BTreeMap::new(),
         };
 
         let json = serde_json::to_value(&resource).unwrap();
@@ -4198,12 +5092,12 @@ import json
 import sys
 
 req = json.loads(sys.stdin.readline())
-sys.stdout.write(json.dumps({"jsonrpc":"2.0","id":900,"method":"roots/list"}) + "\n")
+sys.stdout.write(json.dumps({"jsonrpc":"2.0","id":"server-roots-900","method":"roots/list"}) + "\n")
 sys.stdout.flush()
 roots_reply = json.loads(sys.stdin.readline())
 root = roots_reply.get("result", {}).get("roots", [{}])[0]
 ok = (
-    roots_reply.get("id") == 900
+    roots_reply.get("id") == "server-roots-900"
     and root.get("uri", "").startswith("file://")
     and bool(root.get("name"))
 )
@@ -4463,7 +5357,15 @@ sys.stdout.flush()
 
     #[async_trait]
     impl McpTransport for FakeTransport {
-        async fn request(&self, _method: &str, _params: Option<Value>) -> Result<Value, McpError> {
+        async fn request(&self, method: &str, _params: Option<Value>) -> Result<Value, McpError> {
+            if method == "server/discover" {
+                return Err(McpError::Rpc {
+                    code: -32601,
+                    message: "Method not found".to_string(),
+                    data: None,
+                    http_status: None,
+                });
+            }
             // Take the delay (once); on first call we honour it.
             let delay = self.delay_first_response.lock().expect("lock").take();
             if let Some(d) = delay {
@@ -4478,6 +5380,317 @@ sys.stdout.flush()
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct RecordedMcpRequest {
+        context: McpRequestContext,
+        method: String,
+        params: Option<Value>,
+    }
+
+    /// Strict current-era fixture: using the legacy `request` entry point or
+    /// changing the scripted method order is a test failure, not a permissive
+    /// canned response.
+    struct CurrentProtocolTransport {
+        requests: Arc<std::sync::Mutex<Vec<RecordedMcpRequest>>>,
+        responses:
+            std::sync::Mutex<std::collections::VecDeque<(&'static str, Result<Value, McpError>)>>,
+        binding: McpTransportBinding,
+    }
+
+    impl CurrentProtocolTransport {
+        fn new(
+            binding: McpTransportBinding,
+            responses: Vec<(&'static str, Result<Value, McpError>)>,
+        ) -> (Self, Arc<std::sync::Mutex<Vec<RecordedMcpRequest>>>) {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                Self {
+                    requests: Arc::clone(&requests),
+                    responses: std::sync::Mutex::new(responses.into()),
+                    binding,
+                },
+                requests,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl McpTransport for CurrentProtocolTransport {
+        fn binding(&self) -> McpTransportBinding {
+            self.binding
+        }
+
+        async fn request(&self, method: &str, _params: Option<Value>) -> Result<Value, McpError> {
+            Err(McpError::Protocol(format!(
+                "current fixture unexpectedly used legacy request path for {method}"
+            )))
+        }
+
+        async fn request_with_context(
+            &self,
+            context: McpRequestContext,
+            method: &str,
+            params: Option<Value>,
+        ) -> Result<Value, McpError> {
+            self.requests
+                .lock()
+                .expect("request record lock")
+                .push(RecordedMcpRequest {
+                    context,
+                    method: method.to_string(),
+                    params,
+                });
+            let (expected, response) = self
+                .responses
+                .lock()
+                .expect("response queue lock")
+                .pop_front()
+                .ok_or_else(|| {
+                    McpError::Protocol(format!(
+                        "current fixture has no response for method {method}"
+                    ))
+                })?;
+            if method != expected {
+                return Err(McpError::Protocol(format!(
+                    "current fixture expected method {expected}, got {method}"
+                )));
+            }
+            response
+        }
+
+        async fn close(&self) -> Result<(), McpError> {
+            Ok(())
+        }
+    }
+
+    fn complete_cached(mut value: Value) -> Value {
+        let object = value.as_object_mut().expect("fixture result object");
+        object.insert("resultType".to_string(), json!("complete"));
+        object.insert("ttlMs".to_string(), json!(0));
+        object.insert("cacheScope".to_string(), json!("private"));
+        value
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One scripted flow proves every negotiated typed feature stays on one profile.
+    async fn s065_current_profile_preserves_typed_features_and_request_metadata() {
+        let (transport, requests) = CurrentProtocolTransport::new(
+            McpTransportBinding::StreamableHttp,
+            vec![
+                (
+                    "server/discover",
+                    Ok(complete_cached(json!({
+                        "supportedVersions": [CURRENT_PROTOCOL_VERSION],
+                        "capabilities": {
+                            "tools": {"listChanged": true},
+                            "resources": {"listChanged": true, "subscribe": true},
+                            "prompts": {"listChanged": true},
+                            "logging": {}
+                        },
+                        "_meta": {
+                            "io.modelcontextprotocol/serverInfo": {
+                                "name": "current-fixture",
+                                "version": "2026.7"
+                            }
+                        }
+                    }))),
+                ),
+                (
+                    "tools/list",
+                    Ok(complete_cached(json!({
+                        "tools": [{
+                            "name": "inspect",
+                            "title": "Inspect",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "trace": {"type": "string", "x-mcp-header": "Trace-Id"}
+                                },
+                                "required": ["trace"]
+                            },
+                            "outputSchema": {
+                                "type": "object",
+                                "properties": {"ok": {"type": "boolean"}},
+                                "required": ["ok"]
+                            }
+                        }]
+                    }))),
+                ),
+                (
+                    "resources/list",
+                    Ok(complete_cached(json!({
+                        "resources": [{
+                            "uri": "fixture://guide",
+                            "name": "guide",
+                            "title": "Fixture guide",
+                            "mimeType": "text/plain"
+                        }]
+                    }))),
+                ),
+                (
+                    "resources/read",
+                    Ok(complete_cached(json!({
+                        "contents": [
+                            {"uri": "fixture://guide", "text": "hello", "mimeType": "text/plain"},
+                            {"uri": "fixture://pixel", "blob": "aGVsbG8=", "mimeType": "image/png"}
+                        ]
+                    }))),
+                ),
+                (
+                    "prompts/list",
+                    Ok(complete_cached(json!({
+                        "prompts": [{
+                            "name": "review",
+                            "title": "Review",
+                            "arguments": [{"name": "topic", "required": true}]
+                        }]
+                    }))),
+                ),
+                (
+                    "prompts/get",
+                    Ok(json!({
+                        "resultType": "complete",
+                        "description": "A typed prompt",
+                        "messages": [{
+                            "role": "user",
+                            "content": {"type": "text", "text": "Review MCP"}
+                        }]
+                    })),
+                ),
+                (
+                    "tools/call",
+                    Ok(json!({
+                        "resultType": "complete",
+                        "content": [
+                            {"type": "text", "text": "done"},
+                            {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+                            {"type": "resource_link", "uri": "fixture://guide", "name": "guide"},
+                            {"type": "resource", "resource": {"uri": "fixture://embedded", "text": "embedded"}}
+                        ],
+                        "structuredContent": {"ok": true}
+                    })),
+                ),
+            ],
+        );
+
+        let server = McpServer::new("current", Box::new(transport))
+            .await
+            .expect("current discovery and tool listing");
+        assert_eq!(server.protocol_version(), McpProtocolVersion::V2026_07_28);
+        assert_eq!(server.tools()[0].title.as_deref(), Some("Inspect"));
+
+        let resources = server.list_resources().await.expect("typed resources/list");
+        assert_eq!(resources[0].title.as_deref(), Some("Fixture guide"));
+        let resource = server
+            .read_resource_typed("fixture://guide")
+            .await
+            .expect("typed resources/read");
+        assert!(matches!(
+            resource.contents[1],
+            McpResourceContents::Blob { .. }
+        ));
+
+        let prompts = server.list_prompts().await.expect("typed prompts/list");
+        assert!(prompts[0].arguments[0].required);
+        let prompt = server
+            .get_prompt(
+                "review",
+                BTreeMap::from([("topic".to_string(), "MCP".to_string())]),
+            )
+            .await
+            .expect("typed prompts/get");
+        assert!(matches!(
+            prompt.messages[0].content,
+            McpContentBlock::Text { .. }
+        ));
+
+        let call = server
+            .call_tool("inspect", json!({"trace": "trace value"}))
+            .await
+            .expect("typed tools/call");
+        let typed: McpCallToolResult = serde_json::from_value(call).expect("typed tool result");
+        assert_eq!(typed.content.len(), 4);
+        assert_eq!(typed.structured_content, Some(json!({"ok": true})));
+
+        let requests = requests.lock().expect("request record lock");
+        assert_eq!(requests.len(), 7);
+        assert!(requests.iter().all(|request| {
+            request.context.version == McpProtocolVersion::V2026_07_28
+                && request.params.as_ref().and_then(|params| {
+                    params.pointer("/_meta/io.modelcontextprotocol~1protocolVersion")
+                }) == Some(&json!(CURRENT_PROTOCOL_VERSION))
+                && request.params.as_ref().and_then(|params| {
+                    params.pointer("/_meta/io.modelcontextprotocol~1clientCapabilities")
+                }) == Some(&json!({}))
+        }));
+        assert!(requests[1..].iter().all(|request| {
+            request
+                .params
+                .as_ref()
+                .and_then(|params| params.pointer("/_meta/progressToken"))
+                .is_some()
+        }));
+        let call_request = requests
+            .iter()
+            .find(|request| request.method == "tools/call")
+            .expect("recorded tool call");
+        assert_eq!(
+            call_request.context.routing_name.as_deref(),
+            Some("inspect")
+        );
+        assert_eq!(
+            call_request.context.parameter_headers,
+            vec![("Mcp-Param-Trace-Id".to_string(), "trace value".to_string())]
+        );
+        drop(requests);
+    }
+
+    #[tokio::test]
+    async fn s065_legacy_adapter_selects_the_returned_supported_revision() {
+        let transport = FakeTransport::new(vec![
+            json!({
+                "protocolVersion": "2025-11-25",
+                "serverInfo": {"name": "legacy", "version": "1"},
+                "capabilities": {}
+            }),
+            Value::Null,
+        ]);
+        let server = McpServer::new("legacy", Box::new(transport))
+            .await
+            .expect("legacy handshake");
+        assert_eq!(server.protocol_version(), McpProtocolVersion::V2025_11_25);
+    }
+
+    #[tokio::test]
+    async fn s065_current_unsupported_version_error_never_falls_back() {
+        let (transport, requests) = CurrentProtocolTransport::new(
+            McpTransportBinding::StreamableHttp,
+            vec![(
+                "server/discover",
+                Err(McpError::Rpc {
+                    code: -32022,
+                    message: "Unsupported protocol version".to_string(),
+                    data: Some(json!({
+                        "requested": CURRENT_PROTOCOL_VERSION,
+                        "supported": ["2027-01-01"]
+                    })),
+                    http_status: Some(400),
+                }),
+            )],
+        );
+        let Err(error) = McpServer::new("future", Box::new(transport)).await else {
+            panic!("recognized current error must not enter legacy initialize");
+        };
+        assert!(matches!(
+            error,
+            McpError::UnsupportedProtocolVersion { requested, supported }
+                if requested == CURRENT_PROTOCOL_VERSION && supported == ["2027-01-01"]
+        ));
+        let requests = requests.lock().expect("request record lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "server/discover");
+    }
+
     struct BlockingCallTransport {
         call_started: Arc<tokio::sync::Notify>,
     }
@@ -4486,6 +5699,12 @@ sys.stdout.flush()
     impl McpTransport for BlockingCallTransport {
         async fn request(&self, method: &str, _params: Option<Value>) -> Result<Value, McpError> {
             match method {
+                "server/discover" => Err(McpError::Rpc {
+                    code: -32601,
+                    message: "Method not found".to_string(),
+                    data: None,
+                    http_status: None,
+                }),
                 "initialize" => Ok(json!({
                     "serverInfo": {"name": "blocking", "version": "1"},
                     "capabilities": {"tools": {"listChanged": false}}
@@ -5194,7 +6413,15 @@ sys.stdout.flush()
 
     #[async_trait]
     impl McpTransport for FakeReconnectTransport {
-        async fn request(&self, _method: &str, _params: Option<Value>) -> Result<Value, McpError> {
+        async fn request(&self, method: &str, _params: Option<Value>) -> Result<Value, McpError> {
+            if method == "server/discover" {
+                return Err(McpError::Rpc {
+                    code: -32601,
+                    message: "Method not found".to_string(),
+                    data: None,
+                    http_status: None,
+                });
+            }
             let next = self.responses.lock().expect("lock").pop_front();
             next.unwrap_or(Ok(Value::Null))
         }
@@ -5449,7 +6676,10 @@ sys.stdout.flush()
         // operation resumes.
         let transport = FakeReconnectTransport::from_results(handshake_responses(
             "ping",
-            Ok(json!({"ok": true})),
+            Ok(json!({
+                "content": [{"type": "text", "text": "ok"}],
+                "structuredContent": {"ok": true}
+            })),
         ));
         let server = McpServer::new("flaky", Box::new(transport))
             .await
@@ -5470,7 +6700,7 @@ sys.stdout.flush()
             .call_tool("mcp__flaky__ping", json!({}))
             .await
             .expect("post-reconnect call must succeed");
-        assert_eq!(result["ok"], true);
+        assert_eq!(result["structuredContent"]["ok"], true);
     }
 
     /// Fix #629: the BACKOFF schedule is exactly 1 s / 5 s / 30 s.
@@ -6049,7 +7279,7 @@ sys.stdout.flush()
     // depending on transport — a silent footgun for HTTP MCP servers.
 
     /// Fix #626: an `error.data` payload returned by an HTTP MCP server
-    /// MUST appear in the `McpError::Protocol` message string.
+    /// MUST remain available as typed `McpError::Rpc` context.
     #[tokio::test]
     async fn fix626_http_transport_preserves_error_data() {
         let url = spawn_one_shot_http_mock(
@@ -6063,27 +7293,19 @@ sys.stdout.flush()
             .expect("request did not deadlock")
             .expect_err("JSON-RPC error response MUST surface as Err");
 
-        match err {
-            McpError::Protocol(msg) => {
-                assert!(
-                    msg.contains("Invalid params"),
-                    "message must include error.message; got: {msg}"
-                );
-                assert!(
-                    msg.contains("-32602"),
-                    "message must include error.code; got: {msg}"
-                );
-                assert!(
-                    msg.contains("data:"),
-                    "message must label the preserved data field; got: {msg}"
-                );
-                assert!(
-                    msg.contains("missing"),
-                    "message must include error.data content; got: {msg}"
-                );
-            }
-            other => panic!("expected Protocol error, got {other:?}"),
-        }
+        let McpError::Rpc {
+            code,
+            message,
+            data,
+            http_status,
+        } = err
+        else {
+            panic!("expected typed Rpc error, got {err:?}");
+        };
+        assert_eq!(code, -32602);
+        assert_eq!(message, "Invalid params");
+        assert_eq!(data, Some(json!({"missing": "argument", "field": "name"})));
+        assert_eq!(http_status, Some(200));
     }
 
     #[tokio::test]
@@ -6100,26 +7322,25 @@ sys.stdout.flush()
             .await
             .expect("request did not deadlock")
             .expect_err("JSON-RPC error response must surface as Err");
-        let message = match error {
-            McpError::Protocol(message) => message,
-            other => panic!("expected Protocol error, got {other:?}"),
+        let (message, data) = match error {
+            McpError::Rpc { message, data, .. } => (message, data),
+            other => panic!("expected typed Rpc error, got {other:?}"),
         };
+        let diagnostic = format!("{message} {data:?}");
 
         assert!(
-            !message.contains(SECRET),
-            "MCP error leaked header: {message}"
+            !diagnostic.contains(SECRET),
+            "MCP error leaked header: {diagnostic}"
         );
         assert!(
-            message.contains(crate::secrets::REDACTED_SECRET),
-            "{message}"
+            diagnostic.contains(crate::secrets::REDACTED_SECRET),
+            "{diagnostic}"
         );
-        assert!(message.len() <= crate::secrets::MAX_DIAGNOSTIC_BYTES);
+        assert!(diagnostic.len() <= crate::secrets::MAX_DIAGNOSTIC_BYTES * 2);
     }
 
-    /// Fix #626: when the server omits `error.data`, the message must
-    /// match the pre-fix format (no spurious `(data: null)` tail).
-    /// Locks in that the data preservation is additive, not a format
-    /// rewrite that breaks existing log/grep tooling.
+    /// Fix #626: when the server omits `error.data`, the typed field is
+    /// `None`, rather than inventing a JSON `null` payload.
     #[tokio::test]
     async fn fix626_http_transport_no_data_field_omits_data_suffix() {
         let url = spawn_one_shot_http_mock(
@@ -6133,23 +7354,23 @@ sys.stdout.flush()
             .expect("request did not deadlock")
             .expect_err("error response MUST surface as Err");
 
-        match err {
-            McpError::Protocol(msg) => {
-                assert!(msg.contains("Method not found"), "got: {msg}");
-                assert!(msg.contains("-32601"), "got: {msg}");
-                assert!(
-                    !msg.contains("(data:"),
-                    "must NOT append (data: ...) when error.data is absent; got: {msg}"
-                );
-            }
-            other => panic!("expected Protocol error, got {other:?}"),
-        }
+        let McpError::Rpc {
+            code,
+            message,
+            data,
+            http_status,
+        } = err
+        else {
+            panic!("expected typed Rpc error, got {err:?}");
+        };
+        assert_eq!(code, -32601);
+        assert_eq!(message, "Method not found");
+        assert_eq!(data, None);
+        assert_eq!(http_status, Some(200));
     }
 
-    /// Fix #626: HTTP and Stdio transports MUST produce the same shape
-    /// of error message when surfacing a JSON-RPC error with `data`.
-    /// Cross-transport parity is the whole point of the fix — without
-    /// this assertion, the regression-detection net has a hole.
+    /// Fix #626: HTTP and Stdio transports MUST preserve the same JSON-RPC
+    /// code, message, and data. HTTP additionally records its status code.
     #[tokio::test]
     async fn fix626_http_and_stdio_error_data_formatting_matches() {
         // HTTP path
@@ -6162,8 +7383,14 @@ sys.stdout.flush()
             .await
             .expect("not deadlocked")
             .expect_err("must be Err");
-        let McpError::Protocol(http_msg) = http_err else {
-            panic!("HTTP error variant changed unexpectedly");
+        let McpError::Rpc {
+            code: http_code,
+            message: http_message,
+            data: http_data,
+            http_status,
+        } = http_err
+        else {
+            panic!("HTTP error variant changed unexpectedly: {http_err:?}");
         };
 
         // Stdio path — a tiny shell script that returns the same JSON-RPC error.
@@ -6175,15 +7402,21 @@ sys.stdout.flush()
             .await
             .expect("not deadlocked")
             .expect_err("must be Err");
-        let McpError::Protocol(stdio_msg) = stdio_err else {
-            panic!("Stdio error variant changed unexpectedly");
+        let McpError::Rpc {
+            code: stdio_code,
+            message: stdio_message,
+            data: stdio_data,
+            http_status: stdio_status,
+        } = stdio_err
+        else {
+            panic!("Stdio error variant changed unexpectedly: {stdio_err:?}");
         };
 
-        // Identical suffix proves both transports format error.data the same way.
-        assert_eq!(
-            http_msg, stdio_msg,
-            "HTTP and Stdio error formatting must match — fix #626 is about parity"
-        );
+        assert_eq!(http_code, stdio_code);
+        assert_eq!(http_message, stdio_message);
+        assert_eq!(http_data, stdio_data);
+        assert_eq!(http_status, Some(200));
+        assert_eq!(stdio_status, None);
         let _ = stdio.close().await;
     }
 

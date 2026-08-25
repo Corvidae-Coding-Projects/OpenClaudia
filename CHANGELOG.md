@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- S-065: Implement the current MCP protocol adapter (#1140)
 - Add Kimi/Moonshot and MiniMax OpenAI-compatible providers with documented defaults, env-key loading, model lists, and adapter dispatch coverage (#42)
 - Bash safety allowlist (`is_safe_for_auto_allow`) with CC-parity rejection of process/command substitution, pipe-to-interpreter, eval/exec/source, and find -exec (#589)
 - Resume subagent should reuse original agent_id for transcript/cache continuity (CC parity) (#582)

@@ -453,9 +453,7 @@ impl ToolExecutor {
         drop(manager);
 
         let handler_result = match outcome {
-            Ok(value) => {
-                tools::ToolHandlerResult::success_structured(mcp_result_text(&value), value)
-            }
+            Ok(value) => mcp_handler_result(value),
             Err(error) => mcp_error_result(
                 &error,
                 remotely_dispatched.load(std::sync::atomic::Ordering::Acquire),
@@ -766,20 +764,63 @@ const fn json_value_type_name(value: &Value) -> &'static str {
     }
 }
 
-fn mcp_result_text(value: &Value) -> String {
-    let text = value
-        .get("content")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|item| item.get("text").and_then(Value::as_str))
+fn mcp_handler_result(value: Value) -> tools::ToolHandlerResult {
+    let Ok(typed) = serde_json::from_value::<crate::mcp::McpCallToolResult>(value.clone()) else {
+        return tools::ToolHandlerResult::success_structured(
+            "MCP tool completed with structured output.",
+            value,
+        );
+    };
+    let text = typed
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            crate::mcp::McpContentBlock::Text { text, .. }
+            | crate::mcp::McpContentBlock::Resource {
+                resource: crate::mcp::McpResourceContents::Text { text, .. },
+                ..
+            } => Some(text.clone()),
+            crate::mcp::McpContentBlock::ResourceLink { uri, name, .. } => {
+                Some(format!("MCP resource {name}: {uri}"))
+            }
+            _ => None,
+        })
         .collect::<Vec<_>>()
         .join("\n");
     if text.is_empty() {
-        "MCP tool completed with structured output.".to_string()
+        let result = tools::ToolHandlerResult::success_structured(
+            "MCP tool completed with structured output.",
+            value,
+        );
+        attach_mcp_media(result, &typed)
     } else {
-        text
+        let result = tools::ToolHandlerResult::success_structured(text, value);
+        attach_mcp_media(result, &typed)
     }
+}
+
+fn attach_mcp_media(
+    mut result: tools::ToolHandlerResult,
+    typed: &crate::mcp::McpCallToolResult,
+) -> tools::ToolHandlerResult {
+    use base64::Engine as _;
+
+    for block in &typed.content {
+        let Some((encoded, media_type)) = block.encoded_media() else {
+            continue;
+        };
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+            continue;
+        };
+        if let Ok(attachment) = tools::register_transient_attachment(
+            media_type,
+            bytes,
+            tools::ToolSensitivity::Workspace,
+        ) {
+            result = result.with_attachment(attachment);
+        }
+    }
+    result
 }
 
 fn mcp_error_result(
@@ -800,6 +841,8 @@ fn mcp_error_result(
         crate::mcp::McpError::ToolReportedError { .. }
         | crate::mcp::McpError::Transport(_)
         | crate::mcp::McpError::Protocol(_)
+        | crate::mcp::McpError::Rpc { .. }
+        | crate::mcp::McpError::HttpStatus { .. }
         | crate::mcp::McpError::ResponseIdMismatch { .. }
         | crate::mcp::McpError::Io(_) => (ToolFailureCode::External, ToolRetryability::Unknown),
         crate::mcp::McpError::ServerUnreachable(_) => {
@@ -808,11 +851,28 @@ fn mcp_error_result(
         crate::mcp::McpError::ToolNotFound(_)
         | crate::mcp::McpError::NotConnected(_)
         | crate::mcp::McpError::StaleToolRegistration(_)
+        | crate::mcp::McpError::UnsupportedProtocolVersion { .. }
+        | crate::mcp::McpError::UnsupportedCapability(_)
         | crate::mcp::McpError::InvalidToolSchema { .. } => {
             (ToolFailureCode::Unavailable, ToolRetryability::Safe)
         }
     };
-    let failure = tools::ToolFailure::new(code, error.to_string(), retryability);
+    let mut failure = tools::ToolFailure::new(code, error.to_string(), retryability);
+    if let crate::mcp::McpError::Rpc {
+        code,
+        message,
+        data,
+        http_status,
+    } = error
+    {
+        failure.recovery = Some(serde_json::json!({
+            "protocol": "mcp-json-rpc-2.0",
+            "code": code,
+            "message": message,
+            "data": data,
+            "http_status": http_status,
+        }));
+    }
     if remotely_dispatched {
         let (message, structured) = match error {
             crate::mcp::McpError::ToolReportedError { result, .. } => (
@@ -893,6 +953,48 @@ mod tests {
             })
             .build()
             .expect("run")
+    }
+
+    #[test]
+    fn s065_mcp_result_keeps_structured_content_and_native_media() {
+        let wire = serde_json::json!({
+            "resultType": "complete",
+            "content": [
+                {"type": "text", "text": "visible text"},
+                {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+                {"type": "audio", "data": "d29ybGQ=", "mimeType": "audio/wav"},
+                {
+                    "type": "resource",
+                    "resource": {"uri": "fixture://note", "text": "embedded text"}
+                },
+                {
+                    "type": "resource_link",
+                    "uri": "fixture://more",
+                    "name": "more"
+                }
+            ],
+            "structuredContent": {"answer": 42}
+        });
+
+        let result = mcp_handler_result(wire.clone());
+        assert_eq!(
+            result.content(),
+            "visible text\nembedded text\nMCP resource more: fixture://more"
+        );
+        assert!(matches!(
+            &result.outcome,
+            crate::tools::ToolOutcome::Success { content }
+                if content.structured.as_ref() == Some(&wire)
+        ));
+        assert_eq!(result.attachments.len(), 2);
+
+        let metadata = serde_json::to_value(&result.attachments).expect("attachment metadata");
+        let resolved = crate::tools::resolve_tool_attachments(Some(&metadata))
+            .expect("provider-ready MCP media");
+        assert_eq!(resolved[0].media_type, "image/png");
+        assert_eq!(&*resolved[0].bytes, b"hello");
+        assert_eq!(resolved[1].media_type, "audio/wav");
+        assert_eq!(&*resolved[1].bytes, b"world");
     }
 
     #[test]
