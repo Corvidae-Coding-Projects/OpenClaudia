@@ -365,7 +365,6 @@ where
                     break;
                 }
             }
-            #[cfg(unix)]
             secure_fs::SecureFileType::Other => {
                 state.stats.skipped_non_regular_entries =
                     state.stats.skipped_non_regular_entries.saturating_add(1);

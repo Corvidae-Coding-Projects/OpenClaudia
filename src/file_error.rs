@@ -412,9 +412,10 @@ mod tests {
         assert_eq!(err.path(), p.as_path());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn session_json_adapter_uses_private_descriptor_safe_commit() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = tempfile::tempdir().expect("session root");
@@ -424,6 +425,7 @@ mod tests {
 
         let value: serde_json::Value = read_json(&path).expect("read session JSON");
         assert_eq!(value["generation"], 1);
+        #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(&path)
                 .expect("session metadata")
@@ -432,15 +434,25 @@ mod tests {
                 & 0o7777,
             0o600
         );
+        #[cfg(windows)]
+        crate::windows_fs::validate_owned_acl(
+            &std::fs::File::open(&path).expect("session file handle"),
+            true,
+        )
+        .expect("owner-private session ACL");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
-    fn session_json_adapter_rejects_symlinked_parent_without_outside_write() {
+    fn session_json_adapter_rejects_linked_parent_without_outside_write() {
         let holder = tempfile::tempdir().expect("holder");
         let outside = tempfile::tempdir().expect("outside");
         let linked_parent = holder.path().join("linked");
+        #[cfg(unix)]
         std::os::unix::fs::symlink(outside.path(), &linked_parent).expect("parent symlink");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(outside.path(), &linked_parent)
+            .expect("parent directory reparse point");
         let path = linked_parent.join("session.json");
 
         let error = write_json_pretty_atomic(&path, &serde_json::json!({"redirect": true}))

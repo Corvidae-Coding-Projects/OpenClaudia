@@ -35,9 +35,9 @@ fn call(
     )
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
-fn private_session_temp_is_narrow_isolated_and_symlink_safe() {
+fn private_session_temp_is_narrow_isolated_and_link_safe() {
     let _serial = session_lock();
     let project = tempfile::tempdir_in(".").expect("project fixture");
     let context_a = ToolRunContext::builder(openclaudia::state::SessionId::new(), project.path())
@@ -71,7 +71,10 @@ fn private_session_temp_is_narrow_isolated_and_symlink_safe() {
     assert!(!sibling_read.content().contains("sibling-secret"));
 
     let link = context_a.private_temp_root().join("escape-link");
+    #[cfg(unix)]
     std::os::unix::fs::symlink(&sibling_file, &link).expect("plant symlink");
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(&sibling_file, &link).expect("plant file reparse point");
     let link_read = call(&context_a, "read_file", json!({ "path": link }));
     assert!(link_read.is_error(), "temp symlink escape must be denied");
     assert!(!link_read.content().contains("sibling-secret"));

@@ -98,6 +98,8 @@ jobs:
 
   platform-fail-closed:
     timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: 4
     strategy:
       fail-fast: false
       matrix:
@@ -113,3 +115,27 @@ jobs:
           toolchain: 1.98.0
       - run: cargo check --locked --all-features --all-targets
       - run: cargo test --locked --all-features --test sandbox_platform_fail_closed_e2e -- --test-threads=1
+      - name: Windows shared descriptor-safe persistence contract
+        if: runner.os == 'Windows'
+        run: cargo test --locked --all-features --test descriptor_safe_persistence_e2e -- --test-threads=1
+      - name: Windows session filesystem capability contract
+        if: runner.os == 'Windows'
+        run: cargo test --locked --all-features --test session_filesystem_capabilities_e2e -- --test-threads=1
+      - name: Windows file-tool lifecycle contract
+        if: runner.os == 'Windows'
+        run: cargo test --locked --all-features --test file_tools_integration -- --test-threads=1
+      - name: Windows persistence interruption and validation contract
+        if: runner.os == 'Windows'
+        run: cargo test --locked --all-features --lib persistence::windows_backend::tests -- --test-threads=1
+      - name: Windows atomic notebook interruption recovery
+        if: runner.os == 'Windows'
+        run: cargo test --locked --all-features --lib tools::file::notebook::tests::interruption_before_publication_preserves_prior_generation_and_retry_recovers -- --exact --test-threads=1
+      - name: Windows notebook reparse-point rejection
+        if: runner.os == 'Windows'
+        run: cargo test --locked --all-features --lib tools::file::notebook::tests::fix417_notebook_rejects_link_at_target -- --exact --test-threads=1
+      - name: Windows protected credential persistence contract
+        if: runner.os == 'Windows'
+        run: cargo test --locked --all-features --lib provider_credentials::tests -- --test-threads=1
+      - name: Windows session persistence adapter contract
+        if: runner.os == 'Windows'
+        run: cargo test --locked --all-features --lib file_error::tests::session_json_adapter -- --test-threads=1

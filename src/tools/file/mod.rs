@@ -437,7 +437,9 @@ fn resolve_host_control_path(
         return Err(format!("Host-control path traversal not allowed: '{path}'"));
     }
     let resolved = canonicalize_or_walk_up(&absolute, path)?;
-    if !resolved.starts_with(run.project_root()) || !run.is_denied_path(&resolved) {
+    if !super::security::path_is_within(&resolved, run.project_root())
+        || !run.is_denied_path(&resolved)
+    {
         return Err(format!(
             "Path '{}' is not masked host-control state below run project '{}'",
             resolved.display(),

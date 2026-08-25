@@ -3,8 +3,8 @@
 //! A [`PersistentStorage`] is an explicit filesystem capability: its trusted
 //! root is opened once, pinned by descriptor, and every target is resolved
 //! beneath that descriptor without following links. Commits use a per-target
-//! advisory lock, a bounded owner-only staging file, `fsync`, descriptor-
-//! relative rename, and parent-directory `fsync`.
+//! advisory lock, a bounded owner-only staging file, file synchronization,
+//! handle-relative rename, and parent-directory synchronization.
 //!
 //! Publication and durability are deliberately separate states. If the
 //! rename succeeds but the directory sync fails, callers receive
@@ -14,10 +14,10 @@
 //! [`CommitState::Recovered`] rather than publishing twice.
 //!
 //! Generation exclusion is cooperative: every `OpenClaudia` writer for a
-//! target must use this API and its sidecar lock. POSIX advisory locks cannot
-//! stop an unrelated same-user process that deliberately bypasses the API;
-//! host root selection and process/sandbox policy remain the authority against
-//! such a peer.
+//! target must use this API and its sidecar lock. Advisory OS locks cannot stop
+//! an unrelated same-user process that deliberately bypasses the API; host
+//! root selection and process/sandbox policy remain the authority against such
+//! a peer.
 
 use std::fmt;
 use std::io;
@@ -32,17 +32,17 @@ use thiserror::Error;
 
 use crate::runtime::ContentDigest;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const MAX_TARGET_COMPONENTS: usize = 32;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const MAX_TARGET_BYTES: usize = 4_096;
 #[cfg(unix)]
 const INTERNAL_SIDECAR_PREFIX: &[u8] = b".openclaudia-persistence-";
-#[cfg(all(unix, not(test)))]
+#[cfg(all(any(unix, windows), not(test)))]
 const LOCK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-#[cfg(all(unix, test))]
+#[cfg(all(any(unix, windows), test))]
 const LOCK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(75);
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Semantic class of a persisted artifact.
@@ -123,7 +123,7 @@ pub enum StorageGeneration {
 }
 
 impl StorageGeneration {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn for_bytes(bytes: &[u8]) -> Self {
         Self::Present(ContentDigest::sha256(bytes))
     }
@@ -172,7 +172,7 @@ impl fmt::Debug for DiagnosticGeneration {
 pub struct BoundedFileBytes(zeroize::Zeroizing<Vec<u8>>);
 
 impl BoundedFileBytes {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn new(bytes: Vec<u8>) -> Self {
         Self(zeroize::Zeroizing::new(bytes))
     }
@@ -208,7 +208,7 @@ pub struct ReadState {
 }
 
 impl ReadState {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     const fn missing(class: FileClass) -> Self {
         Self {
             class,
@@ -217,7 +217,7 @@ impl ReadState {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn present(class: FileClass, bytes: Vec<u8>) -> Self {
         Self {
             class,
@@ -272,6 +272,9 @@ impl fmt::Debug for ReadState {
 pub struct StorageRootId {
     device: u64,
     inode: u64,
+    #[cfg(windows)]
+    #[serde(default)]
+    file_id_high: u64,
 }
 
 impl StorageRootId {
@@ -312,7 +315,7 @@ pub struct DurabilityFailure {
 }
 
 impl DurabilityFailure {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn from_io(error: &io::Error) -> Self {
         Self {
             kind: format!("{:?}", error.kind()),
@@ -581,9 +584,9 @@ impl PersistenceError {
 struct StorageRoot {
     path: PathBuf,
     id: StorageRootId,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     directory: std::fs::File,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     control: ActiveCheckpointControl,
 }
 
@@ -604,13 +607,14 @@ impl fmt::Debug for PersistentStorage {
 }
 
 impl PersistentStorage {
-    /// Open and pin an existing trusted root without following a symlink in
-    /// any absolute path component.
+    /// Open and pin an existing trusted root without following a link or
+    /// reparse point in any absolute path component.
     ///
-    /// The root must be absolute, owned by the effective user, and not
-    /// writable by group or world. Callers remain responsible for choosing a
-    /// root authorized by host policy; after construction no operation
-    /// reconsults ambient CWD or a string-prefix allowlist.
+    /// The root must be absolute, owned by the current OS principal, and not
+    /// broadly mutable under the platform's permission model. Callers remain
+    /// responsible for choosing a root authorized by host policy; after
+    /// construction no operation reconsults ambient CWD or a string-prefix
+    /// allowlist.
     ///
     /// # Errors
     /// Returns [`PersistenceError::InvalidRoot`] for an untrusted root or
@@ -673,13 +677,13 @@ impl PersistentStorage {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn open_storage(root: &Path) -> Result<PersistentStorage, PersistenceError> {
     let _ = root;
     Err(PersistenceError::UnsupportedPlatform { operation: "open" })
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn read_storage(
     _storage: &PersistentStorage,
     _target: &Path,
@@ -688,7 +692,7 @@ fn read_storage(
     Err(PersistenceError::UnsupportedPlatform { operation: "read" })
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn commit_storage(
     _storage: &PersistentStorage,
     _target: &Path,
@@ -857,7 +861,7 @@ impl Drop for StageFile<'_> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Checkpoint {
     ParentOpened,
@@ -1931,32 +1935,32 @@ fn clone_io_error(error: &io::Error) -> io::Error {
     )
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 trait CheckpointControl {
     fn check(&self, checkpoint: Checkpoint) -> io::Result<()>;
 }
 
-#[cfg(all(unix, not(test)))]
+#[cfg(all(any(unix, windows), not(test)))]
 #[derive(Default)]
 struct NoCheckpointControl;
 
-#[cfg(all(unix, not(test)))]
+#[cfg(all(any(unix, windows), not(test)))]
 impl CheckpointControl for NoCheckpointControl {
     fn check(&self, _checkpoint: Checkpoint) -> io::Result<()> {
         Ok(())
     }
 }
 
-#[cfg(all(unix, not(test)))]
+#[cfg(all(any(unix, windows), not(test)))]
 type ActiveCheckpointControl = NoCheckpointControl;
 
-#[cfg(all(unix, test))]
+#[cfg(all(any(unix, windows), test))]
 #[derive(Default)]
 struct TestControl {
     action: std::sync::Mutex<Option<(Checkpoint, TestAction)>>,
 }
 
-#[cfg(all(unix, test))]
+#[cfg(all(any(unix, windows), test))]
 enum TestAction {
     Error(i32),
     Exit(i32),
@@ -1966,10 +1970,10 @@ enum TestAction {
     },
 }
 
-#[cfg(all(unix, test))]
+#[cfg(all(any(unix, windows), test))]
 type ActiveCheckpointControl = TestControl;
 
-#[cfg(all(unix, test))]
+#[cfg(all(any(unix, windows), test))]
 impl CheckpointControl for TestControl {
     fn check(&self, checkpoint: Checkpoint) -> io::Result<()> {
         let action = {
@@ -1999,7 +2003,7 @@ impl CheckpointControl for TestControl {
     }
 }
 
-#[cfg(all(unix, test))]
+#[cfg(all(any(unix, windows), test))]
 impl PersistentStorage {
     fn set_test_action(&self, checkpoint: Checkpoint, action: TestAction) {
         *self
@@ -2011,10 +2015,17 @@ impl PersistentStorage {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn checkpoint(storage: &PersistentStorage, checkpoint: Checkpoint) -> io::Result<()> {
     storage.root.control.check(checkpoint)
 }
+
+#[cfg(windows)]
+#[path = "persistence_windows.rs"]
+mod windows_backend;
+
+#[cfg(windows)]
+use windows_backend::{commit_storage, open_storage, read_storage};
 
 #[cfg(all(test, unix))]
 mod tests {

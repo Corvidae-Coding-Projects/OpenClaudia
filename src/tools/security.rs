@@ -428,7 +428,7 @@ pub struct ToolRunContext {
     network_available: bool,
     secrets_available: bool,
     process_owner: String,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     root_handles: Vec<CapabilityRootHandle>,
 }
 
@@ -481,7 +481,7 @@ pub enum AgentNetworkPolicy {
     Denied,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Debug)]
 struct CapabilityRootHandle {
     path: PathBuf,
@@ -707,8 +707,14 @@ impl ToolRunContext {
         } else {
             AgentNetworkPolicy::Denied
         };
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let root_handles = open_capability_roots(&canonical_read_only, &canonical_read_write)?;
+
+        #[cfg(not(any(unix, windows)))]
+        return Err(
+            "Run construction is unsupported because this platform has no handle-relative filesystem capability backend"
+                .to_string(),
+        );
 
         let generation = next_capability_generation()?;
         let workspace_generation = WorkspaceGeneration::new(generation.get())
@@ -822,7 +828,7 @@ impl ToolRunContext {
             network_available: network,
             secrets_available: secrets,
             process_owner,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             root_handles,
         };
         context
@@ -1525,15 +1531,15 @@ impl ToolRunContext {
             && self
                 .denied_paths
                 .iter()
-                .any(|denied| path == denied || path.starts_with(denied))
+                .any(|denied| path_is_within(path, denied))
     }
 
-    /// Return the longest matching pre-opened Linux capability-root handle.
+    /// Return the longest matching pre-opened capability-root handle.
     ///
     /// Root descriptors are pinned when the session is created. File tools
     /// must anchor authoritative lookups to these descriptors rather than
     /// reopening a root by pathname after policy validation.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn root_handle_for(
         &self,
         path: &Path,
@@ -1547,10 +1553,7 @@ impl ToolRunContext {
         }
         self.root_handles
             .iter()
-            .filter(|root| {
-                (!write || root.writable)
-                    && (path == root.path.as_path() || path.starts_with(&root.path))
-            })
+            .filter(|root| (!write || root.writable) && path_is_within(path, &root.path))
             .max_by_key(|root| root.path.components().count())
             .map(|root| (root.path.as_path(), &root.directory))
             .ok_or_else(|| {
@@ -1570,7 +1573,7 @@ impl ToolRunContext {
     /// masked subtrees (for example plan-mode and branch snapshots). This
     /// separate boundary keeps that authority explicit and refuses paths that
     /// are either outside the exact run project or not masked control state.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn host_control_root_handle_for(
         &self,
         path: &Path,
@@ -2009,6 +2012,37 @@ fn open_capability_roots(
     Ok(handles)
 }
 
+#[cfg(windows)]
+fn open_capability_roots(
+    read_only_roots: &[PathBuf],
+    read_write_roots: &[PathBuf],
+) -> Result<Vec<CapabilityRootHandle>, String> {
+    let mut handles = Vec::with_capacity(read_only_roots.len() + read_write_roots.len());
+    for (path, writable) in read_only_roots
+        .iter()
+        .map(|path| (path, false))
+        .chain(read_write_roots.iter().map(|path| (path, true)))
+    {
+        let directory = if writable {
+            crate::windows_fs::open_absolute_directory_for_write(path)
+        } else {
+            crate::windows_fs::open_absolute_directory(path)
+        }
+        .map_err(|error| {
+            format!(
+                "Cannot pin Windows capability root '{}': {error}",
+                path.display()
+            )
+        })?;
+        handles.push(CapabilityRootHandle {
+            path: path.clone(),
+            writable,
+            directory,
+        });
+    }
+    Ok(handles)
+}
+
 #[derive(Debug)]
 struct PrivateTempDir {
     path: PathBuf,
@@ -2016,6 +2050,10 @@ struct PrivateTempDir {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(windows)]
+    volume: u64,
+    #[cfg(windows)]
+    file_id: [u8; 16],
 }
 
 impl PrivateTempDir {
@@ -2023,6 +2061,41 @@ impl PrivateTempDir {
         let parent = std::env::temp_dir();
         for _ in 0..16 {
             let path = parent.join(format!("openclaudia-agent-{}", uuid::Uuid::new_v4()));
+            #[cfg(windows)]
+            {
+                match crate::windows_fs::create_new_private_directory(&path) {
+                    Ok(directory) => {
+                        let identity =
+                            crate::windows_fs::file_identity(&directory).map_err(|error| {
+                                let _ = std::fs::remove_dir(&path);
+                                format!(
+                                    "Cannot pin private session temp identity '{}': {error}",
+                                    path.display()
+                                )
+                            })?;
+                        let canonical = path.canonicalize().map_err(|error| {
+                            let _ = std::fs::remove_dir(&path);
+                            format!(
+                                "Cannot resolve private session temp directory '{}': {error}",
+                                path.display()
+                            )
+                        })?;
+                        return Ok(Self {
+                            path: canonical,
+                            volume: identity.volume,
+                            file_id: identity.id,
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "Cannot create private session temp directory below '{}': {error}",
+                            parent.display()
+                        ));
+                    }
+                }
+            }
+            #[cfg(not(windows))]
             match std::fs::create_dir(&path) {
                 Ok(()) => {
                     #[cfg(unix)]
@@ -2060,7 +2133,7 @@ impl PrivateTempDir {
                             inode: metadata.ino(),
                         });
                     }
-                    #[cfg(not(unix))]
+                    #[cfg(not(any(unix, windows)))]
                     return Ok(Self { path: canonical });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -2099,10 +2172,10 @@ impl Drop for PrivateTempDir {
             Ok(metadata)
                 if metadata.file_type().is_dir()
                     && !metadata.file_type().is_symlink()
-                    && private_temp_identity_matches(self, &metadata) =>
+                    && private_temp_identity_matches(self, &tombstone, &metadata) =>
             {
-                // `remove_dir_all` uses descriptor-relative, no-follow
-                // traversal on supported Unix platforms. The unpredictable
+                // `remove_dir_all` uses no-follow traversal on supported
+                // platforms. The unpredictable
                 // tombstone name also prevents reuse of the original
                 // capability path while cleanup proceeds.
                 if let Err(error) = std::fs::remove_dir_all(&tombstone) {
@@ -2132,14 +2205,35 @@ impl Drop for PrivateTempDir {
 }
 
 #[cfg(unix)]
-fn private_temp_identity_matches(temp: &PrivateTempDir, metadata: &std::fs::Metadata) -> bool {
+fn private_temp_identity_matches(
+    temp: &PrivateTempDir,
+    _path: &Path,
+    metadata: &std::fs::Metadata,
+) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     metadata.dev() == temp.device && metadata.ino() == temp.inode
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn private_temp_identity_matches(
+    temp: &PrivateTempDir,
+    path: &Path,
+    _metadata: &std::fs::Metadata,
+) -> bool {
+    let Ok(identity) = crate::windows_fs::open_absolute_directory(path)
+        .and_then(|directory| crate::windows_fs::file_identity(&directory))
+    else {
+        return false;
+    };
+    let same_volume = identity.volume == temp.volume;
+    let same_file = identity.id == temp.file_id;
+    same_volume && same_file
+}
+
+#[cfg(not(any(unix, windows)))]
 const fn private_temp_identity_matches(
     _temp: &PrivateTempDir,
+    _path: &Path,
     _metadata: &std::fs::Metadata,
 ) -> bool {
     true
@@ -2191,13 +2285,20 @@ pub(crate) fn validate_client_buffer_path(
     if !context.permits_read(&normalized) {
         return Err("IDE buffer path is outside or masked from the session capability".to_string());
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let (root, _) = context.root_handle_for(&normalized, false)?;
+        #[cfg(unix)]
         let relative = normalized
             .strip_prefix(root)
-            .map_err(|_| "IDE buffer path escaped its capability root".to_string())?;
+            .map_err(|_| "IDE buffer path escaped its capability root".to_string())?
+            .to_path_buf();
+        #[cfg(windows)]
+        let relative = crate::windows_fs::relative_to_root(&normalized, root)
+            .map_err(|error| format!("IDE buffer path escaped its capability root: {error}"))?;
+        #[cfg(unix)]
         let mut walked = root.to_path_buf();
+        #[cfg(unix)]
         for component in relative.components() {
             let std::path::Component::Normal(name) = component else {
                 continue;
@@ -2212,9 +2313,11 @@ pub(crate) fn validate_client_buffer_path(
                 Err(error) => return Err(format!("Cannot inspect IDE buffer path: {error}")),
             }
         }
+        #[cfg(windows)]
+        validate_windows_client_buffer_path(context, root, &relative)?;
         Ok(normalized)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = normalized;
         Err(
@@ -2222,6 +2325,83 @@ pub(crate) fn validate_client_buffer_path(
                 .to_string(),
         )
     }
+}
+
+#[cfg(windows)]
+fn validate_windows_client_buffer_path(
+    context: &ToolRunContext,
+    root: &Path,
+    relative: &Path,
+) -> Result<(), String> {
+    let (_, root_handle) = context.root_handle_for(root, false)?;
+    let components = relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_os_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut directory = root_handle
+        .try_clone()
+        .map_err(|error| format!("Cannot duplicate IDE capability root: {error}"))?;
+    for (index, component) in components.iter().enumerate() {
+        let is_last = index + 1 == components.len();
+        let component_path = Path::new(component);
+        let opened = if is_last {
+            match crate::windows_fs::open_relative(
+                &directory,
+                component_path,
+                crate::windows_fs::ObjectKind::Regular,
+                crate::windows_fs::OpenAccess::Read,
+                crate::windows_fs::OpenDisposition::Open,
+                None,
+            ) {
+                Ok(opened) => Some(opened.file),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) if error.kind() == std::io::ErrorKind::IsADirectory => Some(
+                    crate::windows_fs::open_relative(
+                        &directory,
+                        component_path,
+                        crate::windows_fs::ObjectKind::Directory,
+                        crate::windows_fs::OpenAccess::Read,
+                        crate::windows_fs::OpenDisposition::Open,
+                        None,
+                    )
+                    .map_err(|error| format!("Cannot inspect IDE buffer directory: {error}"))?
+                    .file,
+                ),
+                Err(error) => {
+                    return Err(format!(
+                        "Cannot inspect IDE buffer path without following reparse points: {error}"
+                    ))
+                }
+            }
+        } else {
+            match crate::windows_fs::open_relative(
+                &directory,
+                component_path,
+                crate::windows_fs::ObjectKind::Directory,
+                crate::windows_fs::OpenAccess::Read,
+                crate::windows_fs::OpenDisposition::Open,
+                None,
+            ) {
+                Ok(opened) => Some(opened.file),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(format!(
+                        "Cannot inspect IDE buffer path without following reparse points: {error}"
+                    ))
+                }
+            }
+        };
+        let Some(opened) = opened else {
+            break;
+        };
+        if !is_last {
+            directory = opened;
+        }
+    }
+    Ok(())
 }
 
 fn canonical_roots(roots: &[PathBuf], kind: &str) -> Result<Vec<PathBuf>, String> {
@@ -2254,8 +2434,15 @@ fn canonical_directory(path: &Path, label: &str) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
-fn path_is_within(path: &Path, root: &Path) -> bool {
-    path == root || path.starts_with(root)
+pub(super) fn path_is_within(path: &Path, root: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        crate::windows_fs::path_is_within(path, root)
+    }
+    #[cfg(not(windows))]
+    {
+        path == root || path.starts_with(root)
+    }
 }
 
 fn is_unsafe_broad_root(path: &Path) -> bool {

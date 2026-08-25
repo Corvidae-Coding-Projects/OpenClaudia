@@ -10,7 +10,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::Path;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -41,19 +41,19 @@ impl std::fmt::Display for AtomicWriteError {
 
 impl std::error::Error for AtomicWriteError {}
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 std::thread_local! {
     static FAIL_BEFORE_ATOMIC_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Arm one deterministic, current-thread failure after staged bytes are
 /// synchronized but before the target generation is published.
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 pub(super) fn fail_next_atomic_write_before_publish() {
     FAIL_BEFORE_ATOMIC_PUBLISH.set(true);
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 fn take_fail_before_atomic_publish() -> bool {
     FAIL_BEFORE_ATOMIC_PUBLISH.replace(false)
 }
@@ -198,9 +198,9 @@ pub(super) fn create_host_control_directories(
 /// A directory pinned to the kernel object reached through a capability root.
 pub(super) struct SecureDirectory {
     context: Arc<ToolRunContext>,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     file: File,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     display_path: PathBuf,
 }
 
@@ -240,7 +240,6 @@ impl std::fmt::Display for SecureDirectoryEntriesError {
 pub(super) enum SecureFileType {
     Directory,
     Regular,
-    #[cfg(unix)]
     Other,
 }
 
@@ -282,7 +281,7 @@ pub(super) fn open_directory(
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub(super) fn open_directory(
     _context: &Arc<ToolRunContext>,
     _path: &Path,
@@ -370,7 +369,7 @@ impl SecureDirectory {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl SecureDirectory {
     pub(super) fn entries_bounded(
         &self,
@@ -408,8 +407,14 @@ impl SecureDirectory {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct SecureDirectoryIdentity {
+    #[cfg(unix)]
     device: u64,
+    #[cfg(unix)]
     inode: u64,
+    #[cfg(windows)]
+    volume: u64,
+    #[cfg(windows)]
+    file_id: [u8; 16],
 }
 
 impl From<String> for SecureDirectoryEntriesError {
@@ -665,7 +670,7 @@ pub(super) fn write_atomic_generation(
     Ok(crate::runtime::ContentDigest::sha256(contents))
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub(super) fn write_atomic_generation(
     _context: &ToolRunContext,
     path: &Path,
@@ -963,7 +968,17 @@ pub(super) fn same_file_snapshot(left: &std::fs::Metadata, right: &std::fs::Meta
         && left.ctime_nsec() == right.ctime_nsec()
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(super) fn same_file_snapshot(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    left.file_size() == right.file_size()
+        && left.last_write_time() == right.last_write_time()
+        && left.creation_time() == right.creation_time()
+        && left.file_attributes() == right.file_attributes()
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(super) fn same_file_snapshot(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
     left.len() == right.len() && left.modified().ok() == right.modified().ok()
 }
@@ -982,7 +997,7 @@ fn require_regular(file: &File, path: &Path) -> Result<(), String> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn require_directory(file: &File, path: &Path) -> Result<(), String> {
     let metadata = file
         .metadata()
@@ -1026,12 +1041,12 @@ fn reject_readable_hardlink(file: &File, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn reject_readable_hardlink(_file: &File, _path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn reject_writable_hardlink(_file: &File, _path: &Path) -> Result<(), String> {
     Ok(())
 }
@@ -1094,7 +1109,7 @@ fn open_beneath(
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn open_beneath(
     _context: &ToolRunContext,
     _path: &Path,
@@ -1440,7 +1455,7 @@ fn clear_errno() {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn create_parent_directories(
     _context: &ToolRunContext,
     _path: &Path,
@@ -1468,6 +1483,17 @@ fn relative_to_root(path: &Path, root: &Path) -> Result<PathBuf, String> {
     }
 }
 
+#[cfg(windows)]
+fn relative_to_root(path: &Path, root: &Path) -> Result<PathBuf, String> {
+    crate::windows_fs::relative_to_root(path, root).map_err(|error| {
+        format!(
+            "Path '{}' is not below capability root '{}': {error}",
+            path.display(),
+            root.display()
+        )
+    })
+}
+
 #[cfg(unix)]
 mod libc_flags {
     pub(super) const O_RDONLY: i32 = libc::O_RDONLY;
@@ -1487,13 +1513,34 @@ fn openat2_relative(
     openat_walk(root_fd, relative, flags, mode)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+mod libc_flags {
+    pub(super) const O_RDONLY: i32 = 0;
+    pub(super) const O_RDWR: i32 = 1 << 0;
+    pub(super) const O_CREAT: i32 = 1 << 1;
+    pub(super) const O_EXCL: i32 = 1 << 2;
+    pub(super) const O_DIRECTORY: i32 = 1 << 3;
+}
+
+#[cfg(not(any(unix, windows)))]
 mod libc_flags {
     pub(super) const O_RDONLY: i32 = 0;
     pub(super) const O_RDWR: i32 = 0;
     pub(super) const O_CREAT: i32 = 0;
     pub(super) const O_EXCL: i32 = 0;
 }
+
+#[cfg(windows)]
+#[path = "secure_fs_windows.rs"]
+mod windows_backend;
+
+#[cfg(windows)]
+use windows_backend::{
+    create_parent_directories, open_beneath, reject_readable_hardlink, reject_writable_hardlink,
+};
+
+#[cfg(windows)]
+pub(super) use windows_backend::{open_directory, write_atomic_generation};
 
 #[cfg(test)]
 mod tests {

@@ -1717,9 +1717,9 @@ mod tests {
 
     // ===== crosslink #417: notebook_edit rejects symlink-swap on the leaf =====
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
-    fn fix417_notebook_rejects_symlink_at_target() {
+    fn fix417_notebook_rejects_link_at_target() {
         use tempfile::TempDir;
         let dir = TempDir::new_in(".").expect("tempdir");
         let target = dir.path().join("attacker_target.ipynb");
@@ -1732,7 +1732,10 @@ mod tests {
         )
         .expect("setup target");
         let leaf = dir.path().join("leaf.ipynb");
+        #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &leaf).expect("symlink");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&target, &leaf).expect("file reparse point");
         let leaf_canon = leaf.canonicalize().expect("canonicalize leaf");
         READ_TRACKER.mark_read(test_run(), &leaf_canon);
         let args = args_replace_by_id(
@@ -1774,7 +1777,7 @@ mod tests {
         assert_eq!(src, "new");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn interruption_before_publication_preserves_prior_generation_and_retry_recovers() {
         let _lock = super::super::shared_tracker_lock();

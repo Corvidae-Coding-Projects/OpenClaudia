@@ -7,9 +7,7 @@
 //! replaced. Project files are never a fallback destination.
 
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(unix)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::ser::SerializeStruct as _;
 use serde::{Deserialize, Serialize, Serializer};
@@ -156,7 +154,7 @@ impl std::fmt::Debug for ProviderCredentialStore {
 }
 
 impl ProviderCredentialStore {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn open(root: impl AsRef<Path>) -> Result<Self, ProviderCredentialError> {
         Ok(Self {
             storage: PersistentStorage::open(root)?,
@@ -291,10 +289,10 @@ pub fn user_store_path() -> Result<PathBuf, ProviderCredentialError> {
 /// Whether this build can offer descriptor-safe provider-key persistence.
 #[must_use]
 pub const fn protected_persistence_supported() -> bool {
-    cfg!(unix)
+    cfg!(any(unix, windows))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn open_default_store_for_read() -> Result<Option<ProviderCredentialStore>, ProviderCredentialError>
 {
     let path = match user_store_path() {
@@ -312,7 +310,7 @@ fn open_default_store_for_read() -> Result<Option<ProviderCredentialStore>, Prov
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn open_default_store_for_read() -> Result<Option<ProviderCredentialStore>, ProviderCredentialError>
 {
     // Existing config/environment authentication remains usable on platforms
@@ -360,7 +358,29 @@ fn open_default_store_for_write() -> Result<ProviderCredentialStore, ProviderCre
     ProviderCredentialStore::open(root)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn open_default_store_for_write() -> Result<ProviderCredentialStore, ProviderCredentialError> {
+    let path = user_store_path()?;
+    let root = path
+        .parent()
+        .expect("credential store path always has an application-data parent");
+    let parent = root
+        .parent()
+        .expect("application data store always has a parent");
+    std::fs::create_dir_all(parent).map_err(|source| ProviderCredentialError::Directory {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    crate::windows_fs::create_private_directory(root).map_err(|source| {
+        ProviderCredentialError::Directory {
+            path: root.to_path_buf(),
+            source,
+        }
+    })?;
+    ProviderCredentialStore::open(root)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn open_default_store_for_write() -> Result<ProviderCredentialStore, ProviderCredentialError> {
     Err(ProviderCredentialError::UnsupportedPlatform)
 }
@@ -487,7 +507,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn save_load_replace_and_deny_overwrite_are_transactional() {
         let root = tempfile::tempdir().expect("temp root");
@@ -520,9 +540,10 @@ mod tests {
         assert!(store.load().expect("load")["google"].matches("sk-approved-replacement"));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn persisted_document_is_private_and_generic_diagnostics_stay_redacted() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt as _;
 
         let root = tempfile::tempdir().expect("temp root");
@@ -531,6 +552,7 @@ mod tests {
         store.save("openai", api_key.clone(), false).expect("save");
 
         let path = root.path().join(STORE_FILE_NAME);
+        #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(&path)
                 .expect("metadata")
@@ -539,6 +561,12 @@ mod tests {
                 & 0o777,
             0o600
         );
+        #[cfg(windows)]
+        crate::windows_fs::validate_owned_acl(
+            &std::fs::File::open(&path).expect("credential file handle"),
+            true,
+        )
+        .expect("owner-private credential ACL");
         let bytes = std::fs::read_to_string(path).expect("stored document");
         assert!(bytes.contains("sk-private-persisted-key"));
         assert!(!format!("{api_key:?}").contains("private-persisted-key"));
