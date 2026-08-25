@@ -1,6 +1,6 @@
 {
   "next_display_id": 1137,
-  "next_comment_id": 1542,
+  "next_comment_id": 1543,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -27949,7 +27949,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T03:05:37.879221589Z",
-      "updated_at": "2026-08-25T03:43:06.792755483Z",
+      "updated_at": "2026-08-25T03:59:08.639914405Z",
       "labels": [
         "remediation"
       ],
@@ -27992,6 +27992,15 @@
           "kind": "handoff",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAXdxB85Qqids4iOTAjyQEb4GxX1QouUO8LcNe5Sw25mjjf6zwaMQS3QvDi0wQfOg/Vo0gG5+wq9KhCRxpVqtXAg=="
+        },
+        "b28af51f-c5b0-40dc-9224-faf70351fcce": {
+          "display_id": 1542,
+          "author": "6Vw9",
+          "content": "S-034 implementation stabilization: typed text/binary/image/document reads are wired through the registry; text reads use bounded stable pages with opaque generation-bound cursors; raw media lives only in a bounded transient sidecar and provider adapters project it natively. Removed legacy tests that asserted base64-in-prose and 10 MiB text rejection. Focused evidence now green on Rust 1.98 with CARGO_BUILD_JOBS=4: cargo check --lib --locked; 18 direct read tests; 47 typed-result/provider tests; 21 read-file dispatcher integration tests; 28 registry-schema tests; strict clippy --all-targets --all-features --locked -D warnings. Next: final diff/test skepticism review, full serialized suite and repo gates.",
+          "created_at": "2026-08-25T03:59:08.633931582Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAR9Q56IJSWAfDCVwTY3opvZG9iauMH5hM7YCVtlSK4AK9iVFk01kSOVvz/boL/wbr2qnRJ/wU+llLylswy+f2Dw=="
         }
       }
     },
@@ -39726,11 +39735,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1554,
       "timestamp": "2026-08-25T03:43:06.792755483Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1555,
+      "timestamp": "2026-08-25T03:59:08.639914405Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T03:43:06.792755483Z",
+    "timestamp": "2026-08-25T03:59:08.639914405Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1554
+    "agent_seq": 1555
   }
 }
