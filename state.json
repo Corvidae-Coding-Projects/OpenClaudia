@@ -1,6 +1,6 @@
 {
   "next_display_id": 1140,
-  "next_comment_id": 1606,
+  "next_comment_id": 1607,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -16222,7 +16222,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T09:21:03.171579016Z",
-      "updated_at": "2026-08-25T11:02:50.422801570Z",
+      "updated_at": "2026-08-25T11:02:54.831257131Z",
       "labels": [
         "remediation"
       ],
@@ -16319,6 +16319,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA+Ry7wEjGH244jXSUWjtTbG1q55wxBjGKYAPxFZCfzOw1zzELiU/AND7sWW0d30704XYymdZvgW8i+ElHNdCoDg=="
+        },
+        "dd0509ae-ba82-46ff-85e3-d4a866dd0a7d": {
+          "display_id": 1606,
+          "author": "6Vw9",
+          "content": "[action] S-036 authoritative Windows CI exposed TokenUser-vs-TokenOwner ACL misclassification; implementing the narrow owner-identity repair without weakening DACL checks.",
+          "created_at": "2026-08-25T11:02:54.828760326Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAzxPZKhgqJJtRoW+nl2Q0E9MO/sXtH6IevgsAyxdD8Re2k3THvuqNuE5zsGsMpFsnn+hIBL5Gri1hmG6o8c1RCQ=="
         },
         "e1acf8b6-ad46-4b04-9666-3b8bb07f249c": {
           "display_id": 1591,
@@ -40869,11 +40878,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1652,
       "timestamp": "2026-08-25T11:02:50.422801570Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1653,
+      "timestamp": "2026-08-25T11:02:54.831257131Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T11:02:50.422801570Z",
+    "timestamp": "2026-08-25T11:02:54.831257131Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1652
+    "agent_seq": 1653
   }
 }
