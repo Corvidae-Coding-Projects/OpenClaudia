@@ -1,6 +1,6 @@
 {
   "next_display_id": 1140,
-  "next_comment_id": 1612,
+  "next_comment_id": 1613,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -16222,7 +16222,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T09:21:03.171579016Z",
-      "updated_at": "2026-08-25T11:26:28.810032251Z",
+      "updated_at": "2026-08-25T11:32:28.759085262Z",
       "labels": [
         "remediation"
       ],
@@ -16337,6 +16337,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAqU1sDr42VlZNHvxnFEsa6jpHsM5B0Ta8Pt9Gpihg1bS3uStyoS0q1CvzLIAFUp237q0L7+oIj2SfL3taybW6Dg=="
+        },
+        "c3957898-4ddc-4142-b3f2-fbc168f321c7": {
+          "display_id": 1612,
+          "author": "6Vw9",
+          "content": "Commit 4bc7ce34 (fix(files): publish Windows stages handle-relatively) replaces the failing Win32 rename wrapper with NtSetInformationFile(FileRenameInformation), preserving the pinned RootDirectory authority and adding a direct Windows regression for initial publication plus replacement. Verified: Rust 1.98 fmt pass; focused Windows unit test passes under Wine (1/1); Rust 1.98 Windows GNU all-target/all-feature check pass with CARGO_BUILD_JOBS=4. Strict Windows Clippy has no src/windows_fs.rs diagnostics and remains blocked only by unrelated #1099 debt. Native hosted persistence suite awaits user push.",
+          "created_at": "2026-08-25T11:32:28.756532445Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAy/28T1CnSUxDlm6kfZf63Rqija069+1/g8WhEDuZNFETZIN3jJTicQK8u7KAgQtrLHnE1GcmHdhxMG9lTJqNBw=="
         },
         "c51796ed-76df-4db9-b551-564ab0d9c18c": {
           "display_id": 1592,
@@ -40953,11 +40962,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1658,
       "timestamp": "2026-08-25T11:26:28.810032251Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1659,
+      "timestamp": "2026-08-25T11:32:28.759085262Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T11:26:28.810032251Z",
+    "timestamp": "2026-08-25T11:32:28.759085262Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1658
+    "agent_seq": 1659
   }
 }
