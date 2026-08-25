@@ -173,6 +173,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-033: Bound and stabilize file discovery and grep (#1135)
 - Batch durable background output without blocking job completion (#1134)
 - Make the background-cap stress fixture duration-independent (#1132)
 - Keep sandboxed background jobs owned by their supervisor thread (#1133)
