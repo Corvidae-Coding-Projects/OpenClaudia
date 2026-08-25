@@ -1,6 +1,6 @@
 {
   "next_display_id": 1139,
-  "next_comment_id": 1582,
+  "next_comment_id": 1583,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -17122,7 +17122,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T06:45:36.008716830Z",
-      "updated_at": "2026-08-25T07:08:29.223914948Z",
+      "updated_at": "2026-08-25T07:08:39.802226299Z",
       "labels": [
         "remediation"
       ],
@@ -17135,6 +17135,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAD1+qYyj7faj2IAiudw2Ieo8Tv3ZkBI2VJjz2UQh8T3af2y5jQXzKIpMLcqeaMtpSd/jxw17YxeLLN2K/SS6dCA=="
+        },
+        "44651174-b08f-45ae-8de2-a9826816a928": {
+          "display_id": 1582,
+          "author": "6Vw9",
+          "content": "Plan: commit the exact machine-generated closure line without editing or deduplicating it, then reclose the completed issue and preserve the resulting machine output on the parent remediation issue.",
+          "created_at": "2026-08-25T07:08:39.799582668Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAsRuQE2yYrR51Jj6MAUmH5H7gF7Ogddlowhm6yAF/2AcNcJkisHqy9+aVRIwLunZ3iZiUFJ/KXbhpuDUI4OjHCQ=="
         },
         "6898e0ef-921c-4798-a1fc-05b670770ce8": {
           "display_id": 1581,
@@ -40466,11 +40475,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1621,
       "timestamp": "2026-08-25T07:08:34.724276193Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1622,
+      "timestamp": "2026-08-25T07:08:39.802226299Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T07:08:34.724276193Z",
+    "timestamp": "2026-08-25T07:08:39.802226299Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1621
+    "agent_seq": 1622
   }
 }
