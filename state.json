@@ -1,6 +1,6 @@
 {
   "next_display_id": 1140,
-  "next_comment_id": 1597,
+  "next_comment_id": 1598,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -16211,7 +16211,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T09:21:03.171579016Z",
-      "updated_at": "2026-08-25T10:22:33.011297505Z",
+      "updated_at": "2026-08-25T10:44:44.410818646Z",
       "labels": [
         "remediation"
       ],
@@ -16254,6 +16254,15 @@
           "kind": "handoff",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABACYps6qZCq197/yTFJeniJ6GLeN4F8htt/kGlAJ36bajyeXM9paroAQN0nvG7uUDKX84TNf+v6H3rHkI37FofAQ=="
+        },
+        "d4f3fe8c-b146-4227-b4ff-1b740bb27dcc": {
+          "display_id": 1597,
+          "author": "6Vw9",
+          "content": "Local S-036 gate is complete for artifact S036-G1 (source/test SHA-256 f0080007ad14bb88d27b29a7d42d7345ddf81942b19f8a0636bc6a8e0c26997a). Rust 1.98 Windows GNU all-target/all-feature check passes; focused shared persistence/file/session tests pass 15/15; Linux all-target/all-feature check and strict Clippy pass; the full locked serialized suite passes 2,937 active library tests, 227 binary tests, and every integration target with zero failures. Skeptical review fixed unbounded Windows directory accumulation, SID/record alignment hazards, and pathname-reopen stage cleanup. Hosted Windows PR #66 evidence remains required before issue closure; no S-088 receipt is claimed.",
+          "created_at": "2026-08-25T10:44:44.406749977Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA+Ry7wEjGH244jXSUWjtTbG1q55wxBjGKYAPxFZCfzOw1zzELiU/AND7sWW0d30704XYymdZvgW8i+ElHNdCoDg=="
         },
         "e1acf8b6-ad46-4b04-9666-3b8bb07f249c": {
           "display_id": 1591,
@@ -40733,11 +40742,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1642,
       "timestamp": "2026-08-25T10:22:33.011297505Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1643,
+      "timestamp": "2026-08-25T10:44:44.410818646Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T10:22:33.011297505Z",
+    "timestamp": "2026-08-25T10:44:44.410818646Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1642
+    "agent_seq": 1643
   }
 }
