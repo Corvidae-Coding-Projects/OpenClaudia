@@ -30,9 +30,10 @@ use windows_sys::Win32::Security::Authorization::{
     SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
-    CreateWellKnownSid, EqualSid, GetLengthSid, GetTokenInformation, TokenUser,
+    CreateWellKnownSid, EqualSid, GetLengthSid, GetTokenInformation, TokenOwner, TokenUser,
     WinAuthenticatedUserSid, WinBuiltinUsersSid, WinWorldSid, DACL_SECURITY_INFORMATION,
-    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER,
+    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_INFORMATION_CLASS, TOKEN_OWNER,
+    TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, FileIdInfo,
@@ -684,12 +685,10 @@ pub fn validate_owned_acl(file: &File, private_content: bool) -> io::Result<()> 
         ));
     }
     let descriptor_guard = OwnedSecurityDescriptor(descriptor);
-    let current = current_user_sid()?;
-    // SAFETY: both SID pointers remain valid for this comparison.
-    if owner.is_null() || unsafe { EqualSid(owner, current.as_ptr().cast_mut().cast()) } == 0 {
+    if !owner_matches_current_process_token(owner)? {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "filesystem object is not owned by the current Windows user",
+            "filesystem object is not owned by the current Windows token",
         ));
     }
     if dacl.is_null() {
@@ -745,6 +744,51 @@ pub fn validate_owned_acl(file: &File, private_content: bool) -> io::Result<()> 
 }
 
 fn current_user_sid() -> io::Result<Vec<usize>> {
+    current_process_token_sid(ProcessTokenSid::User)
+}
+
+fn owner_matches_current_process_token(owner: PSID) -> io::Result<bool> {
+    if owner.is_null() {
+        return Ok(false);
+    }
+    // A Windows access token can designate an enabled group (commonly the
+    // Administrators SID for an elevated process) as the default owner of new
+    // objects. Accept the token user and that exact default-owner SID; the
+    // independent DACL checks below still reject broadly writable objects.
+    for kind in [ProcessTokenSid::User, ProcessTokenSid::DefaultOwner] {
+        let candidate = current_process_token_sid(kind)?;
+        // SAFETY: GetSecurityInfo returned `owner` as a valid SID and the
+        // candidate buffer owns a complete, suitably aligned SID.
+        if unsafe { EqualSid(owner, candidate.as_ptr().cast_mut().cast()) } != 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[derive(Clone, Copy)]
+enum ProcessTokenSid {
+    User,
+    DefaultOwner,
+}
+
+impl ProcessTokenSid {
+    const fn information_class(self) -> TOKEN_INFORMATION_CLASS {
+        match self {
+            Self::User => TokenUser,
+            Self::DefaultOwner => TokenOwner,
+        }
+    }
+
+    const fn header_size(self) -> usize {
+        match self {
+            Self::User => std::mem::size_of::<TOKEN_USER>(),
+            Self::DefaultOwner => std::mem::size_of::<TOKEN_OWNER>(),
+        }
+    }
+}
+
+fn current_process_token_sid(kind: ProcessTokenSid) -> io::Result<Vec<usize>> {
     let mut token: HANDLE = std::ptr::null_mut();
     // SAFETY: output receives one owned token handle.
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
@@ -761,7 +805,7 @@ fn current_user_sid() -> io::Result<Vec<usize>> {
     unsafe {
         GetTokenInformation(
             token.0,
-            TokenUser,
+            kind.information_class(),
             std::ptr::null_mut(),
             0,
             &raw mut required,
@@ -771,10 +815,10 @@ fn current_user_sid() -> io::Result<Vec<usize>> {
         return Err(io::Error::last_os_error());
     }
     let required_bytes = usize::try_from(required).unwrap_or(0);
-    if required_bytes < std::mem::size_of::<TOKEN_USER>() {
+    if required_bytes < kind.header_size() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "Windows token returned a truncated TOKEN_USER size",
+            "Windows token returned a truncated SID record",
         ));
     }
     let words = required_bytes.div_ceil(std::mem::size_of::<usize>());
@@ -784,7 +828,7 @@ fn current_user_sid() -> io::Result<Vec<usize>> {
     if unsafe {
         GetTokenInformation(
             token.0,
-            TokenUser,
+            kind.information_class(),
             buffer.as_mut_ptr().cast(),
             required,
             &raw mut required,
@@ -793,11 +837,22 @@ fn current_user_sid() -> io::Result<Vec<usize>> {
     {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: TokenUser initialized a properly aligned TOKEN_USER at the start
-    // of the word buffer.
-    let token_user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
-    // SAFETY: TOKEN_USER contains a valid SID pointer.
-    let length = unsafe { GetLengthSid(token_user.User.Sid) };
+    // SAFETY: GetTokenInformation initialized the selected, properly aligned
+    // token record at the start of the word buffer.
+    let source_sid = unsafe {
+        match kind {
+            ProcessTokenSid::User => (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid,
+            ProcessTokenSid::DefaultOwner => (*buffer.as_ptr().cast::<TOKEN_OWNER>()).Owner,
+        }
+    };
+    if source_sid.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows token returned a null SID",
+        ));
+    }
+    // SAFETY: the selected token record contains a valid SID pointer.
+    let length = unsafe { GetLengthSid(source_sid) };
     if length == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -808,7 +863,7 @@ fn current_user_sid() -> io::Result<Vec<usize>> {
     // SID is later passed back to Windows.
     unsafe {
         std::ptr::copy_nonoverlapping(
-            token_user.User.Sid.cast::<u8>(),
+            source_sid.cast::<u8>(),
             sid.as_mut_ptr().cast::<u8>(),
             length,
         );
