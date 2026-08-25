@@ -1,6 +1,6 @@
 {
   "next_display_id": 1141,
-  "next_comment_id": 1631,
+  "next_comment_id": 1632,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8658,7 +8658,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-25T19:01:18.648815351Z",
+      "updated_at": "2026-08-25T21:11:01.433859117Z",
       "labels": [
         "remediation"
       ],
@@ -8835,6 +8835,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAN2fUvLg2zjiW0nYZJRkI4z0KlkS1VKKtcKI3cu0nfQM2g4ZSdbVwGF00BAPkxq2RAc4h83m1j4Vnv86blXwPDw=="
+        },
+        "1e4c4726-0e16-4aeb-97db-1461d4dbf3e3": {
+          "display_id": 1631,
+          "author": "6Vw9",
+          "content": "Session auto-ended (stale after 649 minutes). No handoff notes provided.",
+          "created_at": "2026-08-25T21:11:01.431052764Z",
+          "kind": "handoff",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAwVj04/5ThDuHh4I4pXjv+HoiymqvjBoVt7KibWHpdw+kNX++HPw3aW7RZK0gexkRGPwv36y6vYaHgaYylzERAQ=="
         },
         "1f10dcb3-3870-4f00-90c6-3fc360160ea9": {
           "display_id": 1267,
@@ -41282,11 +41291,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1687,
       "timestamp": "2026-08-25T19:01:18.648815351Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1688,
+      "timestamp": "2026-08-25T21:11:01.433859117Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T19:01:18.648815351Z",
+    "timestamp": "2026-08-25T21:11:01.433859117Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1687
+    "agent_seq": 1688
   }
 }
