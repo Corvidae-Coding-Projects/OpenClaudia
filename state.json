@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1138,
+  "next_display_id": 1139,
   "next_comment_id": 1577,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -538,6 +538,7 @@
     "80c4bd35-680c-43a5-8712-a4f740b407a4": 467,
     "8122bdd0-f681-4b52-89bb-957333cdce41": 546,
     "81ca948a-cdee-4ed1-86ad-0a4e20947c97": 252,
+    "821e556a-8225-401a-8baa-34d533e618e9": 1138,
     "82788825-a530-4909-9ca3-88848daf58d7": 677,
     "82f93069-d1a1-4519-b36f-e7d1ad37def2": 130,
     "830b294d-7ae6-4a28-a214-85b18a2db586": 196,
@@ -17106,6 +17107,18 @@
         "qa-seam-vdd",
         "refactor"
       ]
+    },
+    "821e556a-8225-401a-8baa-34d533e618e9": {
+      "uuid": "821e556a-8225-401a-8baa-34d533e618e9",
+      "display_id": 1138,
+      "title": "Eliminate background-job job.json generation conflicts in Linux CI",
+      "description": "PR #66 run 32816834460 failed the serialized Rust 1.98 Linux suite in tools::bash::tests::fix1133_background_survives_spawning_thread_exit: background startup returned Cannot persist background-job record: persistence generation conflict for job.json after formatting, check, and Clippy passed. Reproduce and repair the actual background-job persistence/test isolation invariant without weakening the parent-death test.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-25T06:45:36.008716830Z",
+      "updated_at": "2026-08-25T06:45:36.008716830Z"
     },
     "82788825-a530-4909-9ca3-88848daf58d7": {
       "uuid": "82788825-a530-4909-9ca3-88848daf58d7",
@@ -40339,11 +40352,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1609,
       "timestamp": "2026-08-25T06:24:12.113438964Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1610,
+      "timestamp": "2026-08-25T06:45:36.008716830Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T06:24:12.113438964Z",
+    "timestamp": "2026-08-25T06:45:36.008716830Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1609
+    "agent_seq": 1610
   }
 }
