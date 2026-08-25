@@ -1,6 +1,6 @@
 {
   "next_display_id": 1140,
-  "next_comment_id": 1605,
+  "next_comment_id": 1606,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -16222,7 +16222,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T09:21:03.171579016Z",
-      "updated_at": "2026-08-25T10:47:44.351242766Z",
+      "updated_at": "2026-08-25T11:02:50.422801570Z",
       "labels": [
         "remediation"
       ],
@@ -16271,6 +16271,15 @@
           "kind": "result",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA50IVQtOjIOU1Kc7yMlonQrFjVz5i5LgYpVktMf8FOkoA005s35oONF0QO7PKDm8SxKq31HJ0hX23BEx+yZkcBQ=="
+        },
+        "937cb9ab-3bfd-4cf0-89e7-d399f88a8e6e": {
+          "display_id": 1605,
+          "author": "6Vw9",
+          "content": "Hosted Windows run 32839167240 failed in step 'Windows shared descriptor-safe persistence contract' after cargo check and sandbox_platform_fail_closed_e2e passed. All 5 descriptor_safe_persistence_e2e tests rejected tempfile roots because validate_owned_acl compared the filesystem owner only with TokenUser. Elevated Windows tokens can create objects owned by their TokenOwner/default-owner SID (for example Administrators), so the backend misclassified legitimately current-token-owned roots. Repair will accept exactly TokenUser or TokenOwner, retaining DACL and reparse/type checks; later Windows steps were skipped by the workflow.",
+          "created_at": "2026-08-25T11:02:50.419489975Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAH9CF6iKJwwoQmL0KR18kc/aw0z719FTv4E5MkTYzco2M5hhwuKZ1TJgSQzSjVJJNYXqFRdrnAK1Rj2ZhKWyVAA=="
         },
         "93e21187-9ba4-4eaf-ae5e-3ad521eed81e": {
           "display_id": 1596,
@@ -40855,11 +40864,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1651,
       "timestamp": "2026-08-25T10:47:44.351242766Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1652,
+      "timestamp": "2026-08-25T11:02:50.422801570Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T10:47:44.351242766Z",
+    "timestamp": "2026-08-25T11:02:50.422801570Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1651
+    "agent_seq": 1652
   }
 }
