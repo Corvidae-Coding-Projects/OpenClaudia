@@ -1,6 +1,6 @@
 {
   "next_display_id": 1142,
-  "next_comment_id": 1634,
+  "next_comment_id": 1635,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -30352,7 +30352,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T21:13:29.243020245Z",
-      "updated_at": "2026-08-25T21:31:22.832949662Z",
+      "updated_at": "2026-08-25T22:12:13.318961365Z",
       "labels": [
         "remediation"
       ],
@@ -30365,6 +30365,15 @@
           "kind": "decision",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAF21xNiLK0cQbSMZpJTB3/iZTanMM2IIPEAacPVUeZVmwfes2Zebo28pDnVhw5ah4ybNQCsU2KZKR+whfS8nwBQ=="
+        },
+        "4a15f2d5-65e0-4f51-aae9-a37ed352b74c": {
+          "display_id": 1634,
+          "author": "6Vw9",
+          "content": "Implemented per-server bounded MCP actors: 32-entry fail-fast mailboxes, 10 MiB queued/request/frame/body caps, 60 s operation/shutdown deadlines, exact run+connection generations, cancellation-aware caller drop, typed partial fan-out, coherent catalog snapshots, replacement/shutdown joins, stdio kill+reap fallback, and legacy HTTP session DELETE. Resource handlers now defer Process/Network admission to the selected transport; #1026 cases cover stdio-only, HTTP-only, mismatch, stale run/connection, unknown, and mixed servers. Focused evidence so far: Rust 1.98 library Clippy -D warnings green; MCP unit suite 96/96 green before final close adjustments; S-066 tests green; HTTP session DELETE test green; compiled stdio/current-HTTP round trips green. Full serialized gates remain.",
+          "created_at": "2026-08-25T22:12:13.316496999Z",
+          "kind": "progress",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAx3Lt5Qbakn1RrkuD6bSRsbp9mDhpxv+xUPCbOaHdvkVPoysQW8xv/gW+fM88A8Og0+2yIxhCYpiU/zBEiN9GAg=="
         },
         "6046705a-c94e-43dc-ab61-3a8b80b3a2e0": {
           "display_id": 1633,
@@ -41361,11 +41370,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1693,
       "timestamp": "2026-08-25T21:31:22.832949662Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1694,
+      "timestamp": "2026-08-25T22:12:13.318961365Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T21:31:22.832949662Z",
+    "timestamp": "2026-08-25T22:12:13.318961365Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1693
+    "agent_seq": 1694
   }
 }
