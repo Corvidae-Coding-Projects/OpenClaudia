@@ -1,6 +1,6 @@
 {
   "next_display_id": 1139,
-  "next_comment_id": 1584,
+  "next_comment_id": 1585,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8649,7 +8649,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-25T06:22:47.985576459Z",
+      "updated_at": "2026-08-25T07:09:16.431122817Z",
       "labels": [
         "remediation"
       ],
@@ -9372,6 +9372,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA6w3MC5UNiP+DyUXKvqvrjNJ8WtCiYSJhzOH2S9FfipjdfXFzw9Vt0HbE/bsWkac6YJY4R7Gamly9Z5wf6LCcBQ=="
+        },
+        "c9852424-054d-448f-b321-389636be4b63": {
+          "display_id": 1584,
+          "author": "6Vw9",
+          "content": "Plan: preserve the exact duplicate changelog line emitted by Crosslink when the completed runner-fix issue #1138 was reclosed; do not manually normalize machine-owned closure output.",
+          "created_at": "2026-08-25T07:09:16.428698663Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAkJpsf959ErQo+Ktm456F97gGMQxZUR642wbt0QOIZr4tW5pw3fnSEdhhhmLWfdedqMAT5YxfKHNHH2CWpQUHDQ=="
         },
         "cb40e55d-cec1-4b9f-8ae9-f024c4bda234": {
           "display_id": 1230,
@@ -40501,11 +40510,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1625,
       "timestamp": "2026-08-25T07:09:04.145091866Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1626,
+      "timestamp": "2026-08-25T07:09:16.431122817Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T07:09:04.145091866Z",
+    "timestamp": "2026-08-25T07:09:16.431122817Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1625
+    "agent_seq": 1626
   }
 }
