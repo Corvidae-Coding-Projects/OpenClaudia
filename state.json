@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1140,
+  "next_display_id": 1141,
   "next_comment_id": 1619,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -308,6 +308,7 @@
     "4a36082e-13b8-437f-b66f-7ee7beb6e37d": 103,
     "4a463d5d-ce25-413a-aa00-e82c9f2d4104": 920,
     "4aba17c7-1b3c-411b-b388-591e7001ab3c": 520,
+    "4b2f0ddf-e3eb-40a8-a635-7f480533019f": 1140,
     "4b4c1c60-67ab-404b-a810-59728e5b3d54": 1069,
     "4bcc5066-2e6d-42a5-a189-76f3ea0e8b97": 24,
     "4bcd67fd-31b8-4458-a7ba-bda6f686db6b": 321,
@@ -10340,6 +10341,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAip/hIVErwAxCKWlQXDGIMF1QhXcqL9TucK8dRoCSbITKk8QS35BxWzx3mr8hTsZcTGoZqUm8n1GvaubbVCQtCQ=="
         }
       }
+    },
+    "4b2f0ddf-e3eb-40a8-a635-7f480533019f": {
+      "uuid": "4b2f0ddf-e3eb-40a8-a635-7f480533019f",
+      "display_id": 1140,
+      "title": "S-065: Implement the current MCP protocol adapter",
+      "description": "Goal: \n\nAcceptance criteria:\n- \n\nReplace the retired/flattened core MCP model with a current typed protocol boundary while preserving operational MCP behavior. Negotiate versions and capabilities explicitly; isolate supported older revisions behind versioned adapters; keep tools, resources, prompts, typed content, logging, progress, tasks, errors, and cancellation typed through real consumers. Reject unsupported combinations honestly. Keep scope within S-065, prioritize realistic application behavior over speculative edge cases, use official MCP sources, treat tests skeptically, validate with Rust 1.98 under bounded resources, and reconcile #1026 only if actually resolved.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-25T12:44:39.647023098Z",
+      "updated_at": "2026-08-25T12:44:39.647023098Z"
     },
     "4b4c1c60-67ab-404b-a810-59728e5b3d54": {
       "uuid": "4b4c1c60-67ab-404b-a810-59728e5b3d54",
@@ -41058,11 +41071,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1667,
       "timestamp": "2026-08-25T12:28:06.555805371Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1668,
+      "timestamp": "2026-08-25T12:44:39.647023098Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T12:28:06.555805371Z",
+    "timestamp": "2026-08-25T12:44:39.647023098Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1667
+    "agent_seq": 1668
   }
 }
