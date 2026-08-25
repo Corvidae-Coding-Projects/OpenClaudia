@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1143,
+  "next_display_id": 1144,
   "next_comment_id": 1644,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -867,6 +867,7 @@
     "d063cb34-5ff9-4fa5-bee3-62ef5aa50941": 972,
     "d0e9dd34-df5e-44f4-bd08-9523aafc7c2e": 70,
     "d0f06472-ce20-4d78-b948-4337a35925cc": 428,
+    "d17198cd-14a5-45b7-ab42-6612dcb5d851": 1143,
     "d1918f4c-d902-472f-adbd-b28572d7eb66": 1,
     "d1b439d9-baf4-494f-8f43-4b630dacbfc0": 1033,
     "d1fd1bce-ca2e-4824-9682-27b5ffbf1030": 35,
@@ -27330,6 +27331,16 @@
         }
       }
     },
+    "d17198cd-14a5-45b7-ab42-6612dcb5d851": {
+      "uuid": "d17198cd-14a5-45b7-ab42-6612dcb5d851",
+      "display_id": 1143,
+      "title": "Identify next unfinished remediation slice",
+      "status": "open",
+      "priority": "medium",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-25T23:40:07.796661644Z",
+      "updated_at": "2026-08-25T23:40:07.796661644Z"
+    },
     "d1918f4c-d902-472f-adbd-b28572d7eb66": {
       "uuid": "d1918f4c-d902-472f-adbd-b28572d7eb66",
       "display_id": 1,
@@ -41571,11 +41582,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1713,
       "timestamp": "2026-08-25T23:18:48.977728083Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1714,
+      "timestamp": "2026-08-25T23:40:07.796661644Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T23:18:48.977728083Z",
+    "timestamp": "2026-08-25T23:40:07.796661644Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1713
+    "agent_seq": 1714
   }
 }
