@@ -10351,12 +10351,13 @@
       "display_id": 1140,
       "title": "S-065: Implement the current MCP protocol adapter",
       "description": "Goal:\nImplement the current typed MCP protocol adapter without removing or weakening operational MCP behavior.\n\nAcceptance criteria:\n- Official current MCP protocol semantics are represented and negotiated explicitly for initialization, capabilities, tools, resources, prompts, typed content, logging, progress, tasks, errors, and cancellation.\n- Supported older revisions use explicit versioned adapters; unsupported versions and capability combinations fail honestly.\n- Production consumers preserve structured values rather than flattening protocol data into strings.\n- Focused conformance, compatibility, and failure-path tests prove realistic behavior without weakening existing tests.\n- Rust 1.98 focused and full resource-bounded gates pass; PR #66 runners are terminal green.\n\nConstraints:\nPreserve intended features, keep scope within S-065, prioritize realistic application behavior over hypothetical edge cases or unrelated cleanup, reconcile #1026 only if genuinely resolved, preserve generated CHANGELOG output exactly, sign commits as dollspace-gay, and clean Cargo caches after final validation.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T12:44:39.647023098Z",
-      "updated_at": "2026-08-25T14:02:57.475519519Z",
+      "updated_at": "2026-08-25T14:03:23.998706573Z",
+      "closed_at": "2026-08-25T14:03:23.998705090Z",
       "labels": [
         "feature",
         "remediation"
@@ -41162,11 +41163,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1676,
       "timestamp": "2026-08-25T14:02:57.475519519Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1677,
+      "timestamp": "2026-08-25T14:03:23.998706573Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T14:02:57.475519519Z",
+    "timestamp": "2026-08-25T14:03:23.998706573Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1676
+    "agent_seq": 1677
   }
 }
