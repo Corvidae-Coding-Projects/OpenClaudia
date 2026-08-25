@@ -13108,11 +13108,12 @@
       "display_id": 1026,
       "title": "Make MCP resource capability requirements transport-specific",
       "description": "S-019 follow-up for S-064/S-066. The list_mcp_resources and read_mcp_resource handlers currently declare REQUIRES_PROCESS_AND_NETWORK unconditionally. Stdio MCP needs Process while HTTP MCP needs Network, so a least-privilege run with only the transport it actually uses is rejected before the owned manager can select/revalidate the server transport. Model the requirement from the selected server/transport generation, fail closed for missing transport metadata, and add stdio-only, HTTP-only, mismatched, stale-generation, and mixed-server tests. Discovered during #1025; intentionally not widened into S-019 because the current rule is conservative and S-066 owns transport-specific admission.",
-      "status": "open",
+      "status": "closed",
       "priority": "medium",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T12:46:11.407594026Z",
-      "updated_at": "2026-08-25T22:25:01.118631401Z",
+      "updated_at": "2026-08-25T22:25:05.794843891Z",
+      "closed_at": "2026-08-25T22:25:05.794833309Z",
       "labels": [
         "remediation"
       ],
@@ -41391,11 +41392,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1695,
       "timestamp": "2026-08-25T22:25:01.118631401Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1696,
+      "timestamp": "2026-08-25T22:25:05.794843891Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T22:25:01.118631401Z",
+    "timestamp": "2026-08-25T22:25:05.794843891Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1695
+    "agent_seq": 1696
   }
 }
