@@ -1,6 +1,6 @@
 {
   "next_display_id": 1139,
-  "next_comment_id": 1577,
+  "next_comment_id": 1578,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -17122,10 +17122,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T06:45:36.008716830Z",
-      "updated_at": "2026-08-25T06:45:41.108446379Z",
+      "updated_at": "2026-08-25T06:51:13.361117572Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "cc5027eb-516d-4a63-aaa5-28712acb66e7": {
+          "display_id": 1577,
+          "author": "6Vw9",
+          "content": "Finding: the #1133 parent-death test constructed a local BackgroundShellManager but reused the global bash test ToolRunContext and durable job namespace. In the full serialized suite, its fresh manager could recover a prior job while that job supervisor was still atomically finalizing job.json, producing a legitimate generation conflict before the tested job started. The test passes alone and the 33-test Bash module passes locally. Repair category: local correctness/test isolation; give this local manager its own real workspace/session while preserving the transient spawning thread, supervisor lifetime, readable running state, and kill assertions.",
+          "created_at": "2026-08-25T06:51:13.358304213Z",
+          "kind": "finding",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAsqzodvOUGOvwFynNosL621uETNHEtJGe1XObsl7mo2etDWEhjGGiV12RmTGNdGmQrffX5MFREP1Fa332kGRlCw=="
+        }
+      }
     },
     "82788825-a530-4909-9ca3-88848daf58d7": {
       "uuid": "82788825-a530-4909-9ca3-88848daf58d7",
@@ -40374,11 +40385,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1612,
       "timestamp": "2026-08-25T06:45:46.571317663Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1613,
+      "timestamp": "2026-08-25T06:51:13.361117572Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T06:45:46.571317663Z",
+    "timestamp": "2026-08-25T06:51:13.361117572Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1612
+    "agent_seq": 1613
   }
 }
