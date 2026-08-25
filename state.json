@@ -1,6 +1,6 @@
 {
   "next_display_id": 1142,
-  "next_comment_id": 1635,
+  "next_comment_id": 1636,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -13112,10 +13112,21 @@
       "priority": "medium",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T12:46:11.407594026Z",
-      "updated_at": "2026-08-19T12:46:15.575655020Z",
+      "updated_at": "2026-08-25T22:25:01.118631401Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "2e9e6559-7c62-4829-8d41-5717a5f6507b": {
+          "display_id": 1635,
+          "author": "6Vw9",
+          "content": "Completed in S-066. MCP resource handlers no longer require Process and Network together: the registered server actor selects Process for stdio or Network for HTTP and revalidates the exact run generation before transport work. Tests cover stdio-only, HTTP-only, mismatch, stale run and connection generations, unknown server, and mixed-server partial failure. Rust 1.98 strict all-target/all-feature Clippy and the complete locked serialized test suite pass.",
+          "created_at": "2026-08-25T22:25:01.116214199Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAesL6MTgTWNUX807+NlCkoviat5N4oKJjOADlzi47tZXSpxc+iSc9kRNPrVgI+UKda41mVrdSGO9C0lMPt3FhCA=="
+        }
+      }
     },
     "60d7cd9b-f642-4d77-b172-1d0857dd7807": {
       "uuid": "60d7cd9b-f642-4d77-b172-1d0857dd7807",
@@ -41375,11 +41386,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1694,
       "timestamp": "2026-08-25T22:12:13.318961365Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1695,
+      "timestamp": "2026-08-25T22:25:01.118631401Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T22:12:13.318961365Z",
+    "timestamp": "2026-08-25T22:25:01.118631401Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1694
+    "agent_seq": 1695
   }
 }
