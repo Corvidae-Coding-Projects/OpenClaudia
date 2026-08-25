@@ -1,6 +1,6 @@
 # S-036: Provide cross-platform secure file capabilities
 
-Status: Implemented and locally verified; authoritative Windows runner and canonical VDD receipt pending
+Status: Implemented and verified; canonical VDD receipt pending S-088
 Effort: Medium
 Primary findings: F-035
 Workstreams: W15
@@ -99,14 +99,16 @@ authority against a deliberate same-user process that bypasses both APIs.
 
 ## Artifact generation
 
-- Generation: `S036-G1`.
+- Generation: `S036-G3`, superseding the source/test generations invalidated by
+  the hosted-Windows TokenOwner and native rename repairs.
 - Baseline commit: `c4bd8decf7982798769f9df6b5a68f419977e110`.
+- Verified implementation commit: `4bc7ce345147ac1c342d891ed654f626537a9645`.
 - Source/test artifact digest: SHA-256
-  `f0080007ad14bb88d27b29a7d42d7345ddf81942b19f8a0636bc6a8e0c26997a`
-  over `git diff --cached --binary HEAD -- src tests` after the skeptical
-  implementation/test review and explicit staging. Any source or test change
-  invalidates this generation.
-- Scope: fourteen source/test paths; 3,370 insertions and 105 deletions. The
+  `a788c459d8a0cd82f3f8a231e7a21bf1816d4320d67afb86905f35ef925b4be2`
+  over `git diff --binary c4bd8decf7982798769f9df6b5a68f419977e110..4bc7ce345147ac1c342d891ed654f626537a9645 -- src tests`
+  after the skeptical implementation/test review and both native Windows
+  repairs. Any source or test change invalidates this generation.
+- Scope: fourteen source/test paths; 3,484 insertions and 105 deletions. The
   complete delivery also updates the Windows dependency features, authoritative
   runner matrix, and this handoff document.
 
@@ -114,12 +116,12 @@ authority against a deliberate same-user process that bypasses both APIs.
 
 | Receipt | Evidence | Result |
 | --- | --- | --- |
-| `S036-E1` | Rust 1.98 Windows GNU all-target/all-feature compilation covers every library, binary, unit-test, and integration-test target with the new Windows backend enabled. | Pass as compile evidence; runtime evidence pending hosted Windows |
+| `S036-E1` | Rust 1.98 Windows GNU all-target/all-feature compilation covers every library, binary, unit-test, and integration-test target with the new Windows backend enabled. | Pass |
 | `S036-E2` | Shared descriptor persistence (4), file-tool lifecycle (9), and session filesystem capability (2) suites execute the existing Unix backend after the shared-contract changes. Parent links preserve the outside sentinel, stale writers conflict, deep creation works, and private temp links cannot escape. | Pass |
 | `S036-E3` | The complete locked Linux all-target/all-feature suite runs serialized: 2,937 active library tests and 227 binary tests pass, followed by every integration target with zero failures. The one ignored library entry is the subprocess-only persistence crash worker, which its active recovery test invokes. | Pass |
 | `S036-E4` | Strict Linux all-target/all-feature Clippy passes with `-D warnings`. Windows Clippy identifies no S-036-local finding after the FFI/alignment and bounded-enumeration review; independent pre-existing Windows lint debt remains tracked by Crosslink #1099 without weakening lint settings. | Pass for changed surface |
-| `S036-E5` | Windows runner steps execute shared persistence, session capability, file-tool, notebook reparse/interruption, credential ACL, and session-adapter contracts on the actual platform. | Pending PR #66 runner |
-| `S036-E6` | No S-088 verifier is operational, so no alternate-model receipt is represented as present. `S036-G1` and its exact digest are queued for future verification with the canonical harness and guardrails. | Pending S-088 by design |
+| `S036-E5` | PR #66 run `32843208084` executes shared persistence, session capability, file-tool, persistence interruption/validation, notebook reparse/interruption, credential ACL, and session-adapter contracts on `windows-latest` at exact commit `4bc7ce345147ac1c342d891ed654f626537a9645`. All Windows runtime steps and the enclosing job pass. | Pass |
+| `S036-E6` | No S-088 verifier is operational, so no alternate-model receipt is represented as present. `S036-G3` and its exact digest are queued for future verification with the canonical harness and guardrails. | Pending S-088 by design |
 
 ## Verification record
 
@@ -141,14 +143,13 @@ OpenClaudia Cargo invocation. Test commands used `--test-threads=1`.
 - `cargo test --quiet --locked --all-targets --all-features --
   --test-threads=1` — pass for the complete repository, with zero failures.
 - `git diff --check` — pass.
+- PR #66 run `32843208084` at `4bc7ce345147ac1c342d891ed654f626537a9645`
+  — pass: repository policy, Rust 1.98 MSRV, Linux, macOS, and Windows jobs all
+  completed successfully. The Windows job passed its all-target/all-feature
+  check, platform fail-closed test, and every Windows-specific runtime contract.
 
 ## Unresolved risks and queues
 
-- Hosted Windows execution remains the authoritative evidence for NT handle,
-  reparse, ACL, locking, rename, and directory-flush behavior. Crosslink #1139
-  and this document remain open/pending until every required PR #66 runner is
-  terminal and green; Linux cross-compilation is not substituted for that
-  evidence.
 - Windows filesystems and storage drivers ultimately define what a successful
   directory flush guarantees. Persistent storage reports a failed flush as
   `PublishedDurabilityUncertain` and reconciles it on retry. The workspace
