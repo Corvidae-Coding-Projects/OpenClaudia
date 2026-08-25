@@ -1,6 +1,6 @@
 {
   "next_display_id": 1139,
-  "next_comment_id": 1581,
+  "next_comment_id": 1582,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -17122,7 +17122,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T06:45:36.008716830Z",
-      "updated_at": "2026-08-25T07:07:54.310442442Z",
+      "updated_at": "2026-08-25T07:07:59.854694179Z",
       "labels": [
         "remediation"
       ],
@@ -17135,6 +17135,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAD1+qYyj7faj2IAiudw2Ieo8Tv3ZkBI2VJjz2UQh8T3af2y5jQXzKIpMLcqeaMtpSd/jxw17YxeLLN2K/SS6dCA=="
+        },
+        "6898e0ef-921c-4798-a1fc-05b670770ce8": {
+          "display_id": 1581,
+          "author": "6Vw9",
+          "content": "Committed 8c222b36 test(shell): isolate parent-death job storage. Verified focused #1133 regression, all 33 Bash unit tests, Rust 1.98 locked all-target/all-feature suite, strict Clippy, formatting, 27 repository-policy tests, and repository hygiene. The commit is signed and changes only the isolated test plus canonical digest-bound evidence.",
+          "created_at": "2026-08-25T07:07:59.852267664Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAgOGy6QaXMxb+3ODhU4aL+kUeH2Jyp+MGc+GoLW8gUeA55EKIpwcpeKkHWZJi1YDRZI7auAqNh1HJ8b1XM3D8Cw=="
         },
         "6c4d216d-d1c2-4851-9d36-37fe6c1fb5b1": {
           "display_id": 1580,
@@ -40432,11 +40441,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1616,
       "timestamp": "2026-08-25T07:07:54.310442442Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1617,
+      "timestamp": "2026-08-25T07:07:59.854694179Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T07:07:54.310442442Z",
+    "timestamp": "2026-08-25T07:07:59.854694179Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1616
+    "agent_seq": 1617
   }
 }
