@@ -17117,12 +17117,13 @@
       "display_id": 1138,
       "title": "Eliminate background-job job.json generation conflicts in Linux CI",
       "description": "PR #66 run 32816834460 failed the serialized Rust 1.98 Linux suite in tools::bash::tests::fix1133_background_survives_spawning_thread_exit: background startup returned Cannot persist background-job record: persistence generation conflict for job.json after formatting, check, and Clippy passed. Reproduce and repair the actual background-job persistence/test isolation invariant without weakening the parent-death test.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T06:45:36.008716830Z",
-      "updated_at": "2026-08-25T07:08:55.197207793Z",
+      "updated_at": "2026-08-25T07:08:59.475257160Z",
+      "closed_at": "2026-08-25T07:08:59.475255765Z",
       "labels": [
         "remediation"
       ],
@@ -40494,11 +40495,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1623,
       "timestamp": "2026-08-25T07:08:55.197207793Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1624,
+      "timestamp": "2026-08-25T07:08:59.475257160Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T07:08:55.197207793Z",
+    "timestamp": "2026-08-25T07:08:59.475257160Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1623
+    "agent_seq": 1624
   }
 }
