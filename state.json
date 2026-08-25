@@ -1,6 +1,6 @@
 {
   "next_display_id": 1138,
-  "next_comment_id": 1564,
+  "next_comment_id": 1565,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -25232,7 +25232,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T05:28:55.304078244Z",
-      "updated_at": "2026-08-25T05:33:30.788917206Z",
+      "updated_at": "2026-08-25T05:58:02.366448503Z",
       "labels": [
         "remediation"
       ],
@@ -25245,6 +25245,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAtZrxatNnwVEHAuzY+dN7PGNlaovEsFeW7sJyB8dsWibUYoi6hw5uEqscXTRENb8/hxO7FwMOr98wCqBoyaLGDw=="
+        },
+        "2e1ecff8-fcf6-4f2c-bfc6-69822972a0b7": {
+          "display_id": 1564,
+          "author": "6Vw9",
+          "content": "Implementation checkpoint: notebook_edit now requires the read_file generation, revalidates bounded bytes, validates nbformat 4 structure/cells/IDs/metadata/sources/outputs, repairs missing IDs and upgrades minor metadata, generates collision-checked IDs on insert, revalidates the candidate, and publishes through write_atomic_generation. Delete no longer needs new_source. Deterministic pre-publication interruption proves byte-exact rollback/stage cleanup/retry; public tests cover stale generation, malformed no-write, legacy round-trip, receipt generation, symlink refusal, and existing edit semantics. Focused unit/integration tests and strict Clippy are green; full review/gates remain.",
+          "created_at": "2026-08-25T05:58:02.362999096Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAZ24JS8d7D3WHXmMtFYIAYI8LCXDJQ7spOFS5DiV/R5Ohdk2gYnyyCFW0l3Zj7nohPoHbyH31KqZ31DJTxDEGDw=="
         },
         "5b48761c-f42f-4e82-9619-92953f1045d3": {
           "display_id": 1563,
@@ -40121,11 +40130,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1589,
       "timestamp": "2026-08-25T05:33:30.788917206Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1590,
+      "timestamp": "2026-08-25T05:58:02.366448503Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T05:33:30.788917206Z",
+    "timestamp": "2026-08-25T05:58:02.366448503Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1589
+    "agent_seq": 1590
   }
 }
