@@ -1,6 +1,6 @@
 {
   "next_display_id": 1143,
-  "next_comment_id": 1643,
+  "next_comment_id": 1644,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -21783,7 +21783,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T22:27:55.729393206Z",
-      "updated_at": "2026-08-25T22:55:29.542149748Z",
+      "updated_at": "2026-08-25T23:18:40.501475763Z",
       "labels": [
         "remediation"
       ],
@@ -21826,6 +21826,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAcMIhwwCWmp5zCdzXaeDXcSudG4ZPVM+w8Fj8XbuYOmtSLOjBAipd82g6hPQIK12JxfpIfOH0eMMq/T0cvnh1Aw=="
+        },
+        "eeb25e9e-1e97-4214-9794-e5516125a4b1": {
+          "display_id": 1643,
+          "author": "6Vw9",
+          "content": "S-066 publication verified at signed head 6934cfb2ae0f411ca65de38cc8b633b0ab75c3b1. Draft PR #66 remains open. GitHub Actions run 32908413395 completed successfully on that exact head: repository-policy, msrv, linux, platform-fail-closed (macos-latest), and platform-fail-closed (windows-latest) all reached terminal success. Local HEAD and origin/agent/refactor-agent-system-remediation are identical, and the worktree is clean.",
+          "created_at": "2026-08-25T23:18:40.498916183Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAA9dkMclFDshPflu3dYXJJnm7/kGebW/Pag9HM5c+vTwuIdX/SeL79vGk2qXHJwYLK38H3fcU9GM4VQe2mbrZDA=="
         },
         "f61d04b2-8a10-4bc5-8c0d-966aa617df0e": {
           "display_id": 1641,
@@ -41550,11 +41559,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1710,
       "timestamp": "2026-08-25T22:55:29.542149748Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1711,
+      "timestamp": "2026-08-25T23:18:40.501475763Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T22:55:29.542149748Z",
+    "timestamp": "2026-08-25T23:18:40.501475763Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1710
+    "agent_seq": 1711
   }
 }
