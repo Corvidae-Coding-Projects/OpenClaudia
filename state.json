@@ -16217,12 +16217,13 @@
       "display_id": 1139,
       "title": "S-036: Provide cross-platform secure file capabilities",
       "description": "Implement the planned S-036 platform-neutral secure-file contract and a production-usable Windows backend with reparse containment, regular-file checks, snapshot conflicts, safe creation, and atomic persistence. Preserve the operational Unix descriptor backend. Detect genuinely unsupported platforms at capability registration/startup. Add shared conformance and Windows behavioral CI evidence. Keep scope bounded to realistic application paths; VDD remains an S-088 handoff.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T09:21:03.171579016Z",
-      "updated_at": "2026-08-25T12:00:25.144755266Z",
+      "updated_at": "2026-08-25T12:00:30.010626706Z",
+      "closed_at": "2026-08-25T12:00:30.010620936Z",
       "labels": [
         "remediation"
       ],
@@ -40995,11 +40996,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1661,
       "timestamp": "2026-08-25T12:00:25.144755266Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1662,
+      "timestamp": "2026-08-25T12:00:30.010626706Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T12:00:25.144755266Z",
+    "timestamp": "2026-08-25T12:00:30.010626706Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1661
+    "agent_seq": 1662
   }
 }
