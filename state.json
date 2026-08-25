@@ -1,6 +1,6 @@
 {
   "next_display_id": 1140,
-  "next_comment_id": 1600,
+  "next_comment_id": 1601,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -22144,10 +22144,21 @@
       "priority": "low",
       "created_by": "6Vw9",
       "created_at": "2026-08-19T23:21:51.642430836Z",
-      "updated_at": "2026-08-19T23:23:54.621682849Z",
+      "updated_at": "2026-08-25T10:45:30.150540746Z",
       "labels": [
         "maintenance"
-      ]
+      ],
+      "comments": {
+        "71e2e351-9059-435e-b1dd-f8742f97d510": {
+          "display_id": 1600,
+          "author": "6Vw9",
+          "content": "Resolved by bbe329b8: Windows SecureDirectory now uses its pinned ToolRunContext for bounded handle-relative enumeration, child opens, masked-path filtering, and identity checks. Rust 1.98 Windows GNU lib and all-target/all-feature checks no longer report SecureDirectory.context as dead code; no lint setting was weakened and the capability was not removed.",
+          "created_at": "2026-08-25T10:45:30.148050303Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAiVS1vuCA+7XXnLWTwMTBBhw+ywOq4JxTh6bJUGnu4N40rh+0iclRwTzTFrkXZivg2KJ+wXlAafOZVWS1vdiVCQ=="
+        }
+      }
     },
     "a9f719b7-4b6c-4b50-bb2d-735a32642c48": {
       "uuid": "a9f719b7-4b6c-4b50-bb2d-735a32642c48",
@@ -40775,11 +40786,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1645,
       "timestamp": "2026-08-25T10:45:09.442745257Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1646,
+      "timestamp": "2026-08-25T10:45:30.150540746Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T10:45:09.442745257Z",
+    "timestamp": "2026-08-25T10:45:30.150540746Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1645
+    "agent_seq": 1646
   }
 }
