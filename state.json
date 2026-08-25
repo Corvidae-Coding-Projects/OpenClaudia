@@ -1,6 +1,6 @@
 {
   "next_display_id": 1145,
-  "next_comment_id": 1646,
+  "next_comment_id": 1647,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -29821,11 +29821,22 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T23:43:22.282994195Z",
-      "updated_at": "2026-08-25T23:43:31.066670570Z",
+      "updated_at": "2026-08-25T23:50:35.080603217Z",
       "labels": [
         "feature",
         "remediation"
-      ]
+      ],
+      "comments": {
+        "f968cbe2-97ee-49fc-bf4c-1640ee7450be": {
+          "display_id": 1646,
+          "author": "6Vw9",
+          "content": "[action] S-067 preflight complete: selected dedicated MCP auth owner on HTTP transport, bounded MRTR elicitation retry driver, and in-process admission through existing per-server actor; provider OAuth remains untouched",
+          "created_at": "2026-08-25T23:50:35.077864719Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA1M4L7wiO84TTBQY66U92TRH5161CvFy/fgZedP/JJc5mUY8Ch4NnpcJ0DA+Sv7+OYY9/8ziMpfW9gFnCtkr1Dg=="
+        }
+      }
     },
     "e7a14f5a-1282-4a75-a792-699c42744928": {
       "uuid": "e7a14f5a-1282-4a75-a792-699c42744928",
@@ -41685,11 +41696,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1724,
       "timestamp": "2026-08-25T23:43:37.371281007Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1725,
+      "timestamp": "2026-08-25T23:50:35.080603217Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T23:43:37.371281007Z",
+    "timestamp": "2026-08-25T23:50:35.080603217Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1724
+    "agent_seq": 1725
   }
 }
