@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1141,
+  "next_display_id": 1142,
   "next_comment_id": 1632,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -974,6 +974,7 @@
     "eba545fe-bd62-40b6-a40e-9ffa917404f4": 343,
     "ebae47cf-fa4d-4842-bb9b-eb942a511283": 41,
     "ebd8d223-144c-4ae6-a011-21407e168bfa": 425,
+    "ebffc218-b73c-45ce-b21a-290c957a1376": 1141,
     "ec16c4ed-d6b9-4c1c-b5f0-80e6175d855d": 874,
     "ec3115c6-6be5-42f8-b98e-0bcef445b534": 988,
     "ec430c74-a4e4-4785-aaf9-63e90dad5793": 215,
@@ -30337,6 +30338,18 @@
         }
       }
     },
+    "ebffc218-b73c-45ce-b21a-290c957a1376": {
+      "uuid": "ebffc218-b73c-45ce-b21a-290c957a1376",
+      "display_id": 1141,
+      "title": "S-066: Own and bound MCP transports",
+      "description": "Implement bounded, generation-owned MCP stdio and HTTP transports on the S-065 protocol adapter. Preserve operational and supported legacy MCP behavior. Add request correlation, framing/body/queue limits, deadlines, backpressure, cancellation, supervised shutdown/reaping, and transport-specific capability admission. Keep S-067 OAuth, elicitation, and in-process semantics out of scope. Verify realistic failure modes and production paths under the repository Rust 1.98 resource and CI gates.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-25T21:13:29.243020245Z",
+      "updated_at": "2026-08-25T21:13:29.243020245Z"
+    },
     "ec16c4ed-d6b9-4c1c-b5f0-80e6175d855d": {
       "uuid": "ec16c4ed-d6b9-4c1c-b5f0-80e6175d855d",
       "display_id": 874,
@@ -41296,11 +41309,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1688,
       "timestamp": "2026-08-25T21:11:01.433859117Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1689,
+      "timestamp": "2026-08-25T21:13:29.243020245Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T21:11:01.433859117Z",
+    "timestamp": "2026-08-25T21:13:29.243020245Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1688
+    "agent_seq": 1689
   }
 }
