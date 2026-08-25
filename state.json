@@ -1,6 +1,6 @@
 {
   "next_display_id": 1140,
-  "next_comment_id": 1602,
+  "next_comment_id": 1603,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -4380,7 +4380,18 @@
       "priority": "medium",
       "created_by": "6Vw9",
       "created_at": "2026-08-22T21:56:43.875839539Z",
-      "updated_at": "2026-08-22T21:56:43.875839539Z"
+      "updated_at": "2026-08-25T10:46:02.470927733Z",
+      "comments": {
+        "d7d48e62-31cb-49ef-8371-462fc053d4e9": {
+          "display_id": 1602,
+          "author": "6Vw9",
+          "content": "S-036 commit bbe329b8 removes the SecureDirectory.context warning and all S-036-local Windows Clippy findings found during review. The remaining Windows GNU all-target/Clippy warnings are unchanged independent debt in the paths already owned by #1099, so this issue remains open.",
+          "created_at": "2026-08-25T10:46:02.468441106Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAEsVYlzBsovCjUiBzrsdDh4oBih0chdn/ZcI/xarO3Jcv2kE/Dt36qDdXmRWY6rKS8oeEo0KoTzXjgTT7+FyuCw=="
+        }
+      }
     },
     "1ed272be-0a2c-44cc-975d-f650004b7b1c": {
       "uuid": "1ed272be-0a2c-44cc-975d-f650004b7b1c",
@@ -40811,11 +40822,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1648,
       "timestamp": "2026-08-25T10:45:58.319552090Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1649,
+      "timestamp": "2026-08-25T10:46:02.470927733Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T10:45:58.319552090Z",
+    "timestamp": "2026-08-25T10:46:02.470927733Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1648
+    "agent_seq": 1649
   }
 }
