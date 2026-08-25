@@ -1,6 +1,6 @@
 {
   "next_display_id": 1140,
-  "next_comment_id": 1615,
+  "next_comment_id": 1616,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8661,7 +8661,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-25T08:49:56.708671964Z",
+      "updated_at": "2026-08-25T12:01:42.600592798Z",
       "labels": [
         "remediation"
       ],
@@ -8883,6 +8883,15 @@
           "kind": "result",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAZRI3xLrz9phKMIJknIzdYoldVyr28JYG1WsFtW+Q0NOFgfK/PmQuP9M7UTZZBQuoV8q56Usf7N9+cnkWuF34Ag=="
+        },
+        "24014f78-4ca2-4a94-aafa-239318c0c4f6": {
+          "display_id": 1615,
+          "author": "6Vw9",
+          "content": "[result] S-036 child #1139 closed after authoritative PR #66 run 32843208084 passed all five jobs at implementation commit 4bc7ce345147ac1c342d891ed654f626537a9645, including every Windows runtime contract. Signed closure commit 8d426c3e (docs(remediation): record S-036 verification) records final S036-G3 digest a788c459d8a0cd82f3f8a231e7a21bf1816d4320d67afb86905f35ef925b4be2 and preserves Crosslink-generated CHANGELOG output exactly. Worktree is clean; final docs-only head awaits user push and terminal PR checks.",
+          "created_at": "2026-08-25T12:01:42.598198167Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAWl3vlFit4fJqpc5/8rSw2aUa+4IoskmBb2alzaiYYsfOi3Z+BUX9yaL+KSZ9qc0z690nZO6HZlw3VQtg+tlSBQ=="
         },
         "24746f93-2a57-48b6-bc5c-0968a1aad6cd": {
           "display_id": 1321,
@@ -41002,11 +41011,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1663,
       "timestamp": "2026-08-25T12:00:34.813044891Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1664,
+      "timestamp": "2026-08-25T12:01:42.600592798Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T12:00:34.813044891Z",
+    "timestamp": "2026-08-25T12:01:42.600592798Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1663
+    "agent_seq": 1664
   }
 }
