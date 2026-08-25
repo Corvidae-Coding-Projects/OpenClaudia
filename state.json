@@ -1,6 +1,6 @@
 {
   "next_display_id": 1141,
-  "next_comment_id": 1620,
+  "next_comment_id": 1621,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -10356,12 +10356,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T12:44:39.647023098Z",
-      "updated_at": "2026-08-25T12:53:45.365822923Z",
+      "updated_at": "2026-08-25T12:53:49.858420901Z",
       "labels": [
         "feature",
         "remediation"
       ],
       "comments": {
+        "9d243361-f02d-456b-a033-c6308362b02f": {
+          "display_id": 1620,
+          "author": "6Vw9",
+          "content": "[action] S-065 mapped official 2026-07-28 dual-era negotiation and existing production MCP paths; chose internal versioned codec over SDK replacement, preserving legacy behavior and S-066 boundary.",
+          "created_at": "2026-08-25T12:53:49.855911460Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA/NJcyYhMd/yrNMrP0xUjStuM1dogSIkLp1+8CgWZ39WL/AlwHRWTM46ya78aCSt4J/XkD2yZfIjTKXvQfxAPAw=="
+        },
         "dc431d93-7ec0-41af-9440-15008a604c78": {
           "display_id": 1619,
           "author": "6Vw9",
@@ -41120,11 +41129,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1673,
       "timestamp": "2026-08-25T12:53:45.365822923Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1674,
+      "timestamp": "2026-08-25T12:53:49.858420901Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T12:53:45.365822923Z",
+    "timestamp": "2026-08-25T12:53:49.858420901Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1673
+    "agent_seq": 1674
   }
 }
