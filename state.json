@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1144,
+  "next_display_id": 1145,
   "next_comment_id": 1646,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -951,6 +951,7 @@
     "e74e21fe-1def-4b64-9584-a95442b42690": 778,
     "e7630c27-7e6e-4157-bbc9-231b1d51ce32": 259,
     "e7714245-93b6-4412-ac26-17d21d06c481": 776,
+    "e785df92-15a6-43d0-a947-9690b620153e": 1144,
     "e7a14f5a-1282-4a75-a792-699c42744928": 146,
     "e7ae99d8-2e12-4340-a382-8243e6d61ea3": 1101,
     "e7eb22d0-91ee-4661-ab75-6e45c813079b": 96,
@@ -29806,6 +29807,18 @@
         "qa-review"
       ]
     },
+    "e785df92-15a6-43d0-a947-9690b620153e": {
+      "uuid": "e785df92-15a6-43d0-a947-9690b620153e",
+      "display_id": 1144,
+      "title": "S-067: Complete MCP OAuth, elicitation, and in-process semantics",
+      "description": "Production-wire the S-067 MCP boundary without removing operational behavior: current authorization discovery and protected OAuth lifecycle reuse; correlated concurrent multi-round elicitation; and in-process servers governed by the same identity, capability, budget, cancellation, shutdown, grounding, and guardrail contracts as external transports. Preserve current plus explicitly supported legacy MCP compatibility and existing Claude/Codex authentication. Verify realistic security, concurrency, failure, and compiled production paths on Rust 1.98 under resource-aware gates. S-068 and unrelated cleanup are excluded.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-25T23:43:22.282994195Z",
+      "updated_at": "2026-08-25T23:43:22.282994195Z"
+    },
     "e7a14f5a-1282-4a75-a792-699c42744928": {
       "uuid": "e7a14f5a-1282-4a75-a792-699c42744928",
       "display_id": 146,
@@ -41644,11 +41657,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1720,
       "timestamp": "2026-08-25T23:41:45.194507685Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1721,
+      "timestamp": "2026-08-25T23:43:22.282994195Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T23:41:45.194507685Z",
+    "timestamp": "2026-08-25T23:43:22.282994195Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1720
+    "agent_seq": 1721
   }
 }
