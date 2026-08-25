@@ -1,3 +1,4 @@
+mod discovery;
 mod edit;
 mod glob;
 mod grep;
@@ -9,9 +10,11 @@ pub mod workspace_projection;
 mod write;
 
 pub use edit::execute_edit_file;
-pub use glob::execute_glob;
-pub use grep::execute_grep;
+pub use glob::execute_glob_typed;
+pub use grep::execute_grep_typed;
+#[cfg(test)]
 pub use list::execute_list_files;
+pub use list::execute_list_files_typed;
 #[cfg(test)]
 pub use notebook::execute_notebook_edit;
 pub use notebook::execute_notebook_edit_typed;

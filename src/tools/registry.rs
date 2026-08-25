@@ -843,13 +843,24 @@ impl ToolHandler for ListFilesHandler {
             "type": "function",
             "function": {
                 "name": "list_files",
-                "description": "List files and directories at a given path. Returns a list of entries.",
+                "description": "List one deterministic, bounded page of files and directories. Results are directories-first and include an opaque next cursor when more entries remain or coverage is partial.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
                             "description": "Directory path to list. Absolute paths are accepted; relative paths are resolved against the current working directory. Defaults to the current working directory."
+                        },
+                        "cursor": {
+                            "type": "string",
+                            "maxLength": 4096,
+                            "description": "Opaque next cursor returned by a prior list_files call with the same path."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 500,
+                            "description": "Maximum entries in this page (default 200)."
                         }
                     },
                     "required": []
@@ -857,13 +868,13 @@ impl ToolHandler for ListFilesHandler {
             }
         })
     }
-    fn execute_legacy(
+    fn execute(
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
-    ) -> (String, bool) {
-        file::execute_list_files(ctx.run, args)
+    ) -> ToolHandlerResult {
+        file::execute_list_files_typed(ctx.run, args)
     }
 }
 
@@ -880,7 +891,7 @@ impl ToolHandler for GlobHandler {
             "type": "function",
             "function": {
                 "name": "glob",
-                "description": "Find files by glob pattern. Supports `*` (any non-/), `**` (any including /), and `?`. Returns up to 100 paths sorted lexicographically. Vendor directories (.git, node_modules, target, dist, build) are skipped by default. Crosslink #567.",
+                "description": "Find a deterministic, bounded page of files by glob pattern. Supports `*` (any non-/), `**` (any including /), and `?`. Vendor and hidden subdirectories are skipped. Partial coverage and the opaque next cursor are reported explicitly.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -891,6 +902,17 @@ impl ToolHandler for GlobHandler {
                         "path": {
                             "type": "string",
                             "description": "Directory to walk (defaults to current working directory). Must lie within the project root."
+                        },
+                        "cursor": {
+                            "type": "string",
+                            "maxLength": 4096,
+                            "description": "Opaque next cursor returned by a prior glob call with the same path and pattern."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 500,
+                            "description": "Maximum matching paths in this page (default 100)."
                         }
                     },
                     "required": ["pattern"]
@@ -898,13 +920,13 @@ impl ToolHandler for GlobHandler {
             }
         })
     }
-    fn execute_legacy(
+    fn execute(
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
-    ) -> (String, bool) {
-        file::execute_glob(ctx.run, args)
+    ) -> ToolHandlerResult {
+        file::execute_glob_typed(ctx.run, args)
     }
 }
 
@@ -921,7 +943,7 @@ impl ToolHandler for GrepHandler {
             "type": "function",
             "function": {
                 "name": "grep",
-                "description": "Search file contents by regex. Returns matching lines as `file:line:text` with optional ±N context lines emitted as `file-N-text`. Vendor dirs are skipped. Capped at 200 matches. Crosslink #568.",
+                "description": "Search UTF-8 files by bounded Rust regex. Returns a deterministic page as `file:line:text` with deduplicated context lines as `file-N-text`; partial coverage and an opaque next cursor are explicit.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -936,11 +958,23 @@ impl ToolHandler for GrepHandler {
                         "context_lines": {
                             "type": "integer",
                             "minimum": 0,
-                            "description": "Number of ±N context lines to include around each match (default 0)."
+                            "maximum": 20,
+                            "description": "Number of ±N context lines to include around each match (default 0, maximum 20)."
                         },
                         "case_insensitive": {
                             "type": "boolean",
                             "description": "If true, prepend `(?i)` to the pattern (default false)."
+                        },
+                        "cursor": {
+                            "type": "string",
+                            "maxLength": 4096,
+                            "description": "Opaque next cursor returned by a prior grep call with the same search arguments."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 500,
+                            "description": "Maximum matching lines in this page (default 200)."
                         }
                     },
                     "required": ["pattern"]
@@ -948,13 +982,13 @@ impl ToolHandler for GrepHandler {
             }
         })
     }
-    fn execute_legacy(
+    fn execute(
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
-    ) -> (String, bool) {
-        file::execute_grep(ctx.run, args)
+    ) -> ToolHandlerResult {
+        file::execute_grep_typed(ctx.run, args)
     }
 }
 

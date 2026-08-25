@@ -1,411 +1,431 @@
-//! Native glob tool — crosslink #567.
-//!
-//! Parity target: CC `tools/GlobTool/GlobTool.ts`. The CC tool accepts a
-//! required `pattern` and an optional `path`, walks the directory, and
-//! returns a list of matching file paths (capped at 100 results, with a
-//! `truncated` flag).
-//!
-//! Design notes
-//! ────────────
-//! * The pattern is interpreted as a *glob* (`*`, `**`, `?`) against the
-//!   relative path of each visited file. This intentionally mirrors the
-//!   glob dialect already used by `permissions.rs::glob_to_regex` so
-//!   operators have a single mental model.
-//! * The walker is breadth-bounded by a hard cap on visited entries
-//!   (`MAX_WALK_ENTRIES`) so a pathological tree (e.g. a symlink loop
-//!   into `/`) cannot blow up the agent.
-//! * Hidden directories (`.git`, `.cache`, `node_modules`, `target`) are
-//!   skipped by default — the CC tool relies on `.gitignore`, which we
-//!   approximate with a small allowlist. Pattern matches inside an
-//!   explicitly-given `path` argument still descend hidden subdirs so
-//!   `path: ".git"` works.
-//!
-//! [`PROJECT_ROOT`]: super::PROJECT_ROOT
+//! Deterministic, paginated native glob discovery.
 
-use super::{resolve_path, secure_fs};
+use super::{discovery, resolve_path};
 use crate::tools::args::ToolArgs as _;
-use regex::Regex;
-use serde_json::Value;
+use crate::tools::{ToolFailure, ToolFailureCode, ToolHandlerResult, ToolRetryability, ToolUsage};
+use regex::{Regex, RegexBuilder};
+use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 
-/// Hard cap on returned filenames (parity with CC `GlobTool`).
-const MAX_RESULTS: usize = 100;
+const DEFAULT_PAGE_LIMIT: usize = 100;
+const MAX_PAGE_LIMIT: usize = 500;
+const MAX_GLOB_PATTERN_BYTES: usize = 4 * 1024;
+const MAX_REGEX_COMPILED_BYTES: usize = 2 * 1024 * 1024;
 
-/// Hard cap on directory-walk entries — prevents pathological loops
-/// (symlink cycles, deeply-nested generated trees) from stalling the
-/// agent.
-const MAX_WALK_ENTRIES: usize = 50_000;
-
-/// Directory names that the walker skips by default. Caller can opt
-/// back in by passing the directory as the explicit `path` argument.
-const SKIP_DIRS: &[&str] = &[
-    ".git",
-    "node_modules",
-    "target",
-    ".cache",
-    ".svelte-kit",
-    ".next",
-    "dist",
-    "build",
-];
-
-/// Execute the `glob` tool.
-///
-/// Returns `(stdout, is_error)`. Errors include: missing pattern, invalid
-/// pattern (uncompilable as regex), invalid `path` (jail violation).
-pub fn execute_glob(
+/// Typed glob execution retained through registry, provider, trace, and
+/// frontend adapters.
+#[allow(clippy::too_many_lines)] // Parsing, traversal, pagination, and typed rendering are one tool transaction.
+pub fn execute_glob_typed(
     run: &std::sync::Arc<crate::tools::security::ToolRunContext>,
     args: &HashMap<String, Value>,
-) -> (String, bool) {
+) -> ToolHandlerResult {
     let pattern = match args.arg_str_strict("pattern") {
-        Ok(p) => p,
-        Err(e) => return e.into_tool_error(),
+        Ok(pattern) => pattern,
+        Err(error) => return invalid_arguments(error.to_string()),
     };
-
+    if pattern.len() > MAX_GLOB_PATTERN_BYTES {
+        return invalid_arguments(format!(
+            "Invalid glob pattern: maximum length is {MAX_GLOB_PATTERN_BYTES} bytes"
+        ));
+    }
+    let regex = match glob_to_regex(pattern) {
+        Ok(regex) => regex,
+        Err(error) => return invalid_arguments(error),
+    };
     let raw_path = match args.arg_str_or_strict("path", ".") {
         Ok(path) => path,
-        Err(e) => return e.into_tool_error(),
+        Err(error) => return invalid_arguments(error.to_string()),
     };
     let root = match resolve_path(run, raw_path) {
-        Ok(p) => p,
-        Err(e) => return (e, true),
+        Ok(path) => path,
+        Err(error) => return invalid_arguments(error),
+    };
+    let ignore_policy = if args.contains_key("path")
+        && root.components().any(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .is_some_and(|name| name.starts_with('.') && name != "." && name != "..")
+        }) {
+        discovery::IgnorePolicy::None
+    } else {
+        discovery::IgnorePolicy::Standard
+    };
+    let limit =
+        match discovery::parse_page_limit(args.get("limit"), DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT) {
+            Ok(limit) => limit,
+            Err(error) => return invalid_arguments(error),
+        };
+    let cursor_arg = match args.arg_str_opt_strict("cursor") {
+        Ok(cursor) => cursor,
+        Err(error) => return invalid_arguments(error.to_string()),
+    };
+    let root_id = root.to_string_lossy();
+    let binding = discovery::cursor_binding(&["glob", &root_id, pattern]);
+    let cursor = match discovery::decode_cursor(cursor_arg, &binding) {
+        Ok(None) => None,
+        Ok(Some(discovery::CursorPosition::Entry { resource_id })) => Some(resource_id),
+        Ok(Some(discovery::CursorPosition::Match { .. })) => {
+            return invalid_arguments("Invalid cursor: expected a glob-entry position")
+        }
+        Err(error) => return invalid_arguments(error),
     };
 
-    let Some(regex) = glob_to_regex(pattern) else {
-        return (format!("Invalid glob pattern: '{pattern}'"), true);
-    };
-
-    // Whether the caller explicitly named a dotfile/skip-listed root —
-    // if so, we descend into it instead of skipping it.
-    let allow_hidden_root = SKIP_DIRS
-        .iter()
-        .any(|d| root.file_name().is_some_and(|n| n == *d))
-        || raw_path.contains("/.")
-        || raw_path.starts_with('.');
-
-    let mut matches: Vec<String> = Vec::new();
-    let mut visited: usize = 0;
-    let mut truncated = false;
     let mut resource_batch = match crate::guardrails::begin_path_resource_batch(run) {
         Ok(batch) => batch,
-        Err(error) => return (format!("Blocked by blast radius guardrails: {error}"), true),
+        Err(error) => return policy_error(error),
     };
     if let Err(error) = resource_batch.check_scope(run, &root) {
-        return (format!("Blocked by blast radius guardrails: {error}"), true);
+        return policy_error(error);
     }
 
-    let directory = match secure_fs::open_directory(run, &root) {
-        Ok(directory) => directory,
-        Err(error) => {
-            return (
-                format!(
-                    "Failed to securely open glob root '{}': {error}",
-                    root.display()
-                ),
-                true,
-            );
-        }
-    };
-    if let Err(error) = walk(
+    let mut cursor_seen = cursor.is_none();
+    let mut matches = Vec::with_capacity(limit);
+    let mut rendered_bytes = 0usize;
+    let mut has_more = false;
+    let mut output_limited = false;
+    let walk = discovery::walk(
         run,
         &root,
-        &directory,
-        Path::new(""),
-        &regex,
-        allow_hidden_root,
-        &mut matches,
-        &mut visited,
-        &mut truncated,
-        &mut resource_batch,
-    ) {
-        return (format!("Blocked by blast radius guardrails: {error}"), true);
+        discovery::WalkOptions {
+            recursive: true,
+            visit_directories: true,
+            directories_first: false,
+            ignore_policy,
+        },
+        |entry| {
+            if entry.kind == discovery::WalkEntryKind::Directory {
+                resource_batch.check_scope(run, entry.absolute_path)?;
+                return Ok(discovery::WalkControl::Continue);
+            }
+            if !cursor_seen {
+                if cursor.as_deref() == Some(entry.resource_id) {
+                    cursor_seen = true;
+                }
+                return Ok(discovery::WalkControl::Continue);
+            }
+            if !regex.is_match(entry.resource_id) {
+                return Ok(discovery::WalkControl::Continue);
+            }
+            if matches.len() >= limit {
+                has_more = true;
+                return Ok(discovery::WalkControl::Stop);
+            }
+            let next_bytes = entry.resource_id.len().saturating_add(1);
+            if rendered_bytes.saturating_add(next_bytes) > discovery::MAX_RENDERED_BYTES {
+                has_more = true;
+                output_limited = true;
+                return Ok(discovery::WalkControl::Stop);
+            }
+            resource_batch.reserve_file(run, entry.absolute_path)?;
+            rendered_bytes = rendered_bytes.saturating_add(next_bytes);
+            matches.push(entry.resource_id.to_string());
+            Ok(discovery::WalkControl::Continue)
+        },
+    );
+    let report = match walk {
+        Ok(report) => report,
+        Err(discovery::WalkError::Visitor(error)) => return policy_error(error),
+        Err(discovery::WalkError::Filesystem(error)) => {
+            return ToolHandlerResult::error(ToolFailure::new(
+                ToolFailureCode::External,
+                format!(
+                    "Failed to securely search glob root '{}': {error}",
+                    root.display()
+                ),
+                ToolRetryability::Safe,
+            ))
+        }
+    };
+
+    if cursor.is_some() && !cursor_seen {
+        if report.is_complete() {
+            return invalid_arguments("Invalid cursor: its glob entry no longer exists");
+        }
+        has_more = true;
     }
-
-    matches.sort();
-
-    let header = if truncated {
-        format!(
-            "Found {} matches (truncated at {MAX_RESULTS}):",
-            matches.len()
-        )
+    let incomplete_walk =
+        !report.is_complete() && report.termination != discovery::WalkTermination::Visitor;
+    let complete = !has_more && !incomplete_walk;
+    let next_cursor = if complete {
+        None
     } else {
-        format!("Found {} matches:", matches.len())
+        matches.last().map(|resource_id| {
+            discovery::encode_cursor(
+                &binding,
+                discovery::CursorPosition::Entry {
+                    resource_id: resource_id.clone(),
+                },
+            )
+        })
     };
-    let body = matches.join("\n");
-    let out = if body.is_empty() {
-        header
+    let mut diagnostics = report
+        .diagnostics
+        .iter()
+        .map(|diagnostic| {
+            json!({
+                "code": diagnostic.code,
+                "resource_id": diagnostic.resource_id,
+                "message": diagnostic.message,
+            })
+        })
+        .collect::<Vec<_>>();
+    if output_limited {
+        diagnostics.push(json!({
+            "code": "rendered_output_limit",
+            "resource_id": "",
+            "message": format!(
+                "glob reached its {}-byte rendered-output budget",
+                discovery::MAX_RENDERED_BYTES
+            ),
+        }));
+    }
+    if report.stats.diagnostics_omitted > 0 {
+        diagnostics.push(json!({
+            "code": "diagnostics_omitted",
+            "resource_id": "",
+            "message": format!(
+                "{} additional diagnostics were omitted",
+                report.stats.diagnostics_omitted
+            ),
+        }));
+    }
+    let ignore_policy_metadata = if ignore_policy == discovery::IgnorePolicy::Standard {
+        json!({
+            "mode": "standard",
+            "directories": discovery::STANDARD_IGNORED_DIRECTORIES,
+        })
     } else {
-        format!("{header}\n{body}")
+        json!({
+            "mode": "none",
+            "directories": [],
+        })
     };
+
+    let mut text = format!(
+        "Found {} match{}{}:",
+        matches.len(),
+        if matches.len() == 1 { "" } else { "es" },
+        if complete { "" } else { " (partial)" }
+    );
+    for resource_id in &matches {
+        text.push('\n');
+        text.push_str(resource_id);
+    }
+    append_partial_text(&mut text, &diagnostics, next_cursor.as_deref());
+
+    let structured = json!({
+        "file_discovery": {
+            "schema_version": 1,
+            "operation": "glob",
+            "root": root_id.as_ref(),
+            "pattern": pattern,
+            "entries": &matches,
+            "page": {
+                "complete": complete,
+                "next_cursor": next_cursor.as_deref(),
+                "limit": limit,
+            },
+            "coverage": &report.stats,
+            "diagnostics": &diagnostics,
+            "ignore_policy": ignore_policy_metadata,
+        }
+    });
     resource_batch.commit();
-    (out, false)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn walk(
-    run: &crate::tools::ToolRunContext,
-    root: &Path,
-    dir: &secure_fs::SecureDirectory,
-    relative_dir: &Path,
-    regex: &Regex,
-    allow_hidden_root: bool,
-    matches: &mut Vec<String>,
-    visited: &mut usize,
-    truncated: &mut bool,
-    resource_batch: &mut crate::guardrails::PathResourceBatch,
-) -> Result<(), String> {
-    if matches.len() >= MAX_RESULTS || *visited >= MAX_WALK_ENTRIES {
-        return Ok(());
-    }
-    let entries = match dir.entries() {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!(
-                dir = %relative_dir.display(),
-                error = %e,
-                "glob: skipping unreadable directory",
-            );
-            return Ok(());
-        }
+    let mut result = if complete {
+        ToolHandlerResult::success_structured(text, structured)
+    } else {
+        ToolHandlerResult::partial_structured(
+            text,
+            structured,
+            report_failures(&report, output_limited),
+            next_cursor.as_ref().map(|cursor| json!({"cursor": cursor})),
+        )
     };
-    let mut subdirs: Vec<(secure_fs::SecureDirectory, PathBuf)> = Vec::new();
-    for entry in entries {
-        *visited += 1;
-        if *visited >= MAX_WALK_ENTRIES {
-            tracing::warn!(
-                limit = MAX_WALK_ENTRIES,
-                "glob: visited-entry cap reached; results may be incomplete",
-            );
-            *truncated = true;
-            return Ok(());
-        }
-        let path = relative_dir.join(&entry.name);
-        let absolute = root.join(&path);
-        if entry.kind == secure_fs::SecureFileType::Directory {
-            let name = entry.name;
-            let name_str = name.to_string_lossy();
-            // Skip hidden / vendor dirs unless caller explicitly chose
-            // to descend (root was named such a dir).
-            if !allow_hidden_root
-                && (name_str.starts_with('.') || SKIP_DIRS.contains(&name_str.as_ref()))
-            {
-                continue;
-            }
-            resource_batch.check_scope(run, &absolute)?;
-            match dir.open_child_directory(&name) {
-                Ok(child) => subdirs.push((child, path)),
-                Err(error) => {
-                    tracing::warn!(
-                        entry = %path.display(),
-                        %error,
-                        "glob: directory changed before secure open"
-                    );
-                }
-            }
-        } else if entry.kind == secure_fs::SecureFileType::Regular {
-            let rel_str = path.to_string_lossy();
-            if regex.is_match(&rel_str) {
-                resource_batch.reserve_file(run, &absolute)?;
-                matches.push(path.display().to_string());
-                if matches.len() >= MAX_RESULTS {
-                    *truncated = true;
-                    return Ok(());
-                }
-            }
-        }
-    }
-    for (sub, relative) in subdirs {
-        walk(
-            run,
-            root,
-            &sub,
-            &relative,
-            regex,
-            false, // descend with default hidden-skip behaviour
-            matches,
-            visited,
-            truncated,
-            resource_batch,
-        )?;
-        if matches.len() >= MAX_RESULTS || *visited >= MAX_WALK_ENTRIES {
-            return Ok(());
-        }
-    }
-    Ok(())
+    result.usage = ToolUsage {
+        output_bytes: u64::try_from(result.content().len()).unwrap_or(u64::MAX),
+        elapsed_ms: report.stats.elapsed_ms,
+        ..ToolUsage::default()
+    };
+    result
 }
 
-/// Translate a glob pattern into an anchored regex.
-///
-/// Mirrors the dialect of `permissions.rs::glob_to_regex` so operators
-/// have a single mental model:
-/// * `*`  — any sequence of non-`/` characters
-/// * `**` — any sequence, including `/`
-/// * `?`  — any single non-`/` character
-/// * regex specials are escaped
-///
-/// Returns `None` if the resulting regex fails to compile.
-fn glob_to_regex(pattern: &str) -> Option<Regex> {
-    let mut re = String::from("^");
-    let chars: Vec<char> = pattern.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        match chars[i] {
-            '*' => {
-                if i + 1 < chars.len() && chars[i + 1] == '*' {
-                    re.push_str(".*");
-                    i += 2;
-                    if i < chars.len() && chars[i] == '/' {
-                        re.push_str("/?");
-                        i += 1;
-                    }
-                } else {
-                    re.push_str("[^/]*");
-                    i += 1;
+fn glob_to_regex(pattern: &str) -> Result<Regex, String> {
+    let mut expression = String::with_capacity(pattern.len().saturating_mul(2).saturating_add(2));
+    expression.push('^');
+    let mut chars = pattern.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '*' if chars.peek() == Some(&'*') => {
+                let _second = chars.next();
+                expression.push_str(".*");
+                if chars.peek() == Some(&'/') {
+                    let _slash = chars.next();
+                    expression.push_str("/?");
                 }
             }
-            '?' => {
-                re.push_str("[^/]");
-                i += 1;
-            }
+            '*' => expression.push_str("[^/]*"),
+            '?' => expression.push_str("[^/]"),
             '.' | '+' | '^' | '$' | '(' | ')' | '{' | '}' | '[' | ']' | '|' | '\\' => {
-                re.push('\\');
-                re.push(chars[i]);
-                i += 1;
+                expression.push('\\');
+                expression.push(character);
             }
-            c => {
-                re.push(c);
-                i += 1;
-            }
+            other => expression.push(other),
         }
     }
-    re.push('$');
-    Regex::new(&re).ok()
+    expression.push('$');
+    RegexBuilder::new(&expression)
+        .size_limit(MAX_REGEX_COMPILED_BYTES)
+        .dfa_size_limit(MAX_REGEX_COMPILED_BYTES)
+        .build()
+        .map_err(|error| format!("Invalid glob pattern '{pattern}': {error}"))
+}
+
+fn invalid_arguments(message: impl Into<String>) -> ToolHandlerResult {
+    ToolHandlerResult::error(ToolFailure::new(
+        ToolFailureCode::InvalidArguments,
+        message.into(),
+        ToolRetryability::Never,
+    ))
+}
+
+fn policy_error(message: impl Into<String>) -> ToolHandlerResult {
+    ToolHandlerResult::error(ToolFailure::new(
+        ToolFailureCode::PolicyDenied,
+        format!("Blocked by blast radius guardrails: {}", message.into()),
+        ToolRetryability::Never,
+    ))
+}
+
+fn report_failures(report: &discovery::WalkReport, output_limited: bool) -> Vec<ToolFailure> {
+    let mut failures = Vec::new();
+    match report.termination {
+        discovery::WalkTermination::Cancelled => failures.push(ToolFailure::new(
+            ToolFailureCode::Cancelled,
+            "Glob discovery was cancelled before coverage completed".to_string(),
+            ToolRetryability::Never,
+        )),
+        discovery::WalkTermination::Deadline => failures.push(ToolFailure::new(
+            ToolFailureCode::DeadlineExceeded,
+            "Glob discovery exceeded its traversal deadline".to_string(),
+            ToolRetryability::Safe,
+        )),
+        _ if !report.diagnostics.is_empty() => failures.push(ToolFailure::new(
+            ToolFailureCode::External,
+            "Glob discovery omitted entries; inspect typed diagnostics".to_string(),
+            ToolRetryability::Safe,
+        )),
+        _ => {}
+    }
+    if output_limited {
+        failures.push(ToolFailure::new(
+            ToolFailureCode::External,
+            "Glob discovery reached its rendered-output limit".to_string(),
+            ToolRetryability::Safe,
+        ));
+    }
+    failures
+}
+
+fn append_partial_text(text: &mut String, diagnostics: &[Value], next_cursor: Option<&str>) {
+    if !diagnostics.is_empty() {
+        text.push_str("\nPartial diagnostics:");
+        for diagnostic in diagnostics.iter().take(8) {
+            let code = diagnostic["code"].as_str().unwrap_or("partial");
+            let resource = diagnostic["resource_id"].as_str().unwrap_or("");
+            let message = diagnostic["message"]
+                .as_str()
+                .unwrap_or("coverage incomplete");
+            text.push_str("\n- ");
+            text.push_str(code);
+            if !resource.is_empty() {
+                text.push_str(" (");
+                text.push_str(resource);
+                text.push(')');
+            }
+            text.push_str(": ");
+            text.push_str(message);
+        }
+    }
+    if let Some(cursor) = next_cursor {
+        text.push_str("\nNext cursor: ");
+        text.push_str(cursor);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-    use std::fs;
-    use std::fs::File;
-    use std::io::Write as _;
-    use tempfile::TempDir;
+    use std::path::Path;
 
-    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
-        crate::tools::security::test_run_context()
-    }
-
-    fn write_file(dir: &Path, rel: &str, body: &str) {
-        let p = dir.join(rel);
-        if let Some(parent) = p.parent() {
-            fs::create_dir_all(parent).unwrap();
+    fn write_file(root: &Path, relative: &str) {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("parent");
         }
-        let mut f = File::create(&p).unwrap();
-        f.write_all(body.as_bytes()).unwrap();
+        std::fs::write(path, "x").expect("file");
     }
 
-    /// Pin: glob walks the named tree and returns paths that match the
-    /// `*.rs` pattern at the root level only (`*` does NOT cross `/`).
-    /// Subdirs are reached only with `**`.
     #[test]
-    fn glob_matches_rust_files_at_root_with_star() {
-        let dir = TempDir::new_in(".").unwrap();
-        write_file(dir.path(), "lib.rs", "fn x() {}");
-        write_file(dir.path(), "main.rs", "fn main() {}");
-        write_file(dir.path(), "src/inner.rs", "fn y() {}");
-        let mut args = HashMap::new();
-        args.insert("pattern".to_string(), json!("*.rs"));
-        args.insert(
-            "path".to_string(),
-            json!(dir.path().to_string_lossy().to_string()),
-        );
-        let (out, err) = execute_glob(test_run(), &args);
-        assert!(!err, "got error: {out}");
-        assert!(out.contains("lib.rs"), "lib.rs missing in: {out}");
-        assert!(out.contains("main.rs"), "main.rs missing in: {out}");
+    fn glob_pages_in_stable_order_and_skips_standard_hidden_subtrees() {
+        let root = tempfile::tempdir().expect("root");
+        write_file(root.path(), "z.rs");
+        write_file(root.path(), "src/b.rs");
+        write_file(root.path(), "src/a.rs");
+        write_file(root.path(), ".git/hidden.rs");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        let first_args = HashMap::from([
+            ("pattern".to_string(), json!("**/*.rs")),
+            ("limit".to_string(), json!(2)),
+        ]);
+
+        let first = execute_glob_typed(&run, &first_args);
+
         assert!(
-            !out.contains("src/inner.rs"),
-            "single-star must NOT cross '/': {out}"
+            matches!(&first.outcome, crate::tools::ToolOutcome::Partial { .. }),
+            "{}",
+            first.content()
         );
-    }
+        assert!(first.content().contains("src/a.rs\nsrc/b.rs"));
+        assert!(!first.content().contains("hidden.rs"));
+        let cursor = match &first.outcome {
+            crate::tools::ToolOutcome::Partial { content, .. } => content
+                .structured
+                .as_ref()
+                .and_then(|value| value.pointer("/file_discovery/page/next_cursor"))
+                .and_then(Value::as_str)
+                .expect("cursor"),
+            other => panic!("expected partial glob, got {other:?}"),
+        };
+        let second_args = HashMap::from([
+            ("pattern".to_string(), json!("**/*.rs")),
+            ("limit".to_string(), json!(2)),
+            ("cursor".to_string(), json!(cursor)),
+        ]);
+        let second = execute_glob_typed(&run, &second_args);
 
-    /// Pin: `**` crosses path separators — `**/*.rs` reaches subdirs.
-    #[test]
-    fn glob_double_star_crosses_directories() {
-        let dir = TempDir::new_in(".").unwrap();
-        write_file(dir.path(), "src/deep/a.rs", "fn a() {}");
-        write_file(dir.path(), "src/deep/b.txt", "no");
-        let mut args = HashMap::new();
-        args.insert("pattern".to_string(), json!("**/*.rs"));
-        args.insert(
-            "path".to_string(),
-            json!(dir.path().to_string_lossy().to_string()),
-        );
-        let (out, err) = execute_glob(test_run(), &args);
-        assert!(!err, "got error: {out}");
-        assert!(out.contains("a.rs"), "deep .rs missing in: {out}");
-        assert!(!out.contains("b.txt"), "non-rs leaked into matches: {out}");
-    }
-
-    /// Pin: a missing `pattern` produces an error rather than panicking.
-    #[test]
-    fn glob_missing_pattern_errors() {
-        let args = HashMap::new();
-        let (out, err) = execute_glob(test_run(), &args);
-        assert!(err, "missing pattern must be an error: {out}");
-        assert!(out.contains("pattern"), "error must name the arg: {out}");
-    }
-
-    #[test]
-    fn glob_rejects_non_string_pattern() {
-        let mut args = HashMap::new();
-        args.insert("pattern".to_string(), json!(42));
-
-        let (out, err) = execute_glob(test_run(), &args);
-
-        assert!(err, "non-string pattern must be an error: {out}");
-        assert_eq!(out, "Invalid 'pattern' argument: expected string");
-    }
-
-    #[test]
-    fn glob_rejects_non_string_path() {
-        let mut args = HashMap::new();
-        args.insert("pattern".to_string(), json!("*.rs"));
-        args.insert("path".to_string(), json!(42));
-
-        let (out, err) = execute_glob(test_run(), &args);
-
-        assert!(err, "non-string path must be an error: {out}");
         assert!(
-            out.contains("Invalid 'path' argument: expected string"),
-            "unexpected error: {out}"
+            !matches!(&second.outcome, crate::tools::ToolOutcome::Error { .. }),
+            "{}",
+            second.content()
         );
+        assert!(second.content().contains("z.rs"));
+        assert!(!second.content().contains("src/a.rs"));
     }
 
-    /// Pin: the glob walker is robust against unusual but legal glob
-    /// characters — special regex characters in the pattern are escaped
-    /// by `glob_to_regex`, so a literal `[unterminated` matches a
-    /// file by that name rather than panicking on regex compile.
-    /// This pins the "no panic on weird input" invariant.
     #[test]
-    fn glob_special_characters_are_escaped_not_panicking() {
-        let dir = TempDir::new_in(".").unwrap();
-        // Create a file whose name contains the literal characters we
-        // are testing: `[` and `]`. The glob dialect treats these as
-        // literals (regex specials are escaped before compile).
-        write_file(dir.path(), "weird[name].txt", "ok");
-        let mut args = HashMap::new();
-        args.insert("pattern".to_string(), json!("weird[name].txt"));
-        args.insert(
-            "path".to_string(),
-            json!(dir.path().to_string_lossy().to_string()),
-        );
-        let (out, err) = execute_glob(test_run(), &args);
-        assert!(!err, "literal-bracket pattern must not error: {out}");
-        assert!(
-            out.contains("weird[name].txt"),
-            "literal-bracket name lost: {out}"
-        );
+    fn glob_rejects_oversized_pattern_before_compilation() {
+        let args = HashMap::from([(
+            "pattern".to_string(),
+            json!("a".repeat(MAX_GLOB_PATTERN_BYTES + 1)),
+        )]);
+
+        let result = execute_glob_typed(crate::tools::security::test_run_context(), &args);
+
+        assert!(matches!(
+            &result.outcome,
+            crate::tools::ToolOutcome::Error { .. }
+        ));
+        assert!(result.content().contains("maximum length"));
     }
 }

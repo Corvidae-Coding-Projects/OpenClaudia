@@ -3047,13 +3047,20 @@ impl AcpServer {
         args: &HashMap<String, Value>,
     ) -> Result<ToolResult, ToolFailure> {
         let path = parse_acp_optional_string_arg(args, "path", ".")?;
+        let mut local_args = json!({"path": path});
+        if let Some(cursor) = args.get("cursor") {
+            local_args["cursor"] = cursor.clone();
+        }
+        if let Some(limit) = args.get("limit") {
+            local_args["limit"] = limit.clone();
+        }
         Ok(self
             .execute_local_tool_async(
                 run,
                 session_id,
                 tool_call_id,
                 "list_files",
-                &json!({"path": path}).to_string(),
+                &local_args.to_string(),
             )
             .await)
     }
@@ -6524,6 +6531,49 @@ blast_radius:
             failure.message
         );
         assert_no_client_request(&mut rx, "bad list_files path");
+    }
+
+    #[tokio::test]
+    async fn acp_list_files_preserves_pagination_arguments() {
+        let (server, mut rx, _tmp) = test_server();
+        let fixture = tempfile::tempdir_in(".").expect("project-local fixture");
+        std::fs::write(fixture.path().join("a.txt"), "a").expect("first fixture");
+        std::fs::write(fixture.path().join("b.txt"), "b").expect("second fixture");
+        let args = HashMap::from([
+            ("path".to_string(), json!(fixture.path().to_string_lossy())),
+            ("limit".to_string(), json!(1)),
+        ]);
+
+        let result = server
+            .acp_list_files(
+                test_run(&server),
+                "acp-list-pagination",
+                "call-list-pagination",
+                &args,
+            )
+            .await
+            .expect("valid list arguments");
+
+        assert!(
+            result.is_partial(),
+            "first page must be partial: {result:?}"
+        );
+        assert_eq!(
+            result
+                .structured()
+                .and_then(|value| value.pointer("/file_discovery/page/limit"))
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert!(
+            result
+                .structured()
+                .and_then(|value| value.pointer("/file_discovery/page/next_cursor"))
+                .and_then(Value::as_str)
+                .is_some(),
+            "typed ACP result must retain the continuation cursor"
+        );
+        assert_no_client_request(&mut rx, "local list_files pagination");
     }
 
     fn config_option<'a>(response: &'a Value, id: &str) -> &'a Value {

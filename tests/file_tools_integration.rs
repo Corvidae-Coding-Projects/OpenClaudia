@@ -270,6 +270,55 @@ fn read_image_extensions_dispatched_as_image() {
 }
 
 // =============================================================================
+// ListFiles — typed pagination through public execute_tool dispatch
+// =============================================================================
+
+#[test]
+fn list_files_pagination_survives_execute_tool_dispatch() {
+    let dir = TempDir::new_in(".").expect("tempdir");
+    fs::write(dir.path().join("a.txt"), "a\n").expect("write a");
+    fs::write(dir.path().join("b.txt"), "b\n").expect("write b");
+    fs::write(dir.path().join("c.txt"), "c\n").expect("write c");
+    let first_call = make_call(
+        "list_files",
+        &json!({
+            "path": dir.path().to_string_lossy(),
+            "limit": 2
+        }),
+    );
+
+    let first = execute_tool(support::shared_run_context(), &first_call);
+
+    assert!(first.is_partial(), "first page must be partial: {first:?}");
+    assert!(first.content().contains("a.txt\nb.txt"));
+    assert!(!first.content().contains("c.txt"));
+    let cursor = first
+        .structured()
+        .and_then(|value| value.pointer("/file_discovery/page/next_cursor"))
+        .and_then(serde_json::Value::as_str)
+        .expect("typed partial result must expose a next cursor")
+        .to_string();
+    let second_call = make_call(
+        "list_files",
+        &json!({
+            "path": dir.path().to_string_lossy(),
+            "limit": 2,
+            "cursor": cursor
+        }),
+    );
+
+    let second = execute_tool(support::shared_run_context(), &second_call);
+
+    assert!(!second.is_error(), "second page must succeed: {second:?}");
+    assert!(
+        !second.is_partial(),
+        "second page must be complete: {second:?}"
+    );
+    assert!(second.content().contains("c.txt"));
+    assert!(!second.content().contains("a.txt"));
+}
+
+// =============================================================================
 // GlobTool — public execute_tool dispatch
 // =============================================================================
 

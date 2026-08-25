@@ -5,7 +5,10 @@
 use openclaudia::config::{BlastRadiusConfig, GuardrailMode, GuardrailsConfig};
 use openclaudia::state::SessionId;
 use openclaudia::tools::effect::{resolve_for_call, ToolTargetKind};
-use openclaudia::tools::{execute_tool, FunctionCall, ToolCall, ToolRunContext, WorkspaceAccess};
+use openclaudia::tools::{
+    execute_tool, FunctionCall, ToolCall, ToolFailureCode, ToolOutcome, ToolRunContext,
+    WorkspaceAccess,
+};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -404,6 +407,10 @@ fn recursive_file_quota_denial_releases_the_whole_pending_batch() {
     );
     let denied = execute_tool(&run, &grep);
     assert!(denied.is_error());
+    assert!(matches!(
+        denied.outcome(),
+        ToolOutcome::Error { failure } if failure.code == ToolFailureCode::PolicyDenied
+    ));
     assert!(
         denied.content().contains("files limit exceeded"),
         "test must prove concrete-file batch denial: {}",

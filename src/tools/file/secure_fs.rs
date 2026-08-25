@@ -210,6 +210,33 @@ pub(super) struct SecureDirEntry {
     pub(super) kind: SecureFileType,
 }
 
+pub(super) struct SecureDirectoryEntries {
+    pub(super) entries: Vec<SecureDirEntry>,
+    pub(super) skipped_changed_entries: usize,
+}
+
+#[derive(Debug)]
+pub(super) enum SecureDirectoryEntriesError {
+    EntryLimit { limit: usize },
+    NameByteLimit { limit: usize },
+    Read(String),
+}
+
+impl std::fmt::Display for SecureDirectoryEntriesError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EntryLimit { limit } => {
+                write!(formatter, "directory contains more than {limit} entries")
+            }
+            Self::NameByteLimit { limit } => write!(
+                formatter,
+                "directory entry names exceed the {limit}-byte enumeration budget"
+            ),
+            Self::Read(message) => formatter.write_str(message),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum SecureFileType {
     Directory,
@@ -270,9 +297,36 @@ pub(super) fn open_directory(
 #[cfg(unix)]
 impl SecureDirectory {
     /// Enumerate names relative to this pinned directory descriptor. Entry
-    /// types are inspected with `fstatat(..., AT_SYMLINK_NOFOLLOW)`.
-    pub(super) fn entries(&self) -> Result<Vec<SecureDirEntry>, String> {
-        read_directory_entries(&self.context, &self.file, &self.display_path)
+    /// types are inspected with `fstatat(..., AT_SYMLINK_NOFOLLOW)`. Both
+    /// limits are checked before retaining the next name, so a hostile or
+    /// generated directory cannot make a discovery tool allocate its entire
+    /// namespace before applying a page limit.
+    pub(super) fn entries_bounded(
+        &self,
+        maximum_entries: usize,
+        maximum_name_bytes: usize,
+    ) -> Result<SecureDirectoryEntries, SecureDirectoryEntriesError> {
+        read_directory_entries(
+            &self.context,
+            &self.file,
+            &self.display_path,
+            maximum_entries,
+            maximum_name_bytes,
+        )
+    }
+
+    pub(super) fn identity(&self) -> Result<SecureDirectoryIdentity, String> {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = self.file.metadata().map_err(|error| {
+            format!(
+                "Failed to inspect directory '{}': {error}",
+                self.display_path.display()
+            )
+        })?;
+        Ok(SecureDirectoryIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
     }
 
     /// Securely enter one direct child directory.
@@ -319,9 +373,21 @@ impl SecureDirectory {
 
 #[cfg(not(unix))]
 impl SecureDirectory {
-    pub(super) fn entries(&self) -> Result<Vec<SecureDirEntry>, String> {
+    pub(super) fn entries_bounded(
+        &self,
+        _maximum_entries: usize,
+        _maximum_name_bytes: usize,
+    ) -> Result<SecureDirectoryEntries, SecureDirectoryEntriesError> {
         Err(
             "Directory operation is blocked: this platform lacks a race-safe handle-relative filesystem backend"
+                .to_string()
+                .into(),
+        )
+    }
+
+    pub(super) fn identity(&self) -> Result<SecureDirectoryIdentity, String> {
+        Err(
+            "Directory identity is unavailable: this platform lacks a race-safe handle-relative filesystem backend"
                 .to_string(),
         )
     }
@@ -338,6 +404,18 @@ impl SecureDirectory {
             "File operation is blocked: this platform lacks a race-safe handle-relative filesystem backend"
                 .to_string(),
         )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct SecureDirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl From<String> for SecureDirectoryEntriesError {
+    fn from(message: String) -> Self {
+        Self::Read(message)
     }
 }
 
@@ -1208,11 +1286,14 @@ fn single_component(name: &std::ffi::OsStr) -> Result<PathBuf, String> {
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_lines)] // Keep descriptor-relative enumeration and its pre-allocation limits together.
 fn read_directory_entries(
     context: &ToolRunContext,
     file: &File,
     path: &Path,
-) -> Result<Vec<SecureDirEntry>, String> {
+    maximum_entries: usize,
+    maximum_name_bytes: usize,
+) -> Result<SecureDirectoryEntries, SecureDirectoryEntriesError> {
     use std::ffi::CStr;
     use std::os::fd::AsRawFd as _;
     use std::os::unix::ffi::OsStringExt as _;
@@ -1221,11 +1302,11 @@ fn read_directory_entries(
     // SAFETY: `file` is live for this call.
     let duplicate = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if duplicate < 0 {
-        return Err(format!(
+        return Err(SecureDirectoryEntriesError::Read(format!(
             "Failed to duplicate directory '{}': {}",
             path.display(),
             std::io::Error::last_os_error()
-        ));
+        )));
     }
     // SAFETY: `duplicate` is an open directory descriptor and ownership is
     // transferred to `fdopendir` on success.
@@ -1235,14 +1316,16 @@ fn read_directory_entries(
         unsafe {
             libc::close(duplicate);
         }
-        return Err(format!(
+        return Err(SecureDirectoryEntriesError::Read(format!(
             "Failed to enumerate directory '{}': {}",
             path.display(),
             std::io::Error::last_os_error()
-        ));
+        )));
     }
     let directory = Directory(dir);
     let mut entries = Vec::new();
+    let mut retained_name_bytes = 0usize;
+    let mut skipped_changed_entries = 0usize;
     loop {
         clear_errno();
         // SAFETY: the DIR pointer remains live under `directory`.
@@ -1252,15 +1335,30 @@ fn read_directory_entries(
             if error.raw_os_error() == Some(0) {
                 break;
             }
-            return Err(format!(
+            return Err(SecureDirectoryEntriesError::Read(format!(
                 "Failed while enumerating directory '{}': {error}",
                 path.display()
-            ));
+            )));
         }
         // SAFETY: `readdir` returned a valid dirent with NUL-terminated name.
         let name_bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
         if name_bytes == b"." || name_bytes == b".." {
             continue;
+        }
+        if entries.len() >= maximum_entries {
+            return Err(SecureDirectoryEntriesError::EntryLimit {
+                limit: maximum_entries,
+            });
+        }
+        let Some(next_name_bytes) = retained_name_bytes.checked_add(name_bytes.len()) else {
+            return Err(SecureDirectoryEntriesError::NameByteLimit {
+                limit: maximum_name_bytes,
+            });
+        };
+        if next_name_bytes > maximum_name_bytes {
+            return Err(SecureDirectoryEntriesError::NameByteLimit {
+                limit: maximum_name_bytes,
+            });
         }
         let name = OsString::from_vec(name_bytes.to_vec());
         let name_c = std::ffi::CString::new(name_bytes).map_err(|_| {
@@ -1281,6 +1379,7 @@ fn read_directory_entries(
             )
         };
         if result != 0 {
+            skipped_changed_entries = skipped_changed_entries.saturating_add(1);
             tracing::warn!(
                 dir = %path.display(),
                 entry = %name.to_string_lossy(),
@@ -1309,9 +1408,13 @@ fn read_directory_entries(
             );
             continue;
         }
+        retained_name_bytes = next_name_bytes;
         entries.push(SecureDirEntry { name, kind });
     }
-    Ok(entries)
+    Ok(SecureDirectoryEntries {
+        entries,
+        skipped_changed_entries,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1417,8 +1520,9 @@ mod tests {
         assert!(error.contains("masked"), "unexpected denial: {error}");
         let names: Vec<_> = open_directory(&context, root.path())
             .expect("project directory")
-            .entries()
+            .entries_bounded(1_000, 64 * 1024)
             .expect("secure entries")
+            .entries
             .into_iter()
             .map(|entry| entry.name)
             .collect();
