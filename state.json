@@ -1,6 +1,6 @@
 {
   "next_display_id": 1140,
-  "next_comment_id": 1607,
+  "next_comment_id": 1608,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -16222,7 +16222,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T09:21:03.171579016Z",
-      "updated_at": "2026-08-25T11:02:54.831257131Z",
+      "updated_at": "2026-08-25T11:07:51.631905246Z",
       "labels": [
         "remediation"
       ],
@@ -16346,6 +16346,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABATZvhcafX3x6awqnDwYoxKIik3mFn0//kg6Q2KC9SzlBHEtCg5LMDWna9g6gLwwz1qAvFXXca2vrhXXszrLzQDQ=="
+        },
+        "ec068870-4ac7-4992-a931-3f9919f648a7": {
+          "display_id": 1607,
+          "author": "6Vw9",
+          "content": "Commit 45ccd9e7 (fix(files): accept Windows token default owner) repairs hosted Windows run 32839167240's root-owner false rejection. validate_owned_acl now accepts exactly TokenUser or TokenOwner and preserves all DACL, reparse, type, and containment checks. Verified: Rust 1.98 fmt pass; Rust 1.98 Windows GNU all-target/all-feature check pass with CARGO_BUILD_JOBS=4. Strict Windows Clippy produced no src/windows_fs.rs diagnostics but remains repo-failing solely on unrelated #1099 debt. Unchanged native runtime regression awaits the next hosted Windows run.",
+          "created_at": "2026-08-25T11:07:51.629368821Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAt8lLOtLcL0abAasc7V9K2jF/Q/9BaO0jNASLwZ/JIoC1DbcFcuCQkCWhQofMpcMUnMx9hHTtQagQBFJam3KvDg=="
         },
         "f0b73f5c-9fcc-4f4d-aa2c-a0a041652491": {
           "display_id": 1598,
@@ -40883,11 +40892,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1653,
       "timestamp": "2026-08-25T11:02:54.831257131Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1654,
+      "timestamp": "2026-08-25T11:07:51.631905246Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T11:02:54.831257131Z",
+    "timestamp": "2026-08-25T11:07:51.631905246Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1653
+    "agent_seq": 1654
   }
 }
