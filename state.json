@@ -1,6 +1,6 @@
 {
   "next_display_id": 1141,
-  "next_comment_id": 1621,
+  "next_comment_id": 1622,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -10356,12 +10356,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T12:44:39.647023098Z",
-      "updated_at": "2026-08-25T12:53:49.858420901Z",
+      "updated_at": "2026-08-25T14:02:52.592623954Z",
       "labels": [
         "feature",
         "remediation"
       ],
       "comments": {
+        "7fca14e4-852c-42b9-9f04-fb4d003b6ab0": {
+          "display_id": 1621,
+          "author": "6Vw9",
+          "content": "Implemented and reviewed the MCP 2026-07-28 dual-era adapter. Production paths now negotiate current server/discover or an explicit legacy initialize profile; preserve typed tools, resources, prompts, content, errors, progress/log notifications, cache metadata, routing headers, and native binary attachments; advertise only implemented client capabilities; and reject unowned tasks or input-required results honestly. Review caught and fixed real compatibility gaps for HTTP 200 method-not-found fallback, current stdio roots/elicitation advertisement, JSON-RPC string server request IDs, open vendor capabilities, and HTTP failure reconnect state. Verification: Rust 1.98 fmt check passed; all-target/all-feature Clippy with warnings denied passed; 90 focused MCP unit tests passed; mcp_integration 32, mcp_http_transport_e2e 13, and mcp_types_shape_e2e 29 passed; final locked serialized all-target/all-feature suite passed with zero failures. No generated assets. Issue 1026 remains separate because transport-specific resource admission belongs to S-066.",
+          "created_at": "2026-08-25T14:02:52.588785156Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABApHYGYOfy2w+uLvzmsfsk7IUgztMm1QUei0W4kflBbsxR2ztTNPymj/jyCsBTe2QTErzzll0n6dZ7BUOXkfU8CA=="
+        },
         "9d243361-f02d-456b-a033-c6308362b02f": {
           "display_id": 1620,
           "author": "6Vw9",
@@ -41134,11 +41143,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1674,
       "timestamp": "2026-08-25T12:53:49.858420901Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1675,
+      "timestamp": "2026-08-25T14:02:52.592623954Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T12:53:49.858420901Z",
+    "timestamp": "2026-08-25T14:02:52.592623954Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1674
+    "agent_seq": 1675
   }
 }
