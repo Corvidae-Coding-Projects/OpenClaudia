@@ -1,6 +1,6 @@
 {
   "next_display_id": 1140,
-  "next_comment_id": 1601,
+  "next_comment_id": 1602,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -16211,7 +16211,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T09:21:03.171579016Z",
-      "updated_at": "2026-08-25T10:45:09.442745257Z",
+      "updated_at": "2026-08-25T10:45:58.319552090Z",
       "labels": [
         "remediation"
       ],
@@ -16224,6 +16224,15 @@
           "kind": "handoff",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAYXrmsk8WusPIxTvy9Vrs1o5MSDwohZ3ObHBf+vZK0Xe13cIjeOIyOOsWvQ7hqRPgcQheHSEqql+DytOhOB65DQ=="
+        },
+        "2758a356-c5cb-4b8b-accc-e1c83e7f79e9": {
+          "display_id": 1601,
+          "author": "6Vw9",
+          "content": "Generated closure bookkeeping committed exactly as emitted by Crosslink in signed commit 151af0ad docs(changelog): record Windows capability warning closure. Issue #1031 is closed; #1139 remains open pending hosted Windows evidence.",
+          "created_at": "2026-08-25T10:45:58.317077628Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA36PRReQz8zchhnuq6eIbEyzO/oqpgbsWvRT/w7VePCTAC6mv5gLZRasTE90p6hOdvsEaHVDjiRenR54Y4gkrCg=="
         },
         "288a75da-013d-448d-9b31-3b62a1c29aaa": {
           "display_id": 1594,
@@ -40797,11 +40806,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1647,
       "timestamp": "2026-08-25T10:45:34.501835885Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1648,
+      "timestamp": "2026-08-25T10:45:58.319552090Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T10:45:34.501835885Z",
+    "timestamp": "2026-08-25T10:45:58.319552090Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1647
+    "agent_seq": 1648
   }
 }
