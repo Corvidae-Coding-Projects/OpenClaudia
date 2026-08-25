@@ -1,6 +1,6 @@
 {
   "next_display_id": 1141,
-  "next_comment_id": 1623,
+  "next_comment_id": 1624,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -10352,13 +10352,22 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T12:44:39.647023098Z",
-      "updated_at": "2026-08-25T14:03:23.998706573Z",
+      "updated_at": "2026-08-25T14:03:51.470557438Z",
       "closed_at": "2026-08-25T14:03:23.998705090Z",
       "labels": [
         "feature",
         "remediation"
       ],
       "comments": {
+        "2ce3b600-1380-4b30-9879-3c8dce9a535e": {
+          "display_id": 1623,
+          "author": "6Vw9",
+          "content": "Delivered the reviewed MCP 2026-07-28 dual-era adapter with explicit legacy compatibility, typed production consumers, honest unsupported-feature errors, current and legacy wire tests, and complete Rust 1.98 verification. The exact Crosslink-generated CHANGELOG entry is preserved for the signed implementation commit.",
+          "created_at": "2026-08-25T14:03:51.467373580Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA2g1k55cf8puK5TjWjU2NRYe/QGAhnKIxN++15i3ZEzjK+zg9WXlzrTTCePUsPhIOdY4InfzBshWpDwMw0KDXCA=="
+        },
         "7fca14e4-852c-42b9-9f04-fb4d003b6ab0": {
           "display_id": 1621,
           "author": "6Vw9",
@@ -41169,11 +41178,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1678,
       "timestamp": "2026-08-25T14:03:29.006124263Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1679,
+      "timestamp": "2026-08-25T14:03:51.470557438Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T14:03:29.006124263Z",
+    "timestamp": "2026-08-25T14:03:51.470557438Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1678
+    "agent_seq": 1679
   }
 }
