@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1151,
+  "next_display_id": 1152,
   "next_comment_id": 1674,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -874,6 +874,7 @@
     "d0f06472-ce20-4d78-b948-4337a35925cc": 428,
     "d17198cd-14a5-45b7-ab42-6612dcb5d851": 1143,
     "d1918f4c-d902-472f-adbd-b28572d7eb66": 1,
+    "d1b160a5-d59b-45eb-b972-06792c01219d": 1151,
     "d1b439d9-baf4-494f-8f43-4b630dacbfc0": 1033,
     "d1fd1bce-ca2e-4824-9682-27b5ffbf1030": 35,
     "d213895c-6384-4a52-9ea8-c40550510c61": 585,
@@ -27654,6 +27655,18 @@
         }
       }
     },
+    "d1b160a5-d59b-45eb-b972-06792c01219d": {
+      "uuid": "d1b160a5-d59b-45eb-b972-06792c01219d",
+      "display_id": 1151,
+      "title": "S-069: Bound and validate LSP JSON-RPC",
+      "description": "Goal: \n\nAcceptance criteria:\n- \n\nImplement docs/remediation-slices/069-bounded-lsp-jsonrpc.md on top of completed S-068. Preserve and production-harden the stateful LSP service with bounded framing, queues, results, stderr, aggregate deadlines, backpressure, cancellation, reverse-request handling, process/status and URI validation, and explicit typed protocol outcomes. Add deterministic skeptical fixtures for every stated acceptance case. Use Rust 1.98; stay resource-aware; keep adjacent cleanup out of scope; verify focused and full gates; preserve an artifact-bound S-088 VDD handoff; commit signed as dollspace-gay; do not push; monitor PR #66 after user push.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-26T07:52:02.007724838Z",
+      "updated_at": "2026-08-26T07:52:02.007724838Z"
+    },
     "d1b439d9-baf4-494f-8f43-4b630dacbfc0": {
       "uuid": "d1b439d9-baf4-494f-8f43-4b630dacbfc0",
       "display_id": 1033,
@@ -42413,11 +42426,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1790,
       "timestamp": "2026-08-26T07:39:23.034405176Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1791,
+      "timestamp": "2026-08-26T07:52:02.007724838Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T07:39:23.034405176Z",
+    "timestamp": "2026-08-26T07:52:02.007724838Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1790
+    "agent_seq": 1791
   }
 }
