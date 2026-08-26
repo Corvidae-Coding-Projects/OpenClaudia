@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1145,
+  "next_display_id": 1146,
   "next_comment_id": 1660,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -463,6 +463,7 @@
     "6e2acc8d-9b4b-43d9-b1f4-73c4bc2da4ad": 516,
     "6e5d4ff2-0f4d-4a53-ba9e-ab6bb418ab3b": 533,
     "6e91ef5d-5676-43a1-94c2-4fd4abd19332": 366,
+    "6ea4d98d-679e-4078-b6b1-125fa8b5ab9b": 1145,
     "6eca7e6f-d207-4b09-a3a2-23942f86c6a1": 249,
     "6f3a8870-85f3-4e48-8084-ae851ec0d118": 1076,
     "6f7f58c3-2918-4d21-8961-9fc431540ce4": 710,
@@ -14874,6 +14875,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAGxWb/JUkFbsjc9KbrjMlfXzTDNgs5QBCSEL3paVZONuxMoSeF9pwCLu6CJC2PWSidrrtC5zbX0r5//ReRuBBCw=="
         }
       }
+    },
+    "6ea4d98d-679e-4078-b6b1-125fa8b5ab9b": {
+      "uuid": "6ea4d98d-679e-4078-b6b1-125fa8b5ab9b",
+      "display_id": 1145,
+      "title": "S-068: Create a stateful workspace LSP service",
+      "description": "Production-wire the preserved LSP pool and current LSP tool into a supervised per-workspace, per-language, configuration/version/capability/generation service. Own initialization, health, restart, cancellation, shutdown, and versioned document synchronization; preserve full call-hierarchy continuation data with generation-bound opaque tokens and explicit stale failure. Retain plugin configuration, run capabilities, budgets, guardrails, grounding, and current behavior. S-069 transport hardening and unrelated cleanup remain out of scope. Verify realistic compiled local fixtures on Rust 1.98 under resource-aware gates; S-088 VDD remains pending.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-26T05:52:47.734576672Z",
+      "updated_at": "2026-08-26T05:52:47.734576672Z"
     },
     "6eca7e6f-d207-4b09-a3a2-23942f86c6a1": {
       "uuid": "6eca7e6f-d207-4b09-a3a2-23942f86c6a1",
@@ -41940,11 +41953,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1750,
       "timestamp": "2026-08-26T05:47:44.072465628Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1751,
+      "timestamp": "2026-08-26T05:52:47.734576672Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T05:47:44.072465628Z",
+    "timestamp": "2026-08-26T05:52:47.734576672Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1750
+    "agent_seq": 1751
   }
 }
