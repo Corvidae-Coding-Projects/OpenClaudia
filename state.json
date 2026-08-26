@@ -1,6 +1,6 @@
 {
   "next_display_id": 1157,
-  "next_comment_id": 1725,
+  "next_comment_id": 1726,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -13526,10 +13526,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T23:02:08.777248190Z",
-      "updated_at": "2026-08-26T23:02:13.100166037Z",
+      "updated_at": "2026-08-26T23:07:10.566330594Z",
       "labels": [
         "feature"
-      ]
+      ],
+      "comments": {
+        "9df3d0de-abb0-4ae7-bae9-6f5e54cee41c": {
+          "display_id": 1725,
+          "author": "6Vw9",
+          "content": "S-073 design: preserve enter/list behavior and evolve the existing exit_worktree wire surface into one explicit operation per approved call: preview, stage, commit, merge, discard, or remove. Preview returns a typed exact generation bound to canonical repository/worktree identities, branch/worktree HEAD, target branch/HEAD, and complete porcelain state including staged, unstaged, untracked, ignored, and conflicted paths. Every mutation re-observes and matches that generation; stage requires the exact reviewed non-ignored path set, commit requires a fully staged tree, merge revalidates target HEAD/cleanliness and verifies reachability, remove requires a fully clean worktree and avoids --force, and discard alone may force-remove after exact-generation authorization. Commit/merge failures retain the worktree and branch with typed recovery; successful commits receive a persistent recovery ref before merge/removal. Retried calls recognize already-satisfied terminal/postconditions. Deprecated apply_changes/discard_changes booleans no longer perform composite destruction and instead direct callers through preview. Alternative rejected: six new tool names, because it duplicates catalog/policy surface and drifts into S-075; alternative rejected: retain composite apply behind one generation, because stage/commit/merge would still share one approval and one ambiguous failure boundary. S-074 active-workspace rebinding and S-077 general Git workflows remain excluded.",
+          "created_at": "2026-08-26T23:07:10.555921448Z",
+          "kind": "decision",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAlSY64ZHYR7GzlEwpA+wTKx6sZJOzhyDHYpS7ZXv6NwTaDtsjJlNyTZXGcdcw33EjOoI1V01ySA+qQfCLnTV9Cw=="
+        }
+      }
     },
     "61885b53-b3ea-4251-bec5-32006d4f2ee1": {
       "uuid": "61885b53-b3ea-4251-bec5-32006d4f2ee1",
@@ -43418,11 +43429,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1873,
       "timestamp": "2026-08-26T23:02:18.285380042Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1874,
+      "timestamp": "2026-08-26T23:07:10.566330594Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T23:02:18.285380042Z",
+    "timestamp": "2026-08-26T23:07:10.566330594Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1873
+    "agent_seq": 1874
   }
 }
