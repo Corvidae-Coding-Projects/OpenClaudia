@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1146,
+  "next_display_id": 1147,
   "next_comment_id": 1663,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -8,6 +8,7 @@
     "009d33da-5059-41d9-9407-4448e3ecbde8": 112,
     "00a7830b-97d4-4920-b522-8a0a01565456": 850,
     "00c3f362-2d1f-4045-ba09-ce4635e77fcb": 582,
+    "00d8b3e2-5d69-4a9e-8e09-712897b16078": 1146,
     "010c5bd2-f897-429d-85d1-f04c36c3e0ac": 687,
     "01a1fe0d-4577-44ae-bc63-6bf24380cddc": 637,
     "0250cef0-1440-452e-ac97-dea2c909f471": 940,
@@ -1216,6 +1217,18 @@
         "cc-parity",
         "feature"
       ]
+    },
+    "00d8b3e2-5d69-4a9e-8e09-712897b16078": {
+      "uuid": "00d8b3e2-5d69-4a9e-8e09-712897b16078",
+      "display_id": 1146,
+      "title": "S-068C: Prove stateful LSP lifecycle with compiled fixtures",
+      "description": "Add skeptical compiled local fixtures and integration coverage for pool/session isolation, versions, concurrent calls, restart/rehydration, stale continuations, cancellation/shutdown/reaping, config changes, and complete prepare/incoming/outgoing round trips. Parent #1145.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "6ea4d98d-679e-4078-b6b1-125fa8b5ab9b",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-26T06:00:10.088711167Z",
+      "updated_at": "2026-08-26T06:00:10.088711167Z"
     },
     "010c5bd2-f897-429d-85d1-f04c36c3e0ac": {
       "uuid": "010c5bd2-f897-429d-85d1-f04c36c3e0ac",
@@ -42025,11 +42038,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1757,
       "timestamp": "2026-08-26T05:59:50.104300716Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1758,
+      "timestamp": "2026-08-26T06:00:10.088711167Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T05:59:50.104300716Z",
+    "timestamp": "2026-08-26T06:00:10.088711167Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1757
+    "agent_seq": 1758
   }
 }
