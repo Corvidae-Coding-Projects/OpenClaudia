@@ -12393,12 +12393,13 @@
       "display_id": 1154,
       "title": "S-072: Supervise browser and web work",
       "description": "Goal: \n\nAcceptance criteria:\n- \n\nImplement docs/remediation-slices/072-supervised-browser-and-web-cancellation.md under parent #1071. Production-wire run-cancellation and aggregate deadlines through fetch, search, browser, and distillation; supervise browser process/tab/profile/proxy ownership through terminal reconciliation; use verified host browser identity, ephemeral restrictive host-owned profiles and bounded concurrency/resources; make persistent cookies/login an explicit encrypted host capability; preserve S-071 connection-broker behavior and legitimate web features. Focus on realistic failures, inspect tests skeptically, use Rust 1.98 with CARGO_BUILD_JOBS=2 and one heavy process, preserve exact generated changelog, signed dollspace-gay commit on agent/refactor-agent-system-remediation, no push, final cargo clean, and monitor every exact-head PR runner after the user pushes.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T17:40:20.676616314Z",
-      "updated_at": "2026-08-26T19:25:59.602632188Z",
+      "updated_at": "2026-08-26T19:26:04.234714317Z",
+      "closed_at": "2026-08-26T19:26:04.234708473Z",
       "labels": [
         "feature"
       ],
@@ -43305,11 +43306,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1862,
       "timestamp": "2026-08-26T19:25:59.602632188Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1863,
+      "timestamp": "2026-08-26T19:26:04.234714317Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T19:25:59.602632188Z",
+    "timestamp": "2026-08-26T19:26:04.234714317Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1862
+    "agent_seq": 1863
   }
 }
