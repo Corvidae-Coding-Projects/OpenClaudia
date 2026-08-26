@@ -92,12 +92,113 @@ fn build_shared_runtime() -> Result<Runtime, String> {
 ///
 /// Centralising the dispatch makes it impossible for a future web
 /// tool to regress and `Runtime::new()` again.
+#[cfg(test)]
 fn run_blocking<F>(fut: F) -> Result<F::Output, String>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
     run_blocking_with_timeout(fut, WEB_TOOL_DISPATCH_TIMEOUT)
+}
+
+fn run_supervised_web<T, F, Fut>(
+    run: &std::sync::Arc<crate::tools::security::ToolRunContext>,
+    time_limit: Duration,
+    operation: F,
+) -> Result<T, crate::web_egress::WebEgressError>
+where
+    T: Send + 'static,
+    F: FnOnce(crate::runtime::CancellationHandle) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T, crate::web_egress::WebEgressError>> + Send + 'static,
+{
+    let remaining = run.budget().remaining_time().map_err(|error| {
+        crate::web_egress::WebEgressError::new(
+            crate::web_egress::WebEgressErrorKind::Deadline,
+            format!("Web operation could not reserve a run deadline: {error}"),
+        )
+    })?;
+    let effective_limit = time_limit.min(remaining);
+    let parent_cancellation = run.runtime().cancellation();
+    let operation_cancellation = parent_cancellation.child();
+    let supervised = supervise_web_operation(
+        parent_cancellation,
+        operation_cancellation,
+        effective_limit,
+        operation,
+    );
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(supervised))
+            }
+            _ => std::thread::scope(|scope| {
+                scope
+                    .spawn(move || {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|error| {
+                                crate::web_egress::WebEgressError::external(
+                                    format!("failed to build web supervisor runtime: {error}"),
+                                    Vec::new(),
+                                )
+                            })?
+                            .block_on(supervised)
+                    })
+                    .join()
+                    .map_err(|_| {
+                        crate::web_egress::WebEgressError::external(
+                            "web supervisor helper thread panicked",
+                            Vec::new(),
+                        )
+                    })?
+            }),
+        };
+    }
+
+    SHARED_RUNTIME
+        .as_ref()
+        .map_err(|error| crate::web_egress::WebEgressError::external(error.clone(), Vec::new()))?
+        .block_on(supervised)
+}
+
+async fn supervise_web_operation<T, F, Fut>(
+    parent_cancellation: crate::runtime::CancellationHandle,
+    operation_cancellation: crate::runtime::CancellationHandle,
+    time_limit: Duration,
+    operation: F,
+) -> Result<T, crate::web_egress::WebEgressError>
+where
+    F: FnOnce(crate::runtime::CancellationHandle) -> Fut,
+    Fut: Future<Output = Result<T, crate::web_egress::WebEgressError>>,
+{
+    let operation = operation(operation_cancellation.clone());
+    tokio::pin!(operation);
+    let deadline = tokio::time::sleep(time_limit);
+    tokio::pin!(deadline);
+
+    let terminal = tokio::select! {
+        result = &mut operation => return result,
+        receipt = parent_cancellation.cancelled() => {
+            let _receipt = operation_cancellation.cancel(receipt.reason);
+            (crate::web_egress::WebEgressErrorKind::Cancelled, "Web operation was cancelled")
+        }
+        () = &mut deadline => {
+            let _receipt = operation_cancellation.cancel(crate::runtime::CancellationReason::Deadline);
+            (crate::web_egress::WebEgressErrorKind::Deadline, "Web operation exceeded its aggregate deadline")
+        }
+    };
+
+    let (receipts, browser_receipts) = operation.await.err().map_or_else(
+        || (Vec::new(), Vec::new()),
+        |error| (error.receipts, error.browser_receipts),
+    );
+    Err(
+        crate::web_egress::WebEgressError::new(terminal.0, terminal.1)
+            .with_receipts(receipts)
+            .with_browser_receipts(browser_receipts),
+    )
 }
 
 pub(super) fn run_blocking_with_timeout<F>(fut: F, timeout: Duration) -> Result<F::Output, String>
@@ -178,8 +279,15 @@ pub fn format_fetch_output(title: Option<&str>, url: &str, content: &str) -> Str
 fn success_with_receipts(
     text: String,
     receipts: &[crate::web_egress::NetworkReceipt],
+    browser_receipts: &[crate::web_supervisor::BrowserSupervisionReceipt],
 ) -> ToolHandlerResult {
-    ToolHandlerResult::success_structured(text, serde_json::json!({"network_receipts": receipts}))
+    ToolHandlerResult::success_structured(
+        text,
+        serde_json::json!({
+            "network_receipts": receipts,
+            "browser_supervision_receipts": browser_receipts,
+        }),
+    )
 }
 
 fn failure_from_egress(
@@ -190,6 +298,7 @@ fn failure_from_egress(
         kind,
         message,
         receipts,
+        browser_receipts,
     } = error;
     let code = match kind {
         crate::web_egress::WebEgressErrorKind::InvalidUrl => ToolFailureCode::InvalidInput,
@@ -211,7 +320,10 @@ fn failure_from_egress(
     };
     let mut failure = ToolFailure::new(code, format!("{prefix}: {message}"), retryability);
     failure.source = Some("web_egress".to_string());
-    failure.recovery = Some(serde_json::json!({"network_receipts": receipts}));
+    failure.recovery = Some(serde_json::json!({
+        "network_receipts": receipts,
+        "browser_supervision_receipts": browser_receipts,
+    }));
     ToolHandlerResult::error(failure)
 }
 
@@ -230,6 +342,7 @@ fn capability_denied(prefix: &str, error: impl std::fmt::Display) -> ToolHandler
             kind: crate::web_egress::WebEgressErrorKind::PolicyDenied,
             message: error.to_string(),
             receipts: Vec::new(),
+            browser_receipts: Vec::new(),
         },
     )
 }
@@ -295,16 +408,13 @@ pub fn execute_web_fetch_result(
     // the future doesn't borrow `url` across thread boundaries.
     let url_owned = url.to_string();
     let fetch_run = std::sync::Arc::clone(run);
-    let result =
-        match run_blocking(async move { web::fetch_url_brokered(&url_owned, fetch_run).await }) {
-            Ok(result) => result,
-            Err(error) => {
-                return failure_from_egress(
-                    "Failed to fetch URL",
-                    crate::web_egress::WebEgressError::external(error, Vec::new()),
-                )
-            }
-        };
+    let result = run_supervised_web(
+        run,
+        WEB_TOOL_DISPATCH_TIMEOUT,
+        move |cancellation| async move {
+            web::fetch_url_brokered_with_cancellation(&url_owned, fetch_run, cancellation).await
+        },
+    );
 
     match result {
         Ok(mut brokered) => {
@@ -313,7 +423,7 @@ pub fn execute_web_fetch_result(
                 (prompt, distillation_config_for_prompt(app_config))
             {
                 return match distill_fetch_result(
-                    std::sync::Arc::clone(run),
+                    run,
                     prompt,
                     &fetch_result.url,
                     &fetch_result.content,
@@ -321,12 +431,17 @@ pub fn execute_web_fetch_result(
                 ) {
                     Ok(distilled) => {
                         brokered.network_receipts.push(distilled.receipt);
-                        success_with_receipts(distilled.answer, &brokered.network_receipts)
+                        success_with_receipts(
+                            distilled.answer,
+                            &brokered.network_receipts,
+                            &brokered.browser_receipts,
+                        )
                     }
                     Err(mut error) => {
                         let mut receipts = brokered.network_receipts;
                         receipts.append(&mut error.receipts);
                         error.receipts = receipts;
+                        error.browser_receipts = brokered.browser_receipts;
                         failure_from_egress("Failed to distill fetched page", error)
                     }
                 };
@@ -338,6 +453,7 @@ pub fn execute_web_fetch_result(
                     &fetch_result.content,
                 ),
                 &brokered.network_receipts,
+                &brokered.browser_receipts,
             )
         }
         Err(error) => failure_from_egress("Failed to fetch URL", error),
@@ -378,7 +494,7 @@ struct DistillationResult {
 }
 
 fn distill_fetch_result(
-    run: std::sync::Arc<crate::tools::ToolRunContext>,
+    run: &std::sync::Arc<crate::tools::ToolRunContext>,
     prompt: &str,
     url: &str,
     markdown: &str,
@@ -388,17 +504,15 @@ fn distill_fetch_result(
     let markdown = web_config.truncate_for_distillation(markdown).to_string();
     let call = build_distillation_call(app_config, web_config, prompt, url, &markdown)
         .map_err(|error| crate::web_egress::WebEgressError::external(error, Vec::new()))?;
+    let distillation_run = std::sync::Arc::clone(run);
 
-    run_blocking_with_timeout(
-        async move { execute_distillation_call(run, call).await },
+    run_supervised_web(
+        run,
         WEB_FETCH_DISTILLATION_TIMEOUT,
+        move |cancellation| async move {
+            execute_distillation_call(distillation_run, call, cancellation).await
+        },
     )
-    .map_err(|error| {
-        crate::web_egress::WebEgressError::external(
-            format!("distillation dispatch failed: {error}"),
-            Vec::new(),
-        )
-    })?
 }
 
 fn build_distillation_call(
@@ -510,8 +624,9 @@ fn build_distillation_request(
 async fn execute_distillation_call(
     run: std::sync::Arc<crate::tools::ToolRunContext>,
     call: DistillationCall,
+    cancellation: crate::runtime::CancellationHandle,
 ) -> Result<DistillationResult, crate::web_egress::WebEgressError> {
-    let broker = crate::web_egress::WebEgressBroker::new(run)?;
+    let broker = crate::web_egress::WebEgressBroker::new_with_cancellation(run, cancellation)?;
     let response = broker
         .post_distillation_json(
             &call.endpoint,
@@ -671,25 +786,22 @@ pub fn execute_web_search_result(
         Ok(domains) => domains,
         Err(error) => return invalid_arguments(error),
     };
-    let run = std::sync::Arc::clone(run);
-    let result = match run_blocking_with_timeout(
-        async move { web::search_web_brokered(run, &query, limit).await },
+    let search_run = std::sync::Arc::clone(run);
+    let result = run_supervised_web(
+        run,
         WEB_SEARCH_TOOL_TIMEOUT,
-    ) {
-        Ok(result) => result,
-        Err(error) => {
-            return failure_from_egress(
-                "Search failed",
-                crate::web_egress::WebEgressError::external(error, Vec::new()),
-            )
-        }
-    };
+        move |cancellation| async move {
+            web::search_web_brokered_with_cancellation(search_run, &query, limit, cancellation)
+                .await
+        },
+    );
     match result {
         Ok(mut brokered) => {
             filter_search_results(&mut brokered.results, &allowed, &blocked);
             success_with_receipts(
                 web::format_search_results(&brokered.results),
                 &brokered.network_receipts,
+                &brokered.browser_receipts,
             )
         }
         Err(error) => failure_from_egress("Search failed", error),
@@ -764,18 +876,25 @@ fn run_web_search_backend<F>(
 where
     F: FnOnce(String, usize) -> Result<Vec<web::SearchResult>, String> + Send + 'static,
 {
-    run_blocking(async move {
-        let task = tokio::task::spawn_blocking(move || backend(query, limit));
-        match tokio::time::timeout(timeout, task).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(join_err)) => Err(format!("web search task panicked: {join_err}")),
-            Err(_) => Err(format!(
-                "web search timed out after {} ms",
-                timeout.as_millis()
-            )),
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::Builder::new()
+        .name("web-search-test-backend".to_string())
+        .spawn(move || {
+            let _ = sender.send(backend(query, limit));
+        })
+        .map_err(|error| format!("web search dispatch failed: {error}"))?;
+    let outcome = receiver.recv_timeout(timeout);
+    worker
+        .join()
+        .map_err(|_| "web search task panicked".to_string())?;
+    outcome.map_err(|error| match error {
+        std::sync::mpsc::RecvTimeoutError::Timeout => {
+            format!("web search timed out after {} ms", timeout.as_millis())
         }
-    })
-    .map_err(|e| format!("web search dispatch failed: {e}"))?
+        std::sync::mpsc::RecvTimeoutError::Disconnected => {
+            "web search task ended without a result".to_string()
+        }
+    })?
 }
 
 fn parse_web_search_limit(value: Option<&Value>) -> Result<usize, String> {
@@ -827,31 +946,19 @@ pub fn execute_web_browser_result(
     }
 
     let url_owned = url.to_string();
-    let run = std::sync::Arc::clone(run);
-    let result = match run_blocking(async move {
-        tokio::time::timeout(
-            WEB_BROWSER_TOOL_TIMEOUT,
-            web::fetch_with_browser_brokered(&url_owned, run),
-        )
-        .await
-        .map_err(|_| {
-            crate::web_egress::WebEgressError::external(
-                format!(
-                    "browser fetch timed out after {} seconds",
-                    WEB_BROWSER_TOOL_TIMEOUT.as_secs()
-                ),
-                Vec::new(),
+    let browser_run = std::sync::Arc::clone(run);
+    let result = run_supervised_web(
+        run,
+        WEB_BROWSER_TOOL_TIMEOUT,
+        move |cancellation| async move {
+            web::fetch_with_browser_brokered_with_cancellation(
+                &url_owned,
+                browser_run,
+                cancellation,
             )
-        })?
-    }) {
-        Ok(result) => result,
-        Err(error) => {
-            return failure_from_egress(
-                "Browser fetch failed",
-                crate::web_egress::WebEgressError::external(error, Vec::new()),
-            )
-        }
-    };
+            .await
+        },
+    );
 
     match result {
         Ok(brokered) => success_with_receipts(
@@ -861,6 +968,7 @@ pub fn execute_web_browser_result(
                 &brokered.result.content,
             ),
             &brokered.network_receipts,
+            &brokered.browser_receipts,
         ),
         Err(error) => failure_from_egress("Browser fetch failed", error),
     }
@@ -1076,6 +1184,40 @@ mod tests {
     }
 
     #[test]
+    fn supervised_deadline_waits_for_operation_reconciliation() {
+        let tree = crate::runtime::CancellationTree::new();
+        let parent = tree.root();
+        let operation = parent.child();
+        let reconciled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let operation_reconciled = std::sync::Arc::clone(&reconciled);
+        let result = run_blocking(async move {
+            supervise_web_operation(
+                parent,
+                operation,
+                Duration::from_millis(10),
+                move |cancellation| async move {
+                    let _receipt = cancellation.cancelled().await;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    operation_reconciled.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Err::<(), _>(crate::web_egress::WebEgressError::external(
+                        "operation stopped",
+                        Vec::new(),
+                    ))
+                },
+            )
+            .await
+        })
+        .expect("dispatcher");
+
+        let error = result.expect_err("deadline must fail");
+        assert_eq!(error.kind, crate::web_egress::WebEgressErrorKind::Deadline);
+        assert!(
+            reconciled.load(std::sync::atomic::Ordering::SeqCst),
+            "supervisor returned before the cancelled operation reconciled"
+        );
+    }
+
+    #[test]
     fn web_search_backend_timeout_returns_error_instead_of_hanging() {
         let result = run_web_search_backend(
             "rust".to_string(),
@@ -1191,7 +1333,10 @@ mod tests {
         assert_eq!(failure.source.as_deref(), Some("web_egress"));
         assert_eq!(
             failure.recovery,
-            Some(serde_json::json!({"network_receipts": []}))
+            Some(serde_json::json!({
+                "network_receipts": [],
+                "browser_supervision_receipts": [],
+            }))
         );
     }
 
@@ -1379,7 +1524,7 @@ mod tests {
         let config = distillation_test_config(&server.uri());
         let run = distillation_test_run(&config);
         let answer = distill_fetch_result(
-            run,
+            &run,
             "Which capability shipped?",
             "https://docs.example/openclaudia",
             "OpenClaudia ships web_fetch prompt distillation.",

@@ -257,6 +257,11 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
                     "web_fetch.exact_private_origins".to_string(),
                 ))
                 .is_some();
+            let mut ignored_browser_persistence = mapping
+                .remove(serde_yaml::Value::String(
+                    "web_fetch.browser_persistence".to_string(),
+                ))
+                .is_some();
             if let Some(web_fetch) = mapping
                 .get_mut(serde_yaml::Value::String("web_fetch".to_string()))
                 .and_then(serde_yaml::Value::as_mapping_mut)
@@ -266,11 +271,20 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
                         "exact_private_origins".to_string(),
                     ))
                     .is_some();
+                ignored_browser_persistence |= web_fetch
+                    .remove(serde_yaml::Value::String("browser_persistence".to_string()))
+                    .is_some();
             }
             if ignored_private_origins {
                 tracing::warn!(
                     target: "openclaudia::config",
                     "Ignored project web_fetch.exact_private_origins; private network authority requires trusted host configuration"
+                );
+            }
+            if ignored_browser_persistence {
+                tracing::warn!(
+                    target: "openclaudia::config",
+                    "Ignored project web_fetch.browser_persistence; browser login continuity requires trusted host configuration"
                 );
             }
         }
@@ -420,6 +434,14 @@ impl AppConfig {
             if let Some(provider) = self.get_provider(provider_name) {
                 grants = grants.with_distillation_endpoint(&provider.base_url)?;
             }
+        }
+        if let Some(config) = &self.web_fetch.browser_persistence {
+            grants = grants.with_browser_persistence(
+                config.profile_id.clone(),
+                &config.exact_origins,
+                config.encryption_key.clone(),
+                config.retention_seconds,
+            )?;
         }
         Ok(grants)
     }

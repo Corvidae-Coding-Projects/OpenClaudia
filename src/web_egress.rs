@@ -136,6 +136,7 @@ impl WebOrigin {
 pub struct WebEgressGrants {
     web_content: Arc<BTreeSet<WebOrigin>>,
     distillation: Arc<BTreeSet<WebOrigin>>,
+    browser_persistence: Option<crate::web_supervisor::BrowserPersistenceGrant>,
 }
 
 impl fmt::Debug for WebEgressGrants {
@@ -144,6 +145,13 @@ impl fmt::Debug for WebEgressGrants {
             .debug_struct("WebEgressGrants")
             .field("web_content_origin_count", &self.web_content.len())
             .field("distillation_origin_count", &self.distillation.len())
+            .field(
+                "browser_persistence",
+                &self
+                    .browser_persistence
+                    .as_ref()
+                    .map(crate::web_supervisor::BrowserPersistenceGrant::profile_id),
+            )
             .finish()
     }
 }
@@ -172,6 +180,7 @@ impl WebEgressGrants {
         Ok(Self {
             web_content: Arc::new(web_content),
             distillation: Arc::new(BTreeSet::new()),
+            browser_persistence: None,
         })
     }
 
@@ -199,6 +208,44 @@ impl WebEgressGrants {
         Ok(self)
     }
 
+    /// Add an exact-origin, encrypted cookie capability from trusted host
+    /// configuration. Normal browser runs remain ephemeral when absent.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed profile identifiers, keys, origins, retention, or a
+    /// host without a resolvable local-data directory.
+    pub fn with_browser_persistence<I, S>(
+        mut self,
+        profile_id: String,
+        origins: I,
+        encryption_key: crate::secrets::SecretString,
+        retention_seconds: u64,
+    ) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.browser_persistence = Some(crate::web_supervisor::BrowserPersistenceGrant::new(
+            profile_id,
+            origins,
+            encryption_key,
+            retention_seconds,
+        )?);
+        Ok(self)
+    }
+
+    #[cfg(feature = "browser")]
+    pub(crate) const fn browser_persistence(
+        &self,
+    ) -> Option<&crate::web_supervisor::BrowserPersistenceGrant> {
+        self.browser_persistence.as_ref()
+    }
+
+    pub(crate) const fn has_browser_persistence(&self) -> bool {
+        self.browser_persistence.is_some()
+    }
+
     fn permits_private(&self, origin: &WebOrigin, usage: WebEgressUse) -> bool {
         match usage {
             WebEgressUse::WebContent => self.web_content.contains(origin),
@@ -219,6 +266,11 @@ impl WebEgressGrants {
         for origin in self.distillation.iter() {
             manifest.push_str("distillation=");
             manifest.push_str(&origin.redacted());
+            manifest.push('\n');
+        }
+        if let Some(grant) = &self.browser_persistence {
+            manifest.push_str("browser_persistence=");
+            manifest.push_str(&grant.authority_digest().to_string());
             manifest.push('\n');
         }
         ContentDigest::sha256(manifest)
@@ -296,6 +348,7 @@ pub struct WebEgressError {
     pub kind: WebEgressErrorKind,
     pub message: String,
     pub receipts: Vec<NetworkReceipt>,
+    pub browser_receipts: Vec<crate::web_supervisor::BrowserSupervisionReceipt>,
 }
 
 impl fmt::Display for WebEgressError {
@@ -307,11 +360,12 @@ impl fmt::Display for WebEgressError {
 impl std::error::Error for WebEgressError {}
 
 impl WebEgressError {
-    fn new(kind: WebEgressErrorKind, message: impl Into<String>) -> Self {
+    pub(crate) fn new(kind: WebEgressErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
             receipts: Vec::new(),
+            browser_receipts: Vec::new(),
         }
     }
 
@@ -328,12 +382,35 @@ impl WebEgressError {
         self
     }
 
+    pub(crate) fn with_receipts(mut self, receipts: Vec<NetworkReceipt>) -> Self {
+        self.receipts = receipts;
+        self
+    }
+
+    #[cfg(feature = "browser")]
+    pub(crate) fn with_browser_receipt(
+        mut self,
+        receipt: crate::web_supervisor::BrowserSupervisionReceipt,
+    ) -> Self {
+        self.browser_receipts.push(receipt);
+        self
+    }
+
+    pub(crate) fn with_browser_receipts(
+        mut self,
+        receipts: Vec<crate::web_supervisor::BrowserSupervisionReceipt>,
+    ) -> Self {
+        self.browser_receipts = receipts;
+        self
+    }
+
     #[must_use]
     pub fn external(message: impl Into<String>, receipts: Vec<NetworkReceipt>) -> Self {
         Self {
             kind: WebEgressErrorKind::External,
             message: message.into(),
             receipts,
+            browser_receipts: Vec::new(),
         }
     }
 }
@@ -375,6 +452,7 @@ struct AdmittedDestination {
 /// for each origin for the lifetime of a tool invocation.
 pub struct WebEgressBroker {
     run: Arc<ToolRunContext>,
+    cancellation: crate::runtime::CancellationHandle,
     resolver: Arc<dyn WebResolver>,
     resolved: Mutex<BTreeMap<WebOrigin, Vec<SocketAddr>>>,
 }
@@ -402,10 +480,24 @@ impl WebEgressBroker {
     ///
     /// Returns a capability error if the run has no network authority.
     pub fn new(run: Arc<ToolRunContext>) -> Result<Arc<Self>, WebEgressError> {
+        let cancellation = run.runtime().cancellation();
+        Self::new_with_cancellation(run, cancellation)
+    }
+
+    /// Bind a broker to one supervised child operation in the run tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns a capability error if the run has no network authority.
+    pub(crate) fn new_with_cancellation(
+        run: Arc<ToolRunContext>,
+        cancellation: crate::runtime::CancellationHandle,
+    ) -> Result<Arc<Self>, WebEgressError> {
         run.require(crate::tools::ToolResource::Network)
             .map_err(|error| WebEgressError::policy(error.to_string()))?;
         Ok(Arc::new(Self {
             run,
+            cancellation,
             resolver: Arc::new(SystemWebResolver),
             resolved: Mutex::new(BTreeMap::new()),
         }))
@@ -418,11 +510,18 @@ impl WebEgressBroker {
     ) -> Result<Arc<Self>, WebEgressError> {
         run.require(crate::tools::ToolResource::Network)
             .map_err(|error| WebEgressError::policy(error.to_string()))?;
+        let cancellation = run.runtime().cancellation();
         Ok(Arc::new(Self {
             run,
+            cancellation,
             resolver,
             resolved: Mutex::new(BTreeMap::new()),
         }))
+    }
+
+    #[cfg(feature = "browser")]
+    pub(crate) fn cancellation(&self) -> crate::runtime::CancellationHandle {
+        self.cancellation.clone()
     }
 
     fn parse_url(raw: &str, browser: bool) -> Result<Url, WebEgressError> {
@@ -480,7 +579,7 @@ impl WebEgressBroker {
             )));
         }
 
-        let cancellation = self.run.runtime().cancellation();
+        let cancellation = self.cancellation.clone();
         let resolved = tokio::select! {
             _ = cancellation.cancelled() => {
                 return Err(WebEgressError::new(
@@ -733,7 +832,7 @@ impl WebEgressBroker {
             time_limit,
         );
         let deadline = Instant::now() + time_limit;
-        let cancellation = self.run.runtime().cancellation();
+        let cancellation = self.cancellation.clone();
         let mut current = requested;
 
         for hop in 0..=crate::web::SSRF_REDIRECT_LIMIT {
@@ -894,7 +993,7 @@ impl WebEgressBroker {
             time_limit,
         );
         let deadline = Instant::now() + time_limit;
-        let cancellation = self.run.runtime().cancellation();
+        let cancellation = self.cancellation.clone();
         for address in admitted.addresses {
             let result = tokio::select! {
                 _ = cancellation.cancelled() => {
@@ -1036,11 +1135,13 @@ impl BrowserEgressProxy {
         let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
         let receipts = Arc::new(Mutex::new(Vec::new()));
         let task_receipts = Arc::clone(&receipts);
+        let cancellation = broker.cancellation();
         let task = tokio::spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
+                    _ = cancellation.cancelled() => break,
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else { break; };
                         let connection_broker = Arc::clone(&broker);
@@ -1061,6 +1162,7 @@ impl BrowserEgressProxy {
                     Some(_) = connections.join_next(), if !connections.is_empty() => {}
                 }
             }
+            connections.abort_all();
             while connections.join_next().await.is_some() {}
         });
         Ok(Self {

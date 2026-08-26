@@ -281,6 +281,7 @@ fn web_fetch_config_with_distillation_enabled_round_trips() {
         distillation_model: Some("claude-haiku-4-5".to_string()),
         preapproved_domains: vec!["custom.example.com".to_string()],
         exact_private_origins: vec!["http://127.0.0.1:8080".to_string()],
+        browser_persistence: None,
     };
     let yaml = serde_yaml::to_string(&original).expect("ser");
     let back: WebFetchConfig = serde_yaml::from_str(&yaml).expect("de");
@@ -306,6 +307,7 @@ fn web_fetch_config_clone_preserves_all_fields() {
         distillation_model: Some("m".to_string()),
         preapproved_domains: vec!["a".to_string(), "b".to_string()],
         exact_private_origins: vec!["http://localhost:1234".to_string()],
+        browser_persistence: None,
     };
     let cloned = original.clone();
     assert_eq!(cloned, original);

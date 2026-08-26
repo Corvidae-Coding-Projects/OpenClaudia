@@ -19,9 +19,8 @@ use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+#[cfg(not(feature = "browser"))]
 use std::path::Path;
-#[cfg(feature = "browser")]
-use std::path::PathBuf;
 use std::str::FromStr;
 #[cfg(test)]
 use std::sync::LazyLock;
@@ -523,9 +522,6 @@ pub fn html_to_markdown(html: &str) -> String {
 #[cfg(feature = "browser")]
 const DUCKDUCKGO_HTML_URL: &str = "https://html.duckduckgo.com/html/";
 
-#[cfg(feature = "browser")]
-const BROWSER_PROFILE_DIR: &str = "browser_profile";
-
 /// Result from `web_fetch`
 #[derive(Debug, Clone)]
 pub struct FetchResult {
@@ -539,6 +535,7 @@ pub struct FetchResult {
 pub struct BrokeredFetchResult {
     pub result: FetchResult,
     pub network_receipts: Vec<crate::web_egress::NetworkReceipt>,
+    pub browser_receipts: Vec<crate::web_supervisor::BrowserSupervisionReceipt>,
 }
 
 /// Search result plus receipts for browser connections used to obtain it.
@@ -546,6 +543,7 @@ pub struct BrokeredFetchResult {
 pub struct BrokeredSearchResult {
     pub results: Vec<SearchResult>,
     pub network_receipts: Vec<crate::web_egress::NetworkReceipt>,
+    pub browser_receipts: Vec<crate::web_supervisor::BrowserSupervisionReceipt>,
 }
 
 /// Search result item
@@ -595,7 +593,19 @@ pub async fn fetch_url_brokered(
     url: &str,
     run: std::sync::Arc<crate::tools::ToolRunContext>,
 ) -> Result<BrokeredFetchResult, crate::web_egress::WebEgressError> {
-    let broker = crate::web_egress::WebEgressBroker::new(std::sync::Arc::clone(&run))?;
+    let cancellation = run.runtime().cancellation();
+    fetch_url_brokered_with_cancellation(url, run, cancellation).await
+}
+
+pub(crate) async fn fetch_url_brokered_with_cancellation(
+    url: &str,
+    run: std::sync::Arc<crate::tools::ToolRunContext>,
+    cancellation: crate::runtime::CancellationHandle,
+) -> Result<BrokeredFetchResult, crate::web_egress::WebEgressError> {
+    let broker = crate::web_egress::WebEgressBroker::new_with_cancellation(
+        std::sync::Arc::clone(&run),
+        cancellation,
+    )?;
     let direct_error = match fetch_url_direct(url, &broker).await {
         Ok(result) => return Ok(result),
         Err(error) => {
@@ -620,13 +630,17 @@ pub async fn fetch_url_brokered(
                     "Direct fetch failed: {direct_message}. Browser fallback is unavailable: {error}"
                 ),
                 direct_error.receipts,
-            ));
+            )
+            .with_browser_receipts(direct_error.browser_receipts));
         }
         match fetch_with_browser_using_broker(url, run, broker).await {
             Ok(mut result) => {
                 let mut receipts = direct_error.receipts;
                 receipts.append(&mut result.network_receipts);
                 result.network_receipts = receipts;
+                let mut browser_receipts = direct_error.browser_receipts;
+                browser_receipts.append(&mut result.browser_receipts);
+                result.browser_receipts = browser_receipts;
                 Ok(result)
             }
             Err(browser_error) => {
@@ -634,12 +648,15 @@ pub async fn fetch_url_brokered(
                 let browser_message = browser_error.message;
                 let mut receipts = direct_error.receipts;
                 receipts.extend(browser_error.receipts);
+                let mut browser_receipts = direct_error.browser_receipts;
+                browser_receipts.extend(browser_error.browser_receipts);
                 Err(crate::web_egress::WebEgressError::external(
                     format!(
                         "Both fetch backends failed. Direct: {direct_message}. Browser: {browser_message}"
                     ),
                     receipts,
-                ))
+                )
+                .with_browser_receipts(browser_receipts))
             }
         }
     }
@@ -648,7 +665,8 @@ pub async fn fetch_url_brokered(
         Err(crate::web_egress::WebEgressError::external(
             "Direct fetch failed and this build has no browser fallback",
             direct_error.receipts,
-        ))
+        )
+        .with_browser_receipts(direct_error.browser_receipts))
     }
 }
 
@@ -702,6 +720,7 @@ async fn fetch_url_direct(
             url: response.final_url,
         },
         network_receipts: vec![response.receipt],
+        browser_receipts: Vec::new(),
     })
 }
 
@@ -752,9 +771,19 @@ pub async fn search_web_brokered(
     query: &str,
     limit: usize,
 ) -> Result<BrokeredSearchResult, crate::web_egress::WebEgressError> {
+    let cancellation = run.runtime().cancellation();
+    search_web_brokered_with_cancellation(run, query, limit, cancellation).await
+}
+
+pub(crate) async fn search_web_brokered_with_cancellation(
+    run: std::sync::Arc<crate::tools::ToolRunContext>,
+    query: &str,
+    limit: usize,
+    cancellation: crate::runtime::CancellationHandle,
+) -> Result<BrokeredSearchResult, crate::web_egress::WebEgressError> {
     #[cfg(not(feature = "browser"))]
     {
-        let _ = (run, query, limit);
+        let _ = (run, query, limit, cancellation);
         return Err(crate::web_egress::WebEgressError::external(
             "Web search requires the browser feature",
             Vec::new(),
@@ -767,47 +796,65 @@ pub async fn search_web_brokered(
             .map_err(|error| {
                 crate::web_egress::WebEgressError::external(error.to_string(), Vec::new())
             })?;
-        let broker = crate::web_egress::WebEgressBroker::new(std::sync::Arc::clone(&run))?;
+        let broker = crate::web_egress::WebEgressBroker::new_with_cancellation(
+            std::sync::Arc::clone(&run),
+            cancellation,
+        )?;
         let mut proxy =
             crate::web_egress::BrowserEgressProxy::start(std::sync::Arc::clone(&broker)).await?;
         let proxy_url = proxy.url();
-        let scratch = run.private_temp_root().to_path_buf();
         let query = query.to_string();
-        let browser_result = tokio::task::spawn_blocking(move || {
-            search_web_with_proxy(&scratch, &query, limit, &proxy_url, &broker)
-        })
+        let persistence = run.web_egress_grants().browser_persistence().cloned();
+        let browser_result = crate::web_supervisor::supervise_browser(
+            std::sync::Arc::clone(&run),
+            broker.cancellation(),
+            proxy_url,
+            move |browser, limits, counters| {
+                search_web_with_browser(
+                    browser,
+                    &query,
+                    limit,
+                    &broker,
+                    limits,
+                    &counters,
+                    persistence.as_ref(),
+                )
+                .map(|value| crate::web_supervisor::BrowserWorkOutput { value })
+            },
+        )
         .await;
         proxy.shutdown().await;
         let receipts = proxy.receipts();
         match browser_result {
-            Ok(Ok(results)) => Ok(BrokeredSearchResult {
-                results,
+            Ok(output) => Ok(BrokeredSearchResult {
+                results: output.value,
                 network_receipts: receipts,
+                browser_receipts: vec![output.receipt],
             }),
-            Ok(Err(message)) => Err(crate::web_egress::WebEgressError::external(
-                message, receipts,
-            )),
-            Err(_) => Err(crate::web_egress::WebEgressError::external(
-                "Web search browser task failed",
+            Err(failure) => Err(crate::web_egress::WebEgressError::external(
+                failure.message,
                 receipts,
-            )),
+            )
+            .with_browser_receipt(*failure.receipt)),
         }
     }
 }
 
 #[cfg(feature = "browser")]
-fn search_web_with_proxy(
-    browser_scratch_root: &Path,
+fn search_web_with_browser(
+    browser: &headless_chrome::Browser,
     query: &str,
     limit: usize,
-    proxy_url: &str,
     broker: &std::sync::Arc<crate::web_egress::WebEgressBroker>,
+    limits: crate::web_supervisor::BrowserLimits,
+    counters: &std::sync::Arc<crate::web_supervisor::BrowserCounters>,
+    persistence: Option<&crate::web_supervisor::BrowserPersistenceGrant>,
 ) -> Result<Vec<SearchResult>, String> {
     let mut backend_errors = Vec::new();
 
     // Tier 1 — DuckDuckGo via headless Chromium in browser builds
     // (free, no API key).
-    match search_duckduckgo(browser_scratch_root, query, limit, proxy_url, broker) {
+    match search_duckduckgo(browser, query, limit, broker, limits, counters, persistence) {
         Ok(results) => return Ok(results),
         Err(e) => {
             tracing::warn!("DuckDuckGo search failed: {e}");
@@ -817,7 +864,7 @@ fn search_web_with_proxy(
 
     // Tier 2 — Bing HTML scrape via headless Chromium in browser
     // builds.
-    match search_bing(browser_scratch_root, query, limit, proxy_url, broker) {
+    match search_bing(browser, query, limit, broker, limits, counters, persistence) {
         Ok(results) if !results.is_empty() => return Ok(results),
         Ok(_) => {
             backend_errors.push("Bing: returned zero results (likely bot-challenged)".to_string());
@@ -882,24 +929,28 @@ fn decode_bing_ck_url(href: &str) -> String {
 /// navigation times out, or if the rendered DOM exceeds
 /// [`MAX_WEB_FETCH_BYTES`].
 #[cfg(feature = "browser")]
-pub fn search_bing(
-    browser_scratch_root: &Path,
+pub(crate) fn search_bing(
+    browser: &headless_chrome::Browser,
     query: &str,
     limit: usize,
-    proxy_url: &str,
     broker: &std::sync::Arc<crate::web_egress::WebEgressBroker>,
+    limits: crate::web_supervisor::BrowserLimits,
+    counters: &std::sync::Arc<crate::web_supervisor::BrowserCounters>,
+    persistence: Option<&crate::web_supervisor::BrowserPersistenceGrant>,
 ) -> Result<Vec<SearchResult>, String> {
-    let browser = launch_browser_for_scraping(browser_scratch_root, proxy_url)?;
-
     let tab = browser
         .new_tab()
         .map_err(|e| format!("Failed to create browser tab: {e}"))?;
-    configure_browser_request_policy(&tab, broker)?;
+    configure_browser_request_policy(&tab, broker, limits, counters)?;
 
     let search_url = format!(
         "https://www.bing.com/search?q={}",
         urlencoding::encode(query)
     );
+
+    if let Some(persistence) = persistence {
+        persistence.restore_cookies(&tab, &search_url, counters)?;
+    }
 
     tab.navigate_to(&search_url)
         .map_err(|e| format!("Failed to navigate to Bing: {e}"))?;
@@ -908,16 +959,9 @@ pub fn search_bing(
     // Give Cloudflare Turnstile (when present) a chance to settle.
     std::thread::sleep(Duration::from_millis(1500));
 
-    let html = tab
-        .get_content()
-        .map_err(|e| format!("Failed to get page content: {e}"))?;
-
-    if html.len() > MAX_WEB_FETCH_BYTES {
-        return Err(format!(
-            "Response too large: {} bytes exceeds cap {}",
-            html.len(),
-            MAX_WEB_FETCH_BYTES
-        ));
+    let html = capture_rendered_dom(&tab, limits, counters)?;
+    if let Some(persistence) = persistence {
+        persistence.save_cookies(&tab, counters)?;
     }
 
     parse_bing_results_from_html(&html, limit)
@@ -1014,60 +1058,34 @@ pub fn search_bing(
 /// # Errors
 ///
 /// Returns an error string if the browser cannot be launched or no results are found.
-/// Launch a headless Chromium for scraping.
-///
-/// `LaunchOptions::path = None` lets the upstream process resolver consult
-/// the standard install directories (`/usr/bin/chromium`,
-/// `/Applications/Google Chrome`, and similar locations). Runtime executable
-/// download is deliberately disabled, so an operator enabling the `browser`
-/// feature must install a compatible browser.
-#[cfg(feature = "browser")]
-fn launch_browser_for_scraping(
-    browser_scratch_root: &Path,
-    proxy_url: &str,
-) -> Result<headless_chrome::Browser, String> {
-    use headless_chrome::{Browser, LaunchOptions};
-    use std::ffi::OsStr;
-
-    let user_data_dir = browser_profile_dir_under(browser_scratch_root)?;
-    let opts = LaunchOptions::default_builder()
-        .headless(true)
-        .user_data_dir(Some(user_data_dir))
-        .ignore_certificate_errors(false)
-        .proxy_server(Some(proxy_url))
-        .args(vec![
-            OsStr::new("--disable-quic"),
-            OsStr::new("--proxy-bypass-list=<-loopback>"),
-            OsStr::new("--disable-features=AsyncDns,DnsOverHttps"),
-        ])
-        .build()
-        .map_err(|e| format!("Failed to configure browser: {e}"))?;
-    Browser::new(opts).map_err(|e| {
-        format!(
-            "Failed to launch Chromium: {e}. Install chromium/google-chrome \
-             on PATH; this build does not download browser executables at runtime."
-        )
-    })
-}
-
 #[cfg(feature = "browser")]
 fn configure_browser_request_policy(
     tab: &std::sync::Arc<headless_chrome::Tab>,
     broker: &std::sync::Arc<crate::web_egress::WebEgressBroker>,
+    limits: crate::web_supervisor::BrowserLimits,
+    counters: &std::sync::Arc<crate::web_supervisor::BrowserCounters>,
 ) -> Result<(), String> {
     use headless_chrome::browser::tab::RequestPausedDecision;
-    use headless_chrome::protocol::cdp::{Fetch, Network};
+    use headless_chrome::protocol::cdp::{Fetch, Network, Page};
+
+    tab.call_method(Page::SetDownloadBehavior {
+        behavior: Page::SetDownloadBehaviorBehaviorOption::Deny,
+        download_path: None,
+    })
+    .map_err(|error| format!("Failed to deny browser downloads: {error}"))?;
 
     tab.enable_fetch(None, None)
         .map_err(|error| format!("Failed to enable browser request policy: {error}"))?;
     let broker = std::sync::Arc::clone(broker);
+    let counters = std::sync::Arc::clone(counters);
     tab.enable_request_interception(std::sync::Arc::new(
         move |
             _transport: std::sync::Arc<headless_chrome::browser::transport::Transport>,
             _session_id: headless_chrome::browser::transport::SessionId,
             intercepted: headless_chrome::protocol::cdp::Fetch::events::RequestPausedEvent,
         | {
-            if broker
+            if counters.admit_request(limits.requests)
+                && broker
                 .validate_browser_request(&intercepted.params.request.url)
                 .is_ok()
             {
@@ -1084,15 +1102,35 @@ fn configure_browser_request_policy(
 }
 
 #[cfg(feature = "browser")]
-fn browser_profile_dir_under(browser_scratch_root: &Path) -> Result<PathBuf, String> {
-    let dir = browser_scratch_root.join(BROWSER_PROFILE_DIR);
-    std::fs::create_dir_all(&dir).map_err(|e| {
-        format!(
-            "Failed to create Chromium browser profile directory '{}': {e}",
-            dir.display()
-        )
-    })?;
-    Ok(dir)
+fn capture_rendered_dom(
+    tab: &std::sync::Arc<headless_chrome::Tab>,
+    limits: crate::web_supervisor::BrowserLimits,
+    counters: &std::sync::Arc<crate::web_supervisor::BrowserCounters>,
+) -> Result<String, String> {
+    let nodes = tab
+        .evaluate("document.getElementsByTagName('*').length", false)
+        .map_err(|error| format!("Failed to count rendered DOM nodes: {error}"))?
+        .value
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| "Browser returned an invalid rendered DOM node count".to_string())?;
+    let html = tab
+        .get_content()
+        .map_err(|error| format!("Failed to get page content: {error}"))?;
+    let bytes = u64::try_from(html.len()).unwrap_or(u64::MAX);
+    counters.record_dom(bytes, nodes);
+    if bytes > limits.dom_bytes {
+        return Err(format!(
+            "Rendered DOM exceeded the {}-byte browser limit",
+            limits.dom_bytes
+        ));
+    }
+    if nodes > limits.dom_nodes {
+        return Err(format!(
+            "Rendered DOM exceeded the {}-node browser limit",
+            limits.dom_nodes
+        ));
+    }
+    Ok(html)
 }
 
 /// Search `DuckDuckGo` via a headless Chromium and parse the rendered
@@ -1105,22 +1143,26 @@ fn browser_profile_dir_under(browser_scratch_root: &Path) -> Result<PathBuf, Str
 /// navigation times out, if the response exceeds the rendered-HTML
 /// cap, or if the DOM does not contain the expected selectors.
 #[cfg(feature = "browser")]
-pub fn search_duckduckgo(
-    browser_scratch_root: &Path,
+pub(crate) fn search_duckduckgo(
+    browser: &headless_chrome::Browser,
     query: &str,
     limit: usize,
-    proxy_url: &str,
     broker: &std::sync::Arc<crate::web_egress::WebEgressBroker>,
+    limits: crate::web_supervisor::BrowserLimits,
+    counters: &std::sync::Arc<crate::web_supervisor::BrowserCounters>,
+    persistence: Option<&crate::web_supervisor::BrowserPersistenceGrant>,
 ) -> Result<Vec<SearchResult>, String> {
-    let browser = launch_browser_for_scraping(browser_scratch_root, proxy_url)?;
-
     let tab = browser
         .new_tab()
         .map_err(|e| format!("Failed to create browser tab: {e}"))?;
-    configure_browser_request_policy(&tab, broker)?;
+    configure_browser_request_policy(&tab, broker, limits, counters)?;
 
     // Navigate to DuckDuckGo HTML search
     let search_url = format!("{}?q={}", DUCKDUCKGO_HTML_URL, urlencoding::encode(query));
+
+    if let Some(persistence) = persistence {
+        persistence.restore_cookies(&tab, &search_url, counters)?;
+    }
 
     tab.navigate_to(&search_url)
         .map_err(|e| format!("Failed to navigate to DuckDuckGo: {e}"))?;
@@ -1132,18 +1174,9 @@ pub fn search_duckduckgo(
     std::thread::sleep(Duration::from_millis(500));
 
     // Get page HTML
-    let html = tab
-        .get_content()
-        .map_err(|e| format!("Failed to get page content: {e}"))?;
-
-    // Size-cap the rendered HTML (crosslink #745). Headless Chrome will happily
-    // materialize multi-GB DOMs from hostile pages; refuse to propagate that.
-    if html.len() > MAX_WEB_FETCH_BYTES {
-        return Err(format!(
-            "Response too large: {} bytes exceeds cap {}",
-            html.len(),
-            MAX_WEB_FETCH_BYTES
-        ));
+    let html = capture_rendered_dom(&tab, limits, counters)?;
+    if let Some(persistence) = persistence {
+        persistence.save_cookies(&tab, counters)?;
     }
 
     parse_duckduckgo_results_from_html(&html, limit)
@@ -1312,11 +1345,15 @@ pub async fn fetch_with_browser(
 }
 
 #[cfg(feature = "browser")]
-pub(crate) async fn fetch_with_browser_brokered(
+pub(crate) async fn fetch_with_browser_brokered_with_cancellation(
     url: &str,
     run: std::sync::Arc<crate::tools::ToolRunContext>,
+    cancellation: crate::runtime::CancellationHandle,
 ) -> Result<BrokeredFetchResult, crate::web_egress::WebEgressError> {
-    let broker = crate::web_egress::WebEgressBroker::new(std::sync::Arc::clone(&run))?;
+    let broker = crate::web_egress::WebEgressBroker::new_with_cancellation(
+        std::sync::Arc::clone(&run),
+        cancellation,
+    )?;
     fetch_with_browser_using_broker(url, run, broker).await
 }
 
@@ -1330,42 +1367,57 @@ async fn fetch_with_browser_using_broker(
     let mut proxy =
         crate::web_egress::BrowserEgressProxy::start(std::sync::Arc::clone(&broker)).await?;
     let proxy_url = proxy.url();
-    let browser_scratch_root = run.private_temp_root().to_path_buf();
     let url = url.to_string();
-    let browser_result = tokio::task::spawn_blocking(move || {
-        fetch_with_browser_sync(&url, &browser_scratch_root, &proxy_url, &broker)
-    })
+    let persistence = run.web_egress_grants().browser_persistence().cloned();
+    let browser_result = crate::web_supervisor::supervise_browser(
+        run,
+        broker.cancellation(),
+        proxy_url,
+        move |browser, limits, counters| {
+            fetch_with_browser_sync(
+                browser,
+                &url,
+                &broker,
+                limits,
+                &counters,
+                persistence.as_ref(),
+            )
+            .map(|value| crate::web_supervisor::BrowserWorkOutput { value })
+        },
+    )
     .await;
     proxy.shutdown().await;
     let receipts = proxy.receipts();
     match browser_result {
-        Ok(Ok(result)) => Ok(BrokeredFetchResult {
-            result,
+        Ok(output) => Ok(BrokeredFetchResult {
+            result: output.value,
             network_receipts: receipts,
+            browser_receipts: vec![output.receipt],
         }),
-        Ok(Err(message)) => Err(crate::web_egress::WebEgressError::external(
-            message, receipts,
-        )),
-        Err(_) => Err(crate::web_egress::WebEgressError::external(
-            "Browser fetch task failed",
-            receipts,
-        )),
+        Err(failure) => Err(
+            crate::web_egress::WebEgressError::external(failure.message, receipts)
+                .with_browser_receipt(*failure.receipt),
+        ),
     }
 }
 
 #[cfg(feature = "browser")]
 fn fetch_with_browser_sync(
+    browser: &headless_chrome::Browser,
     url: &str,
-    browser_scratch_root: &Path,
-    proxy_url: &str,
     broker: &std::sync::Arc<crate::web_egress::WebEgressBroker>,
+    limits: crate::web_supervisor::BrowserLimits,
+    counters: &std::sync::Arc<crate::web_supervisor::BrowserCounters>,
+    persistence: Option<&crate::web_supervisor::BrowserPersistenceGrant>,
 ) -> Result<FetchResult, String> {
-    let browser = launch_browser_for_scraping(browser_scratch_root, proxy_url)?;
-
     let tab = browser
         .new_tab()
         .map_err(|e| format!("Failed to create browser tab: {e}"))?;
-    configure_browser_request_policy(&tab, broker)?;
+    configure_browser_request_policy(&tab, broker, limits, counters)?;
+
+    if let Some(persistence) = persistence {
+        persistence.restore_cookies(&tab, url, counters)?;
+    }
 
     tab.navigate_to(url)
         .map_err(|e| format!("Failed to navigate to URL: {e}"))?;
@@ -1382,19 +1434,9 @@ fn fetch_with_browser_sync(
     let title = tab.get_title().ok();
 
     // Rendered DOM HTML.
-    let html = tab
-        .get_content()
-        .map_err(|e| format!("Failed to get page content: {e}"))?;
-
-    // Size-cap the rendered HTML (crosslink #745). Same threat model as the
-    // DuckDuckGo path: a hostile site can materialize an arbitrarily large
-    // DOM through headless Chrome, so refuse anything past the configured cap.
-    if html.len() > MAX_WEB_FETCH_BYTES {
-        return Err(format!(
-            "Response too large: {} bytes exceeds cap {}",
-            html.len(),
-            MAX_WEB_FETCH_BYTES
-        ));
+    let html = capture_rendered_dom(&tab, limits, counters)?;
+    if let Some(persistence) = persistence {
+        persistence.save_cookies(&tab, counters)?;
     }
 
     // Render DOM → Markdown locally via `htmd`.
@@ -1459,20 +1501,6 @@ mod tests {
     fn shared_http_client_builder_succeeds() {
         let client = build_shared_http_client().expect("shared HTTP client builder must succeed");
         drop(client);
-    }
-
-    #[cfg(feature = "browser")]
-    #[test]
-    fn browser_profile_dir_is_run_scratch_local_and_created() {
-        let root = tempfile::tempdir().expect("temp run scratch root");
-        let dir = browser_profile_dir_under(root.path()).expect("browser profile dir");
-
-        assert_eq!(dir, root.path().join("browser_profile"));
-        assert!(dir.is_dir(), "browser profile directory must be created");
-        assert!(
-            dir.starts_with(root.path()),
-            "browser profile must stay inside the run scratch root"
-        );
     }
 
     #[test]

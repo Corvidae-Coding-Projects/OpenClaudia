@@ -71,5 +71,6 @@ pub mod tui;
 pub mod vdd;
 pub mod web;
 pub mod web_egress;
+pub mod web_supervisor;
 #[cfg(windows)]
 pub(crate) mod windows_fs;

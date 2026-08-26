@@ -575,6 +575,12 @@ impl ToolRunContext {
         let secrets = secrets.ok_or_else(|| {
             "Run construction requires an explicit secret capability decision".to_string()
         })?;
+        if web_egress_grants.has_browser_persistence() && !secrets {
+            return Err(
+                "Encrypted browser persistence requires the run's explicit secrets capability"
+                    .to_string(),
+            );
+        }
         let read_only_roots = match read_only_roots {
             Some(roots) => roots,
             None if inherit_host_startup_grants => {

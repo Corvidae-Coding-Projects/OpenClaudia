@@ -615,6 +615,42 @@ web_fetch:
 }
 
 #[test]
+fn project_browser_persistence_is_stripped_but_trusted_home_capability_is_bound() {
+    let encoded_key =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [9_u8; 32]);
+    let project = format!(
+        r"
+web_fetch:
+  browser_persistence:
+    profile_id: project
+    exact_origins: [https://project.example]
+    encryption_key: {encoded_key}
+"
+    );
+    let home = format!(
+        r"
+web_fetch:
+  browser_persistence:
+    profile_id: operator
+    exact_origins: [https://example.com]
+    encryption_key: {encoded_key}
+    retention_seconds: 3600
+"
+    );
+    with_isolated_config_sources(Some(&project), Some(&home), || {
+        let config = load_config().expect("trusted browser persistence config");
+        let persistence = config
+            .web_fetch
+            .browser_persistence
+            .as_ref()
+            .expect("trusted capability");
+        assert_eq!(persistence.profile_id, "operator");
+        assert_eq!(persistence.exact_origins, ["https://example.com"]);
+        assert!(config.build_web_egress_grants().is_ok());
+    });
+}
+
+#[test]
 fn dotted_project_private_web_origin_cannot_bypass_source_filtering() {
     with_isolated_config_sources(
         Some(

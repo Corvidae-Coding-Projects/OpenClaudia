@@ -21,6 +21,27 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Trusted-host opt-in for encrypted cookie continuity between ephemeral
+/// browser operations. Repository configuration is stripped before merge.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserPersistenceConfig {
+    /// Stable, non-secret namespace for one explicitly managed login profile.
+    pub profile_id: String,
+    /// Exact HTTP(S) origins whose cookies may be restored and saved.
+    pub exact_origins: Vec<String>,
+    /// Base64-encoded 32-byte AES-256 key. Debug/display/serialization remain
+    /// redacted through [`crate::secrets::SecretString`].
+    pub encryption_key: crate::secrets::SecretString,
+    /// Discard encrypted state older than this many seconds.
+    #[serde(default = "default_browser_cookie_retention_seconds")]
+    pub retention_seconds: u64,
+}
+
+const fn default_browser_cookie_retention_seconds() -> u64 {
+    30 * 24 * 60 * 60
+}
+
 /// Hard cap CC enforces on the markdown blob handed to the distillation model.
 ///
 /// Mirrors `MAX_MARKDOWN_LENGTH` in `applyPromptToMarkdown.ts` — diverging
@@ -57,6 +78,9 @@ pub struct WebFetchConfig {
     /// configuration; repository values are stripped before source merge.
     #[serde(default)]
     pub exact_private_origins: Vec<String>,
+    /// Explicit trusted-host capability for encrypted cookie continuity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_persistence: Option<BrowserPersistenceConfig>,
 }
 
 const fn default_max_distillation_bytes() -> usize {
@@ -72,6 +96,7 @@ impl Default for WebFetchConfig {
             distillation_model: None,
             preapproved_domains: default_preapproved_domains(),
             exact_private_origins: Vec::new(),
+            browser_persistence: None,
         }
     }
 }
@@ -113,6 +138,7 @@ mod tests {
         assert!(cfg.distillation_provider.is_none());
         assert!(cfg.distillation_model.is_none());
         assert!(cfg.exact_private_origins.is_empty());
+        assert!(cfg.browser_persistence.is_none());
     }
 
     #[test]
@@ -146,6 +172,7 @@ mod tests {
             distillation_model: Some("claude-haiku-4".into()),
             preapproved_domains: default_preapproved_domains(),
             exact_private_origins: vec!["http://127.0.0.1:8080".to_string()],
+            browser_persistence: None,
         };
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         let back: WebFetchConfig = serde_yaml::from_str(&yaml).unwrap();
