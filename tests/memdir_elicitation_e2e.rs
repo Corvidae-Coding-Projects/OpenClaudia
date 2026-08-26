@@ -14,8 +14,8 @@
 mod support;
 
 use openclaudia::mcp_elicitation::{
-    action_to_response, ElicitationAction, ElicitationRequest, McpElicitationHandler,
-    NoopElicitationHandler,
+    action_to_response, ElicitationAction, ElicitationMode, ElicitationRequest,
+    McpElicitationHandler, NoopElicitationHandler,
 };
 use openclaudia::memdir::{
     load_entrypoint, EntrypointInspection, EntrypointIssueCode, MAX_ENTRYPOINT_BYTES,
@@ -34,6 +34,19 @@ fn write(dir: &std::path::Path, name: &str, content: &str) {
         std::fs::create_dir_all(parent).expect("mkdir");
     }
     std::fs::write(&path, content).expect("write");
+}
+
+fn form_request(server: &str, message: &str, schema: serde_json::Value) -> ElicitationRequest {
+    ElicitationRequest {
+        server_name: server.to_string(),
+        operation_id: "test-operation".to_string(),
+        request_key: "input".to_string(),
+        round: 0,
+        mode: ElicitationMode::Form,
+        message: message.to_string(),
+        requested_schema: Some(schema),
+        url: None,
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -140,6 +153,7 @@ fn elicitation_action_accept_carries_inner_value() {
 fn elicitation_action_round_trips_through_json() {
     let cases = vec![
         ElicitationAction::Accept(json!({"x": 1})),
+        ElicitationAction::AcceptUrl,
         ElicitationAction::Decline,
         ElicitationAction::Cancel,
     ];
@@ -194,11 +208,11 @@ fn action_to_response_accept_with_empty_object_still_carries_content_key() {
 #[tokio::test]
 async fn noop_handler_always_returns_cancel() {
     let handler = NoopElicitationHandler;
-    let request = ElicitationRequest {
-        message: "What is your favourite colour?".to_string(),
-        requested_schema: json!({"type": "string"}),
-        server_name: "test-server".to_string(),
-    };
+    let request = form_request(
+        "test-server",
+        "What is your favourite colour?",
+        json!({"type": "string"}),
+    );
     let action = handler.handle(request).await.expect("handle");
     assert_eq!(action, ElicitationAction::Cancel);
 }
@@ -211,11 +225,7 @@ async fn noop_handler_cancels_regardless_of_server_name_or_schema() {
         ("server-b", json!({"type": "object"})),
         ("server-c", json!({"type": "array"})),
     ] {
-        let request = ElicitationRequest {
-            message: "Q?".to_string(),
-            requested_schema: schema.clone(),
-            server_name: (*server).to_string(),
-        };
+        let request = form_request(server, "Q?", schema.clone());
         let action = handler.handle(request).await.expect("handle");
         assert_eq!(
             action,
@@ -230,15 +240,17 @@ async fn noop_handler_cancels_regardless_of_server_name_or_schema() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn elicitation_request_captures_all_three_fields() {
-    let request = ElicitationRequest {
-        message: "Test prompt".to_string(),
-        requested_schema: json!({"type": "string"}),
-        server_name: "test-server".to_string(),
-    };
+fn elicitation_request_captures_correlation_and_form_fields() {
+    let request = form_request("test-server", "Test prompt", json!({"type": "string"}));
     assert_eq!(request.message, "Test prompt");
     assert_eq!(request.server_name, "test-server");
-    assert_eq!(request.requested_schema["type"], "string");
+    assert_eq!(request.operation_id, "test-operation");
+    assert_eq!(request.request_key, "input");
+    assert_eq!(request.mode, ElicitationMode::Form);
+    assert_eq!(
+        request.requested_schema.expect("form schema")["type"],
+        "string"
+    );
 }
 
 #[test]

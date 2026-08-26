@@ -114,6 +114,33 @@ fn mcp_server_config_http_transport_with_url_round_trips() {
 }
 
 #[test]
+fn mcp_server_config_oauth_shape_is_opt_in_and_redacts_client_secret() {
+    let json = r#"{
+        "transport": "http",
+        "url": "https://api.example.com/mcp",
+        "oauth": {
+            "clientId": "openclaudia-client",
+            "clientSecret": "oauth-secret-sentinel",
+            "redirectUri": "http://127.0.0.1:7777/callback",
+            "scopes": ["mcp.read"]
+        }
+    }"#;
+    let config: McpServerConfig = serde_json::from_str(json).expect("de");
+    let oauth = config.oauth.as_ref().expect("OAuth config");
+    assert_eq!(oauth.client_id, "openclaudia-client");
+    assert_eq!(oauth.redirect_uri, "http://127.0.0.1:7777/callback");
+    assert_eq!(oauth.scopes, ["mcp.read"]);
+    assert!(oauth
+        .client_secret
+        .as_ref()
+        .is_some_and(|secret| secret.matches("oauth-secret-sentinel")));
+    assert!(!format!("{config:?}").contains("oauth-secret-sentinel"));
+    assert!(!serde_json::to_string(&config)
+        .expect("ser")
+        .contains("oauth-secret-sentinel"));
+}
+
+#[test]
 fn mcp_server_config_type_alias_http_protects_headers_on_parse() {
     let json = r#"{
         "type": "http",
@@ -167,6 +194,7 @@ fn mcp_server_config_omits_empty_args_and_env_on_serialize() {
         url: None,
         headers: SensitiveHeaders::new(),
         headers_helper: None,
+        oauth: None,
         timeout: None,
         always_load: None,
     };
@@ -378,6 +406,7 @@ fn mcp_server_config_clone_preserves_all_fields() {
         )]))
         .expect("valid test headers"),
         headers_helper: Some("/bin/headers".to_string()),
+        oauth: None,
         timeout: Some(5000),
         always_load: Some(true),
     };

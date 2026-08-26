@@ -330,6 +330,10 @@ pub struct McpServerConfig {
         rename = "headersHelper"
     )]
     pub headers_helper: Option<String>,
+    /// Standards-based OAuth settings for an HTTP MCP server. Existing static
+    /// headers remain supported; OAuth is opt-in per server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<crate::mcp_oauth::McpOAuthClientConfig>,
     /// Per-server tool execution timeout in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,

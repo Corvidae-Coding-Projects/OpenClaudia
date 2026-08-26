@@ -28,6 +28,7 @@ fn make_spec(transport: &str) -> McpServerSpec {
         url: None,
         headers: SensitiveHeaders::new(),
         headers_helper: None,
+        oauth: None,
         timeout: None,
         always_load: None,
     }

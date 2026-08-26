@@ -395,6 +395,8 @@ pub struct PluginMcpServer {
     pub headers: crate::secrets::SensitiveHeaders,
     /// Dynamic header helper command
     pub headers_helper: Option<String>,
+    /// Optional standards-based OAuth owner configuration.
+    pub oauth: Option<crate::mcp_oauth::McpOAuthClientConfig>,
     /// Per-server tool execution timeout in milliseconds
     pub timeout: Option<u64>,
     /// Whether Claude Code should eagerly load this server's tools
@@ -526,6 +528,35 @@ where
     Ok(expanded)
 }
 
+fn expand_mcp_oauth_config_with<F>(
+    config: Option<&crate::mcp_oauth::McpOAuthClientConfig>,
+    lookup: &F,
+) -> Result<Option<crate::mcp_oauth::McpOAuthClientConfig>, String>
+where
+    F: Fn(&str) -> Result<Option<crate::secrets::SecretString>, String>,
+{
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let client_secret = config
+        .client_secret
+        .as_ref()
+        .map(|secret| {
+            secret
+                .expose(|raw| expand_mcp_config_value_with("oauth.clientSecret", raw, lookup, true))
+        })
+        .transpose()?
+        .map(crate::secrets::SecretString::try_from_string)
+        .transpose()
+        .map_err(|error| format!("oauth.clientSecret: {error}"))?;
+    Ok(Some(crate::mcp_oauth::McpOAuthClientConfig {
+        client_id: config.client_id.clone(),
+        client_secret,
+        redirect_uri: config.redirect_uri.clone(),
+        scopes: config.scopes.clone(),
+    }))
+}
+
 fn resolved_mcp_server_from_config_with<F>(
     name: &str,
     config: &McpServerConfig,
@@ -558,6 +589,7 @@ where
         env: expand_mcp_environment_map_with(&config.env, lookup)?,
         headers: expand_mcp_header_map_with(&config.headers, lookup)?,
         headers_helper: config.headers_helper.clone(),
+        oauth: expand_mcp_oauth_config_with(config.oauth.as_ref(), lookup)?,
         timeout: config.timeout,
         always_load: config.always_load,
     })
@@ -719,6 +751,7 @@ impl Plugin {
                         url: server["url"].as_str().map(String::from),
                         headers: crate::secrets::SensitiveHeaders::new(),
                         headers_helper: None,
+                        oauth: None,
                         timeout: None,
                         always_load: None,
                     },
@@ -2052,6 +2085,7 @@ mod tests {
             )),
             headers,
             headers_helper: Some(format!("printf '%s' '{}'", mcp_env_ref("TOKEN"))),
+            oauth: None,
             timeout: Some(250),
             always_load: Some(true),
         };
@@ -2072,6 +2106,39 @@ mod tests {
     }
 
     #[test]
+    fn resolved_mcp_server_expands_oauth_client_secret_without_exposing_it() {
+        let lookup = |name: &str| -> Result<Option<crate::secrets::SecretString>, String> {
+            Ok((name == "TOKEN").then(|| protected("oauth-secret-sentinel")))
+        };
+        let config = McpServerConfig {
+            command: None,
+            args: Vec::new(),
+            env: crate::secrets::EnvironmentGrants::new(),
+            transport: "http".to_string(),
+            url: Some("https://mcp.example.test".to_string()),
+            headers: crate::secrets::SensitiveHeaders::new(),
+            headers_helper: None,
+            oauth: Some(crate::mcp_oauth::McpOAuthClientConfig {
+                client_id: "public-client".to_string(),
+                client_secret: Some(protected(&mcp_env_ref("TOKEN"))),
+                redirect_uri: "http://127.0.0.1:7777/callback".to_string(),
+                scopes: vec!["mcp.read".to_string()],
+            }),
+            timeout: None,
+            always_load: None,
+        };
+        let resolved = resolved_mcp_server_from_config_with("remote", &config, &lookup)
+            .expect("resolved OAuth config");
+        let oauth = resolved.oauth.expect("OAuth config");
+        assert!(oauth
+            .client_secret
+            .as_ref()
+            .is_some_and(|secret| secret.matches("oauth-secret-sentinel")));
+        let rendered = format!("{oauth:?}");
+        assert!(!rendered.contains("oauth-secret-sentinel"), "{rendered}");
+    }
+
+    #[test]
     fn resolved_mcp_server_rejects_protected_values_in_process_arguments() {
         let lookup = |name: &str| -> Result<Option<crate::secrets::SecretString>, String> {
             Ok((name == "TOKEN").then(|| protected("secret")))
@@ -2084,6 +2151,7 @@ mod tests {
             url: None,
             headers: crate::secrets::SensitiveHeaders::new(),
             headers_helper: None,
+            oauth: None,
             timeout: None,
             always_load: None,
         };

@@ -47,6 +47,7 @@ fn default_cfg() -> McpServerConfig {
         url: None,
         headers: SensitiveHeaders::new(),
         headers_helper: None,
+        oauth: None,
         timeout: None,
         always_load: None,
     }
@@ -95,6 +96,12 @@ fn from_plugin_config_propagates_headers_and_mcp_metadata() {
     let cfg = McpServerConfig {
         headers: secret_headers([("Authorization", "Bearer token")]),
         headers_helper: Some("/bin/get-headers".to_string()),
+        oauth: Some(openclaudia::mcp_oauth::McpOAuthClientConfig {
+            client_id: "registry-client".to_string(),
+            client_secret: None,
+            redirect_uri: "http://127.0.0.1:7777/callback".to_string(),
+            scopes: vec!["mcp.read".to_string()],
+        }),
         timeout: Some(600_000),
         always_load: Some(true),
         ..default_cfg()
@@ -102,6 +109,10 @@ fn from_plugin_config_propagates_headers_and_mcp_metadata() {
     let spec = McpServerSpec::from_plugin_config(&cfg);
     assert!(spec.headers.matches_value("Authorization", "Bearer token"));
     assert_eq!(spec.headers_helper.as_deref(), Some("/bin/get-headers"));
+    assert_eq!(
+        spec.oauth.as_ref().map(|oauth| oauth.client_id.as_str()),
+        Some("registry-client")
+    );
     assert_eq!(spec.timeout, Some(600_000));
     assert_eq!(spec.always_load, Some(true));
 }
@@ -190,6 +201,7 @@ fn spec_clone_preserves_all_fields() {
         url: None,
         headers: SensitiveHeaders::new(),
         headers_helper: None,
+        oauth: None,
         timeout: None,
         always_load: None,
     };
@@ -209,6 +221,7 @@ fn spec_partial_eq_distinguishes_different_commands() {
         url: None,
         headers: SensitiveHeaders::new(),
         headers_helper: None,
+        oauth: None,
         timeout: None,
         always_load: None,
     };
@@ -229,6 +242,7 @@ fn spec_partial_eq_distinguishes_different_args() {
         url: None,
         headers: SensitiveHeaders::new(),
         headers_helper: None,
+        oauth: None,
         timeout: None,
         always_load: None,
     };
@@ -249,6 +263,7 @@ fn spec_partial_eq_distinguishes_different_transports() {
         url: None,
         headers: SensitiveHeaders::new(),
         headers_helper: None,
+        oauth: None,
         timeout: None,
         always_load: None,
     };
@@ -269,6 +284,7 @@ fn spec_debug_format_includes_field_names() {
         url: None,
         headers: SensitiveHeaders::new(),
         headers_helper: None,
+        oauth: None,
         timeout: None,
         always_load: None,
     };
@@ -291,6 +307,7 @@ fn from_plugin_config_called_twice_yields_equal_specs() {
         url: None,
         headers: SensitiveHeaders::new(),
         headers_helper: None,
+        oauth: None,
         timeout: None,
         always_load: None,
     };
@@ -313,6 +330,7 @@ fn from_plugin_config_with_full_config_propagates_every_field() {
         url: None,
         headers: secret_headers([("X-Api-Key", "secret")]),
         headers_helper: Some("/bin/helper".to_string()),
+        oauth: None,
         timeout: Some(1234),
         always_load: Some(false),
     };

@@ -844,6 +844,7 @@ fn mcp_error_result(
         | crate::mcp::McpError::Protocol(_)
         | crate::mcp::McpError::Rpc { .. }
         | crate::mcp::McpError::HttpStatus { .. }
+        | crate::mcp::McpError::OAuth(_)
         | crate::mcp::McpError::ResponseTooLarge { .. }
         | crate::mcp::McpError::ResponseIdMismatch { .. }
         | crate::mcp::McpError::Io(_) => (ToolFailureCode::External, ToolRetryability::Unknown),
@@ -859,6 +860,7 @@ fn mcp_error_result(
         | crate::mcp::McpError::StaleRunGeneration { .. }
         | crate::mcp::McpError::UnsupportedProtocolVersion { .. }
         | crate::mcp::McpError::UnsupportedCapability(_)
+        | crate::mcp::McpError::AuthorizationRequired(_)
         | crate::mcp::McpError::InvalidToolSchema { .. } => {
             (ToolFailureCode::Unavailable, ToolRetryability::Safe)
         }

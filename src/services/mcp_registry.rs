@@ -42,6 +42,8 @@ pub struct McpServerSpec {
     pub headers: SensitiveHeaders,
     /// Dynamic header helper command.
     pub headers_helper: Option<String>,
+    /// Standards-based OAuth settings for remote MCP transports.
+    pub oauth: Option<crate::mcp_oauth::McpOAuthClientConfig>,
     /// Per-server tool timeout in milliseconds.
     pub timeout: Option<u64>,
     /// Tool-search hint for eager loading.
@@ -62,6 +64,7 @@ impl McpServerSpec {
             url: cfg.url.clone(),
             headers: cfg.headers.clone(),
             headers_helper: cfg.headers_helper.clone(),
+            oauth: cfg.oauth.clone(),
             timeout: cfg.timeout,
             always_load: cfg.always_load,
         }
@@ -146,6 +149,7 @@ mod tests {
                 url: None,
                 headers: SensitiveHeaders::new(),
                 headers_helper: None,
+                oauth: None,
                 timeout: None,
                 always_load: None,
             },
@@ -200,6 +204,7 @@ mod tests {
             url: None,
             headers: SensitiveHeaders::new(),
             headers_helper: None,
+            oauth: None,
             timeout: None,
             always_load: None,
         };

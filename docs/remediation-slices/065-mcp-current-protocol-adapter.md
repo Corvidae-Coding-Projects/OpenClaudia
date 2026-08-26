@@ -1,6 +1,6 @@
 # S-065: Implement the current MCP protocol adapter
 
-Status: Planned
+Status: Complete
 Effort: Medium
 Primary findings: F-091
 Workstreams: W6

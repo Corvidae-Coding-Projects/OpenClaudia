@@ -117,6 +117,12 @@ pub enum McpError {
     #[error("MCP HTTP endpoint returned status {status} without a recognized protocol error")]
     HttpStatus { status: u16 },
 
+    #[error(transparent)]
+    AuthorizationRequired(#[from] crate::mcp_oauth::McpAuthorizationRequired),
+
+    #[error("MCP OAuth failed: {0}")]
+    OAuth(crate::secrets::SafeDiagnostic),
+
     #[error("MCP request exceeded the {limit}-byte transport limit")]
     RequestTooLarge { limit: usize },
 
@@ -425,6 +431,12 @@ pub trait McpTransport: Send + Sync {
     /// Wire binding used by the dual-era negotiation rules.
     fn binding(&self) -> McpTransportBinding {
         McpTransportBinding::InProcess
+    }
+
+    /// Sanitize untrusted transport/handler diagnostics against the exact
+    /// credential set owned by this connection.
+    fn sanitize_diagnostic(&self, text: &str) -> crate::secrets::SafeDiagnostic {
+        crate::secrets::SafeDiagnostic::from_untrusted(text)
     }
 
     /// Send a request and receive a response
@@ -1235,6 +1247,10 @@ impl McpTransport for StdioTransport {
         })
     }
 
+    fn sanitize_diagnostic(&self, text: &str) -> crate::secrets::SafeDiagnostic {
+        self.run_context.sanitize_diagnostic(text)
+    }
+
     async fn request(&self, method: &str, params: Option<Value>) -> Result<Value, McpError> {
         let id = self.request_id.fetch_add(1, Ordering::SeqCst);
 
@@ -1335,6 +1351,7 @@ impl McpTransport for StdioTransport {
 pub struct HttpTransport {
     base_url: String,
     headers: crate::secrets::SensitiveHeaders,
+    oauth: Option<Arc<crate::mcp_oauth::McpOAuthManager>>,
     request_id: AtomicU64,
     /// MCP Streamable HTTP session id (crosslink #631).
     ///
@@ -1420,6 +1437,7 @@ impl HttpTransport {
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             headers,
+            oauth: None,
             request_id: AtomicU64::new(1),
             session_id: std::sync::RwLock::new(None),
         })
@@ -1463,9 +1481,20 @@ impl HttpTransport {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             headers,
+            oauth: None,
             request_id: AtomicU64::new(1),
             session_id: std::sync::RwLock::new(None),
         }
+    }
+
+    fn new_with_sensitive_headers_and_oauth(
+        base_url: &str,
+        headers: crate::secrets::SensitiveHeaders,
+        oauth: Arc<crate::mcp_oauth::McpOAuthManager>,
+    ) -> Result<Self, McpError> {
+        let mut transport = Self::new_with_sensitive_headers(base_url, headers)?;
+        transport.oauth = Some(oauth);
+        Ok(transport)
     }
 
     /// MCP Streamable HTTP session id, once captured (crosslink #631).
@@ -1522,6 +1551,62 @@ fn response_content_type_is_event_stream(headers: &HeaderMap) -> bool {
         .iter()
         .filter_map(|value| value.to_str().ok())
         .any(content_type_value_is_event_stream)
+}
+
+#[derive(Debug, Default)]
+struct McpHttpAuthChallenge {
+    error: Option<String>,
+    scopes: Vec<String>,
+    resource_metadata: Option<String>,
+    invalid_token: bool,
+    insufficient_scope: bool,
+}
+
+fn parse_mcp_auth_challenge(headers: &HeaderMap) -> McpHttpAuthChallenge {
+    let mut challenge = McpHttpAuthChallenge::default();
+    for value in headers
+        .get_all(reqwest::header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+    {
+        let Some((scheme, parameters)) = value.split_once(' ') else {
+            continue;
+        };
+        if !scheme.eq_ignore_ascii_case("Bearer") {
+            continue;
+        }
+        for parameter in parameters.split(',') {
+            let Some((name, value)) = parameter.trim().split_once('=') else {
+                continue;
+            };
+            let value = value.trim().trim_matches('"');
+            match name.trim().to_ascii_lowercase().as_str() {
+                "error" => {
+                    challenge.invalid_token = value == "invalid_token";
+                    challenge.insufficient_scope = value == "insufficient_scope";
+                    challenge.error = Some(value.to_string());
+                }
+                "scope" => {
+                    challenge.scopes = value
+                        .split_ascii_whitespace()
+                        .filter(|scope| !scope.is_empty() && scope.len() <= 256)
+                        .map(str::to_string)
+                        .collect();
+                }
+                "resource_metadata" => challenge.resource_metadata = Some(value.to_string()),
+                _ => {}
+            }
+        }
+    }
+    challenge.scopes.sort();
+    challenge.scopes.dedup();
+    challenge
+}
+
+fn mcp_oauth_error(error: crate::mcp_oauth::McpOAuthRuntimeError) -> McpError {
+    let rendered = error.to_string();
+    drop(error);
+    McpError::OAuth(crate::secrets::SafeDiagnostic::from_untrusted(&rendered))
 }
 
 fn content_type_value_is_event_stream(value: &str) -> bool {
@@ -1722,10 +1807,19 @@ fn should_fall_back_to_legacy(binding: McpTransportBinding, error: &McpError) ->
     }
 }
 
+#[allow(clippy::too_many_lines)] // One bounded HTTP exchange owns auth retry and response framing.
 #[async_trait]
 impl McpTransport for HttpTransport {
     fn binding(&self) -> McpTransportBinding {
         McpTransportBinding::StreamableHttp
+    }
+
+    fn sanitize_diagnostic(&self, text: &str) -> crate::secrets::SafeDiagnostic {
+        let headers = self.headers.sanitize_diagnostic(text);
+        self.oauth.as_ref().map_or_else(
+            || headers.clone(),
+            |oauth| oauth.sanitize_diagnostic(headers.as_str()),
+        )
     }
 
     async fn request(&self, method: &str, params: Option<Value>) -> Result<Value, McpError> {
@@ -1772,41 +1866,89 @@ impl McpTransport for HttpTransport {
         //   (servers MAY respond with either; both branches are parsed below).
         // * Echo any captured `Mcp-Session-Id` so the server can route
         //   subsequent requests to the same logical session.
-        let mut builder = self
-            .headers
-            .apply(Self::client()?.post(&self.base_url))
-            .map_err(|error| McpError::Transport(format!("Invalid MCP HTTP header: {error}")))?
-            .timeout(HTTP_REQUEST_TIMEOUT)
-            .header("Accept", "application/json, text/event-stream")
-            .header("Content-Type", "application/json")
-            .body(request_body);
-        if context.version.era() == McpProtocolEra::Modern {
-            builder = builder
-                .header("MCP-Protocol-Version", context.version.as_str())
-                .header("Mcp-Method", method);
-            if let Some(name) = context.routing_name.as_deref() {
-                builder = builder.header("Mcp-Name", encode_mcp_header_value(name));
-            }
-            for (name, value) in &context.parameter_headers {
-                builder = builder.header(name, encode_mcp_header_value(value));
-            }
-        } else if let Some(sid) = self.session_id() {
-            builder = builder.header("Mcp-Session-Id", sid);
-        }
-        let response = builder.send().await.map_err(|e| {
-            if e.is_timeout() {
-                // Per-request HTTP cap (`HTTP_REQUEST_TIMEOUT`)
-                // fired. Phase reflects that this is a steady-state
-                // request, not the connection-establishment
-                // handshake (fix #628 — the latter is bounded by
-                // `McpServer::new_with_config`).
-                McpError::Timeout {
-                    phase: "http-request",
-                }
+        let mut retried_invalid_token = false;
+        let response = loop {
+            let bearer = if let Some(oauth) = self.oauth.as_ref() {
+                oauth
+                    .optional_access_token()
+                    .await
+                    .map_err(mcp_oauth_error)?
             } else {
-                McpError::Transport(format!("HTTP request failed: {e}"))
+                None
+            };
+            let mut builder = self
+                .headers
+                .apply(Self::client()?.post(&self.base_url))
+                .map_err(|error| McpError::Transport(format!("Invalid MCP HTTP header: {error}")))?
+                .timeout(HTTP_REQUEST_TIMEOUT)
+                .header("Accept", "application/json, text/event-stream")
+                .header("Content-Type", "application/json")
+                .body(request_body.clone());
+            if let Some(token) = bearer.as_ref() {
+                builder = token.expose(|value| builder.bearer_auth(value));
             }
-        })?;
+            if context.version.era() == McpProtocolEra::Modern {
+                builder = builder
+                    .header("MCP-Protocol-Version", context.version.as_str())
+                    .header("Mcp-Method", method);
+                if let Some(name) = context.routing_name.as_deref() {
+                    builder = builder.header("Mcp-Name", encode_mcp_header_value(name));
+                }
+                for (name, value) in &context.parameter_headers {
+                    builder = builder.header(name, encode_mcp_header_value(value));
+                }
+            } else if let Some(sid) = self.session_id() {
+                builder = builder.header("Mcp-Session-Id", sid);
+            }
+            let response = builder.send().await.map_err(|e| {
+                if e.is_timeout() {
+                    McpError::Timeout {
+                        phase: "http-request",
+                    }
+                } else {
+                    McpError::Transport(format!("HTTP request failed: {e}"))
+                }
+            })?;
+            let challenge = parse_mcp_auth_challenge(response.headers());
+            if let (Some(oauth), Some(resource_metadata)) =
+                (self.oauth.as_ref(), challenge.resource_metadata.as_deref())
+            {
+                oauth
+                    .note_resource_metadata(resource_metadata)
+                    .await
+                    .map_err(mcp_oauth_error)?;
+            }
+            if response.status().as_u16() == 401 {
+                if let Some(oauth) = self.oauth.as_ref() {
+                    if let Some(rejected) = bearer.as_ref() {
+                        if challenge.invalid_token
+                            && !retried_invalid_token
+                            && oauth.refresh_after_rejection(rejected).await.is_ok()
+                        {
+                            retried_invalid_token = true;
+                            continue;
+                        }
+                    }
+                    return Err(McpError::AuthorizationRequired(
+                        oauth.required(
+                            challenge
+                                .error
+                                .unwrap_or_else(|| "resource server returned HTTP 401".to_string()),
+                            challenge.scopes,
+                        ),
+                    ));
+                }
+            }
+            if response.status().as_u16() == 403 && challenge.insufficient_scope {
+                if let Some(oauth) = self.oauth.as_ref() {
+                    return Err(McpError::AuthorizationRequired(oauth.required(
+                        "resource server requires additional scope",
+                        challenge.scopes,
+                    )));
+                }
+            }
+            break response;
+        };
 
         let status = response.status();
 
@@ -1832,7 +1974,7 @@ impl McpTransport for HttpTransport {
         }
 
         let response = match parse_http_json_rpc_response(response, &|text| {
-            self.headers.sanitize_diagnostic(text).to_string()
+            self.sanitize_diagnostic(text).to_string()
         })
         .await
         {
@@ -1862,7 +2004,7 @@ impl McpTransport for HttpTransport {
 
         if let Some(error) = response.error {
             return Err(typed_rpc_error(error, Some(status.as_u16()), &|text| {
-                self.headers.sanitize_diagnostic(text).to_string()
+                self.sanitize_diagnostic(text).to_string()
             }));
         }
         if !status.is_success() {
@@ -1894,6 +2036,15 @@ impl McpTransport for HttpTransport {
             .header("Accept", "application/json, text/event-stream")
             .header("Content-Type", "application/json")
             .body(request_body);
+        if let Some(oauth) = self.oauth.as_ref() {
+            if let Some(token) = oauth
+                .optional_access_token()
+                .await
+                .map_err(mcp_oauth_error)?
+            {
+                builder = token.expose(|value| builder.bearer_auth(value));
+            }
+        }
         if let Some(session_id) = self.session_id() {
             builder = builder.header("Mcp-Session-Id", session_id);
         }
@@ -2004,6 +2155,7 @@ impl Default for McpServerConfig {
 pub struct McpServer {
     name: String,
     transport: Box<dyn McpTransport>,
+    elicitation: crate::mcp_elicitation::McpElicitationRouter,
     adapter: McpProtocolAdapter,
     info: Option<McpServerInfo>,
     capabilities: McpCapabilities,
@@ -2023,7 +2175,22 @@ impl McpServer {
     /// Returns other [`McpError`] variants on transport/protocol
     /// failures.
     pub async fn new(name: &str, transport: Box<dyn McpTransport>) -> Result<Self, McpError> {
-        Self::new_with_config(name, transport, McpServerConfig::new()).await
+        Self::new_with_config_and_elicitation(
+            name,
+            transport,
+            McpServerConfig::new(),
+            crate::mcp_elicitation::McpElicitationRouter::default(),
+        )
+        .await
+    }
+
+    async fn new_with_elicitation(
+        name: &str,
+        transport: Box<dyn McpTransport>,
+        elicitation: crate::mcp_elicitation::McpElicitationRouter,
+    ) -> Result<Self, McpError> {
+        Self::new_with_config_and_elicitation(name, transport, McpServerConfig::new(), elicitation)
+            .await
     }
 
     /// Create a new MCP server with explicit runtime configuration.
@@ -2047,9 +2214,25 @@ impl McpServer {
         transport: Box<dyn McpTransport>,
         config: McpServerConfig,
     ) -> Result<Self, McpError> {
+        Self::new_with_config_and_elicitation(
+            name,
+            transport,
+            config,
+            crate::mcp_elicitation::McpElicitationRouter::default(),
+        )
+        .await
+    }
+
+    async fn new_with_config_and_elicitation(
+        name: &str,
+        transport: Box<dyn McpTransport>,
+        config: McpServerConfig,
+        elicitation: crate::mcp_elicitation::McpElicitationRouter,
+    ) -> Result<Self, McpError> {
         let mut server = Self {
             name: name.to_string(),
             transport,
+            elicitation,
             adapter: McpProtocolAdapter::current(),
             info: None,
             capabilities: McpCapabilities::default(),
@@ -2112,6 +2295,23 @@ impl McpServer {
         Ok(server)
     }
 
+    fn current_client_capabilities(&self) -> Value {
+        // Preserve transport-specific capabilities that are actually wired
+        // (notably stdio roots), while publishing the current elicitation
+        // shape fulfilled by the bounded MRTR driver.
+        let mut capabilities = self
+            .transport
+            .client_capabilities()
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        capabilities.insert(
+            "elicitation".to_string(),
+            self.elicitation.client_capability(),
+        );
+        Value::Object(capabilities)
+    }
+
     /// Negotiate the server era, using modern discovery first and an explicit
     /// initialization-based adapter only when the binding's fallback rules
     /// identify a legacy server.
@@ -2132,7 +2332,7 @@ impl McpServer {
     async fn discover_current(&mut self) -> Result<(), McpError> {
         let adapter = McpProtocolAdapter::current();
         let params = adapter
-            .request_params(None, self.transport.client_capabilities())
+            .request_params(None, self.current_client_capabilities())
             .map_err(McpError::Protocol)?;
         let result = self
             .transport
@@ -2359,7 +2559,14 @@ impl McpServer {
     ) -> Result<Value, McpError> {
         let params = self
             .adapter
-            .request_params(params, self.transport.client_capabilities())
+            .request_params(
+                params,
+                if self.adapter.era() == McpProtocolEra::Modern {
+                    self.current_client_capabilities()
+                } else {
+                    self.transport.client_capabilities()
+                },
+            )
             .map_err(McpError::Protocol)?;
         let mut params = params;
         if self.adapter.era() == McpProtocolEra::Modern {
@@ -2375,6 +2582,76 @@ impl McpServer {
         self.transport
             .request_with_context(context, method, Some(params))
             .await
+    }
+
+    async fn request_with_input_rounds(
+        &self,
+        method: &'static str,
+        params: Value,
+        routing_name: Option<String>,
+        parameter_headers: Vec<(String, String)>,
+    ) -> Result<Value, McpError> {
+        let original = params
+            .as_object()
+            .cloned()
+            .ok_or_else(|| McpError::Protocol(format!("MCP {method} params must be an object")))?;
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        let mut attempt = Value::Object(original.clone());
+        for round in 0..=crate::mcp_elicitation::MAX_ELICITATION_ROUNDS {
+            let result = self
+                .request(
+                    method,
+                    Some(attempt),
+                    routing_name.clone(),
+                    parameter_headers.clone(),
+                )
+                .await?;
+            if self.adapter.era() == McpProtocolEra::Legacy {
+                return Ok(result);
+            }
+            match result.get("resultType").and_then(Value::as_str) {
+                Some("complete") => return Ok(result),
+                Some("input_required") => {
+                    let resolved = self
+                        .elicitation
+                        .resolve_round(&self.name, &operation_id, round, &result, |text| {
+                            self.transport.sanitize_diagnostic(text)
+                        })
+                        .await
+                        .map_err(|error| McpError::Protocol(error.to_string()))?;
+                    let mut retry = original.clone();
+                    if resolved
+                        .input_responses
+                        .as_object()
+                        .is_some_and(|responses| !responses.is_empty())
+                    {
+                        retry.insert("inputResponses".to_string(), resolved.input_responses);
+                    }
+                    if let Some(state) = resolved.request_state {
+                        retry.insert("requestState".to_string(), Value::String(state));
+                    }
+                    attempt = Value::Object(retry);
+                }
+                Some("task") => {
+                    return Err(McpError::UnsupportedCapability(format!(
+                        "MCP {method} returned a task without negotiated task support"
+                    )));
+                }
+                Some(other) => {
+                    return Err(McpError::Protocol(format!(
+                        "MCP {method} returned unsupported resultType '{other}'"
+                    )));
+                }
+                None => {
+                    return Err(McpError::Protocol(format!(
+                        "MCP {method} response is missing resultType"
+                    )));
+                }
+            }
+        }
+        Err(McpError::Protocol(
+            crate::mcp_elicitation::ElicitationError::TooManyRounds.to_string(),
+        ))
     }
 
     async fn list_paginated<T: serde::de::DeserializeOwned>(
@@ -2567,16 +2844,13 @@ impl McpServer {
             Vec::new()
         };
         let result = self
-            .request(
+            .request_with_input_rounds(
                 "tools/call",
-                Some(params),
+                params,
                 Some(name.to_string()),
                 parameter_headers,
             )
             .await?;
-        self.adapter
-            .require_complete_result("tools/call", &result)
-            .map_err(McpError::UnsupportedCapability)?;
         if self.adapter.era() == McpProtocolEra::Modern
             && !result.get("content").is_some_and(Value::is_array)
         {
@@ -2706,16 +2980,8 @@ impl McpServer {
         debug!(server = %self.name, uri = %uri, "Reading MCP resource");
 
         let result = self
-            .request(
-                "resources/read",
-                Some(params),
-                Some(uri.to_string()),
-                Vec::new(),
-            )
+            .request_with_input_rounds("resources/read", params, Some(uri.to_string()), Vec::new())
             .await?;
-        self.adapter
-            .require_complete_result("resources/read", &result)
-            .map_err(McpError::UnsupportedCapability)?;
         self.adapter
             .require_cache_metadata("resources/read", &result)
             .map_err(McpError::Protocol)?;
@@ -2778,16 +3044,13 @@ impl McpServer {
             )));
         }
         let result = self
-            .request(
+            .request_with_input_rounds(
                 "prompts/get",
-                Some(json!({"name": name, "arguments": arguments})),
+                json!({"name": name, "arguments": arguments}),
                 Some(name.to_string()),
                 Vec::new(),
             )
             .await?;
-        self.adapter
-            .require_complete_result("prompts/get", &result)
-            .map_err(McpError::UnsupportedCapability)?;
         serde_json::from_value(result).map_err(|error| {
             McpError::Protocol(format!(
                 "MCP server '{}' prompts/get result for '{name}' is invalid: {error}",
@@ -3053,6 +3316,21 @@ impl McpTransportKind {
 
 /// Connection blueprint used by [`McpManager`] to rebuild a transport
 /// after a disconnect (fix #629).
+#[derive(Clone)]
+struct InProcessConnectionSpec {
+    server_name: String,
+    server: Arc<dyn crate::mcp_inprocess::McpServerCallable>,
+}
+
+impl std::fmt::Debug for InProcessConnectionSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InProcessConnectionSpec")
+            .field("server_name", &self.server_name)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone)]
 enum ConnectionSpec {
     Stdio {
@@ -3065,7 +3343,9 @@ enum ConnectionSpec {
         headers: crate::secrets::SensitiveHeaders,
         headers_helper: Option<String>,
         server_name: String,
+        oauth: Option<Arc<crate::mcp_oauth::McpOAuthManager>>,
     },
+    InProcess(InProcessConnectionSpec),
 }
 
 impl ConnectionSpec {
@@ -3073,6 +3353,7 @@ impl ConnectionSpec {
         match self {
             Self::Stdio { .. } => McpTransportBinding::Stdio,
             Self::Http { .. } => McpTransportBinding::StreamableHttp,
+            Self::InProcess(_) => McpTransportBinding::InProcess,
         }
     }
 
@@ -3080,6 +3361,7 @@ impl ConnectionSpec {
         match self {
             Self::Stdio { .. } => crate::tools::ToolResource::Process,
             Self::Http { .. } => crate::tools::ToolResource::Network,
+            Self::InProcess(_) => crate::tools::ToolResource::Mcp,
         }
     }
 
@@ -3100,6 +3382,7 @@ impl ConnectionSpec {
                 headers,
                 headers_helper,
                 server_name,
+                oauth,
             } => {
                 let headers = resolve_http_headers(
                     run,
@@ -3108,10 +3391,27 @@ impl ConnectionSpec {
                     headers,
                     headers_helper.as_deref(),
                 )?;
-                Ok(Box::new(HttpTransport::new_with_sensitive_headers(
-                    url, headers,
-                )?))
+                if let Some(oauth) = oauth {
+                    Ok(Box::new(
+                        HttpTransport::new_with_sensitive_headers_and_oauth(
+                            url,
+                            headers,
+                            Arc::clone(oauth),
+                        )?,
+                    ))
+                } else {
+                    Ok(Box::new(HttpTransport::new_with_sensitive_headers(
+                        url, headers,
+                    )?))
+                }
             }
+            Self::InProcess(spec) => Ok(Box::new(
+                crate::mcp_inprocess::InProcessTransport::new_bound(
+                    &spec.server_name,
+                    run,
+                    Arc::clone(&spec.server),
+                ),
+            )),
         }
     }
 }
@@ -3337,6 +3637,7 @@ fn mcp_definition_digest(definition: &Value) -> Result<crate::runtime::ContentDi
 struct ServerEntry {
     spec: ConnectionSpec,
     trust: McpServerTrust,
+    elicitation: crate::mcp_elicitation::McpElicitationRouter,
     server: Option<McpServer>,
     tool_timeout: Option<Duration>,
     failed_attempts: u32,
@@ -3359,9 +3660,11 @@ impl ServerEntry {
     ) -> Self {
         let cached_tools = server.tools().to_vec();
         let supports_list_changed = server.supports_tool_list_changed();
+        let elicitation = server.elicitation.clone();
         Self {
             spec,
             trust,
+            elicitation,
             server: Some(server),
             tool_timeout,
             failed_attempts: 0,
@@ -3943,9 +4246,18 @@ async fn run_mcp_connection_actor(
 pub struct McpManager {
     run_context: Arc<crate::tools::ToolRunContext>,
     permissions: crate::config::PermissionsConfig,
+    elicitation: crate::mcp_elicitation::McpElicitationRouter,
     catalog_epoch: Arc<AtomicU64>,
     catalog_guard: Arc<std::sync::RwLock<()>>,
     servers: Mutex<HashMap<String, Arc<McpConnectionActor>>>,
+    oauth_connections: Mutex<HashMap<String, OAuthConnectionRegistration>>,
+}
+
+#[derive(Debug, Clone)]
+struct OAuthConnectionRegistration {
+    spec: ConnectionSpec,
+    trust: McpServerTrust,
+    tool_timeout: Option<Duration>,
 }
 
 /// Exact run-keyed index used by synchronous registry handlers to find the
@@ -4015,12 +4327,28 @@ impl McpManager {
         run_context: Arc<crate::tools::ToolRunContext>,
         permissions: crate::config::PermissionsConfig,
     ) -> Self {
+        Self::new_with_permissions_and_elicitation(
+            run_context,
+            permissions,
+            Arc::new(crate::mcp_elicitation::NoopElicitationHandler),
+        )
+    }
+
+    /// Create a manager with an attributed interactive MCP input owner.
+    #[must_use]
+    pub fn new_with_permissions_and_elicitation(
+        run_context: Arc<crate::tools::ToolRunContext>,
+        permissions: crate::config::PermissionsConfig,
+        elicitation: Arc<dyn crate::mcp_elicitation::McpElicitationHandler>,
+    ) -> Self {
         Self {
             run_context,
             permissions,
+            elicitation: crate::mcp_elicitation::McpElicitationRouter::new(elicitation),
             catalog_epoch: Arc::new(AtomicU64::new(1)),
             catalog_guard: Arc::new(std::sync::RwLock::new(())),
             servers: Mutex::new(HashMap::new()),
+            oauth_connections: Mutex::new(HashMap::new()),
         }
     }
 
@@ -4081,6 +4409,37 @@ impl McpManager {
     #[must_use]
     pub fn run_context(&self) -> &crate::tools::ToolRunContext {
         &self.run_context
+    }
+
+    /// Register an in-process MCP server through the same bounded actor used
+    /// by stdio and HTTP connections.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed capability, protocol, initialization, or discovery
+    /// error. The callable receives no `ToolRunContext` or ambient host grant.
+    pub async fn connect_in_process(
+        &self,
+        name: &str,
+        server: Arc<dyn crate::mcp_inprocess::McpServerCallable>,
+        tool_timeout: Option<Duration>,
+    ) -> Result<(), McpError> {
+        validate_mcp_server_identity(name)?;
+        self.run_context.require(crate::tools::ToolResource::Mcp)?;
+        let spec = ConnectionSpec::InProcess(InProcessConnectionSpec {
+            server_name: name.to_string(),
+            server,
+        });
+        let transport = spec.build_transport(&self.run_context)?;
+        let server =
+            McpServer::new_with_elicitation(name, transport, self.elicitation.clone()).await?;
+        let entry = ServerEntry::new_with_trust_and_tool_timeout(
+            spec,
+            server,
+            McpServerTrust::HostConfigured,
+            tool_timeout,
+        );
+        self.install_actor(name.to_string(), entry).await
     }
 
     /// Connect to an MCP server via stdio.
@@ -4193,7 +4552,8 @@ impl McpManager {
             env,
         };
         let transport = spec.build_transport(&self.run_context)?;
-        let server = McpServer::new(name, transport).await?;
+        let server =
+            McpServer::new_with_elicitation(name, transport, self.elicitation.clone()).await?;
         let entry = ServerEntry::new_with_trust_and_tool_timeout(spec, server, trust, tool_timeout);
         self.install_actor(name.to_string(), entry).await
     }
@@ -4307,12 +4667,60 @@ impl McpManager {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)] // Existing plugin HTTP grant boundary plus OAuth settings.
+    pub(crate) async fn connect_http_with_plugin_oauth_grant(
+        &self,
+        name: &str,
+        url: &str,
+        headers: crate::secrets::SensitiveHeaders,
+        headers_helper: Option<&str>,
+        oauth_config: crate::mcp_oauth::McpOAuthClientConfig,
+        tool_timeout: Option<Duration>,
+        trust_id: String,
+    ) -> Result<(), McpError> {
+        let oauth = crate::mcp_oauth::McpOAuthManager::persistent(name, url, oauth_config)
+            .map_err(mcp_oauth_error)?;
+        self.connect_http_with_trust_and_oauth(
+            name,
+            url,
+            headers,
+            headers_helper,
+            Some(oauth),
+            tool_timeout,
+            McpServerTrust::PluginGrant(trust_id),
+        )
+        .await
+    }
+
     async fn connect_http_with_trust(
         &self,
         name: &str,
         url: &str,
         headers: crate::secrets::SensitiveHeaders,
         headers_helper: Option<&str>,
+        tool_timeout: Option<Duration>,
+        trust: McpServerTrust,
+    ) -> Result<(), McpError> {
+        self.connect_http_with_trust_and_oauth(
+            name,
+            url,
+            headers,
+            headers_helper,
+            None,
+            tool_timeout,
+            trust,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn connect_http_with_trust_and_oauth(
+        &self,
+        name: &str,
+        url: &str,
+        headers: crate::secrets::SensitiveHeaders,
+        headers_helper: Option<&str>,
+        oauth: Option<Arc<crate::mcp_oauth::McpOAuthManager>>,
         tool_timeout: Option<Duration>,
         trust: McpServerTrust,
     ) -> Result<(), McpError> {
@@ -4324,11 +4732,123 @@ impl McpManager {
             headers,
             headers_helper: headers_helper.map(str::to_string),
             server_name: name.to_string(),
+            oauth,
         };
+        if matches!(&spec, ConnectionSpec::Http { oauth: Some(_), .. }) {
+            self.oauth_connections.lock().await.insert(
+                name.to_string(),
+                OAuthConnectionRegistration {
+                    spec: spec.clone(),
+                    trust: trust.clone(),
+                    tool_timeout,
+                },
+            );
+        }
         let transport = spec.build_transport(&self.run_context)?;
-        let server = McpServer::new(name, transport).await?;
+        let server =
+            McpServer::new_with_elicitation(name, transport, self.elicitation.clone()).await?;
         let entry = ServerEntry::new_with_trust_and_tool_timeout(spec, server, trust, tool_timeout);
         self.install_actor(name.to_string(), entry).await
+    }
+
+    /// Start authorization for a configured HTTP MCP server. The returned URL
+    /// must be shown to the user; this method never opens a browser itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed connection, discovery, policy, or OAuth protocol error.
+    pub async fn begin_http_oauth(
+        &self,
+        name: &str,
+        additional_scopes: &[String],
+    ) -> Result<crate::mcp_oauth::McpAuthorizationStart, McpError> {
+        let registration = self
+            .oauth_connections
+            .lock()
+            .await
+            .get(name)
+            .cloned()
+            .ok_or_else(|| McpError::NotConnected(name.to_string()))?;
+        let ConnectionSpec::Http {
+            oauth: Some(oauth), ..
+        } = registration.spec
+        else {
+            return Err(McpError::NotConnected(name.to_string()));
+        };
+        oauth
+            .begin_authorization(additional_scopes)
+            .await
+            .map_err(mcp_oauth_error)
+    }
+
+    /// Complete a bound OAuth callback and (re)install the configured server
+    /// through its ordinary actor path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when callback binding or token exchange fails, or the
+    /// authorized MCP server cannot be installed.
+    pub async fn complete_http_oauth(
+        &self,
+        name: &str,
+        pending_id: &str,
+        returned_state: &str,
+        returned_issuer: Option<&str>,
+        code: String,
+    ) -> Result<(), McpError> {
+        let registration = self
+            .oauth_connections
+            .lock()
+            .await
+            .get(name)
+            .cloned()
+            .ok_or_else(|| McpError::NotConnected(name.to_string()))?;
+        let ConnectionSpec::Http {
+            oauth: Some(oauth), ..
+        } = &registration.spec
+        else {
+            return Err(McpError::NotConnected(name.to_string()));
+        };
+        oauth
+            .complete_authorization(pending_id, returned_state, returned_issuer, code)
+            .await
+            .map_err(mcp_oauth_error)?;
+        let transport = registration.spec.build_transport(&self.run_context)?;
+        let server =
+            McpServer::new_with_elicitation(name, transport, self.elicitation.clone()).await?;
+        let entry = ServerEntry::new_with_trust_and_tool_timeout(
+            registration.spec,
+            server,
+            registration.trust,
+            registration.tool_timeout,
+        );
+        self.install_actor(name.to_string(), entry).await
+    }
+
+    /// Revoke an MCP OAuth session locally and remotely when supported, then
+    /// shut down the exact registered connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when protected storage, remote revocation, or owned
+    /// connection shutdown fails.
+    pub async fn revoke_http_oauth(&self, name: &str) -> Result<bool, McpError> {
+        let registration = self
+            .oauth_connections
+            .lock()
+            .await
+            .get(name)
+            .cloned()
+            .ok_or_else(|| McpError::NotConnected(name.to_string()))?;
+        let ConnectionSpec::Http {
+            oauth: Some(oauth), ..
+        } = registration.spec
+        else {
+            return Err(McpError::NotConnected(name.to_string()));
+        };
+        let revoked = oauth.revoke().await.map_err(mcp_oauth_error)?;
+        self.disconnect(name).await?;
+        Ok(revoked)
     }
 
     /// Test-only counterpart to [`Self::connect_http`] that bypasses
@@ -4365,11 +4885,13 @@ impl McpManager {
             headers: protected_headers,
             headers_helper: None,
             server_name: name.to_string(),
+            oauth: None,
         };
         let transport: Box<dyn McpTransport> = Box::new(
             HttpTransport::__test_new_unchecked_with_headers(url, headers),
         );
-        let server = McpServer::new(name, transport).await?;
+        let server =
+            McpServer::new_with_elicitation(name, transport, self.elicitation.clone()).await?;
         let entry = ServerEntry::new(spec, server);
         self.install_actor(name.to_string(), entry).await
     }
@@ -4573,7 +5095,9 @@ impl McpManager {
         );
 
         let attempt_result = match entry.spec.build_transport(run) {
-            Ok(transport) => McpServer::new(name, transport).await,
+            Ok(transport) => {
+                McpServer::new_with_elicitation(name, transport, entry.elicitation.clone()).await
+            }
             Err(e) => Err(e),
         };
 
@@ -5029,6 +5553,7 @@ impl McpManager {
     ///
     /// Returns an `McpError` if the server's transport fails to close.
     pub async fn disconnect(&self, name: &str) -> Result<(), McpError> {
+        self.oauth_connections.lock().await.remove(name);
         let removed = {
             let mut servers = self.servers.lock().await;
             let removed = servers.remove(name);
@@ -5050,6 +5575,7 @@ impl McpManager {
     ///
     /// Returns the first `McpError` encountered while closing servers.
     pub async fn disconnect_all(&self) -> Result<(), McpError> {
+        self.oauth_connections.lock().await.clear();
         let actors = {
             let mut servers = self.servers.lock().await;
             let actors = servers.drain().map(|(_, actor)| actor).collect::<Vec<_>>();
@@ -5144,6 +5670,269 @@ mod tests {
                 .expect("header");
         }
         headers
+    }
+
+    fn test_mcp_oauth_config() -> crate::mcp_oauth::McpOAuthClientConfig {
+        crate::mcp_oauth::McpOAuthClientConfig {
+            client_id: "transport-client".to_string(),
+            client_secret: None,
+            redirect_uri: "http://127.0.0.1:7777/callback".to_string(),
+            scopes: vec!["mcp.read".to_string()],
+        }
+    }
+
+    fn unchecked_oauth_transport(
+        base_url: String,
+        oauth: Arc<crate::mcp_oauth::McpOAuthManager>,
+    ) -> HttpTransport {
+        HttpTransport {
+            base_url,
+            headers: crate::secrets::SensitiveHeaders::new(),
+            oauth: Some(oauth),
+            request_id: AtomicU64::new(1),
+            session_id: std::sync::RwLock::new(None),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_transport_materializes_bound_oauth_bearer_only_on_the_wire() {
+        use wiremock::matchers::{body_string_contains, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let fixture = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/oauth-protected-resource/mcp"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "resource": format!("{}/mcp", fixture.uri()),
+                "authorization_servers": [format!("{}/issuer", fixture.uri())],
+                "scopes_supported": ["mcp.read"]
+            })))
+            .expect(1)
+            .mount(&fixture)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/oauth-authorization-server/issuer"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": format!("{}/issuer", fixture.uri()),
+                "authorization_endpoint": format!("{}/authorize", fixture.uri()),
+                "token_endpoint": format!("{}/token", fixture.uri()),
+                "scopes_supported": ["mcp.read"],
+                "code_challenge_methods_supported": ["S256"]
+            })))
+            .expect(1)
+            .mount(&fixture)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("grant_type=authorization_code"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "wire-access-sentinel",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                "scope": "mcp.read"
+            })))
+            .expect(1)
+            .mount(&fixture)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(header("authorization", "Bearer wire-access-sentinel"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"ok": true}
+            })))
+            .expect(1)
+            .mount(&fixture)
+            .await;
+
+        let oauth = crate::mcp_oauth::McpOAuthManager::__test_ephemeral_unchecked(
+            "wire",
+            &format!("{}/mcp", fixture.uri()),
+            test_mcp_oauth_config(),
+        )
+        .expect("OAuth manager");
+        let start = oauth.begin_authorization(&[]).await.expect("begin");
+        let state = start
+            .authorization_url
+            .query_pairs()
+            .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+            .expect("state");
+        oauth
+            .complete_authorization(&start.pending_id, &state, None, "wire-code".to_string())
+            .await
+            .expect("complete");
+        let transport = unchecked_oauth_transport(format!("{}/mcp", fixture.uri()), oauth);
+        let result = transport.request("ping", None).await.expect("request");
+        assert_eq!(result["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn http_transport_surfaces_scope_challenge_as_typed_authorization_required() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let fixture = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(ResponseTemplate::new(403).insert_header(
+                "www-authenticate",
+                format!(
+                    "Bearer error=\"insufficient_scope\", scope=\"mcp.read mcp.write\", resource_metadata=\"{}/resource-metadata\"",
+                    fixture.uri()
+                ),
+            ))
+            .expect(1)
+            .mount(&fixture)
+            .await;
+        let oauth = crate::mcp_oauth::McpOAuthManager::__test_ephemeral_unchecked(
+            "wire",
+            &format!("{}/mcp", fixture.uri()),
+            test_mcp_oauth_config(),
+        )
+        .expect("OAuth manager");
+        let transport = unchecked_oauth_transport(format!("{}/mcp", fixture.uri()), oauth);
+        let error = transport
+            .request("ping", None)
+            .await
+            .expect_err("scope challenge");
+        assert!(matches!(
+            error,
+            McpError::AuthorizationRequired(crate::mcp_oauth::McpAuthorizationRequired {
+                ref server,
+                ref scopes,
+                ..
+            }) if server == "wire" && scopes == &["mcp.read", "mcp.write"]
+        ));
+    }
+
+    #[derive(Debug, Clone)]
+    struct InProcessCallRecord {
+        server_name: String,
+        run_id: Option<String>,
+        session_id: Option<String>,
+        run_generation: Option<u64>,
+        method: String,
+        params: Option<Value>,
+    }
+
+    struct ManagedInProcessFixture {
+        calls: std::sync::Mutex<Vec<InProcessCallRecord>>,
+        shutdowns: AtomicUsize,
+    }
+
+    impl ManagedInProcessFixture {
+        const fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                shutdowns: AtomicUsize::new(0),
+            }
+        }
+
+        fn response(method: &str) -> Result<Value, McpError> {
+            match method {
+                "server/discover" => Ok(complete_cached(json!({
+                    "supportedVersions": [CURRENT_PROTOCOL_VERSION],
+                    "capabilities": {"tools": {"listChanged": false}}
+                }))),
+                "tools/list" => Ok(complete_cached(json!({
+                    "tools": [{
+                        "name": "echo",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"message": {"type": "string"}},
+                            "required": ["message"],
+                            "additionalProperties": false
+                        }
+                    }]
+                }))),
+                "tools/call" => Ok(complete_cached(json!({
+                    "content": [{"type": "text", "text": "managed-ok"}],
+                    "isError": false
+                }))),
+                other => Err(McpError::Protocol(format!(
+                    "unexpected managed in-process method: {other}"
+                ))),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::mcp_inprocess::McpServerCallable for ManagedInProcessFixture {
+        async fn call(&self, method: &str, _params: Option<Value>) -> Result<Value, McpError> {
+            Self::response(method)
+        }
+
+        async fn call_with_context(
+            &self,
+            context: crate::mcp_inprocess::McpInProcessRequestContext,
+            method: &str,
+            params: Option<Value>,
+        ) -> Result<Value, McpError> {
+            self.calls
+                .lock()
+                .expect("call records")
+                .push(InProcessCallRecord {
+                    server_name: context.server_name().to_string(),
+                    run_id: context.run_id().map(str::to_string),
+                    session_id: context.session_id().map(str::to_string),
+                    run_generation: context.run_generation(),
+                    method: method.to_string(),
+                    params,
+                });
+            Self::response(method)
+        }
+
+        async fn shutdown(&self) -> Result<(), McpError> {
+            self.shutdowns.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_in_process_server_uses_actor_identity_policy_and_shutdown() {
+        let run = Arc::clone(test_run());
+        let manager =
+            McpManager::new_with_permissions(Arc::clone(&run), mcp_permissions("local", &["echo"]));
+        let fixture = Arc::new(ManagedInProcessFixture::new());
+        manager
+            .connect_in_process("local", fixture.clone(), Some(Duration::from_secs(5)))
+            .await
+            .expect("connect");
+        let result = manager
+            .call_tool("mcp__local__echo", json!({"message": "hello"}))
+            .await
+            .expect("tool call");
+        assert_eq!(result["content"][0]["text"], "managed-ok");
+
+        let calls = fixture.calls.lock().expect("call records").clone();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.method.as_str())
+                .collect::<Vec<_>>(),
+            ["server/discover", "tools/list", "tools/call"]
+        );
+        assert!(calls.iter().all(|call| call.server_name == "local"));
+        let expected_run_id = run.run_id().to_string();
+        assert!(calls
+            .iter()
+            .all(|call| call.run_id.as_deref() == Some(expected_run_id.as_str())));
+        assert!(calls
+            .iter()
+            .all(|call| call.session_id.as_deref() == Some(run.session_id())));
+        assert!(calls
+            .iter()
+            .all(|call| call.run_generation == Some(run.generation().get())));
+        let discovery = calls[0].params.as_ref().expect("discovery params");
+        assert!(discovery
+            .pointer("/_meta/io.modelcontextprotocol~1clientCapabilities/elicitation/form")
+            .is_some());
+        drop(calls);
+
+        manager.disconnect("local").await.expect("disconnect");
+        assert_eq!(fixture.shutdowns.load(Ordering::SeqCst), 1);
+        assert!(!manager.is_connected("local").await);
     }
 
     fn test_run() -> &'static Arc<crate::tools::ToolRunContext> {
@@ -6033,6 +6822,24 @@ sys.stdout.flush()
         }
     }
 
+    #[test]
+    fn bearer_challenge_parses_scope_and_protected_resource_metadata() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::WWW_AUTHENTICATE,
+            reqwest::header::HeaderValue::from_static(
+                "BEARER error=\"insufficient_scope\", scope=\"mcp.read mcp.write\", resource_metadata=\"https://mcp.example/.well-known/oauth-protected-resource\"",
+            ),
+        );
+        let challenge = parse_mcp_auth_challenge(&headers);
+        assert!(challenge.insufficient_scope);
+        assert_eq!(challenge.scopes, ["mcp.read", "mcp.write"]);
+        assert_eq!(
+            challenge.resource_metadata.as_deref(),
+            Some("https://mcp.example/.well-known/oauth-protected-resource")
+        );
+    }
+
     /// Fix #490: per-request timeout is set on the `RequestBuilder`
     /// (not on the shared client), so a stalled server returns a
     /// timeout error within the per-request cap. We point the
@@ -6279,6 +7086,125 @@ sys.stdout.flush()
         value
     }
 
+    #[derive(Default)]
+    struct AcceptingElicitationHandler {
+        seen: std::sync::Mutex<Vec<crate::mcp_elicitation::ElicitationRequest>>,
+    }
+
+    #[async_trait]
+    impl crate::mcp_elicitation::McpElicitationHandler for AcceptingElicitationHandler {
+        async fn handle(
+            &self,
+            request: crate::mcp_elicitation::ElicitationRequest,
+        ) -> anyhow::Result<crate::mcp_elicitation::ElicitationAction> {
+            self.seen.lock().expect("elicitation records").push(request);
+            Ok(crate::mcp_elicitation::ElicitationAction::Accept(
+                json!({"name": "octocat"}),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn current_tool_call_retries_only_its_correlated_input_required_round() {
+        let (transport, requests) = CurrentProtocolTransport::new(
+            McpTransportBinding::InProcess,
+            vec![
+                (
+                    "server/discover",
+                    Ok(complete_cached(json!({
+                        "supportedVersions": [CURRENT_PROTOCOL_VERSION],
+                        "capabilities": {"tools": {"listChanged": false}}
+                    }))),
+                ),
+                (
+                    "tools/list",
+                    Ok(complete_cached(json!({
+                        "tools": [{
+                            "name": "lookup",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {"query": {"type": "string"}},
+                                "required": ["query"],
+                                "additionalProperties": false
+                            }
+                        }]
+                    }))),
+                ),
+                (
+                    "tools/call",
+                    Ok(json!({
+                        "resultType": "input_required",
+                        "requestState": "opaque-round-state",
+                        "inputRequests": {
+                            "account": {
+                                "method": "elicitation/create",
+                                "params": {
+                                    "mode": "form",
+                                    "message": "Choose an account",
+                                    "requestedSchema": {
+                                        "type": "object",
+                                        "properties": {"name": {"type": "string"}},
+                                        "required": ["name"],
+                                        "additionalProperties": false
+                                    }
+                                }
+                            }
+                        }
+                    })),
+                ),
+                (
+                    "tools/call",
+                    Ok(complete_cached(json!({
+                        "content": [{"type": "text", "text": "done"}],
+                        "isError": false
+                    }))),
+                ),
+            ],
+        );
+        let handler = Arc::new(AcceptingElicitationHandler::default());
+        let router = crate::mcp_elicitation::McpElicitationRouter::new(handler.clone());
+        let server = McpServer::new_with_elicitation("current", Box::new(transport), router)
+            .await
+            .expect("current server");
+        let result = server
+            .call_tool("lookup", json!({"query": "profile"}))
+            .await
+            .expect("elicited tool result");
+        assert_eq!(result["content"][0]["text"], "done");
+
+        let seen = handler.seen.lock().expect("elicitation records");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].server_name, "current");
+        assert_eq!(seen[0].request_key, "account");
+        assert_eq!(seen[0].round, 0);
+        assert!(!seen[0].operation_id.is_empty());
+        drop(seen);
+
+        let requests = requests.lock().expect("request records");
+        let tool_calls = requests
+            .iter()
+            .filter(|request| request.method == "tools/call")
+            .collect::<Vec<_>>();
+        assert_eq!(tool_calls.len(), 2);
+        let first = tool_calls[0].params.as_ref().expect("first params");
+        let retry = tool_calls[1].params.as_ref().expect("retry params");
+        assert!(first.get("inputResponses").is_none());
+        assert_eq!(retry["name"], "lookup");
+        assert_eq!(retry["arguments"], json!({"query": "profile"}));
+        assert_eq!(retry["requestState"], "opaque-round-state");
+        assert_eq!(retry["inputResponses"]["account"]["action"], "accept");
+        assert_eq!(
+            retry["inputResponses"]["account"]["content"],
+            json!({"name": "octocat"})
+        );
+        assert_ne!(
+            first.pointer("/_meta/progressToken"),
+            retry.pointer("/_meta/progressToken")
+        );
+        drop(tool_calls);
+        drop(requests);
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // One scripted flow proves every negotiated typed feature stays on one profile.
     async fn s065_current_profile_preserves_typed_features_and_request_metadata() {
@@ -6429,7 +7355,7 @@ sys.stdout.flush()
                 }) == Some(&json!(CURRENT_PROTOCOL_VERSION))
                 && request.params.as_ref().and_then(|params| {
                     params.pointer("/_meta/io.modelcontextprotocol~1clientCapabilities")
-                }) == Some(&json!({}))
+                }) == Some(&json!({"elicitation": {"form": {}, "url": {}}}))
         }));
         assert!(requests[1..].iter().all(|request| {
             request
@@ -6634,6 +7560,7 @@ sys.stdout.flush()
                 headers: crate::secrets::SensitiveHeaders::new(),
                 headers_helper: None,
                 server_name: server_name.to_string(),
+                oauth: None,
             },
             McpTransportBinding::InProcess => panic!("manager has no in-process connection spec"),
         };
@@ -7687,6 +8614,7 @@ sys.stdout.flush()
             last_failure: Some(std::time::Instant::now()),
             cached_tools: vec![],
             supports_list_changed: false,
+            elicitation: crate::mcp_elicitation::McpElicitationRouter::default(),
             connection_generation: NEXT_MCP_CONNECTION_GENERATION.fetch_add(1, Ordering::AcqRel),
         };
         manager
@@ -7727,6 +8655,7 @@ sys.stdout.flush()
             last_failure: Some(std::time::Instant::now()),
             cached_tools: vec![],
             supports_list_changed: false,
+            elicitation: crate::mcp_elicitation::McpElicitationRouter::default(),
             connection_generation: NEXT_MCP_CONNECTION_GENERATION.fetch_add(1, Ordering::AcqRel),
         };
         let mut entry = entry;
@@ -7786,6 +8715,7 @@ sys.stdout.flush()
             last_failure: None, // ⇒ backoff_elapsed() is true
             cached_tools: vec![],
             supports_list_changed: false,
+            elicitation: crate::mcp_elicitation::McpElicitationRouter::default(),
             connection_generation: NEXT_MCP_CONNECTION_GENERATION.fetch_add(1, Ordering::AcqRel),
         };
         let mut entry = entry;

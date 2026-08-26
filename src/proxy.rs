@@ -2952,6 +2952,13 @@ pub async fn connect_mcp_servers_with_trust<S: std::hash::BuildHasher + Sync>(
                         "MCP stdio server declares HTTP headers; ignoring headers for stdio transport"
                     );
                 }
+                if server.oauth.is_some() {
+                    warn!(
+                        server = %server.name,
+                        plugin = %plugin.name(),
+                        "MCP stdio server declares HTTP OAuth settings; ignoring OAuth for stdio transport"
+                    );
+                }
                 if let Some(command) = &server.command {
                     let args: Vec<&str> = server
                         .args
@@ -2987,8 +2994,19 @@ pub async fn connect_mcp_servers_with_trust<S: std::hash::BuildHasher + Sync>(
                             "MCP discovery is eager but model publication is progressive; alwaysLoad is not yet a publication override"
                         );
                     }
-                    match mcp
-                        .connect_http_with_plugin_grant(
+                    let connection = if let Some(oauth) = server.oauth.clone() {
+                        mcp.connect_http_with_plugin_oauth_grant(
+                            &server.name,
+                            url,
+                            server.headers.clone(),
+                            server.headers_helper.as_deref(),
+                            oauth,
+                            tool_timeout,
+                            trust_id.clone(),
+                        )
+                        .await
+                    } else {
+                        mcp.connect_http_with_plugin_grant(
                             &server.name,
                             url,
                             server.headers.clone(),
@@ -2997,7 +3015,8 @@ pub async fn connect_mcp_servers_with_trust<S: std::hash::BuildHasher + Sync>(
                             trust_id.clone(),
                         )
                         .await
-                    {
+                    };
+                    match connection {
                         Ok(()) => {
                             info!(server = %server.name, plugin = %plugin.name(), "Connected MCP (http)");
                         }
