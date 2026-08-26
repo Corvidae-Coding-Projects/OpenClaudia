@@ -1,6 +1,6 @@
 {
   "next_display_id": 1152,
-  "next_comment_id": 1674,
+  "next_comment_id": 1675,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -27669,10 +27669,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T07:52:02.007724838Z",
-      "updated_at": "2026-08-26T07:52:06.286297012Z",
+      "updated_at": "2026-08-26T07:58:35.695090462Z",
       "labels": [
         "feature"
-      ]
+      ],
+      "comments": {
+        "78347f22-ca87-4deb-a1c7-6404e2249d72": {
+          "display_id": 1674,
+          "author": "6Vw9",
+          "content": "Preflight/root-cause classification: repair the shared LSP protocol boundary in src/services/lsp_pool.rs and model projection in src/tools/lsp.rs; production-wire typed bounded diagnostics through the same run-owned service. Current real gaps are unbounded header-line growth, blocking stdin writes, missing aggregate turn/message budgets, incomplete JSON-RPC envelope/ID validation, unvalidated returned URIs, unbounded/lossy semantic projection, and an unconsumed diagnostic staging path. Preserve S-068 pooling, document versions, continuations, plugin composition, sandboxing, and public actions. Planned checks: compiled hostile fixture for oversized/drip/malformed/server-error/blocked-stdin/reverse-request/cancellation/URI/result cases; focused LSP/plugin/lifecycle tests; Rust 1.98 fmt/Clippy/full locked suite; fuzz/policy/sandbox/hygiene; artifact/VDD handoff. Resource baseline: 30 GiB RAM, 11 GiB available, 8 GiB zram fully used, 594 GiB disk free; use CARGO_BUILD_JOBS=2 and serialize only heavy tests.",
+          "created_at": "2026-08-26T07:58:35.692407436Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAMyEZZzIvtKJo80cmYX/lp0C7i1MWLTMOnfbKYR0jhUCveR+izON3Ly5JPl5yDU4B5tGvv7ioI/+3CEuwmyMGCQ=="
+        }
+      }
     },
     "d1b439d9-baf4-494f-8f43-4b630dacbfc0": {
       "uuid": "d1b439d9-baf4-494f-8f43-4b630dacbfc0",
@@ -42448,11 +42459,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1793,
       "timestamp": "2026-08-26T07:52:11.255491945Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1794,
+      "timestamp": "2026-08-26T07:58:35.695090462Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T07:52:11.255491945Z",
+    "timestamp": "2026-08-26T07:58:35.695090462Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1793
+    "agent_seq": 1794
   }
 }
