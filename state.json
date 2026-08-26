@@ -1,6 +1,6 @@
 {
   "next_display_id": 1145,
-  "next_comment_id": 1657,
+  "next_comment_id": 1658,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8666,7 +8666,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-25T21:11:01.433859117Z",
+      "updated_at": "2026-08-26T05:47:16.811207189Z",
       "labels": [
         "remediation"
       ],
@@ -9050,6 +9050,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAKVDqi6Ju5jZ8QHHlfMaJq1J29pTyKUniFmYKx+PdOvFMmERbkkN8GFv0JnflfSBGhOSHqsiTzbYM1Gh+ef1vBg=="
+        },
+        "4c37a015-5cfe-46ca-9860-d22b63839b66": {
+          "display_id": 1657,
+          "author": "6Vw9",
+          "content": "A read-only next-slice dependency check was blocked because the previous S-067 session had ended and no issue was active. Session #78 now uses the existing dormant-feature parent #1071 for selection only; no S-068 child or implementation was started. This installed Crosslink build lacks the requested intervene subcommand.",
+          "created_at": "2026-08-26T05:47:16.808876895Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAgEEDuX2vQU8shRkTuS2gDzwSEyruwOoKYNXt6vq6QQys1gptd8RWoahZ+LApgJ+xBS/qFlMxA11X93SFpneHAA=="
         },
         "4d0e5f07-5a8d-445f-a055-59021bcf1488": {
           "display_id": 1627,
@@ -41897,11 +41906,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1746,
       "timestamp": "2026-08-26T05:47:05.630373855Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1747,
+      "timestamp": "2026-08-26T05:47:16.811207189Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T05:47:05.630373855Z",
+    "timestamp": "2026-08-26T05:47:16.811207189Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1746
+    "agent_seq": 1747
   }
 }
