@@ -1,6 +1,6 @@
 {
   "next_display_id": 1155,
-  "next_comment_id": 1713,
+  "next_comment_id": 1714,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -12397,11 +12397,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T17:40:20.676616314Z",
-      "updated_at": "2026-08-26T17:41:09.153417579Z",
+      "updated_at": "2026-08-26T17:45:21.277360839Z",
       "labels": [
         "feature"
       ],
       "comments": {
+        "2d691b40-ca07-422b-8e82-990c7f2b13f8": {
+          "display_id": 1713,
+          "author": "6Vw9",
+          "content": "Architecture: preserve S-071's operation-scoped broker and add one run-bound web supervision policy plus a cancellation child for each fetch/search/browser/distillation call. The synchronous registry seam will use the proven S-040 runtime-aware bridge, but the underlying future remains owned: deadline/run cancellation cancels the child and waits for broker/browser reconciliation instead of dropping a receiver or aborting an unowned spawn_blocking task. Chromium will be launched from an exact run-resolved executable into a unique owner-private profile outside the project, with a cleared environment, process-group ownership, bounded global admission, request/redirect/DOM/download/time/process-memory/CPU/profile-disk limits, and an explicit terminal receipt. A dedicated worker owns browser, tab, process, and profile; cancellation kills the process tree and joins the worker before returning. Optional cross-call login is limited to exact configured origins and encrypted cookie state in host-owned descriptor-safe storage using an explicit host secret capability; normal calls remain stateless. Alternative rejected: keep headless_chrome's ambient launch plus spawn_blocking abort, because abort cannot stop begun blocking work and fixed project profiles retain authority. Also rejected: persist the whole Chromium profile, because it carries unbounded cross-origin cache/state and filesystem attack surface. S-096 remains responsible for broader frontend shutdown propagation; this slice makes web work obey the existing run tree.",
+          "created_at": "2026-08-26T17:45:21.274480708Z",
+          "kind": "decision",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAEanLkjLB93SdNxkLhpC2hON1dIc/QJkCGwpuSYDa29ueCqSFS1kJIIAgOu8Grn2Bwo9yzaTAiE29/qk01KHuBg=="
+        },
         "d1e22f5b-0d62-41ef-aa9c-409d49ffa8e4": {
           "display_id": 1712,
           "author": "6Vw9",
@@ -43181,11 +43190,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1853,
       "timestamp": "2026-08-26T17:41:09.153417579Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1854,
+      "timestamp": "2026-08-26T17:45:21.277360839Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T17:41:09.153417579Z",
+    "timestamp": "2026-08-26T17:45:21.277360839Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1853
+    "agent_seq": 1854
   }
 }
