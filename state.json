@@ -1,6 +1,6 @@
 {
   "next_display_id": 1149,
-  "next_comment_id": 1670,
+  "next_comment_id": 1671,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -14958,7 +14958,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T05:52:47.734576672Z",
-      "updated_at": "2026-08-26T07:09:17.740374380Z",
+      "updated_at": "2026-08-26T07:09:48.592871Z",
       "labels": [
         "feature",
         "remediation"
@@ -15017,6 +15017,15 @@
           "kind": "observation",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABALTgKKtiDtrgEwfQoWge80MLsEAuk/aIXx4wJACgraU2NL9QGHkI+UHB43m033894zmbpU1awba+JST0vuDEOBA=="
+        },
+        "e73a1fa7-af65-442c-ba0e-8ca0bb515127": {
+          "display_id": 1670,
+          "author": "6Vw9",
+          "content": "Committed 3659d3d6 feat(lsp): add stateful workspace service (#1145). Verification: nine compiled LSP lifecycle fixtures, affected focused suites, strict Rust 1.98 all-target/all-feature Clippy, complete locked serial all-target/all-feature tests, 27 policy tests, repository hygiene, formatting, diff checks, and canonical evidence rebinding all passed.",
+          "created_at": "2026-08-26T07:09:48.590022319Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAwuZ3vlzCdpEqGiGSy7D//JSc+1y0WPCTQ/F2T5siregcCiK9pRrMEJmXXrnjSO9DhBOcOOK21SRqzjc3ITD5Aw=="
         }
       }
     },
@@ -42263,11 +42272,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1774,
       "timestamp": "2026-08-26T07:09:17.740374380Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1775,
+      "timestamp": "2026-08-26T07:09:48.592871Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T07:09:17.740374380Z",
+    "timestamp": "2026-08-26T07:09:48.592871Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1774
+    "agent_seq": 1775
   }
 }
