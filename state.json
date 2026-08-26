@@ -1,6 +1,6 @@
 {
   "next_display_id": 1152,
-  "next_comment_id": 1675,
+  "next_comment_id": 1676,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -27669,7 +27669,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T07:52:02.007724838Z",
-      "updated_at": "2026-08-26T07:58:35.695090462Z",
+      "updated_at": "2026-08-26T07:59:08.352456401Z",
       "labels": [
         "feature"
       ],
@@ -27682,6 +27682,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAMyEZZzIvtKJo80cmYX/lp0C7i1MWLTMOnfbKYR0jhUCveR+izON3Ly5JPl5yDU4B5tGvv7ioI/+3CEuwmyMGCQ=="
+        },
+        "b33ae632-8282-45a2-b127-c8f0691be699": {
+          "display_id": 1675,
+          "author": "6Vw9",
+          "content": "Architecture decision: keep the synchronous run-owned LspServerManager API and replace its raw ChildStdin/direct BufRead internals with owned bounded reader/writer workers, aggregate protocol budgets, and joined shutdown. Credible alternative—a Tokio-native multiplexed transport—would require async propagation through every current synchronous tool caller and process-sandbox bridge, greatly widening S-069 without improving its one-at-a-time production semantics. Public changes will be additive/defaulted: explicit limits, result completeness/provenance/typed diagnostics, and error variants; existing actions and legacy tuple projection remain compatible. Production diagnostics travel as structured untrusted result data from the exact server/document generation, not through the preserved raw XML-like injector. Rollback remains one commit; tests use a compiled hostile local server.",
+          "created_at": "2026-08-26T07:59:08.350079696Z",
+          "kind": "decision",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAhbLjv/FEcMHVWudoFQB6fk4K/6TRCOk71n2lBKK25klBvyBasFkinP3EqLLTiQuoRWy7yW6Ry1CSGIirWuvtBQ=="
         }
       }
     },
@@ -42464,11 +42473,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1794,
       "timestamp": "2026-08-26T07:58:35.695090462Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1795,
+      "timestamp": "2026-08-26T07:59:08.352456401Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T07:58:35.695090462Z",
+    "timestamp": "2026-08-26T07:59:08.352456401Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1794
+    "agent_seq": 1795
   }
 }
