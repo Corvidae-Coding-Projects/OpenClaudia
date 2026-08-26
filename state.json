@@ -1,6 +1,6 @@
 {
   "next_display_id": 1145,
-  "next_comment_id": 1650,
+  "next_comment_id": 1651,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -29821,7 +29821,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T23:43:22.282994195Z",
-      "updated_at": "2026-08-26T01:29:02.536944612Z",
+      "updated_at": "2026-08-26T01:29:42.647535319Z",
       "labels": [
         "feature",
         "remediation"
@@ -29853,6 +29853,15 @@
           "kind": "result",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA/TaqwpN+bBf3YH8+DEKaMfv2V/+l4B4YqG0d1TnSotBycC4Doo2Z2Zm1iJOVBu1foWPaVxj0D+iOG5IyHuc9Ag=="
+        },
+        "b2decda4-9975-457c-b7cd-841d195b801a": {
+          "display_id": 1650,
+          "author": "6Vw9",
+          "content": "Implement S-067 without replacing working MCP paths: add an opt-in HTTP OAuth owner beside existing static and unauthenticated transport behavior; implement current MRTR elicitation as bounded operation-local retries; route in-process callables through the existing per-server actor and narrow run context; preserve current and legacy adapters plus provider authentication; verify realistic security, concurrency, lifecycle, and compiled fixture paths under Rust 1.98 resource limits.",
+          "created_at": "2026-08-26T01:29:42.644547170Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAlglqTjh3aIYMZEN++MFdGjrrYCNug5mlzRN7BRwpiHMLHqjE5532a7prdQdlrAODXxjzdfwUv02ZEN4uQGo5Bw=="
         },
         "f968cbe2-97ee-49fc-bf4c-1640ee7450be": {
           "display_id": 1646,
@@ -41763,11 +41772,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1732,
       "timestamp": "2026-08-26T01:29:12.891176812Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1733,
+      "timestamp": "2026-08-26T01:29:42.647535319Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T01:29:12.891176812Z",
+    "timestamp": "2026-08-26T01:29:42.647535319Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1732
+    "agent_seq": 1733
   }
 }
