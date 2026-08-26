@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1154,
+  "next_display_id": 1155,
   "next_comment_id": 1712,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -372,6 +372,7 @@
     "5ac506bb-8502-40a4-a979-ad2960f0e4cb": 1073,
     "5b072c3e-0beb-4e95-9473-d3b349860613": 149,
     "5b5fc7e4-0ab1-4a99-82d1-3edb18128ea8": 342,
+    "5bb5d572-ef98-4d55-b50b-2840b6b36032": 1154,
     "5be039a4-4605-4e9c-ab6e-250b57683636": 273,
     "5bfc4701-5367-4ff3-a34a-c314e9770704": 610,
     "5c021e3e-abd4-4e3a-adfc-2bbeed4afa52": 740,
@@ -12381,6 +12382,18 @@
         "bug",
         "qa-review-2026-04"
       ]
+    },
+    "5bb5d572-ef98-4d55-b50b-2840b6b36032": {
+      "uuid": "5bb5d572-ef98-4d55-b50b-2840b6b36032",
+      "display_id": 1154,
+      "title": "S-072: Supervise browser and web work",
+      "description": "Goal: \n\nAcceptance criteria:\n- \n\nImplement docs/remediation-slices/072-supervised-browser-and-web-cancellation.md under parent #1071. Production-wire run-cancellation and aggregate deadlines through fetch, search, browser, and distillation; supervise browser process/tab/profile/proxy ownership through terminal reconciliation; use verified host browser identity, ephemeral restrictive host-owned profiles and bounded concurrency/resources; make persistent cookies/login an explicit encrypted host capability; preserve S-071 connection-broker behavior and legitimate web features. Focus on realistic failures, inspect tests skeptically, use Rust 1.98 with CARGO_BUILD_JOBS=2 and one heavy process, preserve exact generated changelog, signed dollspace-gay commit on agent/refactor-agent-system-remediation, no push, final cargo clean, and monitor every exact-head PR runner after the user pushes.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-26T17:40:20.676616314Z",
+      "updated_at": "2026-08-26T17:40:20.676616314Z"
     },
     "5be039a4-4605-4e9c-ab6e-250b57683636": {
       "uuid": "5be039a4-4605-4e9c-ab6e-250b57683636",
@@ -43125,11 +43138,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1849,
       "timestamp": "2026-08-26T17:29:48.409872135Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1850,
+      "timestamp": "2026-08-26T17:40:20.676616314Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T17:29:48.409872135Z",
+    "timestamp": "2026-08-26T17:40:20.676616314Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1849
+    "agent_seq": 1850
   }
 }
