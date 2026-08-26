@@ -1,6 +1,6 @@
 {
   "next_display_id": 1145,
-  "next_comment_id": 1649,
+  "next_comment_id": 1650,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -29817,7 +29817,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T23:43:22.282994195Z",
-      "updated_at": "2026-08-26T01:27:31.527048211Z",
+      "updated_at": "2026-08-26T01:27:51.911546516Z",
       "closed_at": "2026-08-26T01:27:31.527042140Z",
       "labels": [
         "feature",
@@ -29841,6 +29841,15 @@
           "kind": "progress",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA6+VIxCN100qepeVmaw6FZDW7pvi0eBAyQxjwgZ52lGRMs6RXtuhaBYjtlUvQ3+Tw9xWmqR3KVNOjTq3c+pP1Dw=="
+        },
+        "9caedf3a-37b8-48a0-916e-124a1f9a4dff": {
+          "display_id": 1649,
+          "author": "6Vw9",
+          "content": "Delivered S-067: opt-in MCP HTTP OAuth discovery and PKCE lifecycle with protected credential storage, binding, serialized refresh/rotation/expiry/revocation; correlated bounded multi-round form/URL elicitation; and managed in-process MCP execution through the existing actor identity, capability, budget, generation, cancellation, and shutdown boundary without ambient authority. Preserved current/legacy MCP, stdio roots, unauthenticated MCP, and Claude/Codex provider auth. Verified on Rust/Cargo 1.98 with focused local fixtures, strict all-target/all-feature Clippy, the complete serialized all-target/all-feature test suite, 27 repository-policy tests, hygiene status verified with zero forbidden tracked artifacts, formatting, and diff checks. S-088 VDD remains explicitly pending and parent #1071 remains open.",
+          "created_at": "2026-08-26T01:27:51.909161111Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA/TaqwpN+bBf3YH8+DEKaMfv2V/+l4B4YqG0d1TnSotBycC4Doo2Z2Zm1iJOVBu1foWPaVxj0D+iOG5IyHuc9Ag=="
         },
         "f968cbe2-97ee-49fc-bf4c-1640ee7450be": {
           "display_id": 1646,
@@ -41736,11 +41745,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1729,
       "timestamp": "2026-08-26T01:27:35.972076882Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1730,
+      "timestamp": "2026-08-26T01:27:51.911546516Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T01:27:35.972076882Z",
+    "timestamp": "2026-08-26T01:27:51.911546516Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1729
+    "agent_seq": 1730
   }
 }
