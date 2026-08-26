@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1156,
+  "next_display_id": 1157,
   "next_comment_id": 1725,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -406,6 +406,7 @@
     "603b3d24-0ee0-4e95-943d-31876ce5afb3": 1041,
     "6095bfc0-16ac-4f7f-9da5-9a2845751d1f": 1026,
     "60d7cd9b-f642-4d77-b172-1d0857dd7807": 232,
+    "6122e6c5-b9a5-4632-a130-52b2d9c65a14": 1156,
     "61885b53-b3ea-4251-bec5-32006d4f2ee1": 594,
     "619167ab-632f-49fb-bbc9-469ba79e9efe": 502,
     "61b766a5-4ec1-402f-8cb0-a707a6096bec": 244,
@@ -13510,6 +13511,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAIqwz0thecBMvu7UP4pd/ZlxzwSqVRP0rvxpKcYZR+St6skxITgptUUw/tQc/vYod9vzzDECZLUSZ6sAvRWSLDA=="
         }
       }
+    },
+    "6122e6c5-b9a5-4632-a130-52b2d9c65a14": {
+      "uuid": "6122e6c5-b9a5-4632-a130-52b2d9c65a14",
+      "display_id": 1156,
+      "title": "S-073: Make worktree apply and cleanup transactional",
+      "description": "Implement docs/remediation-slices/073-transactional-worktree-apply.md under parent #1071. Preserve working worktree behavior while separating preview, stage, commit, merge, discard, and removal into generation-bound transactional effects. Failed, timed-out, ambiguous, partially successful, conflicted, or inspection-failed Git operations must retain recoverable state with exact next actions; cleanup must never destroy unproven work, and retries must be idempotent. Keep S-074 workspace capability binding, S-075 command registry, S-077 general Git review/commit, and unrelated perfection work out of scope. Use Rust 1.98 with CARGO_BUILD_JOBS=2, skeptical deterministic tests, complete resource-aware gates, exact generated changelog, artifact-bound S-088 handoff, signed dollspace-gay commit on agent/refactor-agent-system-remediation, no push, final cargo clean, and exact-head PR #66 runner monitoring after user push.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-26T23:02:08.777248190Z",
+      "updated_at": "2026-08-26T23:02:08.777248190Z"
     },
     "61885b53-b3ea-4251-bec5-32006d4f2ee1": {
       "uuid": "61885b53-b3ea-4251-bec5-32006d4f2ee1",
@@ -43383,11 +43396,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1870,
       "timestamp": "2026-08-26T21:39:41.420836080Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1871,
+      "timestamp": "2026-08-26T23:02:08.777248190Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T21:39:41.420836080Z",
+    "timestamp": "2026-08-26T23:02:08.777248190Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1870
+    "agent_seq": 1871
   }
 }
