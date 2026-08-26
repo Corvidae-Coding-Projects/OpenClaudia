@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1148,
+  "next_display_id": 1149,
   "next_comment_id": 1663,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -658,6 +658,7 @@
     "9e3a1d39-c6e7-455c-aebc-fa014ca6123d": 495,
     "9e557374-009d-4049-bbb2-6bb62538c653": 91,
     "9e641b12-e984-4a5d-bfc1-81e5a898aa6f": 591,
+    "9e66ff82-a1d5-45ce-9cc3-a832d9d9956a": 1148,
     "9ea2aa8c-c6d4-4d2c-a28a-2219c8279fa4": 948,
     "9f2ff59a-54a9-478c-99f1-1a1cb3e93eaf": 423,
     "9fd6f21a-5ac5-4d91-b89f-ca17d81862cf": 595,
@@ -21458,6 +21459,18 @@
         }
       }
     },
+    "9e66ff82-a1d5-45ce-9cc3-a832d9d9956a": {
+      "uuid": "9e66ff82-a1d5-45ce-9cc3-a832d9d9956a",
+      "display_id": 1148,
+      "title": "S-068A: Replace bare-child LSP pool with run-owned protocol sessions",
+      "description": "Implement the exact-key stateful LSP manager, initialized server generation, document lifecycle/version ownership, health/restart/rehydration, cancellation, shutdown and idle reaping. Preserve the LanguageServer sandbox/run capability boundary. Parent #1145.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "6ea4d98d-679e-4078-b6b1-125fa8b5ab9b",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-26T06:00:22.813632360Z",
+      "updated_at": "2026-08-26T06:00:22.813632360Z"
+    },
     "9ea2aa8c-c6d4-4d2c-a28a-2219c8279fa4": {
       "uuid": "9ea2aa8c-c6d4-4d2c-a28a-2219c8279fa4",
       "display_id": 948,
@@ -42069,10 +42082,15 @@
       "agent_id": "6Vw9",
       "agent_seq": 1758,
       "timestamp": "2026-08-26T06:00:18.673070701Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1758,
+      "timestamp": "2026-08-26T06:00:22.813632360Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T06:00:18.673070701Z",
+    "timestamp": "2026-08-26T06:00:22.813632360Z",
     "agent_id": "6Vw9",
     "agent_seq": 1758
   }
