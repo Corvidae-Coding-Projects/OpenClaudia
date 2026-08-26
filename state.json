@@ -23594,12 +23594,13 @@
       "display_id": 1153,
       "title": "S-071: Enforce web policy at the connection boundary",
       "description": "Implement docs/remediation-slices/071-web-egress-connection-broker.md under parent #1071. Production-wire one canonical connection broker for fetch, search, browser, and distillation so DNS/address pinning, TLS host verification, redirects, proxies, origins, schemes, userinfo, IPv4/IPv6, and private/local/metadata policy govern the actual connection. Preserve legitimate behavior through explicit typed grants; add redacted typed receipts and skeptical deterministic fixtures; stay within realistic acceptance scope. Use Rust 1.98 and resource-aware verification, preserve exact generated changelog, signed dollspace-gay commit, no push, and cumulative exact-head PR #66 monitoring after the user pushes.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T15:38:01.221799065Z",
-      "updated_at": "2026-08-26T17:28:40.282889538Z",
+      "updated_at": "2026-08-26T17:28:47.281764440Z",
+      "closed_at": "2026-08-26T17:28:47.281758388Z",
       "labels": [
         "feature"
       ],
@@ -43090,11 +43091,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1846,
       "timestamp": "2026-08-26T17:28:40.282889538Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1847,
+      "timestamp": "2026-08-26T17:28:47.281764440Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T17:28:40.282889538Z",
+    "timestamp": "2026-08-26T17:28:47.281764440Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1846
+    "agent_seq": 1847
   }
 }
