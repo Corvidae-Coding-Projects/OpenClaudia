@@ -1,6 +1,6 @@
 {
   "next_display_id": 1149,
-  "next_comment_id": 1666,
+  "next_comment_id": 1667,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -3894,11 +3894,22 @@
       "parent_uuid": "6ea4d98d-679e-4078-b6b1-125fa8b5ab9b",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T06:00:18.673070701Z",
-      "updated_at": "2026-08-26T06:00:35.194109438Z",
+      "updated_at": "2026-08-26T07:07:43.588341723Z",
       "labels": [
         "feature",
         "remediation"
-      ]
+      ],
+      "comments": {
+        "ebd946d3-95ee-428e-a12f-98cdc1f7504b": {
+          "display_id": 1666,
+          "author": "6Vw9",
+          "content": "Production LSP dispatch now consumes each ToolRunContext-owned manager across TUI, REPL, proxy, and derived frontend runs. Enabled plugin declarations refresh exact-run registrations without expanding environment authority. All nine actions remain; complete hierarchy items and opaque generation/document-bound continuations round-trip, stale tokens fail explicitly, and workspace symbols retain identity/container/ranges.",
+          "created_at": "2026-08-26T07:07:43.585907409Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAo+gKWBYUz/6wShc3YEFsFRPYsucD99fNi7YkS2HaDLqt3NAKh1dFHUV/YgC4Up4jXcrx+UAa8sO2LsC0Mdh2CA=="
+        }
+      }
     },
     "180b654d-aa1e-45a7-9bfc-a3ed24894ca2": {
       "uuid": "180b654d-aa1e-45a7-9bfc-a3ed24894ca2",
@@ -42173,11 +42184,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1764,
       "timestamp": "2026-08-26T07:07:39.109603404Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1765,
+      "timestamp": "2026-08-26T07:07:43.588341723Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T07:07:39.109603404Z",
+    "timestamp": "2026-08-26T07:07:43.588341723Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1764
+    "agent_seq": 1765
   }
 }
