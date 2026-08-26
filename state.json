@@ -1,6 +1,6 @@
 {
   "next_display_id": 1154,
-  "next_comment_id": 1699,
+  "next_comment_id": 1700,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -23599,11 +23599,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T15:38:01.221799065Z",
-      "updated_at": "2026-08-26T15:38:26.784134460Z",
+      "updated_at": "2026-08-26T15:45:39.545396549Z",
       "labels": [
         "feature"
       ],
       "comments": {
+        "5a552f0c-b182-4d91-b36c-ea2a5c055b52": {
+          "display_id": 1699,
+          "author": "6Vw9",
+          "content": "Architecture decision: bind an immutable trusted exact-origin grant set into ToolRunContext and create an operation-scoped WebEgressBroker per tool call. Direct fetch/distillation use no-proxy, redirect-disabled reqwest clients pinned to the complete broker-admitted address set; public fetch redirects are followed manually and re-admitted. Browser/search use an explicit loopback forward proxy whose own DNS resolution, address-set cache, and direct TCP dial are authoritative for every navigation/subresource/frame/fetch-XHR/WebSocket/worker/download, while CDP request interception rejects bad schemes/userinfo and records origin/redirect evidence; Chromium TLS verification is explicitly enabled. Alternative considered: retain preflight validation and add only CDP interception or static Chrome host-resolver rules. Rejected because interception is not the dial boundary, static mappings cannot cover dynamic origins, and neither proves the actual peer or ambient-proxy behavior.",
+          "created_at": "2026-08-26T15:45:39.542873024Z",
+          "kind": "decision",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAzzIh25HOgPBOzXu2pij5DpifIlJnAYUJ7lwjZ0altKR3h74KJIX02FDnb1Hzmd5QnXgTIyyVd6D9wgXjD/viCQ=="
+        },
         "9c4af613-3180-45e7-9ffe-d70cdceaefe9": {
           "display_id": 1697,
           "author": "6Vw9",
@@ -42913,11 +42922,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1831,
       "timestamp": "2026-08-26T15:38:26.784134460Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1832,
+      "timestamp": "2026-08-26T15:45:39.545396549Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T15:38:26.784134460Z",
+    "timestamp": "2026-08-26T15:45:39.545396549Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1831
+    "agent_seq": 1832
   }
 }
