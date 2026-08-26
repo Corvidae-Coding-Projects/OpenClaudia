@@ -1,6 +1,6 @@
 {
   "next_display_id": 1149,
-  "next_comment_id": 1663,
+  "next_comment_id": 1664,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -14925,7 +14925,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T05:52:47.734576672Z",
-      "updated_at": "2026-08-26T05:59:50.104300716Z",
+      "updated_at": "2026-08-26T06:36:33.469945624Z",
       "labels": [
         "feature",
         "remediation"
@@ -14939,6 +14939,15 @@
           "kind": "observation",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABARw03e1g/n2vC0kI4XXKefjT9TD2U4gMwawk/2hr9lI+aVA9vOshfOMTtwvYu95HSUQ2zeJ4FycrZoQ9PZ71GBA=="
+        },
+        "712f917e-add2-4aaf-94c5-5d22a5e8970f": {
+          "display_id": 1663,
+          "author": "6Vw9",
+          "content": "[action] S-068 compiled LSP fixture now passes 8 lifecycle tests: state/version/concurrency, full hierarchy continuations, restart/rehydration, cancellation, shutdown/reaping, config changes, run isolation, and exact environment authority denial",
+          "created_at": "2026-08-26T06:36:33.466119543Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAnzYoCnWJS4gZDuDQwErvwRcHZsL1qj9Aca+ddAFweJ0T+LUmgKhFb1RxEtMVkHjj7qyWpYQkDNgtaNFFFQ/gCQ=="
         },
         "7b1290c9-d1f1-4fac-aa05-5084a1ee4da1": {
           "display_id": 1661,
@@ -42121,11 +42130,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1760,
       "timestamp": "2026-08-26T06:00:43.519597497Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1761,
+      "timestamp": "2026-08-26T06:36:33.469945624Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T06:00:43.519597497Z",
+    "timestamp": "2026-08-26T06:36:33.469945624Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1760
+    "agent_seq": 1761
   }
 }
