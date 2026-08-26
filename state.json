@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1152,
+  "next_display_id": 1153,
   "next_comment_id": 1687,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -1078,7 +1078,8 @@
     "fed642f6-f28b-4adb-b215-b651136269cf": 1061,
     "ff030de1-65fd-45d9-8461-c4c5e79b2e64": 255,
     "ff144525-a494-49cc-8aef-0f85c74f5172": 634,
-    "ff2170c9-4fd0-4648-ac71-f2a3b0ef0d5f": 602
+    "ff2170c9-4fd0-4648-ac71-f2a3b0ef0d5f": 602,
+    "ff9fcbe4-2c44-40bd-b0db-a13e05e9392f": 1152
   },
   "locks": {
     "1049": {
@@ -33376,6 +33377,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAwHQE7ABtDkvtXI4neiMZEgLvyjRSw2rda9laA+mdc+ISSFGpQaPjLcReva5mf0fNAQKt/OuuQeEnZeTeqvAJBA=="
         }
       }
+    },
+    "ff9fcbe4-2c44-40bd-b0db-a13e05e9392f": {
+      "uuid": "ff9fcbe4-2c44-40bd-b0db-a13e05e9392f",
+      "display_id": 1152,
+      "title": "S-070: Implement named remote actions safely",
+      "description": "Implement docs/remediation-slices/070-named-remote-action-runtime.md under parent #1071. Production-wire the existing named remote-action intent with typed effect classification, explicit run capability and secret authority, bounded supervised transport, validated inputs/destinations, cancellation, and typed complete/partial/error outcomes. Preserve working behavior; avoid unrelated cleanup and hypothetical perfection work. Use Rust 1.98, resource-aware verification, skeptical fixtures, exact generated changelog, signed dollspace-gay commit, no push, and exact-head PR #66 monitoring after the user pushes.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-26T09:40:48.130007212Z",
+      "updated_at": "2026-08-26T09:40:48.130007212Z"
     }
   },
   "deleted_issues": [
@@ -42649,11 +42662,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1810,
       "timestamp": "2026-08-26T09:31:47.781307806Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1811,
+      "timestamp": "2026-08-26T09:40:48.130007212Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T09:31:47.781307806Z",
+    "timestamp": "2026-08-26T09:40:48.130007212Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1810
+    "agent_seq": 1811
   }
 }
