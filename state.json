@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1153,
+  "next_display_id": 1154,
   "next_comment_id": 1697,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -721,6 +721,7 @@
     "abc3671e-fe2a-4ce1-82c7-146e4de6ad5e": 1025,
     "abe606a0-aaeb-46e3-90e4-8b6a91034ddf": 210,
     "abf21c2d-1c5d-4084-9fd2-f1033a2a73f5": 551,
+    "abf53cd7-6a99-47a1-80eb-3bd9fd47b169": 1153,
     "ac73046d-bbed-485d-8a02-89ac9a641ddf": 102,
     "ad24a204-c4fa-4ce2-8b90-15c1172fcc40": 90,
     "ad280b0b-b8f7-458e-a7b9-8f900eb3db07": 80,
@@ -23584,6 +23585,18 @@
         "eccf1cc7-8993-4eac-a444-d11b5c18765c"
       ]
     },
+    "abf53cd7-6a99-47a1-80eb-3bd9fd47b169": {
+      "uuid": "abf53cd7-6a99-47a1-80eb-3bd9fd47b169",
+      "display_id": 1153,
+      "title": "S-071: Enforce web policy at the connection boundary",
+      "description": "Implement docs/remediation-slices/071-web-egress-connection-broker.md under parent #1071. Production-wire one canonical connection broker for fetch, search, browser, and distillation so DNS/address pinning, TLS host verification, redirects, proxies, origins, schemes, userinfo, IPv4/IPv6, and private/local/metadata policy govern the actual connection. Preserve legitimate behavior through explicit typed grants; add redacted typed receipts and skeptical deterministic fixtures; stay within realistic acceptance scope. Use Rust 1.98 and resource-aware verification, preserve exact generated changelog, signed dollspace-gay commit, no push, and cumulative exact-head PR #66 monitoring after the user pushes.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-26T15:38:01.221799065Z",
+      "updated_at": "2026-08-26T15:38:01.221799065Z"
+    },
     "ac73046d-bbed-485d-8a02-89ac9a641ddf": {
       "uuid": "ac73046d-bbed-485d-8a02-89ac9a641ddf",
       "display_id": 102,
@@ -42848,11 +42861,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1826,
       "timestamp": "2026-08-26T11:03:03.638058208Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1827,
+      "timestamp": "2026-08-26T15:38:01.221799065Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T11:03:03.638058208Z",
+    "timestamp": "2026-08-26T15:38:01.221799065Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1826
+    "agent_seq": 1827
   }
 }
