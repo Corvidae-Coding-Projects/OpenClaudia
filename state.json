@@ -1,6 +1,6 @@
 {
   "next_display_id": 1154,
-  "next_comment_id": 1704,
+  "next_comment_id": 1705,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -23595,7 +23595,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T15:38:01.221799065Z",
-      "updated_at": "2026-08-26T16:20:52.578179378Z",
+      "updated_at": "2026-08-26T16:51:51.378585009Z",
       "labels": [
         "feature"
       ],
@@ -23635,6 +23635,15 @@
           "kind": "decision",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAzzIh25HOgPBOzXu2pij5DpifIlJnAYUJ7lwjZ0altKR3h74KJIX02FDnb1Hzmd5QnXgTIyyVd6D9wgXjD/viCQ=="
+        },
+        "5d353c68-1c7e-4637-98a8-92b66c43f371": {
+          "display_id": 1704,
+          "author": "6Vw9",
+          "content": "Implementation checkpoint: canonical operation-scoped web egress broker is now wired through fetch, search, Chromium browser, and distillation; production run roots and derived subagents carry immutable exact-origin grants in the capability digest. Direct HTTP uses no ambient proxy, manual redirect re-admission, DNS candidate classification/pinning, and TLS hostname preservation; Chromium is forced through a loopback broker with explicit TLS verification plus CDP scheme/userinfo screening. Typed redacted receipts reach canonical tool outcomes. Deterministic tests now pass for rebinding, mixed alternate addresses, redirects, userinfo, IPv6, proxy host smuggling, exact local grants, WSS CONNECT, body limits, and a real Chromium page attempting ungranted fetch/XHR/frame/subresource/WebSocket/blob-worker/download connections. Strict Rust 1.98 all-target/all-feature Clippy passed before the final broad test sweep.",
+          "created_at": "2026-08-26T16:51:51.375113884Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAngZ0PN4/bg36itPnXyfTZZyZfyKyfZu7u/Nng74LlyKAwdBHPm01neF6wNrLwThjee1RQQ2B94qg3wr1H1+kDg=="
         },
         "9c4af613-3180-45e7-9ffe-d70cdceaefe9": {
           "display_id": 1697,
@@ -42994,11 +43003,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1839,
       "timestamp": "2026-08-26T16:20:52.578179378Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1840,
+      "timestamp": "2026-08-26T16:51:51.378585009Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T16:20:52.578179378Z",
+    "timestamp": "2026-08-26T16:51:51.378585009Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1839
+    "agent_seq": 1840
   }
 }
