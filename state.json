@@ -1,6 +1,6 @@
 {
   "next_display_id": 1154,
-  "next_comment_id": 1697,
+  "next_comment_id": 1698,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -23599,10 +23599,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T15:38:01.221799065Z",
-      "updated_at": "2026-08-26T15:38:06.448725036Z",
+      "updated_at": "2026-08-26T15:38:22.330390621Z",
       "labels": [
         "feature"
-      ]
+      ],
+      "comments": {
+        "9c4af613-3180-45e7-9ffe-d70cdceaefe9": {
+          "display_id": 1697,
+          "author": "6Vw9",
+          "content": "Preflight on branch head 96e46566: dependencies S-019 and S-048 are satisfied; worktree clean; Rust/Cargo 1.98.0 available; 30 GiB RAM with about 8.3 GiB available, 8 GiB zram saturated, and 592 GiB disk free. Use CARGO_BUILD_JOBS=2 and one heavy Cargo/browser build at a time. Scope is the actual production fetch/search/browser/distillation connection boundary and typed receipts, with deterministic escape fixtures and no unrelated cleanup or hypothetical perfection work.",
+          "created_at": "2026-08-26T15:38:22.327979749Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAgNoPmwDII3o8tjKEbGtuCEds9rCXMlb059DDKHPdvId8ibPvRzqwE7lhp8PJ+D7rL/xDAUgJDAozddBEe8ENCg=="
+        }
+      }
     },
     "ac73046d-bbed-485d-8a02-89ac9a641ddf": {
       "uuid": "ac73046d-bbed-485d-8a02-89ac9a641ddf",
@@ -42883,11 +42894,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1829,
       "timestamp": "2026-08-26T15:38:12.533662450Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1830,
+      "timestamp": "2026-08-26T15:38:22.330390621Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T15:38:12.533662450Z",
+    "timestamp": "2026-08-26T15:38:22.330390621Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1829
+    "agent_seq": 1830
   }
 }
