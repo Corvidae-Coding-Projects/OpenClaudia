@@ -125,6 +125,7 @@ pub struct ToolRunContextBuilder {
     host_home: Option<PathBuf>,
     skill_access: Option<crate::skills::SkillRunAccess>,
     remote_actions: super::remote_trigger::WebhookRegistry,
+    web_egress_grants: crate::web_egress::WebEgressGrants,
     inherit_host_startup_grants: bool,
     workspace_access: Option<WorkspaceAccess>,
     process: Option<bool>,
@@ -162,6 +163,7 @@ impl ToolRunContextBuilder {
             host_home: None,
             skill_access: None,
             remote_actions: super::remote_trigger::WebhookRegistry::new(),
+            web_egress_grants: crate::web_egress::WebEgressGrants::public_only(),
             inherit_host_startup_grants: false,
             workspace_access: None,
             process: None,
@@ -320,6 +322,13 @@ impl ToolRunContextBuilder {
         self
     }
 
+    /// Bind trusted exact-origin web authority to this run generation.
+    #[must_use]
+    pub fn web_egress_grants(mut self, grants: crate::web_egress::WebEgressGrants) -> Self {
+        self.web_egress_grants = grants;
+        self
+    }
+
     #[must_use]
     pub const fn process(mut self, available: bool) -> Self {
         self.process = Some(available);
@@ -437,6 +446,7 @@ pub struct ToolRunContext {
     host_home: Option<PathBuf>,
     skill_access: crate::skills::SkillRunAccess,
     remote_actions: super::remote_trigger::RemoteActionService,
+    web_egress_grants: crate::web_egress::WebEgressGrants,
     skill_touched_paths: Mutex<BTreeSet<PathBuf>>,
     network_policy: AgentNetworkPolicy,
     process_available: bool,
@@ -474,6 +484,7 @@ impl std::fmt::Debug for ToolRunContext {
             .field("host_home_bound", &self.host_home.is_some())
             .field("skill_access", &self.skill_access)
             .field("remote_action_count", &self.remote_actions.registry().len())
+            .field("web_egress_grants", &self.web_egress_grants)
             .field("process_available", &self.process_available)
             .field("network_available", &self.network_available)
             .field("secrets_available", &self.secrets_available)
@@ -537,6 +548,7 @@ impl ToolRunContext {
             host_home,
             skill_access,
             remote_actions,
+            web_egress_grants,
             inherit_host_startup_grants,
             workspace_access,
             process,
@@ -772,6 +784,7 @@ impl ToolRunContext {
             &environment_grants,
             &mcp_environment_grants,
             remote_actions.authority_digest(),
+            web_egress_grants.authority_digest(),
             &executable_search_path,
             host_home.as_deref(),
             network_policy,
@@ -843,6 +856,7 @@ impl ToolRunContext {
             host_home,
             skill_access,
             remote_actions,
+            web_egress_grants,
             skill_touched_paths: Mutex::new(BTreeSet::new()),
             network_policy,
             process_available: process,
@@ -1235,6 +1249,7 @@ impl ToolRunContext {
             &self.environment_grants,
             &self.mcp_environment_grants,
             self.remote_actions.authority_digest(),
+            self.web_egress_grants.authority_digest(),
             &self.executable_search_path,
             self.host_home.as_deref(),
             self.network_policy,
@@ -1354,6 +1369,7 @@ impl ToolRunContext {
             .host_home(self.host_home.clone())
             .skill_access(self.skill_access.clone())
             .remote_actions(self.remote_actions.registry().clone())
+            .web_egress_grants(self.web_egress_grants.clone())
             .workspace_access(workspace_access)
             .process(self.grants_resource(ToolResource::Process))
             .network(self.grants_resource(ToolResource::Network))
@@ -1475,6 +1491,12 @@ impl ToolRunContext {
     #[must_use]
     pub const fn remote_actions(&self) -> &super::remote_trigger::RemoteActionService {
         &self.remote_actions
+    }
+
+    /// Exact private/local web origins bound to this run generation.
+    #[must_use]
+    pub const fn web_egress_grants(&self) -> &crate::web_egress::WebEgressGrants {
+        &self.web_egress_grants
     }
 
     /// Record a project-relative file touched by a real workspace operation.
@@ -1715,6 +1737,7 @@ fn capability_manifest_digest(
     environment_grants: &crate::secrets::EnvironmentGrants,
     mcp_environment_grants: &crate::secrets::EnvironmentGrants,
     remote_actions_digest: ContentDigest,
+    web_egress_grants_digest: ContentDigest,
     executable_search_path: &OsStr,
     host_home: Option<&Path>,
     network_policy: AgentNetworkPolicy,
@@ -1764,6 +1787,9 @@ fn capability_manifest_digest(
     }
     manifest.push_str("remote_actions=");
     manifest.push_str(&remote_actions_digest.to_string());
+    manifest.push('\n');
+    manifest.push_str("web_egress_grants=");
+    manifest.push_str(&web_egress_grants_digest.to_string());
     manifest.push('\n');
     manifest.push_str("executable_search_path=");
     manifest
@@ -2896,6 +2922,7 @@ mod tests {
             &first_environment,
             &empty_environment,
             ContentDigest::sha256(b"empty-remote-actions"),
+            ContentDigest::sha256(b"empty-web-egress-grants"),
             OsStr::new("/usr/bin"),
             None,
             AgentNetworkPolicy::Denied,
@@ -2915,6 +2942,7 @@ mod tests {
             &second_environment,
             &empty_environment,
             ContentDigest::sha256(b"empty-remote-actions"),
+            ContentDigest::sha256(b"empty-web-egress-grants"),
             OsStr::new("/usr/bin"),
             None,
             AgentNetworkPolicy::Denied,

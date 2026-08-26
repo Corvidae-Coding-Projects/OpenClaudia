@@ -1158,13 +1158,13 @@ impl ToolHandler for WebFetchHandler {
             }
         })
     }
-    fn execute_legacy(
+    fn execute(
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
-    ) -> (String, bool) {
-        web::execute_web_fetch_with_config(ctx.run, args, ctx.app_config)
+    ) -> ToolHandlerResult {
+        web::execute_web_fetch_result(ctx.run, args, ctx.app_config)
     }
 }
 
@@ -1219,13 +1219,13 @@ impl ToolHandler for WebSearchHandler {
             }
         })
     }
-    fn execute_legacy(
+    fn execute(
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
-    ) -> (String, bool) {
-        web::execute_web_search(ctx.run, args)
+    ) -> ToolHandlerResult {
+        web::execute_web_search_result(ctx.run, args)
     }
 }
 
@@ -1269,13 +1269,13 @@ impl ToolHandler for WebBrowserHandler {
             }
         })
     }
-    fn execute_legacy(
+    fn execute(
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
-    ) -> (String, bool) {
-        web::execute_web_browser(ctx.run, args)
+    ) -> ToolHandlerResult {
+        web::execute_web_browser_result(ctx.run, args)
     }
 }
 

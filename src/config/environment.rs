@@ -272,6 +272,7 @@ enum ConfigField {
     WebFetchDistillationProvider,
     WebFetchDistillationModel,
     WebFetchPreapprovedDomains,
+    WebFetchExactPrivateOrigins,
     PolicyMaxRequestTokens,
     PolicyMaxSessionTokens,
     PolicyToolCaps,
@@ -838,6 +839,15 @@ const APP_FIELDS: &[FieldDefinition] = &[
         "web_fetch.preapproved_domains",
         "OPENCLAUDIA_WEB_FETCH__PREAPPROVED_DOMAINS",
         "OPENCLAUDIA_WEB_FETCH_PREAPPROVED_DOMAINS",
+        JsonStringList,
+        Sensitive,
+        true
+    ),
+    field!(
+        ConfigField::WebFetchExactPrivateOrigins,
+        "web_fetch.exact_private_origins",
+        "OPENCLAUDIA_WEB_FETCH__EXACT_PRIVATE_ORIGINS",
+        "OPENCLAUDIA_WEB_FETCH_EXACT_PRIVATE_ORIGINS",
         JsonStringList,
         Sensitive,
         true
@@ -1944,6 +1954,13 @@ fn apply_value(
                 &invalid,
             )?;
         }
+        ConfigField::WebFetchExactPrivateOrigins => {
+            config.web_fetch.exact_private_origins = json_value(
+                expect_value!(Json),
+                EnvironmentValueParser::JsonStringList,
+                &invalid,
+            )?;
+        }
         ConfigField::PolicyMaxRequestTokens => {
             config.policy.max_request_tokens = Some(expect_value!(Usize));
         }
@@ -2432,6 +2449,7 @@ mod tests {
             | ConfigField::GuardrailsBlastRadiusDeniedPaths
             | ConfigField::PermissionsDefaultAllow
             | ConfigField::WebFetchPreapprovedDomains => "[\"typed-env-value\"]",
+            ConfigField::WebFetchExactPrivateOrigins => "[\"http://127.0.0.1:8787\"]",
             ConfigField::GuardrailsQualityGatesChecks => {
                 r#"[{"name":"typed-env","command":"true","required":false}]"#
             }
@@ -2801,6 +2819,12 @@ mod tests {
             ),
             ConfigField::WebFetchPreapprovedDomains => {
                 assert_eq!(config.web_fetch.preapproved_domains, ["typed-env-value"]);
+            }
+            ConfigField::WebFetchExactPrivateOrigins => {
+                assert_eq!(
+                    config.web_fetch.exact_private_origins,
+                    ["http://127.0.0.1:8787"]
+                );
             }
             ConfigField::PolicyMaxRequestTokens => {
                 assert_eq!(config.policy.max_request_tokens, Some(7000));

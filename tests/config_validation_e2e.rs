@@ -42,6 +42,8 @@ const CONFIG_ENV_VARS: &[&str] = &[
     "OPENCLAUDIA_PERMISSIONS_ENABLED",
     "OPENCLAUDIA_PERMISSIONS_DEFAULT_ALLOW",
     "OPENCLAUDIA_WEB_FETCH_PREAPPROVED_DOMAINS",
+    "OPENCLAUDIA_WEB_FETCH__EXACT_PRIVATE_ORIGINS",
+    "OPENCLAUDIA_WEB_FETCH_EXACT_PRIVATE_ORIGINS",
     "OPENCLAUDIA_PROVIDERS_OLLAMA_BASE_URL",
     "OPENCLAUDIA_PROVIDERS_LOCAL_BASE_URL",
     "OPENCLAUDIA_PROVIDERS_LMSTUDIO_BASE_URL",
@@ -575,6 +577,92 @@ web_fetch:
             assert!(config.permissions.project_proposal.is_none());
         },
     );
+}
+
+#[test]
+fn project_private_web_origins_are_stripped_but_trusted_home_origins_are_bound() {
+    with_isolated_config_sources(
+        Some(
+            r"
+web_fetch:
+  exact_private_origins:
+    - http://169.254.169.254
+",
+        ),
+        Some(
+            r"
+web_fetch:
+  exact_private_origins:
+    - http://127.0.0.1:8787
+",
+        ),
+        || {
+            let config = load_config().expect("trusted exact origin must load");
+            assert_eq!(
+                config.web_fetch.exact_private_origins,
+                ["http://127.0.0.1:8787"]
+            );
+            let grants = config
+                .build_web_egress_grants()
+                .expect("trusted origin grants");
+            assert_ne!(
+                grants.authority_digest(),
+                openclaudia::web_egress::WebEgressGrants::public_only().authority_digest(),
+                "the trusted source must contribute immutable run authority"
+            );
+        },
+    );
+}
+
+#[test]
+fn dotted_project_private_web_origin_cannot_bypass_source_filtering() {
+    with_isolated_config_sources(
+        Some(
+            r#"
+"web_fetch.exact_private_origins": ["http://169.254.169.254"]
+"#,
+        ),
+        None,
+        || {
+            let config = load_config().expect("dotted project grant must be stripped");
+            assert!(config.web_fetch.exact_private_origins.is_empty());
+        },
+    );
+}
+
+#[test]
+fn malformed_trusted_private_web_origin_fails_during_config_load() {
+    with_isolated_config_sources(
+        None,
+        Some(
+            r"
+web_fetch:
+  exact_private_origins:
+    - http://user:secret@127.0.0.1:8787/path
+",
+        ),
+        || {
+            let error = load_config().expect_err("malformed exact origin must fail closed");
+            assert!(error.to_string().contains("exact web origin"));
+            assert!(!error.to_string().contains("secret"));
+        },
+    );
+}
+
+#[test]
+fn typed_environment_private_web_origin_is_validated_and_bound() {
+    with_isolated_config_sources(None, None, || {
+        let _origin = EnvGuard::set(
+            "OPENCLAUDIA_WEB_FETCH__EXACT_PRIVATE_ORIGINS",
+            r#"["http://127.0.0.1:9898"]"#,
+        );
+        let config = load_config().expect("typed exact-origin environment grant");
+        assert_eq!(
+            config.web_fetch.exact_private_origins,
+            ["http://127.0.0.1:9898"]
+        );
+        assert!(config.build_web_egress_grants().is_ok());
+    });
 }
 
 #[test]

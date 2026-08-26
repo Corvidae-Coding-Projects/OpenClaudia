@@ -2747,6 +2747,11 @@ async fn build_proxy_state_with_loop_control(
                 .build_registry()
                 .map_err(|error| anyhow::anyhow!(error))?,
         )
+        .web_egress_grants(
+            config
+                .build_web_egress_grants()
+                .map_err(|error| anyhow::anyhow!(error))?,
+        )
         .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
         .process(true)
         .network(true)

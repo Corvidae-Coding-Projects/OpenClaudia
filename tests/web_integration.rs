@@ -44,8 +44,9 @@ async fn fetch_url(url: &str) -> Result<FetchResult, String> {
     openclaudia::web::fetch_url(url, std::sync::Arc::clone(support::shared_run_context())).await
 }
 
-fn fetch_with_browser(url: &str) -> Result<FetchResult, String> {
-    openclaudia::web::fetch_with_browser(url, support::shared_run_context().private_temp_root())
+async fn fetch_with_browser(url: &str) -> Result<FetchResult, String> {
+    openclaudia::web::fetch_with_browser(url, std::sync::Arc::clone(support::shared_run_context()))
+        .await
 }
 
 /// Build a wiremock server that returns the given body and status for GET /*.
@@ -800,9 +801,11 @@ async fn browser_fetch_blocks_ssrf_before_launch() {
     }
     // fetch_with_browser (src/web.rs:598) calls validate_url before Browser::new.
     // An SSRF URL must be rejected without launching Chrome.
-    let err = fetch_with_browser("http://169.254.169.254/latest/meta-data/").unwrap_err();
+    let err = fetch_with_browser("http://169.254.169.254/latest/meta-data/")
+        .await
+        .unwrap_err();
     assert!(
-        err.contains("reserved/internal") || err.contains("metadata endpoint"),
+        err.contains("private") || err.contains("metadata") || err.contains("reserved"),
         "SSRF URL not blocked before browser launch: {err}"
     );
 }
@@ -811,33 +814,108 @@ async fn browser_fetch_blocks_ssrf_before_launch() {
 #[tokio::test]
 #[ignore = "requires headless Chrome — set OPENCLAUDIA_TEST_BROWSER=1 and run with --ignored"]
 async fn browser_fetch_success_contains_url_line() {
-    use openclaudia::tools::{execute_tool, FunctionCall, ToolCall};
+    use openclaudia::tools::{
+        execute_tool, FunctionCall, ToolCall, ToolOutcome, ToolRunContext, WorkspaceAccess,
+    };
+    use std::io::{Read as _, Write as _};
     if std::env::var("OPENCLAUDIA_TEST_BROWSER").is_err() {
         eprintln!("OPENCLAUDIA_TEST_BROWSER not set — skipping browser fetch test");
         return;
     }
 
+    let destination =
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("destination bind");
+    let destination_port = destination
+        .local_addr()
+        .expect("destination address")
+        .port();
+    destination
+        .set_nonblocking(true)
+        .expect("nonblocking destination");
+
+    let origin_listener =
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("origin bind");
+    let origin_port = origin_listener.local_addr().expect("origin address").port();
+    let page = format!(
+        r#"<!doctype html><title>Brokered browser</title><main>browser receipt</main>
+<script>
+fetch('http://127.0.0.1:{destination_port}/fetch');
+const xhr = new XMLHttpRequest(); xhr.open('GET', 'http://127.0.0.1:{destination_port}/xhr'); xhr.send();
+const frame = document.createElement('iframe'); frame.src = 'http://127.0.0.1:{destination_port}/frame'; document.body.appendChild(frame);
+const image = new Image(); image.src = 'http://127.0.0.1:{destination_port}/subresource';
+try {{ new WebSocket('ws://127.0.0.1:{destination_port}/socket'); }} catch (_) {{}}
+const workerSource = "fetch('http://127.0.0.1:{destination_port}/worker-fetch')";
+try {{ new Worker(URL.createObjectURL(new Blob([workerSource], {{type: 'text/javascript'}}))); }} catch (_) {{}}
+const download = document.createElement('a'); download.href = 'http://127.0.0.1:{destination_port}/download'; download.download = 'blocked'; download.target = '_blank'; download.rel = 'noopener'; document.body.appendChild(download); download.click();
+</script>"#
+    );
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = origin_listener.accept().expect("origin accept");
+        let mut request = [0_u8; 4096];
+        let request_len = stream.read(&mut request).expect("origin request");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+            page.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("origin response");
+        String::from_utf8_lossy(&request[..request_len]).into_owned()
+    });
+
+    let origin = format!("http://127.0.0.1:{origin_port}");
+    let grants = openclaudia::web_egress::WebEgressGrants::from_exact_web_origins([&origin])
+        .expect("exact browser origin");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let run = ToolRunContext::builder(openclaudia::state::SessionId::new(), root)
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(std::collections::HashMap::new())
+        .web_egress_grants(grants)
+        .workspace_access(WorkspaceAccess::ReadOnly)
+        .process(true)
+        .network(true)
+        .secrets(false)
+        .provider("browser-egress-test")
+        .ephemeral_background_jobs()
+        .build()
+        .expect("browser run");
+    let url = format!("{origin}/page?not-in-receipt=secret");
     let call = ToolCall {
-        id: "bfetch".to_string(),
+        id: "brokered-browser".to_string(),
         call_type: "function".to_string(),
         function: FunctionCall {
             name: "web_browser".to_string(),
-            arguments: r#"{"url": "https://example.com/"}"#.to_string(),
+            arguments: serde_json::json!({"url": url}).to_string(),
         },
     };
-    let result = execute_tool(support::shared_run_context(), &call);
-    if result.is_error() {
-        eprintln!(
-            "Browser fetch failed (Chrome may not be installed): {}",
-            result.content()
-        );
-        return;
-    }
-    // Spec §4: output contains "URL: <url>" line
+    let result = execute_tool(&run, &call);
+    let origin_request = server.join().expect("origin server");
     assert!(
-        result.content().contains("URL: https://example.com/"),
-        "URL line missing from browser fetch output: {}",
-        result.content()
+        matches!(result.outcome(), ToolOutcome::Success { .. }),
+        "deterministic browser fetch failed after request {origin_request:?}: {}",
+        result.content(),
+    );
+    assert!(result.content().contains(&format!("URL: {url}")));
+    assert!(
+        result.content().contains("browser receipt"),
+        "rendered browser output missing fixture body after request {origin_request:?}; error marker {:?}",
+        result.content().split_whitespace().find(|word| word.starts_with("ERR_"))
+    );
+    let structured = result.structured().expect("browser receipts");
+    let receipts = structured["network_receipts"]
+        .as_array()
+        .expect("receipt array");
+    assert!(receipts.iter().any(|receipt| {
+        receipt["origin"] == origin
+            && receipt["backend"] == "browser_proxy"
+            && receipt["final_peer"] == format!("127.0.0.1:{origin_port}")
+    }));
+    assert!(!structured.to_string().contains("not-in-receipt"));
+    assert!(!structured.to_string().contains("secret"));
+    assert!(
+        matches!(destination.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "browser subresources, frames, XHR, WebSocket, workers, and downloads must not reach an ungranted private origin"
     );
 }
 mod support;

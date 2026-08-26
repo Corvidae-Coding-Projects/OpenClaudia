@@ -243,6 +243,7 @@ environment.
 | `memory.team_id` | `OPENCLAUDIA_MEMORY__TEAM_ID` | strict host-enrolled team selector / authority-sensitive; cannot create membership |
 | `memory.team_memory_path` | `OPENCLAUDIA_MEMORY__TEAM_MEMORY_PATH` | permanently rejected legacy path proposal; a path is never team authority |
 | `web_fetch.preapproved_domains` | `OPENCLAUDIA_WEB_FETCH__PREAPPROVED_DOMAINS` | JSON string array / authority-sensitive |
+| `web_fetch.exact_private_origins` | `OPENCLAUDIA_WEB_FETCH__EXACT_PRIVATE_ORIGINS` | JSON array of exact `http(s)`/`ws(s)` origins / authority-sensitive |
 
 The complete supported-name matrix, including provider aliases, parser,
 secrecy, precedence, and deprecation metadata, is exposed by
@@ -337,6 +338,23 @@ symbolic name, description, and payload schema. OpenClaudia fixes the POST
 destination and headers, requires the run's network and secret capabilities
 plus host approval, and enforces the configured deadline, byte, call,
 concurrency, idempotency, and retry bounds.
+
+Private/local web access is also authority-bearing host configuration. Put
+`web_fetch.exact_private_origins` only in `~/.openclaudia/config.yaml` or its
+typed environment variable; project values are ignored. Each entry must be a
+bare, exact origin such as `http://127.0.0.1:8787` or
+`wss://dev.example.test:9443`—userinfo, paths, queries, fragments, and broad
+host patterns are rejected. These grants are snapshotted into each run and
+apply to model-selected fetch/browser traffic. A configured local
+distillation provider receives a narrower provider-only grant and does not
+become a general browsing destination. `preapproved_domains` controls prompts;
+it does not grant connection-boundary access.
+
+```yaml
+web_fetch:
+  exact_private_origins:
+    - http://127.0.0.1:8787
+```
 
 ```yaml
 remote_actions:

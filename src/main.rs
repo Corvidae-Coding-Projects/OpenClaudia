@@ -1102,6 +1102,9 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
             .remote_actions
             .build_registry()
             .map_err(anyhow::Error::msg)?,
+        config
+            .build_web_egress_grants()
+            .map_err(anyhow::Error::msg)?,
     );
     app.hook_engine = Some(hook_engine);
     app.vdd_engine =

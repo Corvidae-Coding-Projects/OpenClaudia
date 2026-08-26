@@ -15,6 +15,10 @@ use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::runtime::Runtime;
 
+#[cfg(test)]
+use super::ToolOutcome;
+use super::{ToolFailure, ToolFailureCode, ToolHandlerResult, ToolRetryability};
+
 /// Process-wide shared tokio runtime used to drive the async web tools
 /// from sync caller contexts (crosslink #368).
 ///
@@ -171,12 +175,81 @@ pub fn format_fetch_output(title: Option<&str>, url: &str, content: &str) -> Str
     }
 }
 
+fn success_with_receipts(
+    text: String,
+    receipts: &[crate::web_egress::NetworkReceipt],
+) -> ToolHandlerResult {
+    ToolHandlerResult::success_structured(text, serde_json::json!({"network_receipts": receipts}))
+}
+
+fn failure_from_egress(
+    prefix: &str,
+    error: crate::web_egress::WebEgressError,
+) -> ToolHandlerResult {
+    let crate::web_egress::WebEgressError {
+        kind,
+        message,
+        receipts,
+    } = error;
+    let code = match kind {
+        crate::web_egress::WebEgressErrorKind::InvalidUrl => ToolFailureCode::InvalidInput,
+        crate::web_egress::WebEgressErrorKind::PolicyDenied
+        | crate::web_egress::WebEgressErrorKind::Rebinding => ToolFailureCode::PolicyDenied,
+        crate::web_egress::WebEgressErrorKind::Deadline => ToolFailureCode::DeadlineExceeded,
+        crate::web_egress::WebEgressErrorKind::Cancelled => ToolFailureCode::Cancelled,
+        crate::web_egress::WebEgressErrorKind::Resolution
+        | crate::web_egress::WebEgressErrorKind::Connect
+        | crate::web_egress::WebEgressErrorKind::ResponseTooLarge
+        | crate::web_egress::WebEgressErrorKind::Protocol
+        | crate::web_egress::WebEgressErrorKind::External => ToolFailureCode::External,
+    };
+    let retryability = match kind {
+        crate::web_egress::WebEgressErrorKind::Resolution
+        | crate::web_egress::WebEgressErrorKind::Connect
+        | crate::web_egress::WebEgressErrorKind::Deadline => ToolRetryability::Safe,
+        _ => ToolRetryability::Never,
+    };
+    let mut failure = ToolFailure::new(code, format!("{prefix}: {message}"), retryability);
+    failure.source = Some("web_egress".to_string());
+    failure.recovery = Some(serde_json::json!({"network_receipts": receipts}));
+    ToolHandlerResult::error(failure)
+}
+
+fn invalid_arguments(message: impl Into<String>) -> ToolHandlerResult {
+    ToolHandlerResult::error(ToolFailure::new(
+        ToolFailureCode::InvalidArguments,
+        message.into(),
+        ToolRetryability::Never,
+    ))
+}
+
+fn capability_denied(prefix: &str, error: impl std::fmt::Display) -> ToolHandlerResult {
+    failure_from_egress(
+        prefix,
+        crate::web_egress::WebEgressError {
+            kind: crate::web_egress::WebEgressErrorKind::PolicyDenied,
+            message: error.to_string(),
+            receipts: Vec::new(),
+        },
+    )
+}
+
+#[cfg(test)]
+fn handler_result_to_legacy(result: ToolHandlerResult) -> (String, bool) {
+    match result.outcome {
+        ToolOutcome::Success { content } | ToolOutcome::Partial { content, .. } => {
+            (content.text, false)
+        }
+        ToolOutcome::Error { failure } => (failure.message, true),
+    }
+}
+
 /// Fetch a URL and return its body rendered as Markdown.
 ///
-/// Delegates to [`web::fetch_url`], which always tries direct HTTP
-/// via the shared client first. Browser-feature builds then fall back
-/// to headless Chromium for pages that need JavaScript or get blocked
-/// at the WAF edge.
+/// Delegates to [`web::fetch_url_brokered`], which always tries direct HTTP
+/// through the operation-scoped connection broker first. Browser-feature
+/// builds then fall back to brokered headless Chromium for transport failures
+/// or non-success responses.
 /// HTML responses are converted to Markdown locally via `htmd`;
 /// non-HTML bodies (JSON, plain text, RSS, …) are returned verbatim.
 ///
@@ -184,31 +257,37 @@ pub fn format_fetch_output(title: Option<&str>, url: &str, content: &str) -> Str
 /// is true, the fetched markdown is sent to the configured secondary model and
 /// the model's answer is returned instead of raw markdown. Without enabled
 /// distillation the prompt is ignored and raw markdown is returned.
+#[cfg(test)]
 pub fn execute_web_fetch_with_config(
     run: &std::sync::Arc<crate::tools::security::ToolRunContext>,
     args: &HashMap<String, Value>,
     app_config: Option<&AppConfig>,
 ) -> (String, bool) {
+    handler_result_to_legacy(execute_web_fetch_result(run, args, app_config))
+}
+
+pub fn execute_web_fetch_result(
+    run: &std::sync::Arc<crate::tools::security::ToolRunContext>,
+    args: &HashMap<String, Value>,
+    app_config: Option<&AppConfig>,
+) -> ToolHandlerResult {
     if let Err(error) = run.require(crate::tools::security::ToolResource::Network) {
-        return (error.to_string(), true);
+        return capability_denied("Failed to fetch URL", error);
     }
     // crosslink #675: typed accessor.
     let url = match args.arg_str_strict("url") {
         Ok(u) => u,
-        Err(e) => return e.into_tool_error(),
+        Err(e) => return invalid_arguments(e.to_string()),
     };
 
     // Validate URL format
     if !url.starts_with("http://") && !url.starts_with("https://") {
-        return (
-            "Invalid URL: must start with http:// or https://".to_string(),
-            true,
-        );
+        return invalid_arguments("Invalid URL: must start with http:// or https://");
     }
 
     let prompt = match optional_web_fetch_prompt(args) {
         Ok(prompt) => prompt,
-        Err(e) => return (e, true),
+        Err(error) => return invalid_arguments(error),
     };
 
     // Drive the async fetch on `SHARED_RUNTIME` via `run_blocking`.
@@ -216,36 +295,52 @@ pub fn execute_web_fetch_with_config(
     // the future doesn't borrow `url` across thread boundaries.
     let url_owned = url.to_string();
     let fetch_run = std::sync::Arc::clone(run);
-    let result = match run_blocking(async move { web::fetch_url(&url_owned, fetch_run).await }) {
-        Ok(result) => result,
-        Err(e) => return (format!("Failed to fetch URL: {e}"), true),
-    };
+    let result =
+        match run_blocking(async move { web::fetch_url_brokered(&url_owned, fetch_run).await }) {
+            Ok(result) => result,
+            Err(error) => {
+                return failure_from_egress(
+                    "Failed to fetch URL",
+                    crate::web_egress::WebEgressError::external(error, Vec::new()),
+                )
+            }
+        };
 
     match result {
-        Ok(fetch_result) => {
+        Ok(mut brokered) => {
+            let fetch_result = brokered.result;
             if let (Some(prompt), Some(config)) =
                 (prompt, distillation_config_for_prompt(app_config))
             {
                 return match distill_fetch_result(
+                    std::sync::Arc::clone(run),
                     prompt,
                     &fetch_result.url,
                     &fetch_result.content,
                     config,
                 ) {
-                    Ok(answer) => (answer, false),
-                    Err(e) => (format!("Failed to distill fetched page: {e}"), true),
+                    Ok(distilled) => {
+                        brokered.network_receipts.push(distilled.receipt);
+                        success_with_receipts(distilled.answer, &brokered.network_receipts)
+                    }
+                    Err(mut error) => {
+                        let mut receipts = brokered.network_receipts;
+                        receipts.append(&mut error.receipts);
+                        error.receipts = receipts;
+                        failure_from_egress("Failed to distill fetched page", error)
+                    }
                 };
             }
-            (
+            success_with_receipts(
                 format_fetch_output(
                     fetch_result.title.as_deref(),
                     &fetch_result.url,
                     &fetch_result.content,
                 ),
-                false,
+                &brokered.network_receipts,
             )
         }
-        Err(e) => (format!("Failed to fetch URL: {e}"), true),
+        Err(error) => failure_from_egress("Failed to fetch URL", error),
     }
 }
 
@@ -277,21 +372,33 @@ struct DistillationCall {
     adapter: &'static dyn ProviderAdapter,
 }
 
+struct DistillationResult {
+    answer: String,
+    receipt: crate::web_egress::NetworkReceipt,
+}
+
 fn distill_fetch_result(
+    run: std::sync::Arc<crate::tools::ToolRunContext>,
     prompt: &str,
     url: &str,
     markdown: &str,
     app_config: &AppConfig,
-) -> Result<String, String> {
+) -> Result<DistillationResult, crate::web_egress::WebEgressError> {
     let web_config = &app_config.web_fetch;
     let markdown = web_config.truncate_for_distillation(markdown).to_string();
-    let call = build_distillation_call(app_config, web_config, prompt, url, &markdown)?;
+    let call = build_distillation_call(app_config, web_config, prompt, url, &markdown)
+        .map_err(|error| crate::web_egress::WebEgressError::external(error, Vec::new()))?;
 
     run_blocking_with_timeout(
-        async move { execute_distillation_call(call).await },
+        async move { execute_distillation_call(run, call).await },
         WEB_FETCH_DISTILLATION_TIMEOUT,
     )
-    .map_err(|e| format!("distillation dispatch failed: {e}"))?
+    .map_err(|error| {
+        crate::web_egress::WebEgressError::external(
+            format!("distillation dispatch failed: {error}"),
+            Vec::new(),
+        )
+    })?
 }
 
 fn build_distillation_call(
@@ -400,54 +507,65 @@ fn build_distillation_request(
     }
 }
 
-async fn execute_distillation_call(call: DistillationCall) -> Result<String, String> {
-    let client = crate::provider_transport::shared_client().map_err(|error| error.to_string())?;
-    let request = call
-        .headers
-        .apply(
-            client
-                .post(&call.endpoint)
-                .timeout(WEB_FETCH_DISTILLATION_TIMEOUT)
-                .json(&call.body),
-        )
-        .map_err(|error| format!("distillation headers are invalid: {error}"))?;
-
-    let response = crate::provider_transport::send(request)
-        .await
-        .map_err(|e| format!("distillation request failed: {e}"))?;
-    let status = response.status();
-    let body = zeroize::Zeroizing::new(
-        crate::provider_transport::read_body_capped(
-            response,
+async fn execute_distillation_call(
+    run: std::sync::Arc<crate::tools::ToolRunContext>,
+    call: DistillationCall,
+) -> Result<DistillationResult, crate::web_egress::WebEgressError> {
+    let broker = crate::web_egress::WebEgressBroker::new(run)?;
+    let response = broker
+        .post_distillation_json(
+            &call.endpoint,
+            &call.headers,
+            &call.body,
             crate::provider_transport::MAX_JSON_RESPONSE_BYTES,
+            WEB_FETCH_DISTILLATION_TIMEOUT,
         )
-        .await
-        .map_err(|error| format!("distillation response failed: {error}"))?,
-    );
+        .await?;
+    let status = response.status;
+    let receipt = response.receipt;
+    let body = zeroize::Zeroizing::new(response.body);
     if !status.is_success() {
         let body_text = String::from_utf8_lossy(&body);
         let body = call.headers.sanitize_diagnostic(&body_text);
-        return Err(format!(
-            "distillation provider '{}' returned HTTP {status}: {body}",
-            call.provider
+        return Err(crate::web_egress::WebEgressError::external(
+            format!(
+                "distillation provider '{}' returned HTTP {status}: {body}",
+                call.provider
+            ),
+            vec![receipt],
         ));
     }
 
-    let json = serde_json::from_slice::<Value>(&body)
-        .map_err(|e| format!("distillation provider returned invalid JSON: {e}"))?;
+    let json = serde_json::from_slice::<Value>(&body).map_err(|_| {
+        crate::web_egress::WebEgressError::external(
+            "distillation provider returned invalid JSON",
+            vec![receipt.clone()],
+        )
+    })?;
     let normalized = call
         .adapter
         .transform_response(json.clone(), false)
-        .map_err(|e| format!("distillation provider returned invalid response: {e}"))?;
+        .map_err(|_| {
+            crate::web_egress::WebEgressError::external(
+                "distillation provider returned an invalid response",
+                vec![receipt.clone()],
+            )
+        })?;
     let text = call
         .adapter
         .extract_response_text(&json)
         .or_else(|| call.adapter.extract_response_text(&normalized))
         .unwrap_or_default();
     if text.trim().is_empty() {
-        return Err("distillation provider returned an empty answer".to_string());
+        return Err(crate::web_egress::WebEgressError::external(
+            "distillation provider returned an empty answer",
+            vec![receipt],
+        ));
     }
-    Ok(text)
+    Ok(DistillationResult {
+        answer: text,
+        receipt,
+    })
 }
 
 fn default_distillation_model_for_provider(provider: &str) -> Option<&'static str> {
@@ -524,24 +642,61 @@ fn parse_domain_list(args: &HashMap<String, Value>, key: &str) -> Result<Vec<Str
 /// that list are kept. Blocked list takes precedence when both lists
 /// name the same domain.
 #[cfg_attr(not(feature = "browser"), allow(dead_code))]
-pub fn execute_web_search(
-    run: &crate::tools::security::ToolRunContext,
+pub fn execute_web_search_result(
+    run: &std::sync::Arc<crate::tools::security::ToolRunContext>,
     args: &HashMap<String, Value>,
-) -> (String, bool) {
+) -> ToolHandlerResult {
     for resource in [
         crate::tools::security::ToolResource::Network,
         crate::tools::security::ToolResource::Process,
     ] {
         if let Err(error) = run.require(resource) {
-            return (error.to_string(), true);
+            return capability_denied("Search failed", error);
         }
     }
-    let browser_scratch_root = run.private_temp_root().to_path_buf();
-    execute_web_search_with_backend(args, move |query, limit| {
-        web::search_web(&browser_scratch_root, &query, limit)
-    })
+    let query = match args.arg_str_strict("query") {
+        Ok(query) if query.trim().len() >= 2 => query.to_string(),
+        Ok(_) => return invalid_arguments("Query must be at least 2 characters."),
+        Err(error) => return invalid_arguments(error.to_string()),
+    };
+    let limit = match parse_web_search_limit(args.get("limit")) {
+        Ok(limit) => limit,
+        Err(error) => return invalid_arguments(error),
+    };
+    let allowed = match parse_domain_list(args, "allowed_domains") {
+        Ok(domains) => domains,
+        Err(error) => return invalid_arguments(error),
+    };
+    let blocked = match parse_domain_list(args, "blocked_domains") {
+        Ok(domains) => domains,
+        Err(error) => return invalid_arguments(error),
+    };
+    let run = std::sync::Arc::clone(run);
+    let result = match run_blocking_with_timeout(
+        async move { web::search_web_brokered(run, &query, limit).await },
+        WEB_SEARCH_TOOL_TIMEOUT,
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            return failure_from_egress(
+                "Search failed",
+                crate::web_egress::WebEgressError::external(error, Vec::new()),
+            )
+        }
+    };
+    match result {
+        Ok(mut brokered) => {
+            filter_search_results(&mut brokered.results, &allowed, &blocked);
+            success_with_receipts(
+                web::format_search_results(&brokered.results),
+                &brokered.network_receipts,
+            )
+        }
+        Err(error) => failure_from_egress("Search failed", error),
+    }
 }
 
+#[cfg(test)]
 fn execute_web_search_with_backend<F>(args: &HashMap<String, Value>, backend: F) -> (String, bool)
 where
     F: FnOnce(String, usize) -> Result<Vec<web::SearchResult>, String> + Send + 'static,
@@ -573,29 +728,33 @@ where
 
     match result {
         Ok(mut results) => {
-            // Apply domain filters. Unparseable URLs are kept — failing
-            // closed would drop valid results with unusual schemes the
-            // caller might still want to see.
-            if !allowed.is_empty() || !blocked.is_empty() {
-                results.retain(|r| {
-                    let Some(host) = host_of(&r.url) else {
-                        return true;
-                    };
-                    if blocked.iter().any(|d| domain_matches(&host, d)) {
-                        return false;
-                    }
-                    if !allowed.is_empty() && !allowed.iter().any(|d| domain_matches(&host, d)) {
-                        return false;
-                    }
-                    true
-                });
-            }
+            filter_search_results(&mut results, &allowed, &blocked);
             (web::format_search_results(&results), false)
         }
         Err(e) => (format!("Search failed: {e}"), true),
     }
 }
 
+fn filter_search_results(
+    results: &mut Vec<web::SearchResult>,
+    allowed: &[String],
+    blocked: &[String],
+) {
+    if allowed.is_empty() && blocked.is_empty() {
+        return;
+    }
+    results.retain(|result| {
+        let Some(host) = host_of(&result.url) else {
+            return false;
+        };
+        if blocked.iter().any(|domain| domain_matches(&host, domain)) {
+            return false;
+        }
+        allowed.is_empty() || allowed.iter().any(|domain| domain_matches(&host, domain))
+    });
+}
+
+#[cfg(test)]
 fn run_web_search_backend<F>(
     query: String,
     limit: usize,
@@ -644,61 +803,66 @@ fn parse_web_search_limit(value: Option<&Value>) -> Result<usize, String> {
 /// fetches prefer `web_fetch`, which uses the browser only as a
 /// fallback after the cheaper direct HTTP path.
 #[cfg(feature = "browser")]
-pub fn execute_web_browser(
-    run: &crate::tools::security::ToolRunContext,
+pub fn execute_web_browser_result(
+    run: &std::sync::Arc<crate::tools::security::ToolRunContext>,
     args: &HashMap<String, Value>,
-) -> (String, bool) {
+) -> ToolHandlerResult {
     for resource in [
         crate::tools::security::ToolResource::Network,
         crate::tools::security::ToolResource::Process,
     ] {
         if let Err(error) = run.require(resource) {
-            return (error.to_string(), true);
+            return capability_denied("Browser fetch failed", error);
         }
     }
     // crosslink #675: typed accessor.
     let url = match args.arg_str_strict("url") {
         Ok(u) => u,
-        Err(e) => return e.into_tool_error(),
+        Err(error) => return invalid_arguments(error.to_string()),
     };
 
     // Validate URL format
     if !url.starts_with("http://") && !url.starts_with("https://") {
-        return (
-            "Invalid URL: must start with http:// or https://".to_string(),
-            true,
-        );
+        return invalid_arguments("Invalid URL: must start with http:// or https://");
     }
 
     let url_owned = url.to_string();
-    let browser_scratch_root = run.private_temp_root().to_path_buf();
+    let run = std::sync::Arc::clone(run);
     let result = match run_blocking(async move {
-        let task = tokio::task::spawn_blocking(move || {
-            web::fetch_with_browser(&url_owned, &browser_scratch_root)
-        });
-        match tokio::time::timeout(WEB_BROWSER_TOOL_TIMEOUT, task).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(join_err)) => Err(format!("browser fetch task panicked: {join_err}")),
-            Err(_) => Err(format!(
-                "browser fetch timed out after {} seconds",
-                WEB_BROWSER_TOOL_TIMEOUT.as_secs()
-            )),
-        }
+        tokio::time::timeout(
+            WEB_BROWSER_TOOL_TIMEOUT,
+            web::fetch_with_browser_brokered(&url_owned, run),
+        )
+        .await
+        .map_err(|_| {
+            crate::web_egress::WebEgressError::external(
+                format!(
+                    "browser fetch timed out after {} seconds",
+                    WEB_BROWSER_TOOL_TIMEOUT.as_secs()
+                ),
+                Vec::new(),
+            )
+        })?
     }) {
         Ok(result) => result,
-        Err(e) => return (format!("Browser fetch failed: {e}"), true),
+        Err(error) => {
+            return failure_from_egress(
+                "Browser fetch failed",
+                crate::web_egress::WebEgressError::external(error, Vec::new()),
+            )
+        }
     };
 
     match result {
-        Ok(fetch_result) => (
+        Ok(brokered) => success_with_receipts(
             format_fetch_output(
-                fetch_result.title.as_deref(),
-                &fetch_result.url,
-                &fetch_result.content,
+                brokered.result.title.as_deref(),
+                &brokered.result.url,
+                &brokered.result.content,
             ),
-            false,
+            &brokered.network_receipts,
         ),
-        Err(e) => (format!("Browser fetch failed: {e}"), true),
+        Err(error) => failure_from_egress("Browser fetch failed", error),
     }
 }
 
@@ -762,6 +926,22 @@ mod tests {
             policy: EnterprisePolicy::default(),
             managed_settings_path: None,
         }
+    }
+
+    fn distillation_test_run(config: &AppConfig) -> std::sync::Arc<crate::tools::ToolRunContext> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), root)
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::new())
+            .web_egress_grants(config.build_web_egress_grants().expect("egress grants"))
+            .workspace_access(crate::tools::WorkspaceAccess::ReadOnly)
+            .process(false)
+            .network(true)
+            .secrets(true)
+            .provider("distillation-test")
+            .build()
+            .expect("distillation run")
     }
 
     #[test]
@@ -983,6 +1163,39 @@ mod tests {
     }
 
     #[test]
+    fn web_fetch_without_network_authority_returns_a_typed_policy_denial() {
+        let root = tempfile::tempdir().expect("run root");
+        let run =
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), root.path())
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(HashMap::new())
+                .workspace_access(crate::tools::WorkspaceAccess::ReadOnly)
+                .process(false)
+                .network(false)
+                .secrets(false)
+                .provider("web-capability-test")
+                .build()
+                .expect("run");
+        let args = HashMap::from([(
+            "url".to_string(),
+            Value::String("https://example.invalid/".to_string()),
+        )]);
+
+        let result = execute_web_fetch_result(&run, &args, None);
+        let ToolOutcome::Error { failure } = result.outcome else {
+            panic!("missing network authority must fail");
+        };
+        assert_eq!(failure.code, ToolFailureCode::PolicyDenied);
+        assert_eq!(failure.retryability, ToolRetryability::Never);
+        assert_eq!(failure.source.as_deref(), Some("web_egress"));
+        assert_eq!(
+            failure.recovery,
+            Some(serde_json::json!({"network_receipts": []}))
+        );
+    }
+
+    #[test]
     fn web_fetch_prompt_without_config_uses_raw_fetch_path() {
         assert!(
             distillation_config_for_prompt(None).is_none(),
@@ -1029,6 +1242,55 @@ mod tests {
 
         assert!(is_err);
         assert_eq!(msg, "Invalid 'prompt' argument: expected string");
+    }
+
+    #[test]
+    fn web_fetch_success_exposes_connection_receipt_at_the_tool_boundary() {
+        use std::io::{Read as _, Write as _};
+
+        let listener =
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("fixture bind");
+        let port = listener.local_addr().expect("fixture address").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("fixture accept");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).expect("fixture read");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 7\r\nConnection: close\r\n\r\nreceipt",
+                )
+                .expect("fixture response");
+        });
+
+        let origin = format!("http://127.0.0.1:{port}");
+        let mut config = distillation_test_config("https://api.example.invalid");
+        config.web_fetch.distillation_enabled = false;
+        config.web_fetch.exact_private_origins = vec![origin.clone()];
+        let run = distillation_test_run(&config);
+        let args = HashMap::from([(
+            "url".to_string(),
+            Value::String(format!("{origin}/page?not-in-receipt=secret")),
+        )]);
+
+        let result = execute_web_fetch_result(&run, &args, Some(&config));
+        let ToolOutcome::Success { content } = result.outcome else {
+            panic!("expected successful typed web fetch");
+        };
+        assert!(content.text.contains("receipt"));
+        let structured = content.structured.expect("typed network receipt");
+        let receipts = structured["network_receipts"]
+            .as_array()
+            .expect("receipt array");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0]["origin"], origin);
+        assert_eq!(receipts[0]["backend"], "direct_http");
+        assert_eq!(receipts[0]["final_peer"], format!("127.0.0.1:{port}"));
+        assert!(receipts[0]["policy_generation"].as_u64().is_some());
+        assert!(receipts[0]["byte_limit"].as_u64().is_some());
+        assert!(receipts[0]["time_limit_ms"].as_u64().is_some());
+        assert!(!structured.to_string().contains("not-in-receipt"));
+        assert!(!structured.to_string().contains("secret"));
+        server.join().expect("fixture server");
     }
 
     #[test]
@@ -1115,7 +1377,9 @@ mod tests {
             .await;
 
         let config = distillation_test_config(&server.uri());
+        let run = distillation_test_run(&config);
         let answer = distill_fetch_result(
+            run,
             "Which capability shipped?",
             "https://docs.example/openclaudia",
             "OpenClaudia ships web_fetch prompt distillation.",
@@ -1123,7 +1387,11 @@ mod tests {
         )
         .expect("mock distillation provider should answer");
 
-        assert_eq!(answer, "web_fetch prompt distillation shipped.");
+        assert_eq!(answer.answer, "web_fetch prompt distillation shipped.");
+        assert_eq!(
+            answer.receipt.backend,
+            crate::web_egress::WebEgressBackend::Distillation
+        );
     }
 
     // ── crosslink #807: shared format_fetch_output for both fetch paths ──

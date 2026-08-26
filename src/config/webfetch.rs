@@ -52,6 +52,11 @@ pub struct WebFetchConfig {
     /// Hosts that bypass the SSRF prompt for fetches (#603).
     #[serde(default = "default_preapproved_domains")]
     pub preapproved_domains: Vec<String>,
+    /// Exact private/local origins that model-selected fetch and browser
+    /// traffic may reach. This authority is accepted only from trusted host
+    /// configuration; repository values are stripped before source merge.
+    #[serde(default)]
+    pub exact_private_origins: Vec<String>,
 }
 
 const fn default_max_distillation_bytes() -> usize {
@@ -66,6 +71,7 @@ impl Default for WebFetchConfig {
             distillation_provider: None,
             distillation_model: None,
             preapproved_domains: default_preapproved_domains(),
+            exact_private_origins: Vec::new(),
         }
     }
 }
@@ -106,6 +112,7 @@ mod tests {
         assert_eq!(cfg.max_distillation_bytes, CC_MAX_MARKDOWN_LENGTH);
         assert!(cfg.distillation_provider.is_none());
         assert!(cfg.distillation_model.is_none());
+        assert!(cfg.exact_private_origins.is_empty());
     }
 
     #[test]
@@ -138,6 +145,7 @@ mod tests {
             distillation_provider: Some("anthropic".into()),
             distillation_model: Some("claude-haiku-4".into()),
             preapproved_domains: default_preapproved_domains(),
+            exact_private_origins: vec!["http://127.0.0.1:8080".to_string()],
         };
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         let back: WebFetchConfig = serde_yaml::from_str(&yaml).unwrap();

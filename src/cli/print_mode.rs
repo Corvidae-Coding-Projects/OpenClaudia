@@ -589,6 +589,11 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
             .build_registry()
             .map_err(anyhow::Error::msg)?,
     )
+    .web_egress_grants(
+        config
+            .build_web_egress_grants()
+            .map_err(anyhow::Error::msg)?,
+    )
     .workspace_access(openclaudia::tools::WorkspaceAccess::ReadOnly)
     .process(false)
     .network(true)

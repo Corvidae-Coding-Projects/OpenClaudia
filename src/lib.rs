@@ -70,5 +70,6 @@ pub mod transcript;
 pub mod tui;
 pub mod vdd;
 pub mod web;
+pub mod web_egress;
 #[cfg(windows)]
 pub(crate) mod windows_fs;

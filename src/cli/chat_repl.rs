@@ -670,6 +670,11 @@ impl ChatRepl {
                         .build_registry()
                         .map_err(anyhow::Error::msg)?,
                 )
+                .web_egress_grants(
+                    config
+                        .build_web_egress_grants()
+                        .map_err(anyhow::Error::msg)?,
+                )
                 .workspace_access(tools::WorkspaceAccess::ReadWrite)
                 .process(true)
                 .network(true)

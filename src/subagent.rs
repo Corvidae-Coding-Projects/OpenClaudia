@@ -1999,6 +1999,7 @@ async fn run_subagent_inner(
         .executable_search_path(parent_run.executable_search_path())
         .host_home(parent_run.host_home().map(Path::to_path_buf))
         .remote_actions(parent_run.remote_actions().registry().clone())
+        .web_egress_grants(parent_run.web_egress_grants().clone())
         .workspace_access(workspace_access)
         .process(parent_run.grants_resource(crate::tools::ToolResource::Process))
         .network(parent_run.grants_resource(crate::tools::ToolResource::Network))

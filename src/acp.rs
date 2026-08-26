@@ -964,6 +964,7 @@ impl AcpServer {
                 .host_startup_grants()
                 .host_home(Some(host_home))
                 .remote_actions(config.remote_actions.build_registry()?)
+                .web_egress_grants(config.build_web_egress_grants()?)
                 .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
                 .process(true)
                 .network(true)

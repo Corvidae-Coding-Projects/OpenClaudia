@@ -741,12 +741,14 @@ fn build_startup_session_run_context(
     provider: &str,
     budget_limits: crate::runtime::BudgetLimits,
     remote_actions: crate::tools::remote_trigger::WebhookRegistry,
+    web_egress_grants: crate::web_egress::WebEgressGrants,
 ) -> Result<std::sync::Arc<crate::tools::ToolRunContext>, String> {
     let identity = session.inspect_state(|state| state.identity.clone());
     crate::tools::ToolRunContext::builder(identity.session_id, identity.project_root)
         .working_directory(identity.cwd)
         .host_startup_grants()
         .remote_actions(remote_actions)
+        .web_egress_grants(web_egress_grants)
         .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
         .process(true)
         .network(true)
@@ -978,6 +980,7 @@ impl App {
             policy_enforcer,
             budget_limits,
             crate::tools::remote_trigger::WebhookRegistry::new(),
+            crate::web_egress::WebEgressGrants::public_only(),
         )
     }
 
@@ -988,6 +991,7 @@ impl App {
         policy_enforcer: std::sync::Arc<crate::services::policy::PolicyEnforcer>,
         budget_limits: crate::runtime::BudgetLimits,
         remote_actions: crate::tools::remote_trigger::WebhookRegistry,
+        web_egress_grants: crate::web_egress::WebEgressGrants,
     ) -> Self {
         let chat_session = Session::new(model, provider);
         let transcript_subscriber =
@@ -997,6 +1001,7 @@ impl App {
             provider,
             budget_limits,
             remote_actions,
+            web_egress_grants,
         );
         let task_manager = run_context
             .as_ref()

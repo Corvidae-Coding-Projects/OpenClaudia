@@ -252,6 +252,27 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
                     "Ignored project remote_actions configuration; named remote actions require trusted host configuration"
                 );
             }
+            let mut ignored_private_origins = mapping
+                .remove(serde_yaml::Value::String(
+                    "web_fetch.exact_private_origins".to_string(),
+                ))
+                .is_some();
+            if let Some(web_fetch) = mapping
+                .get_mut(serde_yaml::Value::String("web_fetch".to_string()))
+                .and_then(serde_yaml::Value::as_mapping_mut)
+            {
+                ignored_private_origins |= web_fetch
+                    .remove(serde_yaml::Value::String(
+                        "exact_private_origins".to_string(),
+                    ))
+                    .is_some();
+            }
+            if ignored_private_origins {
+                tracing::warn!(
+                    target: "openclaudia::config",
+                    "Ignored project web_fetch.exact_private_origins; private network authority requires trusted host configuration"
+                );
+            }
         }
         let inert_project_config = serde_yaml::to_string(&document).map_err(|error| {
             ConfigError::Message(format!(
@@ -327,6 +348,9 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
         .remote_actions
         .build_registry()
         .map_err(ConfigError::Message)?;
+    config
+        .build_web_egress_grants()
+        .map_err(ConfigError::Message)?;
 
     // Diagnose configured persistence paths before subsystem startup. This
     // rejects known system trees, lexical escape, and existing link
@@ -372,6 +396,34 @@ pub fn canonical_provider_config_key(name: &str) -> Option<&'static str> {
 
 /// Get the active provider configuration
 impl AppConfig {
+    /// Build immutable web-egress authority for one run generation.
+    ///
+    /// Model-selected private origins come only from trusted host config. The
+    /// configured distillation provider contributes its own origin under the
+    /// narrower distillation use so local Ollama/LM Studio development keeps
+    /// working without making those services general browser targets.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a trusted exact-origin grant or configured distillation
+    /// provider endpoint is malformed.
+    pub fn build_web_egress_grants(&self) -> Result<crate::web_egress::WebEgressGrants, String> {
+        let mut grants = crate::web_egress::WebEgressGrants::from_exact_web_origins(
+            &self.web_fetch.exact_private_origins,
+        )?;
+        if self.web_fetch.distillation_enabled {
+            let provider_name = self
+                .web_fetch
+                .distillation_provider
+                .as_deref()
+                .unwrap_or(self.proxy.target.as_str());
+            if let Some(provider) = self.get_provider(provider_name) {
+                grants = grants.with_distillation_endpoint(&provider.base_url)?;
+            }
+        }
+        Ok(grants)
+    }
+
     #[must_use]
     pub fn active_provider(&self) -> Option<&ProviderConfig> {
         self.get_provider(&self.proxy.target)

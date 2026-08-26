@@ -10,8 +10,11 @@
 //! - `web_browser`: Full browser automation via headless Chromium in
 //!   `browser` builds.
 
+#[cfg(test)]
 use futures::StreamExt;
+#[cfg(test)]
 use reqwest::redirect;
+#[cfg(test)]
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
@@ -20,15 +23,14 @@ use std::path::Path;
 #[cfg(feature = "browser")]
 use std::path::PathBuf;
 use std::str::FromStr;
+#[cfg(test)]
 use std::sync::LazyLock;
+#[cfg(any(feature = "browser", test))]
 use std::time::Duration;
 use url::Url;
 
-/// Maximum redirect hops `SHARED_HTTP_CLIENT` will follow (crosslink #671).
-///
-/// Using `redirect::Policy::custom` disables reqwest's built-in
-/// `Policy::limited(10)` cap, so we must re-establish a hop ceiling
-/// inside the SSRF-validating policy. 10 matches the reqwest default.
+/// Maximum redirect hops the connection broker will manually re-admit.
+/// Ten matches reqwest's former automatic-redirect default.
 pub(crate) const SSRF_REDIRECT_LIMIT: usize = 10;
 
 /// Maximum bytes accepted from any remote HTTP response body (crosslink #745).
@@ -53,6 +55,7 @@ pub(crate) const MAX_WEB_FETCH_BYTES: usize = 10 * 1024 * 1024;
 ///
 /// The error message names the observed size and configured cap without
 /// retaining the requested URL, which may contain signed query credentials.
+#[cfg(test)]
 pub(crate) async fn read_bounded_text(response: Response, cap: usize) -> Result<String, String> {
     // Pre-flight: trust server-advertised Content-Length when present.
     if let Some(advertised) = response.content_length() {
@@ -88,9 +91,11 @@ pub(crate) async fn read_bounded_text(response: Response, cap: usize) -> Result<
 /// One client, built once, reused everywhere. Tuned for the web-fetch
 /// hot path: 90s idle pool, 10s connect timeout, TCP keepalive. The
 /// per-request `timeout` overrides are still set at the call site.
+#[cfg(test)]
 pub(crate) static SHARED_HTTP_CLIENT: LazyLock<Result<Client, String>> =
     LazyLock::new(build_shared_http_client);
 
+#[cfg(test)]
 fn build_shared_http_client() -> Result<Client, String> {
     Client::builder()
         .pool_idle_timeout(Duration::from_secs(90))
@@ -105,6 +110,7 @@ fn build_shared_http_client() -> Result<Client, String> {
         .map_err(|e| format!("failed to build shared web HTTP client: {e}"))
 }
 
+#[cfg(test)]
 pub(crate) fn shared_http_client() -> Result<&'static Client, String> {
     SHARED_HTTP_CLIENT.as_ref().map_err(Clone::clone)
 }
@@ -128,6 +134,7 @@ pub(crate) fn shared_http_client() -> Result<&'static Client, String> {
 /// * 302 to `http://localhost/...` (denylisted hostname)
 /// * 302 to `http://metadata.google.internal/...` (denylisted hostname)
 /// * 302 to `file:///etc/passwd` (rejected scheme)
+#[cfg(test)]
 pub(crate) fn ssrf_redirect_policy() -> redirect::Policy {
     ssrf_redirect_policy_with(|url| validate_url_static(url.as_str()))
 }
@@ -136,6 +143,7 @@ pub(crate) fn ssrf_redirect_policy() -> redirect::Policy {
 ///
 /// Exists so tests can install instrumented validators (e.g. counting how many
 /// times the policy was consulted) without bypassing the production guard.
+#[cfg(test)]
 pub(crate) fn ssrf_redirect_policy_with<F>(validator: F) -> redirect::Policy
 where
     F: Fn(&Url) -> Result<(), String> + Send + Sync + 'static,
@@ -183,6 +191,18 @@ const DANGEROUS_HOSTNAMES: &[&str] = &[
     "kubernetes.default.svc",
     "kubernetes.default.svc.cluster.local",
 ];
+
+#[must_use]
+pub(crate) fn is_dangerous_hostname(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host)
+        .to_ascii_lowercase();
+    DANGEROUS_HOSTNAMES
+        .iter()
+        .any(|dangerous| *dangerous == host)
+}
 
 /// Parse a host string as an IP literal, including non-standard single-integer
 /// forms (`http://2130706433/` = 127.0.0.1) that some resolvers accept and
@@ -339,10 +359,10 @@ fn is_ip_forbidden(ip: &IpAddr) -> bool {
 ///     resolved IP is checked against the same forbidden-range matrix via
 ///     [`validate_resolved_ip`].
 ///
-/// Residual risk: a DNS-rebinding server that returns a public IP at
-/// validate time and a private IP at `reqwest`'s dial time still bypasses
-/// this. A custom `reqwest` resolver that re-checks at dial time is the
-/// complete mitigation and is tracked as a follow-up to crosslink #335.
+/// This helper classifies URLs that are not about to connect (for example,
+/// parsed search results). It is not an authorization boundary. Networked web
+/// paths use [`crate::web_egress::WebEgressBroker`] to pin the classified DNS
+/// answer into the transport that performs the actual dial.
 pub(crate) fn validate_url(url_str: &str) -> Result<(), String> {
     match validate_url_parts(url_str)? {
         ValidatePartial::Done => Ok(()),
@@ -453,6 +473,7 @@ fn resolve_and_validate_sync(parsed: &Url) -> Result<(), String> {
 /// Same error contract as [`validate_url`]: returns `Err(String)`
 /// for unsupported schemes, denylisted hostnames, unresolvable hosts,
 /// or any resolved address that falls in a reserved/internal range.
+#[cfg(test)]
 pub(crate) async fn validate_url_async(url_str: &str) -> Result<(), String> {
     let parsed = match validate_url_parts(url_str)? {
         ValidatePartial::Done => return Ok(()),
@@ -513,6 +534,20 @@ pub struct FetchResult {
     pub url: String,
 }
 
+/// Page result plus connection-boundary evidence for every attempted backend.
+#[derive(Debug, Clone)]
+pub struct BrokeredFetchResult {
+    pub result: FetchResult,
+    pub network_receipts: Vec<crate::web_egress::NetworkReceipt>,
+}
+
+/// Search result plus receipts for browser connections used to obtain it.
+#[derive(Debug, Clone)]
+pub struct BrokeredSearchResult {
+    pub results: Vec<SearchResult>,
+    pub network_receipts: Vec<crate::web_egress::NetworkReceipt>,
+}
+
 /// Search result item
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
@@ -525,15 +560,12 @@ pub struct SearchResult {
 ///
 /// Two-tier fallback:
 ///
-/// 1. **Direct HTTP** via `SHARED_HTTP_CLIENT`. Fast, free, no
-///    third-party. Plain text / JSON bodies are returned verbatim;
-///    HTML bodies are converted to Markdown via [`html_to_markdown`].
+/// 1. **Direct HTTP** via the operation-scoped connection broker. Plain text /
+///    JSON bodies are returned verbatim; HTML bodies are converted to Markdown
+///    via [`html_to_markdown`].
 /// 2. **Headless Chrome** via [`fetch_with_browser`]. Used when the
-///    direct fetch returned a non-2xx status, a network error, OR
-///    response markers that look like a Cloudflare bot challenge or
-///    an SPA shell (empty `<body>` / a single `<div id="root">`).
-///    Chrome runs the page's JavaScript, then we re-render to
-///    Markdown the same way.
+///    direct transport failed or returned a non-success response. Chrome runs
+///    the page's JavaScript, then the rendered DOM is converted to Markdown.
 ///
 /// Returns an error only if **both** tiers fail; the error message
 /// carries both diagnostic strings so the agent can see the full
@@ -547,96 +579,114 @@ pub async fn fetch_url(
     url: &str,
     run: std::sync::Arc<crate::tools::ToolRunContext>,
 ) -> Result<FetchResult, String> {
-    run.require(crate::tools::ToolResource::Network)
-        .map_err(|error| error.to_string())?;
-    // crosslink #673 — async DNS via tokio::net::lookup_host. The legacy
-    // sync `validate_url` invoked the blocking std-library resolver from
-    // inside this async function, which stalled the tokio worker for the
-    // full DNS RTT and starved every other task on the same worker.
-    validate_url_async(url).await?;
+    fetch_url_brokered(url, run)
+        .await
+        .map(|brokered| brokered.result)
+        .map_err(|error| error.to_string())
+}
 
-    let direct_err = match fetch_url_direct(url).await {
+/// Fetch through the canonical connection broker and retain typed receipts.
+///
+/// # Errors
+///
+/// Returns a typed policy, resolution, connection, limit, cancellation, or
+/// backend error together with any redacted receipts produced before failure.
+pub async fn fetch_url_brokered(
+    url: &str,
+    run: std::sync::Arc<crate::tools::ToolRunContext>,
+) -> Result<BrokeredFetchResult, crate::web_egress::WebEgressError> {
+    let broker = crate::web_egress::WebEgressBroker::new(std::sync::Arc::clone(&run))?;
+    let direct_error = match fetch_url_direct(url, &broker).await {
         Ok(result) => return Ok(result),
-        Err(e) => {
-            tracing::info!("direct fetch failed: {e}; falling back to headless browser");
-            e
+        Err(error) => {
+            if !matches!(
+                error.kind,
+                crate::web_egress::WebEgressErrorKind::Connect
+                    | crate::web_egress::WebEgressErrorKind::External
+            ) {
+                return Err(error);
+            }
+            tracing::info!(kind = ?error.kind, "direct transport failed; trying browser fallback");
+            error
         }
     };
 
-    // Tier 2: headless Chrome. The browser path is sync (`headless_chrome`
-    // is blocking I/O), so hop onto the blocking pool. Without the
-    // `browser` feature we surface a single combined error.
     #[cfg(feature = "browser")]
     {
-        let browser_scratch_root = browser_scratch_for_fallback(&run, &direct_err)?;
-        let url_owned = url.to_string();
-        match tokio::task::spawn_blocking(move || {
-            fetch_with_browser(&url_owned, &browser_scratch_root)
-        })
-        .await
-        {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(browser_err)) => Err(format!(
-                "Both fetch tiers failed. Direct: {direct_err}. Browser: {browser_err}."
-            )),
-            Err(join_err) => Err(format!(
-                "Direct fetch failed ({direct_err}); browser fallback task panicked: {join_err}"
-            )),
+        if let Err(error) = run.require(crate::tools::ToolResource::Process) {
+            let direct_message = direct_error.message;
+            return Err(crate::web_egress::WebEgressError::external(
+                format!(
+                    "Direct fetch failed: {direct_message}. Browser fallback is unavailable: {error}"
+                ),
+                direct_error.receipts,
+            ));
+        }
+        match fetch_with_browser_using_broker(url, run, broker).await {
+            Ok(mut result) => {
+                let mut receipts = direct_error.receipts;
+                receipts.append(&mut result.network_receipts);
+                result.network_receipts = receipts;
+                Ok(result)
+            }
+            Err(browser_error) => {
+                let direct_message = direct_error.message;
+                let browser_message = browser_error.message;
+                let mut receipts = direct_error.receipts;
+                receipts.extend(browser_error.receipts);
+                Err(crate::web_egress::WebEgressError::external(
+                    format!(
+                        "Both fetch backends failed. Direct: {direct_message}. Browser: {browser_message}"
+                    ),
+                    receipts,
+                ))
+            }
         }
     }
     #[cfg(not(feature = "browser"))]
     {
-        Err(format!(
-            "Direct fetch failed: {direct_err} (no browser fallback compiled in — \
-             rebuild with `--features browser` to enable headless-Chrome fallback)"
+        Err(crate::web_egress::WebEgressError::external(
+            "Direct fetch failed and this build has no browser fallback",
+            direct_error.receipts,
         ))
     }
-}
-
-#[cfg(feature = "browser")]
-fn browser_scratch_for_fallback(
-    run: &crate::tools::ToolRunContext,
-    direct_error: &str,
-) -> Result<PathBuf, String> {
-    run.require(crate::tools::ToolResource::Process)
-        .map_err(|error| {
-            format!("Direct fetch failed: {direct_error}. Browser fallback is unavailable: {error}")
-        })?;
-    Ok(run.private_temp_root().to_path_buf())
 }
 
 /// Tier-1 direct HTTP fetch. HTML response bodies are converted to
 /// Markdown via [`html_to_markdown`]; non-HTML bodies (JSON, plain
 /// text, RSS, robots.txt, …) are returned verbatim so the agent sees
 /// what the server actually sent.
-async fn fetch_url_direct(url: &str) -> Result<FetchResult, String> {
-    let response = shared_http_client()?
-        .get(url)
-        .timeout(Duration::from_secs(30))
-        // A real browser-shaped UA reduces the rate at which sites
-        // block us at the WAF / Cloudflare edge. We still fall back
-        // to headless Chrome if even this is refused.
-        .header(
-            "User-Agent",
-            "Mozilla/5.0 (compatible; OpenClaudia/0.1; +https://github.com/dollspace-gay/OpenClaudia)",
+async fn fetch_url_direct(
+    url: &str,
+    broker: &crate::web_egress::WebEgressBroker,
+) -> Result<BrokeredFetchResult, crate::web_egress::WebEgressError> {
+    let response = broker
+        .get(
+            url,
+            crate::web_egress::WebEgressBackend::DirectHttp,
+            MAX_WEB_FETCH_BYTES,
+            crate::web_egress::DIRECT_WEB_TIME_LIMIT,
         )
-        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {e}"))?;
-
-    let status = response.status();
+        .await?;
+    let status = response.status;
     if !status.is_success() {
-        return Err(format!("HTTP {status} from upstream"));
+        return Err(crate::web_egress::WebEgressError::external(
+            format!("Upstream returned HTTP {status}"),
+            vec![response.receipt],
+        ));
     }
 
     let is_html = response
-        .headers()
+        .headers
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.contains("text/html") || ct.contains("application/xhtml"));
-
-    let body = read_bounded_text(response, MAX_WEB_FETCH_BYTES).await?;
+    let body = String::from_utf8(response.body).map_err(|_| {
+        crate::web_egress::WebEgressError::external(
+            "Web response was not valid UTF-8",
+            vec![response.receipt.clone()],
+        )
+    })?;
 
     let (content, title) = if is_html {
         let title = extract_html_title(&body);
@@ -645,10 +695,13 @@ async fn fetch_url_direct(url: &str) -> Result<FetchResult, String> {
         (body, None)
     };
 
-    Ok(FetchResult {
-        content,
-        title,
-        url: url.to_string(),
+    Ok(BrokeredFetchResult {
+        result: FetchResult {
+            content,
+            title,
+            url: response.final_url,
+        },
+        network_receipts: vec![response.receipt],
     })
 }
 
@@ -677,16 +730,84 @@ fn extract_html_title(html: &str) -> Option<String> {
 /// # Errors
 ///
 /// Returns an error string if all search backends fail.
-pub fn search_web(
+pub async fn search_web(
+    run: std::sync::Arc<crate::tools::ToolRunContext>,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchResult>, String> {
+    search_web_brokered(run, query, limit)
+        .await
+        .map(|result| result.results)
+        .map_err(|error| error.to_string())
+}
+
+/// Search through Chromium's operation-scoped broker and retain receipts.
+///
+/// # Errors
+///
+/// Returns a typed capability, browser, policy, connection, or deadline error
+/// together with any redacted receipts produced before failure.
+pub async fn search_web_brokered(
+    run: std::sync::Arc<crate::tools::ToolRunContext>,
+    query: &str,
+    limit: usize,
+) -> Result<BrokeredSearchResult, crate::web_egress::WebEgressError> {
+    #[cfg(not(feature = "browser"))]
+    {
+        let _ = (run, query, limit);
+        return Err(crate::web_egress::WebEgressError::external(
+            "Web search requires the browser feature",
+            Vec::new(),
+        ));
+    }
+
+    #[cfg(feature = "browser")]
+    {
+        run.require(crate::tools::ToolResource::Process)
+            .map_err(|error| {
+                crate::web_egress::WebEgressError::external(error.to_string(), Vec::new())
+            })?;
+        let broker = crate::web_egress::WebEgressBroker::new(std::sync::Arc::clone(&run))?;
+        let mut proxy =
+            crate::web_egress::BrowserEgressProxy::start(std::sync::Arc::clone(&broker)).await?;
+        let proxy_url = proxy.url();
+        let scratch = run.private_temp_root().to_path_buf();
+        let query = query.to_string();
+        let browser_result = tokio::task::spawn_blocking(move || {
+            search_web_with_proxy(&scratch, &query, limit, &proxy_url, &broker)
+        })
+        .await;
+        proxy.shutdown().await;
+        let receipts = proxy.receipts();
+        match browser_result {
+            Ok(Ok(results)) => Ok(BrokeredSearchResult {
+                results,
+                network_receipts: receipts,
+            }),
+            Ok(Err(message)) => Err(crate::web_egress::WebEgressError::external(
+                message, receipts,
+            )),
+            Err(_) => Err(crate::web_egress::WebEgressError::external(
+                "Web search browser task failed",
+                receipts,
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "browser")]
+fn search_web_with_proxy(
     browser_scratch_root: &Path,
     query: &str,
     limit: usize,
+    proxy_url: &str,
+    broker: &std::sync::Arc<crate::web_egress::WebEgressBroker>,
 ) -> Result<Vec<SearchResult>, String> {
     let mut backend_errors = Vec::new();
 
     // Tier 1 — DuckDuckGo via headless Chromium in browser builds
     // (free, no API key).
-    match search_duckduckgo(browser_scratch_root, query, limit) {
+    match search_duckduckgo(browser_scratch_root, query, limit, proxy_url, broker) {
         Ok(results) => return Ok(results),
         Err(e) => {
             tracing::warn!("DuckDuckGo search failed: {e}");
@@ -696,7 +817,7 @@ pub fn search_web(
 
     // Tier 2 — Bing HTML scrape via headless Chromium in browser
     // builds.
-    match search_bing(browser_scratch_root, query, limit) {
+    match search_bing(browser_scratch_root, query, limit, proxy_url, broker) {
         Ok(results) if !results.is_empty() => return Ok(results),
         Ok(_) => {
             backend_errors.push("Bing: returned zero results (likely bot-challenged)".to_string());
@@ -765,12 +886,15 @@ pub fn search_bing(
     browser_scratch_root: &Path,
     query: &str,
     limit: usize,
+    proxy_url: &str,
+    broker: &std::sync::Arc<crate::web_egress::WebEgressBroker>,
 ) -> Result<Vec<SearchResult>, String> {
-    let browser = launch_browser_for_scraping(browser_scratch_root)?;
+    let browser = launch_browser_for_scraping(browser_scratch_root, proxy_url)?;
 
     let tab = browser
         .new_tab()
         .map_err(|e| format!("Failed to create browser tab: {e}"))?;
+    configure_browser_request_policy(&tab, broker)?;
 
     let search_url = format!(
         "https://www.bing.com/search?q={}",
@@ -900,13 +1024,22 @@ pub fn search_bing(
 #[cfg(feature = "browser")]
 fn launch_browser_for_scraping(
     browser_scratch_root: &Path,
+    proxy_url: &str,
 ) -> Result<headless_chrome::Browser, String> {
     use headless_chrome::{Browser, LaunchOptions};
+    use std::ffi::OsStr;
 
     let user_data_dir = browser_profile_dir_under(browser_scratch_root)?;
     let opts = LaunchOptions::default_builder()
         .headless(true)
         .user_data_dir(Some(user_data_dir))
+        .ignore_certificate_errors(false)
+        .proxy_server(Some(proxy_url))
+        .args(vec![
+            OsStr::new("--disable-quic"),
+            OsStr::new("--proxy-bypass-list=<-loopback>"),
+            OsStr::new("--disable-features=AsyncDns,DnsOverHttps"),
+        ])
         .build()
         .map_err(|e| format!("Failed to configure browser: {e}"))?;
     Browser::new(opts).map_err(|e| {
@@ -915,6 +1048,39 @@ fn launch_browser_for_scraping(
              on PATH; this build does not download browser executables at runtime."
         )
     })
+}
+
+#[cfg(feature = "browser")]
+fn configure_browser_request_policy(
+    tab: &std::sync::Arc<headless_chrome::Tab>,
+    broker: &std::sync::Arc<crate::web_egress::WebEgressBroker>,
+) -> Result<(), String> {
+    use headless_chrome::browser::tab::RequestPausedDecision;
+    use headless_chrome::protocol::cdp::{Fetch, Network};
+
+    tab.enable_fetch(None, None)
+        .map_err(|error| format!("Failed to enable browser request policy: {error}"))?;
+    let broker = std::sync::Arc::clone(broker);
+    tab.enable_request_interception(std::sync::Arc::new(
+        move |
+            _transport: std::sync::Arc<headless_chrome::browser::transport::Transport>,
+            _session_id: headless_chrome::browser::transport::SessionId,
+            intercepted: headless_chrome::protocol::cdp::Fetch::events::RequestPausedEvent,
+        | {
+            if broker
+                .validate_browser_request(&intercepted.params.request.url)
+                .is_ok()
+            {
+                RequestPausedDecision::Continue(None)
+            } else {
+                RequestPausedDecision::Fail(Fetch::FailRequest {
+                    request_id: intercepted.params.request_id,
+                    error_reason: Network::ErrorReason::BlockedByClient,
+                })
+            }
+        },
+    ))
+    .map_err(|error| format!("Failed to install browser request policy: {error}"))
 }
 
 #[cfg(feature = "browser")]
@@ -943,12 +1109,15 @@ pub fn search_duckduckgo(
     browser_scratch_root: &Path,
     query: &str,
     limit: usize,
+    proxy_url: &str,
+    broker: &std::sync::Arc<crate::web_egress::WebEgressBroker>,
 ) -> Result<Vec<SearchResult>, String> {
-    let browser = launch_browser_for_scraping(browser_scratch_root)?;
+    let browser = launch_browser_for_scraping(browser_scratch_root, proxy_url)?;
 
     let tab = browser
         .new_tab()
         .map_err(|e| format!("Failed to create browser tab: {e}"))?;
+    configure_browser_request_policy(&tab, broker)?;
 
     // Navigate to DuckDuckGo HTML search
     let search_url = format!("{}?q={}", DUCKDUCKGO_HTML_URL, urlencoding::encode(query));
@@ -1130,14 +1299,73 @@ pub fn search_duckduckgo(
 /// navigation times out, or the rendered DOM exceeds
 /// [`MAX_WEB_FETCH_BYTES`].
 #[cfg(feature = "browser")]
-pub fn fetch_with_browser(url: &str, browser_scratch_root: &Path) -> Result<FetchResult, String> {
-    validate_url(url)?;
+pub async fn fetch_with_browser(
+    url: &str,
+    run: std::sync::Arc<crate::tools::ToolRunContext>,
+) -> Result<FetchResult, String> {
+    let broker = crate::web_egress::WebEgressBroker::new(std::sync::Arc::clone(&run))
+        .map_err(|error| error.to_string())?;
+    fetch_with_browser_using_broker(url, run, broker)
+        .await
+        .map(|result| result.result)
+        .map_err(|error| error.to_string())
+}
 
-    let browser = launch_browser_for_scraping(browser_scratch_root)?;
+#[cfg(feature = "browser")]
+pub(crate) async fn fetch_with_browser_brokered(
+    url: &str,
+    run: std::sync::Arc<crate::tools::ToolRunContext>,
+) -> Result<BrokeredFetchResult, crate::web_egress::WebEgressError> {
+    let broker = crate::web_egress::WebEgressBroker::new(std::sync::Arc::clone(&run))?;
+    fetch_with_browser_using_broker(url, run, broker).await
+}
+
+#[cfg(feature = "browser")]
+async fn fetch_with_browser_using_broker(
+    url: &str,
+    run: std::sync::Arc<crate::tools::ToolRunContext>,
+    broker: std::sync::Arc<crate::web_egress::WebEgressBroker>,
+) -> Result<BrokeredFetchResult, crate::web_egress::WebEgressError> {
+    broker.validate_browser_navigation(url)?;
+    let mut proxy =
+        crate::web_egress::BrowserEgressProxy::start(std::sync::Arc::clone(&broker)).await?;
+    let proxy_url = proxy.url();
+    let browser_scratch_root = run.private_temp_root().to_path_buf();
+    let url = url.to_string();
+    let browser_result = tokio::task::spawn_blocking(move || {
+        fetch_with_browser_sync(&url, &browser_scratch_root, &proxy_url, &broker)
+    })
+    .await;
+    proxy.shutdown().await;
+    let receipts = proxy.receipts();
+    match browser_result {
+        Ok(Ok(result)) => Ok(BrokeredFetchResult {
+            result,
+            network_receipts: receipts,
+        }),
+        Ok(Err(message)) => Err(crate::web_egress::WebEgressError::external(
+            message, receipts,
+        )),
+        Err(_) => Err(crate::web_egress::WebEgressError::external(
+            "Browser fetch task failed",
+            receipts,
+        )),
+    }
+}
+
+#[cfg(feature = "browser")]
+fn fetch_with_browser_sync(
+    url: &str,
+    browser_scratch_root: &Path,
+    proxy_url: &str,
+    broker: &std::sync::Arc<crate::web_egress::WebEgressBroker>,
+) -> Result<FetchResult, String> {
+    let browser = launch_browser_for_scraping(browser_scratch_root, proxy_url)?;
 
     let tab = browser
         .new_tab()
         .map_err(|e| format!("Failed to create browser tab: {e}"))?;
+    configure_browser_request_policy(&tab, broker)?;
 
     tab.navigate_to(url)
         .map_err(|e| format!("Failed to navigate to URL: {e}"))?;
@@ -1185,8 +1413,14 @@ pub fn fetch_with_browser(url: &str, browser_scratch_root: &Path) -> Result<Fetc
 ///
 /// Always returns an error when the browser feature is not enabled.
 #[cfg(not(feature = "browser"))]
-pub fn fetch_with_browser(url: &str, _browser_scratch_root: &Path) -> Result<FetchResult, String> {
-    validate_url(url)?;
+pub async fn fetch_with_browser(
+    url: &str,
+    run: std::sync::Arc<crate::tools::ToolRunContext>,
+) -> Result<FetchResult, String> {
+    let broker = crate::web_egress::WebEgressBroker::new(run).map_err(|error| error.to_string())?;
+    broker
+        .validate_browser_navigation(url)
+        .map_err(|error| error.to_string())?;
     Err("Browser feature not enabled. Rebuild with `cargo build --features browser`".to_string())
 }
 
@@ -1239,29 +1473,6 @@ mod tests {
             dir.starts_with(root.path()),
             "browser profile must stay inside the run scratch root"
         );
-    }
-
-    #[cfg(feature = "browser")]
-    #[test]
-    fn browser_fallback_requires_process_only_after_direct_tier_failure() {
-        let root = tempfile::tempdir().expect("network-only run root");
-        let run =
-            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), root.path())
-                .read_only_roots(Vec::new())
-                .read_write_roots(Vec::new())
-                .environment_grants(std::collections::HashMap::new())
-                .workspace_access(crate::tools::WorkspaceAccess::ReadOnly)
-                .process(false)
-                .network(true)
-                .secrets(false)
-                .provider("web-fallback-capability-test")
-                .build()
-                .expect("network-only run");
-
-        let error = browser_scratch_for_fallback(&run, "simulated direct failure")
-            .expect_err("browser fallback must require process authority");
-        assert!(error.contains("simulated direct failure"), "{error}");
-        assert!(error.contains("Process"), "{error}");
     }
 
     #[test]
@@ -1724,11 +1935,27 @@ mod tests {
             .respond_with(wiremock::ResponseTemplate::new(404).set_body_string("not found"))
             .mount(&server)
             .await;
-        let err = fetch_url_direct(&server.uri())
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let grants = crate::web_egress::WebEgressGrants::from_exact_web_origins([server.uri()])
+            .expect("loopback grant");
+        let run = crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), root)
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(std::collections::HashMap::new())
+            .web_egress_grants(grants)
+            .workspace_access(crate::tools::WorkspaceAccess::ReadOnly)
+            .process(false)
+            .network(true)
+            .secrets(false)
+            .provider("web-direct-test")
+            .build()
+            .expect("run");
+        let broker = crate::web_egress::WebEgressBroker::new(run).expect("broker");
+        let err = fetch_url_direct(&server.uri(), &broker)
             .await
             .expect_err("direct HTTP tier must reject non-2xx status");
         assert!(
-            err.contains("HTTP 404 Not Found from upstream"),
+            err.message.contains("HTTP 404 Not Found"),
             "non-2xx error should name upstream status; got {err}"
         );
     }
