@@ -1,6 +1,6 @@
 {
   "next_display_id": 1149,
-  "next_comment_id": 1664,
+  "next_comment_id": 1665,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -1230,11 +1230,22 @@
       "parent_uuid": "6ea4d98d-679e-4078-b6b1-125fa8b5ab9b",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T06:00:10.088711167Z",
-      "updated_at": "2026-08-26T06:00:43.519597497Z",
+      "updated_at": "2026-08-26T06:36:38.384487879Z",
       "labels": [
         "feature",
         "remediation"
-      ]
+      ],
+      "comments": {
+        "a7f84205-a29a-4a26-ad37-2967b7943901": {
+          "display_id": 1664,
+          "author": "6Vw9",
+          "content": "Compiled local LSP fixture coverage is implemented and passing 8 serial tests across document versions/concurrency, complete prepare/incoming/outgoing call-hierarchy continuations and stale-token rejection, crash restart with rehydration, cancellation, balanced shutdown, config replacement/idle reap, run isolation, and plugin environment authority denial. Full repository gates remain pending.",
+          "created_at": "2026-08-26T06:36:38.382052638Z",
+          "kind": "progress",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAmKazO3Rq1cBNBpHSIRAb43td2kAmS/BS+n+qCwaqGZKt/9VvPBOk4jUVsH75OFRSwuiKpCqOMXXrq1oOXqiuAg=="
+        }
+      }
     },
     "010c5bd2-f897-429d-85d1-f04c36c3e0ac": {
       "uuid": "010c5bd2-f897-429d-85d1-f04c36c3e0ac",
@@ -42135,11 +42146,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1761,
       "timestamp": "2026-08-26T06:36:33.469945624Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1762,
+      "timestamp": "2026-08-26T06:36:38.384487879Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T06:36:33.469945624Z",
+    "timestamp": "2026-08-26T06:36:38.384487879Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1761
+    "agent_seq": 1762
   }
 }
