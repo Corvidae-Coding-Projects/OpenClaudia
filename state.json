@@ -1,6 +1,6 @@
 {
   "next_display_id": 1149,
-  "next_comment_id": 1665,
+  "next_comment_id": 1666,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -21494,11 +21494,22 @@
       "parent_uuid": "6ea4d98d-679e-4078-b6b1-125fa8b5ab9b",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T06:00:22.813632360Z",
-      "updated_at": "2026-08-26T06:00:39.216383163Z",
+      "updated_at": "2026-08-26T07:07:34.622093601Z",
       "labels": [
         "feature",
         "remediation"
-      ]
+      ],
+      "comments": {
+        "ce44cb1c-7066-44da-ba03-108f30753aac": {
+          "display_id": 1665,
+          "author": "6Vw9",
+          "content": "Implemented the run-owned stateful LSP manager: exact workspace/language/executable/config/capability pool identity; initialize/health/restart/rehydration; versioned didOpen/didChange/didClose; typed server/cancellation/stale failures; graceful shutdown, forced reaping, idle eviction, and bounded server/continuation state under the existing LanguageServer sandbox.",
+          "created_at": "2026-08-26T07:07:34.618204665Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA9qvpud1PUWKu9j4rqU4E0K9A/NoLvVZgC7ay2fjKTKmuRFjLuYfDssnxmqPWj4BPwt9Uh4epKqMQNkRFHcSGAw=="
+        }
+      }
     },
     "9ea2aa8c-c6d4-4d2c-a28a-2219c8279fa4": {
       "uuid": "9ea2aa8c-c6d4-4d2c-a28a-2219c8279fa4",
@@ -42151,11 +42162,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1762,
       "timestamp": "2026-08-26T06:36:38.384487879Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1763,
+      "timestamp": "2026-08-26T07:07:34.622093601Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T06:36:38.384487879Z",
+    "timestamp": "2026-08-26T07:07:34.622093601Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1762
+    "agent_seq": 1763
   }
 }
