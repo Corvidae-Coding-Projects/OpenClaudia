@@ -1,6 +1,6 @@
 {
   "next_display_id": 1145,
-  "next_comment_id": 1655,
+  "next_comment_id": 1656,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -29821,7 +29821,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T23:43:22.282994195Z",
-      "updated_at": "2026-08-26T01:33:37.814924432Z",
+      "updated_at": "2026-08-26T01:33:42.456493614Z",
       "labels": [
         "feature",
         "remediation"
@@ -29835,6 +29835,15 @@
           "kind": "observation",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAfWyEK8oVAWcpjIhWzXjnavQ+mCG2FoNTUZlkdsGm1yw5evUmki5wTvjDqsbXEWJPFE3f0Y3XpWbkoZD5DhydBQ=="
+        },
+        "3f86dd74-60fc-412a-b967-55d6005397d9": {
+          "display_id": 1655,
+          "author": "6Vw9",
+          "content": "[action] Blocked after three checks: S-067 signed head 918cb7c7 remains one commit ahead of origin; PR #66 is still at 6934cfb2; waiting for Laurelai push before exact-head CI monitoring",
+          "created_at": "2026-08-26T01:33:42.454094442Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAt/18JLlf9FTmNc41ianpAagvSmODUs1RrGfRFnWqHSx9g3ykr5rZx0HMv8+J5DVsafehazLR+mfMUIFz72aJAg=="
         },
         "416622a1-cc56-44aa-9252-b1ac36796ed2": {
           "display_id": 1654,
@@ -41853,11 +41862,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1741,
       "timestamp": "2026-08-26T01:33:37.814924432Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1742,
+      "timestamp": "2026-08-26T01:33:42.456493614Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T01:33:37.814924432Z",
+    "timestamp": "2026-08-26T01:33:42.456493614Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1741
+    "agent_seq": 1742
   }
 }
