@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1155,
+  "next_display_id": 1156,
   "next_comment_id": 1719,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -900,6 +900,7 @@
     "d8675b7c-9b52-4f06-b7b6-eb751ccd9649": 1150,
     "d878fd43-2248-4f8f-b694-f67199caca95": 31,
     "d882369e-1457-40e8-b0c6-91b6c518bc41": 238,
+    "d8e406e3-5c21-477d-b836-78d4262484c5": 1155,
     "d938fede-7834-40d5-ac25-1a673641e8d4": 517,
     "d93e4371-e8ba-427b-b713-2dd3e8fcfcd1": 438,
     "d9b33fc6-9c55-4998-80a6-43029be07305": 912,
@@ -28691,6 +28692,18 @@
         "f1b949bd-be55-457c-8d4d-b7c5d4ad88cc"
       ]
     },
+    "d8e406e3-5c21-477d-b836-78d4262484c5": {
+      "uuid": "d8e406e3-5c21-477d-b836-78d4262484c5",
+      "display_id": 1155,
+      "title": "Add native browser resource accounting on Windows and macOS",
+      "description": "Goal: \n\nAcceptance criteria:\n- \n\nGoal:\nEnforce and evidence browser descendant process-count, resident-memory, and CPU-time ceilings on supported Windows and macOS hosts with semantics equivalent to the Linux supervisor.\n\nAcceptance criteria:\n- Browser descendants are identified without relying on mutable project state.\n- Process, aggregate RSS, and aggregate CPU ceilings terminate and reconcile the owned browser tree before returning.\n- Typed supervision receipts report the measured maxima and terminal reason.\n- Platform-specific tests exercise each supported host in CI; existing portable elapsed/profile/request/DOM/tab/download controls remain intact.\n- Work stays scoped to platform-native resource accounting and does not reopen S-072 browser policy or persistence design.",
+      "status": "open",
+      "priority": "medium",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-26T19:21:44.186460494Z",
+      "updated_at": "2026-08-26T19:21:44.186460494Z"
+    },
     "d938fede-7834-40d5-ac25-1a673641e8d4": {
       "uuid": "d938fede-7834-40d5-ac25-1a673641e8d4",
       "display_id": 517,
@@ -43265,11 +43278,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1859,
       "timestamp": "2026-08-26T19:21:15.033002171Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1860,
+      "timestamp": "2026-08-26T19:21:44.186460494Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T19:21:15.033002171Z",
+    "timestamp": "2026-08-26T19:21:44.186460494Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1859
+    "agent_seq": 1860
   }
 }
