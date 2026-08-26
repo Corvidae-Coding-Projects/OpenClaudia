@@ -29812,13 +29812,12 @@
       "display_id": 1144,
       "title": "S-067: Complete MCP OAuth, elicitation, and in-process semantics",
       "description": "Production-wire the S-067 MCP boundary without removing operational behavior: current authorization discovery and protected OAuth lifecycle reuse; correlated concurrent multi-round elicitation; and in-process servers governed by the same identity, capability, budget, cancellation, shutdown, grounding, and guardrail contracts as external transports. Preserve current plus explicitly supported legacy MCP compatibility and existing Claude/Codex authentication. Verify realistic security, concurrency, failure, and compiled production paths on Rust 1.98 under resource-aware gates. S-068 and unrelated cleanup are excluded.",
-      "status": "closed",
+      "status": "open",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T23:43:22.282994195Z",
-      "updated_at": "2026-08-26T01:30:11.218442617Z",
-      "closed_at": "2026-08-26T01:30:11.218440680Z",
+      "updated_at": "2026-08-26T01:31:53.179155199Z",
       "labels": [
         "feature",
         "remediation"
@@ -41798,11 +41797,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1736,
       "timestamp": "2026-08-26T01:30:15.992412027Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1737,
+      "timestamp": "2026-08-26T01:31:53.179155199Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T01:30:15.992412027Z",
+    "timestamp": "2026-08-26T01:31:53.179155199Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1736
+    "agent_seq": 1737
   }
 }
