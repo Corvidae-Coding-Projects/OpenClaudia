@@ -28241,11 +28241,12 @@
       "uuid": "d8675b7c-9b52-4f06-b7b6-eb751ccd9649",
       "display_id": 1150,
       "title": "Select the next unfinished feature slice after S-068",
-      "status": "open",
+      "status": "closed",
       "priority": "low",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T07:37:46.878769587Z",
-      "updated_at": "2026-08-26T07:39:09.593490518Z",
+      "updated_at": "2026-08-26T07:39:18.689605913Z",
+      "closed_at": "2026-08-26T07:39:18.689604505Z",
       "labels": [
         "planning"
       ],
@@ -42406,11 +42407,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1788,
       "timestamp": "2026-08-26T07:39:09.593490518Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1789,
+      "timestamp": "2026-08-26T07:39:18.689605913Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T07:39:09.593490518Z",
+    "timestamp": "2026-08-26T07:39:18.689605913Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1788
+    "agent_seq": 1789
   }
 }
