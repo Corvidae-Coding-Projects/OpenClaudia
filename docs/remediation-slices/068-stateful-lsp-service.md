@@ -89,10 +89,10 @@ was rebound while retaining its deliberately fail-closed `rejected` verdict.
 
 ## Residual boundaries
 
-- S-069 remains responsible for the broader bounded JSON-RPC transport,
+- S-069 subsequently completed the broader bounded JSON-RPC transport,
   blocked-write and hostile-frame fixtures, returned-resource validation,
-  bounded semantic results and diagnostics. S-068 does not claim those
-  adjacent requirements complete.
+  bounded semantic results, and typed diagnostics. This does not expand the
+  narrower S-068 completion claim retroactively.
 - S-088 remains responsible for an independent artifact-bound VDD receipt
   using the same harness, guardrails, capabilities, budgets, grounding, and
   process supervision. No independent approval is represented here.

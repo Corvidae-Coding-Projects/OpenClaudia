@@ -1300,13 +1300,31 @@ impl ToolHandler for LspHandler {
             }
         })
     }
-    fn execute_legacy(
+    fn execute(
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
-    ) -> (String, bool) {
-        lsp::execute_lsp(ctx.run, args)
+    ) -> ToolHandlerResult {
+        match lsp::execute_lsp_typed(ctx.run, args) {
+            lsp::LspExecution::Complete { text, structured } => {
+                ToolHandlerResult::success_structured(text, structured)
+            }
+            lsp::LspExecution::Partial {
+                text,
+                structured,
+                reasons,
+            } => {
+                let failures = reasons
+                    .into_iter()
+                    .map(|reason| {
+                        ToolFailure::new(ToolFailureCode::External, reason, ToolRetryability::Never)
+                    })
+                    .collect();
+                ToolHandlerResult::partial_structured(text, structured, failures, None)
+            }
+            lsp::LspExecution::Error(error) => ToolHandlerResult::legacy(error, true),
+        }
     }
 }
 

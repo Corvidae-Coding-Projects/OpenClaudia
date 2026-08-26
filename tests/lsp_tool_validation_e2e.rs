@@ -369,20 +369,46 @@ fn query_arg_as_object_returns_validation_error_for_non_workspace_action() {
     assert_eq!(msg, "Invalid 'query' argument: expected string");
 }
 
+#[test]
+fn oversized_query_is_rejected_before_server_lookup() {
+    let args = args_with(&[
+        ("file_path", json!("tests/fixtures/lsp/x.unknownext")),
+        ("action", json!("workspaceSymbol")),
+        ("query", json!("q".repeat(16 * 1024 + 1))),
+    ]);
+    let (msg, is_err) = dispatch_lsp(&args);
+    assert!(is_err);
+    assert!(msg.contains("exceeds the 16384-byte limit"), "{msg}");
+    assert!(!msg.contains("No language server known"), "{msg}");
+}
+
+#[test]
+fn oversized_continuation_is_rejected_before_server_lookup() {
+    let args = args_with(&[
+        ("file_path", json!("tests/fixtures/lsp/x.unknownext")),
+        ("action", json!("incomingCalls")),
+        ("continuation_token", json!("t".repeat(1025))),
+    ]);
+    let (msg, is_err) = dispatch_lsp(&args);
+    assert!(is_err);
+    assert!(msg.contains("maximum is 1024 bytes"), "{msg}");
+    assert!(!msg.contains("No language server known"), "{msg}");
+}
+
 // ───────────────────────────────────────────────────────────────────────────
-// Section G — line + character coercion
+// Section G — line + character validation
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn line_arg_above_u32_max_clamps_to_u32_max_no_panic() {
+fn line_arg_above_u32_max_is_rejected_instead_of_clamped() {
     let args = args_with(&[
         ("file_path", json!("tests/fixtures/lsp/x.rs")),
         ("action", json!("hover")),
         ("line", json!(u64::MAX)),
     ]);
-    let (_msg, is_err) = dispatch_lsp(&args);
-    // No panic on overflow — line is clamped via try_from.
+    let (msg, is_err) = dispatch_lsp(&args);
     assert!(is_err);
+    assert_eq!(msg, "Error: line must fit an unsigned 32-bit integer");
 }
 
 #[test]
@@ -401,14 +427,15 @@ fn line_arg_zero_returns_validation_error() {
 }
 
 #[test]
-fn character_arg_above_u32_max_clamps_no_panic() {
+fn character_arg_above_u32_max_is_rejected_instead_of_clamped() {
     let args = args_with(&[
         ("file_path", json!("tests/fixtures/lsp/x.rs")),
         ("action", json!("hover")),
         ("character", json!(u64::MAX)),
     ]);
-    let (_msg, is_err) = dispatch_lsp(&args);
+    let (msg, is_err) = dispatch_lsp(&args);
     assert!(is_err);
+    assert_eq!(msg, "Error: character must fit an unsigned 32-bit integer");
 }
 
 #[test]

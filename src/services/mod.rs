@@ -35,7 +35,8 @@ pub use lsp_diagnostics::{
     DiagnosticSeverity, NoopDiagnosticInjector,
 };
 pub use lsp_pool::{
-    LspCallHierarchyContinuation, LspServerManager, LspServiceError, LspServiceRequest,
+    LspCallHierarchyContinuation, LspDiagnosticPublication, LspProtocolLimits,
+    LspPublishedDiagnostic, LspServerManager, LspServiceError, LspServiceRequest,
     LspServiceResponse, PluginLspServer,
 };
 pub use mcp_registry::{McpRegistration, McpServerSpec, PluginMcpRegistry};

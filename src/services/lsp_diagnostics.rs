@@ -1,26 +1,23 @@
-//! Preserved LSP diagnostic staging — unavailable in production.
+//! Legacy LSP diagnostic staging retained for compatibility.
 //!
 //! Language servers emit `textDocument/publishDiagnostics` notifications
 //! asynchronously: a request like `goToDefinition` triggers a full
 //! background re-analysis that may yield warnings/errors several
-//! seconds after the original tool call has returned. Today
-//! [`crate::tools::lsp`] drains those notifications on the way to its
-//! response and discards them. That throws away the most useful
-//! signal the LSP exposes — the agent never learns it just edited a
-//! file into a broken state.
+//! seconds after the original tool call has returned.
+//! [`crate::services::LspServerManager`] now drains notifications during a
+//! bounded protocol turn and publishes capability-validated, versioned typed
+//! data in the LSP tool result.
 //!
 //! Production does not construct this registry or inject its rendered text.
-//! The current shape lacks workspace/generation/document-version identity,
-//! aggregate byte budgets, and an untrusted-evidence boundary. Safe activation
-//! remains assigned to S-068/S-069 in
-//! [`crate::services::lifecycle_service_catalog`].
+//! This older shape lacks workspace/generation/document-version identity,
+//! aggregate byte budgets, and an untrusted-evidence boundary; it is therefore
+//! not the production notification path.
 //!
 //! ## What ships
 //!
 //! * [`Diagnostic`] — lossy staging projection of an LSP diagnostic.
-//! * [`DiagnosticRegistry`] — thread-safe accumulator keyed by file
-//!   URI; the LSP tool layer (forthcoming) will push notifications
-//!   here.
+//! * [`DiagnosticRegistry`] — legacy thread-safe accumulator keyed by file
+//!   URI for compatibility tests and downstream callers.
 //! * [`DiagnosticInjector`] — trait the conversation layer
 //!   (`session.rs` / `pipeline.rs`) implements to splice the
 //!   accumulated diagnostics into the next assistant turn as a
@@ -28,13 +25,8 @@
 //! * [`NoopDiagnosticInjector`] — explicit library/test discard behavior; it
 //!   is not a production fallback.
 //!
-//! ## Where it plugs in (later)
-//!
-//! Two-stage rollout. Stage A (this commit) lands the registry +
-//! injector trait and starts no callers; the LSP tool keeps draining
-//! and discarding for now. Stage B replaces the discard with a
-//! `registry.push(uri, diags)` and the session loop calls
-//! `injector.consume()` once per turn boundary.
+//! New code should consume [`crate::services::LspDiagnosticPublication`]
+//! instead of injecting this registry's rendered XML into a later prompt.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

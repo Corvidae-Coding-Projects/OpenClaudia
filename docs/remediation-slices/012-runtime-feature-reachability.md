@@ -38,10 +38,12 @@ composition model:
 
 This preserves the intended capabilities while removing only false wiring and
 duplicate authority. In particular, the transport-neutral plugin MCP mirror,
-feature-flag source, background scheduler, LSP staging, and rate-limit state
-machine remain present for their owning follow-up slices. S-103 and S-104 later
-promoted team memory through a separate authenticated, encrypted replica rather
-than converting the rejected shared-path prototype into runtime authority.
+feature-flag source, background scheduler, legacy LSP staging API, and
+rate-limit state machine remain present. S-069 later wired bounded typed LSP
+diagnostics through the run-owned server manager without activating the legacy
+prompt injector. S-103 and S-104 promoted team memory through a separate
+authenticated, encrypted replica rather than converting the rejected
+shared-path prototype into runtime authority.
 
 ## Audited lifecycle catalog
 
@@ -59,7 +61,7 @@ than converting the rejected shared-path prototype into runtime authority.
 | Enterprise policy | Wired | `PolicyEnforcer::new` / provider and tool policy consumers / frontend owner drop |
 | Tool executor | Wired | typed `ToolExecutorRequest` / `ToolExecutor::execute` / typed result publication |
 | LSP pool | Wired | `ToolRunContext`-owned `LspServerManager` / production LSP tool dispatch / run drop or explicit shutdown |
-| LSP diagnostics | Unavailable | Staging registry lacks bounded versioned production notification handling; S-069 |
+| LSP diagnostics | Wired | `ToolRunContext`-owned `LspServerManager` / bounded capability-validated `publishDiagnostics` collection into typed untrusted LSP results / request publication or run shutdown |
 | Rate-limit failure injection | Test-only | Preserved deterministic state machine is not installed in provider/proxy transport; S-048/S-050 |
 
 `validate_lifecycle_service_catalog()` rejects duplicate or missing service IDs,
@@ -199,8 +201,10 @@ The repair cycle was retained as evidence rather than erased:
   visibly. S-104 process and frontend tests separately bind `memory.team_id` to
   the authenticated replica and canonical scoped tools.
 - **Preservation over deletion:** incomplete feature flags, background jobs,
-  shadow MCP, LSP, and rate-limit implementations remain present under explicit
-  classifications and follow-up owners. Team memory was subsequently wired by
+  shadow MCP, the legacy LSP diagnostic staging API, and rate-limit
+  implementations remain present under explicit classifications and follow-up
+  owners. The LSP production path was subsequently completed through bounded
+  typed results rather than prompt injection. Team memory was wired by
   completing its authenticated authority and bounded replication design.
 - **Deterministic tests and traces:** focused trace/privacy/fail-closed/process
   assertions and the complete Rust gate pass.
@@ -217,9 +221,9 @@ The repair cycle was retained as evidence rather than erased:
   the local typed evidence schema/retrieval baseline; S-103/S-104 subsequently
   completed authenticated authority and production team activation. S-105 owns
   evaluated technical-memory retrieval quality rather than transport wiring.
-  S-061/S-062/S-084 own plugin maintenance and durable job
-  scheduling. S-069 owns the remaining bounded LSP transport, result, and
-  diagnostics work. S-048/S-050 own
+  S-061/S-062/S-084 own plugin maintenance and durable job scheduling. S-069
+  subsequently completed bounded LSP transport, result, and diagnostic
+  handling. S-048/S-050 own
   real provider-transport failure injection. S-014/S-047 own declared rollout
   semantics.
 - The current typed lifecycle path uses stable Rust entrypoint identities plus

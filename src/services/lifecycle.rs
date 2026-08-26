@@ -289,11 +289,14 @@ const CATALOG: &[LifecycleServiceRegistration] = &[
         ),
         "The production LSP tool uses one supervised stateful service per exact run generation.",
     ),
-    LifecycleServiceRegistration::classified(
+    LifecycleServiceRegistration::wired(
         LifecycleServiceId::LspDiagnostics,
-        LifecycleServiceClassification::Unavailable,
-        "The staging registry has no bounded versioned production notification consumer.",
-        Some("S-069"),
+        LifecyclePath::new(
+            "ToolRunContext construction",
+            "LspServerManager typed publishDiagnostics collection",
+            "request result publication / ToolRunContext drop",
+        ),
+        "Bounded diagnostics are capability-validated and returned as typed, versioned, untrusted LSP result data.",
     ),
     LifecycleServiceRegistration::classified(
         LifecycleServiceId::RateLimitFailureInjection,

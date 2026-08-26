@@ -14,6 +14,7 @@ fn main() -> io::Result<()> {
     let mut output = io::stdout().lock();
     let mut hang = false;
     let mut server_error = false;
+    let mut document_uri = None;
 
     while let Some(body) = read_message(&mut input)? {
         append_log(&log, &body)?;
@@ -22,6 +23,9 @@ fn main() -> io::Result<()> {
         {
             hang = body.contains("HANG");
             server_error = body.contains("SERVER_ERROR");
+            if body.contains("\"method\":\"textDocument/didOpen\"") {
+                document_uri = json_string_member(&body, "uri");
+            }
             continue;
         }
         if body.contains("\"method\":\"initialized\"")
@@ -40,21 +44,40 @@ fn main() -> io::Result<()> {
         } else if body.contains("\"method\":\"shutdown\"") {
             "null".to_string()
         } else if body.contains("\"method\":\"textDocument/prepareCallHierarchy\"") {
-            r#"[{"name":"target","kind":12,"detail":"complete fixture item","uri":"file:///fixture.fixture","range":{"start":{"line":0,"character":0},"end":{"line":2,"character":1}},"selectionRange":{"start":{"line":0,"character":3},"end":{"line":0,"character":9}},"data":{"opaque":{"fixture":true,"sequence":7}}}]"#.to_string()
+            format!(
+                r#"[{{"name":"target","kind":12,"detail":"complete fixture item","uri":"{}","range":{{"start":{{"line":0,"character":0}},"end":{{"line":2,"character":1}}}},"selectionRange":{{"start":{{"line":0,"character":3}},"end":{{"line":0,"character":9}}}},"data":{{"opaque":{{"fixture":true,"sequence":7}}}}}}]"#,
+                document_uri.as_deref().expect("didOpen URI")
+            )
         } else if body.contains("\"method\":\"callHierarchy/incomingCalls\"") {
             if !body.contains("\"opaque\":{\"fixture\":true,\"sequence\":7}")
                 && !body.contains("\"roundtrip\":\"incoming\"")
             {
-                write_error(&mut output, id, -32602, "opaque item data was not preserved")?;
+                write_error(
+                    &mut output,
+                    id,
+                    -32602,
+                    "opaque item data was not preserved",
+                )?;
                 continue;
             }
-            r#"[{"from":{"name":"caller","kind":12,"uri":"file:///caller.fixture","range":{"start":{"line":3,"character":0},"end":{"line":4,"character":1}},"selectionRange":{"start":{"line":3,"character":2},"end":{"line":3,"character":8}},"data":{"roundtrip":"incoming"}},"fromRanges":[]}]"#.to_string()
+            format!(
+                r#"[{{"from":{{"name":"caller","kind":12,"uri":"{}","range":{{"start":{{"line":3,"character":0}},"end":{{"line":4,"character":1}}}},"selectionRange":{{"start":{{"line":3,"character":2}},"end":{{"line":3,"character":8}}}},"data":{{"roundtrip":"incoming"}}}},"fromRanges":[]}}]"#,
+                document_uri.as_deref().expect("didOpen URI")
+            )
         } else if body.contains("\"method\":\"callHierarchy/outgoingCalls\"") {
             if !body.contains("\"opaque\":{\"fixture\":true,\"sequence\":7}") {
-                write_error(&mut output, id, -32602, "opaque item data was not preserved")?;
+                write_error(
+                    &mut output,
+                    id,
+                    -32602,
+                    "opaque item data was not preserved",
+                )?;
                 continue;
             }
-            r#"[{"to":{"name":"callee","kind":12,"uri":"file:///callee.fixture","range":{"start":{"line":5,"character":0},"end":{"line":6,"character":1}},"selectionRange":{"start":{"line":5,"character":2},"end":{"line":5,"character":8}},"data":{"roundtrip":"outgoing"}},"fromRanges":[]}]"#.to_string()
+            format!(
+                r#"[{{"to":{{"name":"callee","kind":12,"uri":"{}","range":{{"start":{{"line":5,"character":0}},"end":{{"line":6,"character":1}}}},"selectionRange":{{"start":{{"line":5,"character":2}},"end":{{"line":5,"character":8}}}},"data":{{"roundtrip":"outgoing"}}}},"fromRanges":[]}}]"#,
+                document_uri.as_deref().expect("didOpen URI")
+            )
         } else if body.contains("\"method\":\"textDocument/hover\"") {
             if let Some(marker) = crash_marker.as_ref() {
                 if !marker.exists() {
@@ -71,13 +94,23 @@ fn main() -> io::Result<()> {
             }
             r#"{"contents":{"kind":"plaintext","value":"fixture-hover"}}"#.to_string()
         } else if body.contains("\"method\":\"workspace/symbol\"") {
-            r#"[{"name":"FixtureSymbol","kind":12,"containerName":"fixture","location":{"uri":"file:///fixture.fixture","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":7}}}}]"#.to_string()
+            format!(
+                r#"[{{"name":"FixtureSymbol","kind":12,"containerName":"fixture","location":{{"uri":"{}","range":{{"start":{{"line":0,"character":0}},"end":{{"line":0,"character":7}}}}}}}}]"#,
+                document_uri.as_deref().expect("didOpen URI")
+            )
         } else {
             "[]".to_string()
         };
         write_result(&mut output, id, &result)?;
     }
     Ok(())
+}
+
+fn json_string_member(body: &str, name: &str) -> Option<String> {
+    let marker = format!(r#""{name}":""#);
+    let tail = body.split_once(&marker)?.1;
+    let value = tail.split_once('"')?.0;
+    Some(value.to_string())
 }
 
 fn read_message(reader: &mut impl BufRead) -> io::Result<Option<String>> {
@@ -92,20 +125,13 @@ fn read_message(reader: &mut impl BufRead) -> io::Result<Option<String>> {
             break;
         }
         if let Some(length) = trimmed.strip_prefix("Content-Length:") {
-            content_length = Some(
-                length
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(io::Error::other)?,
-            );
+            content_length = Some(length.trim().parse::<usize>().map_err(io::Error::other)?);
         }
     }
     let length = content_length.ok_or_else(|| io::Error::other("missing Content-Length"))?;
     let mut body = vec![0_u8; length];
     reader.read_exact(&mut body)?;
-    String::from_utf8(body)
-        .map(Some)
-        .map_err(io::Error::other)
+    String::from_utf8(body).map(Some).map_err(io::Error::other)
 }
 
 fn json_id(body: &str) -> Option<u64> {

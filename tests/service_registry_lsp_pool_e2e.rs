@@ -75,16 +75,18 @@ fn lsp_pool_is_reported_as_a_real_production_lifecycle() {
 }
 
 #[test]
-fn diagnostics_remain_explicitly_unavailable_until_their_own_wiring_slice() {
+fn diagnostics_have_a_typed_bounded_production_path() {
     let registration = lifecycle_service_catalog()
         .iter()
         .find(|registration| registration.id() == LifecycleServiceId::LspDiagnostics)
         .expect("diagnostics lifecycle row");
     assert_eq!(
         registration.classification(),
-        LifecycleServiceClassification::Unavailable
+        LifecycleServiceClassification::Wired
     );
-    assert!(registration.follow_up().is_some());
+    let path = registration.path().expect("wired diagnostics path");
+    assert!(path.consume().contains("publishDiagnostics"));
+    assert!(path.shutdown().contains("ToolRunContext"));
 }
 
 #[test]

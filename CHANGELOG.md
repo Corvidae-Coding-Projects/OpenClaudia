@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- S-069: Bound and validate LSP JSON-RPC (#1151)
 - S-068: Create a stateful workspace LSP service (#1145)
 - S-068C: Prove stateful LSP lifecycle with compiled fixtures (#1146)
 - S-068B: Wire LSP tools, continuations, and plugin server configuration (#1147)
