@@ -687,6 +687,7 @@ impl ChatRepl {
         let permission_mgr =
             init_permission_manager(&config, args.dangerously_skip_permissions, &run_context);
         let plugin_manager = init_plugin_manager(run_context.project_root());
+        plugin_manager.configure_lsp_service_for_run(&run_context);
         let permissions = openclaudia::permissions::LocalApprovalCache::for_run(&run_context);
 
         Ok(Self {
@@ -1178,7 +1179,10 @@ impl ChatRepl {
                 SlashOutcome::RewrittenPrompt
             }
             SlashCommandResult::Plugin(action) => {
-                match action.apply(&mut self.plugin_manager, &self.run_context) {
+                let outcome = action.apply(&mut self.plugin_manager, &self.run_context);
+                self.plugin_manager
+                    .configure_lsp_service_for_run(&self.run_context);
+                match outcome {
                     PluginActionOutcome::Handled => SlashOutcome::Continue,
                     PluginActionOutcome::Prompt(invocation) => {
                         eprintln!("\x1b[36m⚡ Running plugin command...\x1b[0m");

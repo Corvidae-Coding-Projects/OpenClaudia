@@ -13,6 +13,9 @@ use openclaudia::plugins::{
 use openclaudia::skills::{
     load_skills_for_run, parse_skill_file, ResolvedSkill, SkillCapabilityPolicy, SkillRunAccess,
 };
+use openclaudia::state::SessionId;
+use openclaudia::tools::{ToolRunContext, WorkspaceAccess};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -166,6 +169,55 @@ fn b1_installed_entry_skipped_if_name_already_loaded_from_search_path() {
     let errors = manager.discover();
     assert!(errors.is_empty());
     assert_eq!(manager.count(), 1);
+}
+
+#[test]
+fn enabled_plugin_lsp_declarations_refresh_the_exact_run_service() {
+    let root = TempDir::new().unwrap();
+    let plugin_dir = make_cc_plugin(root.path(), "lsp-plugin");
+    fs::write(
+        plugin_dir.join(".claude-plugin/plugin.json"),
+        serde_json::json!({
+            "name": "lsp-plugin",
+            "version": "1.0.0",
+            "description": "Integration-test LSP plugin",
+            "lspServers": {
+                "fixture": {
+                    "command": "/bin/fixture-language-server",
+                    "args": ["--stdio"],
+                    "extensions": ["fixture"]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut manager =
+        PluginManager::with_paths_for_project(vec![root.path().to_path_buf()], root.path());
+    assert!(manager.discover().is_empty());
+    let run = ToolRunContext::builder(SessionId::new(), root.path())
+        .working_directory(root.path())
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(HashMap::new())
+        .workspace_access(WorkspaceAccess::ReadWrite)
+        .process(false)
+        .network(false)
+        .secrets(false)
+        .provider("plugin-lsp-composition-test")
+        .build()
+        .expect("plugin LSP test run");
+
+    manager.configure_lsp_service_for_run(&run);
+    let configured = run.lsp_service().plugin_servers();
+    assert_eq!(configured.len(), 1);
+    assert_eq!(configured[0].owner, "lsp-plugin");
+    assert_eq!(configured[0].language, "fixture");
+    assert_eq!(configured[0].config.extensions, ["fixture"]);
+
+    manager.disable("lsp-plugin").expect("disable plugin");
+    manager.configure_lsp_service_for_run(&run);
+    assert!(run.lsp_service().plugin_servers().is_empty());
 }
 
 // ---------------------------------------------------------------------------

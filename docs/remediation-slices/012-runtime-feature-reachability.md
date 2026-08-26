@@ -58,8 +58,8 @@ than converting the rejected shared-path prototype into runtime authority.
 | Guardrails | Wired | `guardrails::configure` / tool, diff, and quality boundaries / last-`Arc` run retirement |
 | Enterprise policy | Wired | `PolicyEnforcer::new` / provider and tool policy consumers / frontend owner drop |
 | Tool executor | Wired | typed `ToolExecutorRequest` / `ToolExecutor::execute` / typed result publication |
-| LSP pool | Unavailable | Language-only prototype is not workspace/generation safe; S-068/S-069 |
-| LSP diagnostics | Unavailable | Staging registry lacks workspace/version identity and aggregate bounds; S-068/S-069 |
+| LSP pool | Wired | `ToolRunContext`-owned `LspServerManager` / production LSP tool dispatch / run drop or explicit shutdown |
+| LSP diagnostics | Unavailable | Staging registry lacks bounded versioned production notification handling; S-069 |
 | Rate-limit failure injection | Test-only | Preserved deterministic state machine is not installed in provider/proxy transport; S-048/S-050 |
 
 `validate_lifecycle_service_catalog()` rejects duplicate or missing service IDs,
@@ -218,7 +218,8 @@ The repair cycle was retained as evidence rather than erased:
   completed authenticated authority and production team activation. S-105 owns
   evaluated technical-memory retrieval quality rather than transport wiring.
   S-061/S-062/S-084 own plugin maintenance and durable job
-  scheduling. S-068/S-069 own workspace/generation-safe LSP. S-048/S-050 own
+  scheduling. S-069 owns the remaining bounded LSP transport, result, and
+  diagnostics work. S-048/S-050 own
   real provider-transport failure injection. S-014/S-047 own declared rollout
   semantics.
 - The current typed lifecycle path uses stable Rust entrypoint identities plus

@@ -34,7 +34,10 @@ pub use lsp_diagnostics::{
     DefaultDiagnosticInjector, Diagnostic, DiagnosticInjector, DiagnosticRegistry,
     DiagnosticSeverity, NoopDiagnosticInjector,
 };
-pub use lsp_pool::{ChildHandle, LspServerManager, LspSpawner};
+pub use lsp_pool::{
+    LspCallHierarchyContinuation, LspServerManager, LspServiceError, LspServiceRequest,
+    LspServiceResponse, PluginLspServer,
+};
 pub use mcp_registry::{McpRegistration, McpServerSpec, PluginMcpRegistry};
 pub use policy::{
     EnterprisePolicy, PolicyDecision, PolicyError, ProviderRequestPolicy,

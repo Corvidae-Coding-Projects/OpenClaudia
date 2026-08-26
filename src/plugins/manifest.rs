@@ -378,10 +378,9 @@ pub struct LspServerConfig {
     /// Arguments passed to the executable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
-    /// Extra environment variables injected into the spawned process.
-    /// The standard LSP env-scrub allowlist (see `tools::lsp`) still
-    /// applies — credentials that fail the allowlist are dropped with a
-    /// `warn!` log.
+    /// Environment values required by the server. Every name/value must be an
+    /// exact member of the owning run's explicit environment grants; a plugin
+    /// declaration cannot grant additional authority.
     #[serde(
         default,
         skip_serializing_if = "crate::secrets::EnvironmentGrants::is_empty"

@@ -1288,7 +1288,11 @@ impl ToolHandler for LspHandler {
                         },
                         "hierarchy_item": {
                             "type": "object",
-                            "description": "Previously-fetched CallHierarchyItem (returned by prepareCallHierarchy); required by incomingCalls / outgoingCalls"
+                            "description": "Compatibility form: one entry from call_hierarchy_items returned by prepareCallHierarchy"
+                        },
+                        "continuation_token": {
+                            "type": "string",
+                            "description": "Opaque token returned by prepareCallHierarchy; required by incomingCalls / outgoingCalls"
                         }
                     },
                     "required": ["action", "file_path"]

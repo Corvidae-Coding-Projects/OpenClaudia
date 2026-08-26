@@ -347,6 +347,29 @@ impl PluginManager {
             .collect()
     }
 
+    /// Install the enabled plugin LSP declarations into one exact run's
+    /// stateful language-server service.
+    pub fn configure_lsp_service_for_run(&self, run: &crate::tools::ToolRunContext) {
+        let mut servers = self
+            .plugins
+            .values()
+            .filter(|plugin| plugin.enabled)
+            .flat_map(|plugin| {
+                plugin.lsp_configs.iter().map(move |(language, config)| {
+                    crate::services::PluginLspServer {
+                        owner: plugin.id.clone(),
+                        language: language.clone(),
+                        config: config.clone(),
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        servers.sort_by(|left, right| {
+            (&left.language, &left.owner).cmp(&(&right.language, &right.owner))
+        });
+        run.lsp_service().configure_plugins(servers);
+    }
+
     /// Get the installation tracker
     #[must_use]
     pub const fn installed(&self) -> &InstalledPlugins {

@@ -280,17 +280,20 @@ const CATALOG: &[LifecycleServiceRegistration] = &[
         ),
         "Primary local-tool paths use the shared typed executor.",
     ),
-    LifecycleServiceRegistration::classified(
+    LifecycleServiceRegistration::wired(
         LifecycleServiceId::LspPool,
-        LifecycleServiceClassification::Unavailable,
-        "The current pool is not workspace/generation safe and is not used by production LSP dispatch.",
-        Some("S-068/S-069"),
+        LifecyclePath::new(
+            "ToolRunContext construction",
+            "lsp tool dispatch through run-owned LspServerManager",
+            "ToolRunContext drop / explicit manager shutdown",
+        ),
+        "The production LSP tool uses one supervised stateful service per exact run generation.",
     ),
     LifecycleServiceRegistration::classified(
         LifecycleServiceId::LspDiagnostics,
         LifecycleServiceClassification::Unavailable,
         "The staging registry has no bounded versioned production notification consumer.",
-        Some("S-068/S-069"),
+        Some("S-069"),
     ),
     LifecycleServiceRegistration::classified(
         LifecycleServiceId::RateLimitFailureInjection,

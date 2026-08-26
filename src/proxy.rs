@@ -2774,6 +2774,7 @@ async fn build_proxy_state_with_loop_control(
         warn!(error = %err, "Plugin discovery error");
     }
     let plugin_manager = Arc::new(plugin_manager);
+    plugin_manager.configure_lsp_service_for_run(&run_context);
 
     // Initialize MCP manager and connect to configured servers
     let mcp_manager = Arc::new(RwLock::new(McpManager::new_with_permissions(

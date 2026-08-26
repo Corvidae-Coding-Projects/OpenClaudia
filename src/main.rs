@@ -1140,6 +1140,7 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
     app.memory_db = memory_db.map(std::sync::Arc::new);
     guardrails::configure(&run_context, &config.guardrails).map_err(anyhow::Error::msg)?;
     let plugin_manager = std::sync::Arc::new(init_plugin_manager(run_context.project_root()));
+    plugin_manager.configure_lsp_service_for_run(&run_context);
     let mcp_manager = std::sync::Arc::new(tokio::sync::RwLock::new(
         openclaudia::mcp::McpManager::new_with_permissions(
             std::sync::Arc::clone(&run_context),

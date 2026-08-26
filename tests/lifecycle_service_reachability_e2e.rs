@@ -86,7 +86,7 @@ fn every_service_has_one_unambiguous_audited_disposition() {
         ),
         (
             LifecycleServiceId::LspPool,
-            LifecycleServiceClassification::Unavailable,
+            LifecycleServiceClassification::Wired,
         ),
         (
             LifecycleServiceId::LspDiagnostics,

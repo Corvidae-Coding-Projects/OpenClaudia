@@ -405,6 +405,7 @@ impl ToolRunContextBuilder {
 pub struct ToolRunContext {
     runtime: Arc<RunContext>,
     generation: CapabilityGeneration,
+    lsp_service: crate::services::LspServerManager,
     runtime_mode: crate::modes::RuntimeModeAuthority,
     background_effect_lifecycle: Mutex<()>,
     tool_catalog: super::catalog::RunToolCatalog,
@@ -805,6 +806,7 @@ impl ToolRunContext {
         let context = Self {
             runtime,
             generation,
+            lsp_service: crate::services::LspServerManager::new(),
             runtime_mode,
             background_effect_lifecycle: Mutex::new(()),
             tool_catalog: super::catalog::RunToolCatalog::default(),
@@ -859,6 +861,12 @@ impl ToolRunContext {
     #[must_use]
     pub const fn generation(&self) -> CapabilityGeneration {
         self.generation
+    }
+
+    /// Stateful language-server service owned by this exact run generation.
+    #[must_use]
+    pub const fn lsp_service(&self) -> &crate::services::LspServerManager {
+        &self.lsp_service
     }
 
     /// Progressive tool-catalog state owned by this exact run generation.
@@ -1315,7 +1323,7 @@ impl ToolRunContext {
         let process_owner = session_id.as_str().to_string();
         let runtime_mode = self.runtime_mode();
 
-        Self::builder(session_id, &project_root)
+        let child = Self::builder(session_id, &project_root)
             .working_directory(working_directory)
             .read_only_roots(read_only_roots)
             .read_write_roots(read_write_roots)
@@ -1337,7 +1345,11 @@ impl ToolRunContext {
             .runtime_mode(runtime_mode.mode)
             .behavior_scope_targets(runtime_mode.scope_targets)
             .background_job_storage(self.background_job_storage)
-            .build()
+            .build()?;
+        child
+            .lsp_service()
+            .configure_plugins(self.lsp_service.plugin_servers());
+        Ok(child)
     }
 
     /// Whether a canonical path is readable by this session.
@@ -1643,6 +1655,7 @@ fn normalize_lexical_path(path: &Path) -> PathBuf {
 
 impl Drop for ToolRunContext {
     fn drop(&mut self) {
+        self.lsp_service.shutdown();
         // The last `Arc` is the run lifecycle boundary. Remove the exact-run
         // read-before-edit bucket so completed runs cannot accumulate process-
         // global path observations or leave authority-looking residue behind.

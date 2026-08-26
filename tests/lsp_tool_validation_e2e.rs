@@ -161,8 +161,8 @@ fn incoming_calls_missing_hierarchy_item_errors_before_server_gate() {
     let (msg, is_err) = dispatch_lsp(&args);
     assert!(is_err);
     assert!(
-        msg.contains("hierarchy_item") && msg.contains("prepareCallHierarchy"),
-        "must explain required call hierarchy argument; got {msg:?}"
+        msg.contains("continuation_token") && msg.contains("prepareCallHierarchy"),
+        "must explain required call hierarchy continuation; got {msg:?}"
     );
     assert!(
         !msg.contains("LSP server unavailable"),
@@ -191,7 +191,7 @@ fn call_hierarchy_with_object_item_reaches_file_validation() {
         ("action", json!("incomingCalls")),
         (
             "hierarchy_item",
-            json!({"name": "f", "uri": "file:///tmp/file.rs"}),
+            json!({"continuation_token": "lspct_fixture"}),
         ),
     ]);
     let (msg, is_err) = dispatch_lsp(&args);

@@ -195,8 +195,12 @@ fn lsp_symbol_with_no_children_round_trips() {
     let original = LspSymbol {
         name: "Foo".to_string(),
         kind: "struct".to_string(),
+        uri: None,
+        container_name: None,
         line: 10,
+        character: None,
         end_line: Some(30),
+        end_character: None,
         children: Vec::new(),
     };
     let json = serde_json::to_string(&original).expect("ser");
@@ -212,15 +216,23 @@ fn lsp_symbol_with_nested_children_round_trips() {
     let child_method = LspSymbol {
         name: "method_a".to_string(),
         kind: "method".to_string(),
+        uri: None,
+        container_name: None,
         line: 12,
+        character: None,
         end_line: Some(14),
+        end_character: None,
         children: Vec::new(),
     };
     let parent_struct = LspSymbol {
         name: "Foo".to_string(),
         kind: "struct".to_string(),
+        uri: None,
+        container_name: None,
         line: 10,
+        character: None,
         end_line: Some(40),
+        end_character: None,
         children: vec![child_method],
     };
     let json = serde_json::to_string(&parent_struct).expect("ser");
@@ -236,13 +248,21 @@ fn lsp_symbol_clone_preserves_recursive_tree() {
     let symbol = LspSymbol {
         name: "X".to_string(),
         kind: "class".to_string(),
+        uri: None,
+        container_name: None,
         line: 1,
+        character: None,
         end_line: Some(10),
+        end_character: None,
         children: vec![LspSymbol {
             name: "y".to_string(),
             kind: "method".to_string(),
+            uri: None,
+            container_name: None,
             line: 5,
+            character: None,
             end_line: None,
+            end_character: None,
             children: Vec::new(),
         }],
     };
@@ -270,6 +290,8 @@ fn lsp_result_full_shape_round_trips() {
         }],
         hover_text: None,
         symbols: Vec::new(),
+        provenance: None,
+        call_hierarchy_items: Vec::new(),
     };
     let json = serde_json::to_string(&original).expect("ser");
     let back: LspResult = serde_json::from_str(&json).expect("de");
@@ -287,6 +309,8 @@ fn lsp_result_hover_action_carries_hover_text_field() {
         results: Vec::new(),
         hover_text: Some("fn name() -> Result<()>".to_string()),
         symbols: Vec::new(),
+        provenance: None,
+        call_hierarchy_items: Vec::new(),
     };
     let json = serde_json::to_string(&original).expect("ser");
     let back: LspResult = serde_json::from_str(&json).expect("de");
@@ -303,10 +327,16 @@ fn lsp_result_document_symbols_action_carries_symbols_field() {
         symbols: vec![LspSymbol {
             name: "Top".to_string(),
             kind: "struct".to_string(),
+            uri: None,
+            container_name: None,
             line: 0,
+            character: None,
             end_line: Some(10),
+            end_character: None,
             children: Vec::new(),
         }],
+        provenance: None,
+        call_hierarchy_items: Vec::new(),
     };
     let json = serde_json::to_string(&original).expect("ser");
     let back: LspResult = serde_json::from_str(&json).expect("de");
@@ -322,6 +352,8 @@ fn lsp_result_clone_preserves_all_fields() {
         results: Vec::new(),
         hover_text: Some("text".to_string()),
         symbols: Vec::new(),
+        provenance: None,
+        call_hierarchy_items: Vec::new(),
     };
     let cloned = original.clone();
     assert_eq!(cloned.action, original.action);
@@ -336,6 +368,8 @@ fn lsp_result_serialized_field_count_matches_documented_5() {
         results: Vec::new(),
         hover_text: None,
         symbols: Vec::new(),
+        provenance: None,
+        call_hierarchy_items: Vec::new(),
     };
     let json: serde_json::Value = serde_json::to_value(&result).expect("ser");
     let obj = json.as_object().expect("obj");

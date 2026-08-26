@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- S-068: Create a stateful workspace LSP service (#1145)
+- S-068C: Prove stateful LSP lifecycle with compiled fixtures (#1146)
+- S-068B: Wire LSP tools, continuations, and plugin server configuration (#1147)
+- S-068A: Replace bare-child LSP pool with run-owned protocol sessions (#1148)
 - S-067: Complete MCP OAuth, elicitation, and in-process semantics (#1144)
 - S-065: Implement the current MCP protocol adapter (#1140)
 - Add Kimi/Moonshot and MiniMax OpenAI-compatible providers with documented defaults, env-key loading, model lists, and adapter dispatch coverage (#42)
