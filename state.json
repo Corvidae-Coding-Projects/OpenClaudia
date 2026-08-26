@@ -1,6 +1,6 @@
 {
   "next_display_id": 1154,
-  "next_comment_id": 1700,
+  "next_comment_id": 1701,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -23599,7 +23599,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T15:38:01.221799065Z",
-      "updated_at": "2026-08-26T15:45:39.545396549Z",
+      "updated_at": "2026-08-26T15:45:44.003459245Z",
       "labels": [
         "feature"
       ],
@@ -23621,6 +23621,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAgNoPmwDII3o8tjKEbGtuCEds9rCXMlb059DDKHPdvId8ibPvRzqwE7lhp8PJ+D7rL/xDAUgJDAozddBEe8ENCg=="
+        },
+        "bda7d203-f44b-4eae-b5e5-091b24110419": {
+          "display_id": 1700,
+          "author": "6Vw9",
+          "content": "[action] Mapped S-071 direct fetch, browser/search, distillation, run capability, permission, config, and test paths; selected run-bound grants plus operation-scoped pinned broker and browser forward-proxy design.",
+          "created_at": "2026-08-26T15:45:44.000955341Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA7Y8Ba6C1FKnajQJPhyspi1VszQIlKh+beufRgEfhRTvy7xZsaUQZKPnhgLGxu4XQvGIqbCaQcKI0mdmWirIZDw=="
         },
         "fbe0db61-9520-4e8f-8f6c-4c8a9e3b0339": {
           "display_id": 1698,
@@ -42927,11 +42936,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1832,
       "timestamp": "2026-08-26T15:45:39.545396549Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1833,
+      "timestamp": "2026-08-26T15:45:44.003459245Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T15:45:39.545396549Z",
+    "timestamp": "2026-08-26T15:45:44.003459245Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1832
+    "agent_seq": 1833
   }
 }
