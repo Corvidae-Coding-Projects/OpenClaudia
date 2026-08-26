@@ -1,6 +1,6 @@
 {
   "next_display_id": 1145,
-  "next_comment_id": 1648,
+  "next_comment_id": 1649,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -29821,12 +29821,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T23:43:22.282994195Z",
-      "updated_at": "2026-08-25T23:50:39.376506702Z",
+      "updated_at": "2026-08-26T01:27:19.607798990Z",
       "labels": [
         "feature",
         "remediation"
       ],
       "comments": {
+        "037f3d56-41e5-46eb-91cf-8408d4cbd858": {
+          "display_id": 1648,
+          "author": "6Vw9",
+          "content": "Full serial verification exposed one existing current-stdio regression: modern capability construction had stopped carrying the transport's wired roots capability, so the compiled discovery fixture rejected the request. The fix preserves transport-specific capabilities and overlays the S-067 current elicitation shape. The focused compiled round trip and the repeated all-target/all-feature serial suite both pass. No tests were weakened and no provider OAuth path was changed.",
+          "created_at": "2026-08-26T01:27:19.604200128Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAfWyEK8oVAWcpjIhWzXjnavQ+mCG2FoNTUZlkdsGm1yw5evUmki5wTvjDqsbXEWJPFE3f0Y3XpWbkoZD5DhydBQ=="
+        },
         "52d8dbaa-47b2-4f97-85c0-de399f388479": {
           "display_id": 1647,
           "author": "6Vw9",
@@ -41715,11 +41724,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1726,
       "timestamp": "2026-08-25T23:50:39.376506702Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1727,
+      "timestamp": "2026-08-26T01:27:19.607798990Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-25T23:50:39.376506702Z",
+    "timestamp": "2026-08-26T01:27:19.607798990Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1726
+    "agent_seq": 1727
   }
 }
