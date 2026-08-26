@@ -1,6 +1,6 @@
 {
   "next_display_id": 1154,
-  "next_comment_id": 1710,
+  "next_comment_id": 1711,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8777,7 +8777,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-26T11:03:03.638058208Z",
+      "updated_at": "2026-08-26T17:29:42.853819390Z",
       "labels": [
         "remediation"
       ],
@@ -9920,6 +9920,15 @@
           "kind": "progress",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA4DtM9JpF60/75OC+vKnhV4I8GCELLQlY7dvOJC5xKEiv6jfp6iftdW1hGhqwcLeYw7D6tgb7AbOyNl39xnyICA=="
+        },
+        "fb4ab761-ec41-4d5e-8cc4-571cd89436f7": {
+          "display_id": 1710,
+          "author": "6Vw9",
+          "content": "Completed child S-071/#1153 in signed commit 36fb8d25. Connection-boundary web egress policy is production-wired and locally verified; exact generated changelog preserved. Parent remains open for S-072 and later unfinished-feature slices. No push; runner monitoring deferred by Laurelai.",
+          "created_at": "2026-08-26T17:29:42.851029003Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAo8TvEgp3KKds/WxzLbg/Cm9JuXT0eTUXaPC3YU+69MtejHLbSJGsObLxXvTyOQkNQ/CeON792xhuFNFw8t2UDQ=="
         },
         "fca36526-f116-4e05-b02f-cb5ac41a3142": {
           "display_id": 1696,
@@ -43097,11 +43106,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1848,
       "timestamp": "2026-08-26T17:28:53.216685284Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1849,
+      "timestamp": "2026-08-26T17:29:42.853819390Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T17:28:53.216685284Z",
+    "timestamp": "2026-08-26T17:29:42.853819390Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1848
+    "agent_seq": 1849
   }
 }
