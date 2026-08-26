@@ -1,6 +1,6 @@
 {
   "next_display_id": 1153,
-  "next_comment_id": 1691,
+  "next_comment_id": 1692,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -33392,7 +33392,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T09:40:48.130007212Z",
-      "updated_at": "2026-08-26T10:40:05.102848985Z",
+      "updated_at": "2026-08-26T11:01:24.845313384Z",
       "labels": [
         "feature"
       ],
@@ -33405,6 +33405,15 @@
           "kind": "decision",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAYrInRPYhSDScWV5w4n4FAk2/WmQlNdfbNViuyImkKT3F2Py1fNVzJfJbQ4UjrVCRZnon66hsPBEmv6l7K/K4DQ=="
+        },
+        "282ed1d2-7d24-4012-bb37-c29ae0b3caaf": {
+          "display_id": 1691,
+          "author": "6Vw9",
+          "content": "S-070 is implemented and production-wired. Trusted home-only configuration builds an immutable named-action registry; project config cannot grant it. The canonical remote_trigger surface requires exact one-use host approval plus network and secret capabilities, exposes only symbolic names and typed payload schemas, fixes POST/destination/headers/credentials at the host boundary, and uses pinned no-proxy/no-redirect transport with DNS/IP admission, deadlines, cancellation, bounded bytes/calls/concurrency/retries, stable idempotency keys, and typed complete/partial/error receipts. Every production run root and derived subagent inherits the registry with fresh run counters. Verification on Rust 1.98 with CARGO_BUILD_JOBS=2: focused remote/config/registry 145/145; new runtime fixture 10/10; complete native library/binary/example/integration coverage collectively passed except explicit ignores; one existing process-global worktree test raced repository metadata during aggregate execution and passed 1/1 in isolation, tracked by #1062; final catalog targets pass; strict native Clippy and fmt pass; Windows GNU all-target/all-feature check passes with only #1099 warnings; fuzz check/Clippy/tests pass 4/4; sandbox/session filesystem 13/13; repository policy 27/27; metadata and both cargo-deny policies pass; retrieval evidence 7/7. S070-G1 base 58b0845fb2dbcd0201ce83b773e720be8f6eb2ad, artifact manifest digest 825f3118bd32067eee6b28768433e8a497b883132c847dcae4d1089244896b20. S-088 handoff is documented without claiming independent approval. Parent #1071 remains open.",
+          "created_at": "2026-08-26T11:01:24.841527054Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAh7enyLEurSTQNDjB4oa2msXVU+/+brHfTCxieam3EmoVuVhcZWz2op80reUzGodr6rH/raiKebR9frOBseyjDg=="
         },
         "5ed90275-325a-47d5-9957-7703039bef28": {
           "display_id": 1689,
@@ -42745,11 +42754,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1817,
       "timestamp": "2026-08-26T10:40:05.102848985Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1818,
+      "timestamp": "2026-08-26T11:01:24.845313384Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T10:40:05.102848985Z",
+    "timestamp": "2026-08-26T11:01:24.845313384Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1817
+    "agent_seq": 1818
   }
 }
