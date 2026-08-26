@@ -1,6 +1,6 @@
 {
   "next_display_id": 1145,
-  "next_comment_id": 1652,
+  "next_comment_id": 1653,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -29821,7 +29821,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-25T23:43:22.282994195Z",
-      "updated_at": "2026-08-26T01:31:53.179155199Z",
+      "updated_at": "2026-08-26T01:32:23.137278888Z",
       "labels": [
         "feature",
         "remediation"
@@ -29844,6 +29844,15 @@
           "kind": "progress",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA6+VIxCN100qepeVmaw6FZDW7pvi0eBAyQxjwgZ52lGRMs6RXtuhaBYjtlUvQ3+Tw9xWmqR3KVNOjTq3c+pP1Dw=="
+        },
+        "74cfa864-d15c-4484-8d7c-e7dd64422b3a": {
+          "display_id": 1652,
+          "author": "6Vw9",
+          "content": "Exact-head CI verification is an explicit S-067 completion condition, so issue #1144 was reopened for the push/runner phase. The provider hook requested a crosslink intervene record, but this installed Crosslink build has no intervene subcommand; this observation records the equivalent provenance without bypassing the hook.",
+          "created_at": "2026-08-26T01:32:23.134685209Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAbMthiJWHhmGZyk5Xx4FYiPfAKamk2k3T2wA+wA7+qn/JJ9n9BIIlhUJzcyB9UV9JweB9Rn/THONcdLo4fMhZAg=="
         },
         "9caedf3a-37b8-48a0-916e-124a1f9a4dff": {
           "display_id": 1649,
@@ -41811,11 +41820,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1738,
       "timestamp": "2026-08-26T01:32:04.965082300Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1739,
+      "timestamp": "2026-08-26T01:32:23.137278888Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T01:32:04.965082300Z",
+    "timestamp": "2026-08-26T01:32:23.137278888Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1738
+    "agent_seq": 1739
   }
 }
