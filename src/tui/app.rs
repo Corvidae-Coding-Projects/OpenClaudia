@@ -740,11 +740,13 @@ fn build_startup_session_run_context(
     session: &Session,
     provider: &str,
     budget_limits: crate::runtime::BudgetLimits,
+    remote_actions: crate::tools::remote_trigger::WebhookRegistry,
 ) -> Result<std::sync::Arc<crate::tools::ToolRunContext>, String> {
     let identity = session.inspect_state(|state| state.identity.clone());
     crate::tools::ToolRunContext::builder(identity.session_id, identity.project_root)
         .working_directory(identity.cwd)
         .host_startup_grants()
+        .remote_actions(remote_actions)
         .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
         .process(true)
         .network(true)
@@ -970,10 +972,32 @@ impl App {
         policy_enforcer: std::sync::Arc<crate::services::policy::PolicyEnforcer>,
         budget_limits: crate::runtime::BudgetLimits,
     ) -> Self {
+        Self::new_with_policy_budget_and_remote_actions(
+            model,
+            provider,
+            policy_enforcer,
+            budget_limits,
+            crate::tools::remote_trigger::WebhookRegistry::new(),
+        )
+    }
+
+    #[must_use]
+    pub fn new_with_policy_budget_and_remote_actions(
+        model: &str,
+        provider: &str,
+        policy_enforcer: std::sync::Arc<crate::services::policy::PolicyEnforcer>,
+        budget_limits: crate::runtime::BudgetLimits,
+        remote_actions: crate::tools::remote_trigger::WebhookRegistry,
+    ) -> Self {
         let chat_session = Session::new(model, provider);
         let transcript_subscriber =
             crate::transcript::TranscriptStateSubscriber::new(chat_session.state_store());
-        let run_context = build_startup_session_run_context(&chat_session, provider, budget_limits);
+        let run_context = build_startup_session_run_context(
+            &chat_session,
+            provider,
+            budget_limits,
+            remote_actions,
+        );
         let task_manager = run_context
             .as_ref()
             .ok()

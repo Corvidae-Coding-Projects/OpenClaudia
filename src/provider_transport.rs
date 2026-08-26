@@ -9,6 +9,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt as _};
 use reqwest::{Client, ClientBuilder, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
+use std::net::SocketAddr;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -215,6 +216,28 @@ pub fn shared_client_required() -> Client {
 /// Returns a sanitized client-build error.
 pub fn client_with_user_agent(user_agent: &'static str) -> Result<Client, ProviderTransportError> {
     build_client_from(canonical_client_builder().user_agent(user_agent))
+}
+
+/// Build a direct, redirect-disabled client pinned to addresses validated by
+/// the caller for one exact destination hostname.
+///
+/// System proxies are deliberately disabled: routing a named action through
+/// an ambient proxy would bypass the caller's DNS/IP admission and make the
+/// actual destination unverifiable.
+pub(crate) fn direct_client_with_pinned_resolution(
+    host: &str,
+    addresses: &[SocketAddr],
+) -> Result<Client, ProviderTransportError> {
+    if host.is_empty() || addresses.is_empty() {
+        return Err(ProviderTransportError::InvalidEndpoint(
+            SafeDiagnostic::from("pinned destination requires a host and at least one address"),
+        ));
+    }
+    build_client_from(
+        canonical_client_builder()
+            .no_proxy()
+            .resolve_to_addrs(host, addresses),
+    )
 }
 
 /// Validate a fully resolved endpoint at the transport boundary.

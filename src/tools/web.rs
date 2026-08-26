@@ -54,6 +54,7 @@ const WEB_FETCH_DISTILLATION_MAX_TOKENS: u32 = 1024;
 fn build_shared_runtime() -> Result<Runtime, String> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .worker_threads(2)
         .thread_name("openclaudia-web-tools")
         .build()
         .map_err(|e| format!("failed to build shared web-tools runtime: {e}"))
@@ -95,29 +96,33 @@ where
     run_blocking_with_timeout(fut, WEB_TOOL_DISPATCH_TIMEOUT)
 }
 
-fn run_blocking_with_timeout<F>(fut: F, timeout: Duration) -> Result<F::Output, String>
+pub(super) fn run_blocking_with_timeout<F>(fut: F, timeout: Duration) -> Result<F::Output, String>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
     let (tx, rx) = std::sync::mpsc::channel();
     let runtime = SHARED_RUNTIME.as_ref().map_err(Clone::clone)?;
-    runtime.spawn(async move {
+    let task = runtime.spawn(async move {
         // Best-effort: if the receiver disappears (caller's thread
         // was cancelled), drop the result silently rather than
         // panicking from inside the runtime.
         let _ = tx.send(fut.await);
     });
-    rx.recv_timeout(timeout).map_err(|e| match e {
-        std::sync::mpsc::RecvTimeoutError::Timeout => format!(
-            "SHARED_RUNTIME web-tool task timed out after {} seconds",
-            timeout.as_secs()
-        ),
-        std::sync::mpsc::RecvTimeoutError::Disconnected => format!(
+    match rx.recv_timeout(timeout) {
+        Ok(output) => Ok(output),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            task.abort();
+            Err(format!(
+                "SHARED_RUNTIME web-tool task timed out after {} seconds",
+                timeout.as_secs()
+            ))
+        }
+        Err(error @ std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(format!(
             "SHARED_RUNTIME web-tool task panicked or the runtime was shut down before delivering \
-             a result: {e}"
-        ),
-    })
+             a result: {error}"
+        )),
+    }
 }
 
 /// Hard cap on the agent-facing fetched-page output string, in bytes.
@@ -753,6 +758,7 @@ mod tests {
                 distillation_model: Some("gpt-distill-test".to_string()),
                 ..WebFetchConfig::default()
             },
+            remote_actions: crate::config::RemoteActionsConfig::default(),
             policy: EnterprisePolicy::default(),
             managed_settings_path: None,
         }

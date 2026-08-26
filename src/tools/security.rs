@@ -124,6 +124,7 @@ pub struct ToolRunContextBuilder {
     executable_search_path: Option<OsString>,
     host_home: Option<PathBuf>,
     skill_access: Option<crate::skills::SkillRunAccess>,
+    remote_actions: super::remote_trigger::WebhookRegistry,
     inherit_host_startup_grants: bool,
     workspace_access: Option<WorkspaceAccess>,
     process: Option<bool>,
@@ -160,6 +161,7 @@ impl ToolRunContextBuilder {
             executable_search_path: None,
             host_home: None,
             skill_access: None,
+            remote_actions: super::remote_trigger::WebhookRegistry::new(),
             inherit_host_startup_grants: false,
             workspace_access: None,
             process: None,
@@ -307,6 +309,17 @@ impl ToolRunContextBuilder {
         self
     }
 
+    /// Bind an already-validated host-owned named-action catalog to this run.
+    ///
+    /// The catalog is immutable after construction and still requires the
+    /// run's explicit network and secret capabilities at publication and
+    /// dispatch time.
+    #[must_use]
+    pub fn remote_actions(mut self, registry: super::remote_trigger::WebhookRegistry) -> Self {
+        self.remote_actions = registry;
+        self
+    }
+
     #[must_use]
     pub const fn process(mut self, available: bool) -> Self {
         self.process = Some(available);
@@ -423,6 +436,7 @@ pub struct ToolRunContext {
     executable_search_path: OsString,
     host_home: Option<PathBuf>,
     skill_access: crate::skills::SkillRunAccess,
+    remote_actions: super::remote_trigger::RemoteActionService,
     skill_touched_paths: Mutex<BTreeSet<PathBuf>>,
     network_policy: AgentNetworkPolicy,
     process_available: bool,
@@ -459,6 +473,7 @@ impl std::fmt::Debug for ToolRunContext {
             .field("executable_search_path", &"<redacted>")
             .field("host_home_bound", &self.host_home.is_some())
             .field("skill_access", &self.skill_access)
+            .field("remote_action_count", &self.remote_actions.registry().len())
             .field("process_available", &self.process_available)
             .field("network_available", &self.network_available)
             .field("secrets_available", &self.secrets_available)
@@ -521,6 +536,7 @@ impl ToolRunContext {
             executable_search_path,
             host_home,
             skill_access,
+            remote_actions,
             inherit_host_startup_grants,
             workspace_access,
             process,
@@ -692,6 +708,7 @@ impl ToolRunContext {
                 crate::skills::SkillRunAccess::default()
             }
         });
+        let remote_actions = super::remote_trigger::RemoteActionService::new(remote_actions);
         if !secrets {
             if let Some(name) = environment_grants
                 .keys()
@@ -754,6 +771,7 @@ impl ToolRunContext {
             &agent_plan_file,
             &environment_grants,
             &mcp_environment_grants,
+            remote_actions.authority_digest(),
             &executable_search_path,
             host_home.as_deref(),
             network_policy,
@@ -824,6 +842,7 @@ impl ToolRunContext {
             executable_search_path,
             host_home,
             skill_access,
+            remote_actions,
             skill_touched_paths: Mutex::new(BTreeSet::new()),
             network_policy,
             process_available: process,
@@ -1215,6 +1234,7 @@ impl ToolRunContext {
             &self.agent_plan_file,
             &self.environment_grants,
             &self.mcp_environment_grants,
+            self.remote_actions.authority_digest(),
             &self.executable_search_path,
             self.host_home.as_deref(),
             self.network_policy,
@@ -1333,6 +1353,7 @@ impl ToolRunContext {
             .executable_search_path(&self.executable_search_path)
             .host_home(self.host_home.clone())
             .skill_access(self.skill_access.clone())
+            .remote_actions(self.remote_actions.registry().clone())
             .workspace_access(workspace_access)
             .process(self.grants_resource(ToolResource::Process))
             .network(self.grants_resource(ToolResource::Network))
@@ -1448,6 +1469,12 @@ impl ToolRunContext {
     #[must_use]
     pub const fn skill_access(&self) -> &crate::skills::SkillRunAccess {
         &self.skill_access
+    }
+
+    /// Exact host-owned named actions bound to this run generation.
+    #[must_use]
+    pub const fn remote_actions(&self) -> &super::remote_trigger::RemoteActionService {
+        &self.remote_actions
     }
 
     /// Record a project-relative file touched by a real workspace operation.
@@ -1687,6 +1714,7 @@ fn capability_manifest_digest(
     agent_plan_file: &Path,
     environment_grants: &crate::secrets::EnvironmentGrants,
     mcp_environment_grants: &crate::secrets::EnvironmentGrants,
+    remote_actions_digest: ContentDigest,
     executable_search_path: &OsStr,
     host_home: Option<&Path>,
     network_policy: AgentNetworkPolicy,
@@ -1734,6 +1762,9 @@ fn capability_manifest_digest(
         manifest.push_str(&digest);
         manifest.push('\n');
     }
+    manifest.push_str("remote_actions=");
+    manifest.push_str(&remote_actions_digest.to_string());
+    manifest.push('\n');
     manifest.push_str("executable_search_path=");
     manifest
         .push_str(&ContentDigest::sha256(executable_search_path.as_encoded_bytes()).to_string());
@@ -2864,6 +2895,7 @@ mod tests {
             &root.path().join(".openclaudia/plans/run.md"),
             &first_environment,
             &empty_environment,
+            ContentDigest::sha256(b"empty-remote-actions"),
             OsStr::new("/usr/bin"),
             None,
             AgentNetworkPolicy::Denied,
@@ -2882,6 +2914,7 @@ mod tests {
             &root.path().join(".openclaudia/plans/run.md"),
             &second_environment,
             &empty_environment,
+            ContentDigest::sha256(b"empty-remote-actions"),
             OsStr::new("/usr/bin"),
             None,
             AgentNetworkPolicy::Denied,

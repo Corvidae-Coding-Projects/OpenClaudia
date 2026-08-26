@@ -1,9 +1,9 @@
 //! End-to-end tests for `tools::remote_trigger::WebhookRegistry::validate_url`
 //! — the URL safety guard. Pins documented semantics: empty
 //! rejection, scheme upgrade for scheme-less input, explicit
-//! `http://` rejected in strict mode (default), `http://`
-//! accepted via `new_allow_plaintext`, non-http(s) schemes
-//! rejected, missing host rejected.
+//! `http://` rejected in strict mode (default), exact loopback
+//! `http://` accepted via `new_allow_plaintext`, public plaintext and
+//! non-http(s) schemes rejected, and missing hosts rejected.
 //!
 //! Sprint 217 of the verification effort.
 
@@ -13,11 +13,11 @@
 
 use openclaudia::tools::remote_trigger::{WebhookError, WebhookRegistry};
 
-fn strict() -> WebhookRegistry {
+const fn strict() -> WebhookRegistry {
     WebhookRegistry::new()
 }
 
-fn plaintext_ok() -> WebhookRegistry {
+const fn plaintext_ok() -> WebhookRegistry {
     WebhookRegistry::new_allow_plaintext()
 }
 
@@ -81,10 +81,12 @@ fn https_url_with_port_accepted() {
 }
 
 #[test]
-fn https_url_with_userinfo_accepted() {
+fn https_url_with_userinfo_rejected() {
     let r = strict();
-    // Userinfo present — still a valid host-bearing URL.
-    assert!(r.validate_url("https://u:p@example.com/").is_ok());
+    assert!(matches!(
+        r.validate_url("https://u:p@example.com/"),
+        Err(WebhookError::CredentialsInUrl {})
+    ));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -117,13 +119,16 @@ fn http_insecure_error_does_not_carry_raw_url_for_diagnostics() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section E — http accepted in plaintext-allowed mode
+// Section E — only exact loopback http accepted in plaintext-allowed mode
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn explicit_http_url_accepted_in_plaintext_mode() {
+fn explicit_public_http_url_rejected_even_in_plaintext_mode() {
     let r = plaintext_ok();
-    assert!(r.validate_url("http://example.com/").is_ok());
+    assert!(matches!(
+        r.validate_url("http://example.com/"),
+        Err(WebhookError::InsecureScheme {})
+    ));
 }
 
 #[test]

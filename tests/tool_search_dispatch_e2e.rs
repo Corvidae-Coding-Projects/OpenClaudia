@@ -71,12 +71,15 @@ impl Fixture {
         self.definitions
             .iter()
             .filter_map(|definition| definition.pointer("/function/name").and_then(Value::as_str))
+            // The fixture has no host-registered actions, so this surface is
+            // correctly unavailable and cannot participate in cap tests.
             .filter(|name| {
-                !self
-                    .snapshot
-                    .active_names
-                    .iter()
-                    .any(|active| active == name)
+                *name != "remote_trigger"
+                    && !self
+                        .snapshot
+                        .active_names
+                        .iter()
+                        .any(|active| active == name)
             })
             .map(str::to_string)
             .collect()

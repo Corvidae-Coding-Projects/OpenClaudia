@@ -583,6 +583,12 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
     .read_write_roots(Vec::new())
     .environment_grants(std::collections::HashMap::new())
     .skill_access(skill_access)
+    .remote_actions(
+        config
+            .remote_actions
+            .build_registry()
+            .map_err(anyhow::Error::msg)?,
+    )
     .workspace_access(openclaudia::tools::WorkspaceAccess::ReadOnly)
     .process(false)
     .network(true)
@@ -854,6 +860,7 @@ mod tests {
             permissions: openclaudia::config::PermissionsConfig::default(),
             memory: openclaudia::config::MemoryConfig::default(),
             web_fetch: openclaudia::config::WebFetchConfig::default(),
+            remote_actions: openclaudia::config::RemoteActionsConfig::default(),
             policy,
             managed_settings_path: None,
         }

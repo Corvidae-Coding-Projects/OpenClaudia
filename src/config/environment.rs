@@ -2125,6 +2125,7 @@ mod tests {
             permissions: PermissionsConfig::default(),
             memory: MemoryConfig::default(),
             web_fetch: WebFetchConfig::default(),
+            remote_actions: crate::config::RemoteActionsConfig::default(),
             policy: crate::services::policy::EnterprisePolicy::default(),
             managed_settings_path: None,
         }

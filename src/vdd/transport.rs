@@ -1102,6 +1102,7 @@ mod tests {
             permissions: PermissionsConfig::default(),
             memory: crate::config::MemoryConfig::default(),
             web_fetch: crate::config::WebFetchConfig::default(),
+            remote_actions: crate::config::RemoteActionsConfig::default(),
             policy: crate::services::policy::EnterprisePolicy::default(),
             managed_settings_path: None,
         }

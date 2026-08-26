@@ -82,6 +82,7 @@ owned by the audit and remediation slices.
 | `glob` | Find files by glob pattern |
 | `grep` | Search file contents by regular expression |
 | `notebook_edit` | Edit notebook cells; requires a successful `read_file` first |
+| `remote_trigger` | Invoke a typed host-registered remote action without exposing its destination or credentials to the model |
 | `web_fetch` | Fetch an allowed web page |
 | `web_search` | Search through the browser-backed implementation when built with `browser` |
 | `web_browser` | Use the opt-in `browser` feature's headless-browser surface |
@@ -327,6 +328,45 @@ session:
 #     - "Edit(src/**)"
 #   mcp:
 #     filesystem: ["read_file", "list_directory"]
+```
+
+Named remote actions are authority-bearing host configuration. A
+`remote_actions` block in `.openclaudia/config.yaml` is ignored; place it in
+`~/.openclaudia/config.yaml`. The model sees only the
+symbolic name, description, and payload schema. OpenClaudia fixes the POST
+destination and headers, requires the run's network and secret capabilities
+plus host approval, and enforces the configured deadline, byte, call,
+concurrency, idempotency, and retry bounds.
+
+```yaml
+remote_actions:
+  # Optional and restricted to exact localhost/loopback destinations.
+  allow_loopback_plaintext: false
+  actions:
+    deploy:
+      url: https://actions.example.com/deploy
+      headers:
+        Authorization: Bearer replace-with-host-secret
+      description: Deliver one deployment event
+      input_schema:
+        type: object
+        additionalProperties: false
+        properties:
+          revision: {type: string, minLength: 1}
+        required: [revision]
+      output_schema:
+        type: object
+        additionalProperties: false
+        properties:
+          accepted: {type: boolean}
+        required: [accepted]
+      idempotency: key_header
+      timeout_milliseconds: 10000
+      max_request_bytes: 65536
+      max_response_bytes: 262144
+      max_calls_per_run: 4
+      max_in_flight: 1
+      max_attempts: 2
 ```
 
 ## CLI Commands

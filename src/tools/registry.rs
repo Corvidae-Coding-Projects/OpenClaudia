@@ -104,11 +104,11 @@ impl ToolDispatchPermit {
         }
     }
 
-    fn invocation_id(&self) -> &str {
+    pub(crate) fn invocation_id(&self) -> &str {
         &self.invocation_id
     }
 
-    const fn require_host_approval(
+    pub(crate) const fn require_host_approval(
         &self,
     ) -> Result<&crate::permissions::HostApprovalEvidence, &'static str> {
         match &self.host_approval {
@@ -317,6 +317,11 @@ const REQUIRES_PROCESS: &[super::security::ToolResource] = &[
 const REQUIRES_NETWORK: &[super::security::ToolResource] = &[
     super::security::ToolResource::WorkspaceRead,
     super::security::ToolResource::Network,
+];
+const REQUIRES_NETWORK_AND_SECRETS: &[super::security::ToolResource] = &[
+    super::security::ToolResource::WorkspaceRead,
+    super::security::ToolResource::Network,
+    super::security::ToolResource::Secrets,
 ];
 const REQUIRES_MEMORY: &[super::security::ToolResource] = &[
     super::security::ToolResource::WorkspaceRead,
@@ -1060,6 +1065,52 @@ impl ToolHandler for CrosslinkHandler {
 }
 
 // ── web ───────────────────────────────────────────────────────────────────────
+
+struct RemoteTriggerHandler;
+impl ToolHandler for RemoteTriggerHandler {
+    fn name(&self) -> &'static str {
+        "remote_trigger"
+    }
+
+    fn required_resources(
+        &self,
+        _args: &HashMap<String, Value>,
+    ) -> &'static [super::security::ToolResource] {
+        REQUIRES_NETWORK_AND_SECRETS
+    }
+
+    fn effect_spec(&self) -> ToolEffectSpec {
+        ToolEffectSpec::effectful(ToolEffect::ExternalMutation, "RemoteAction", "name")
+    }
+
+    fn definition(&self) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "remote_trigger",
+                "description": "Invoke one host-registered named remote action. The host fixes the destination, POST method, headers, credentials, effect, retry policy, deadlines, and byte/rate limits; model arguments contain only the symbolic action name and its typed payload.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "name": {"type": "string"},
+                        "payload": {"type": "object"}
+                    },
+                    "required": ["name", "payload"]
+                }
+            }
+        })
+    }
+
+    fn execute(
+        &self,
+        permit: &ToolDispatchPermit,
+        args: &HashMap<String, Value>,
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolHandlerResult {
+        super::remote_trigger::execute_remote_action(ctx.run, permit, args)
+    }
+}
 
 #[cfg(feature = "browser")]
 const WEB_FETCH_DESCRIPTION: &str = "Fetch the content of a web page and return it as markdown. Uses direct HTTP first, then a headless Chromium fallback for JavaScript-rendered pages or browser challenges. Use this to read documentation, articles, or other web content.";
@@ -3372,6 +3423,7 @@ static HANDLERS: &[&dyn ToolHandler] = &[
     // (Phase 4: legacy ChainlinkHandler removed; see commit history.)
     &CrosslinkHandler,
     // web
+    &RemoteTriggerHandler,
     &WebFetchHandler,
     #[cfg(feature = "browser")]
     &WebSearchHandler,

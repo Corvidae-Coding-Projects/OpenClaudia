@@ -634,6 +634,9 @@ fn unavailable_reason(
 ) -> Option<String> {
     match source {
         ToolSurface::Registry => registry().get(name).and_then(|handler| {
+            if name == "remote_trigger" && run.remote_actions().is_empty() {
+                return Some("run has no host-registered remote actions".to_string());
+            }
             handler
                 .required_resources(empty_args)
                 .iter()

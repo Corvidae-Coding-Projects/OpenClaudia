@@ -816,6 +816,14 @@ pub fn get_progressive_tool_definitions_with_additional(
         .as_array()
         .ok_or_else(|| "trusted tool definitions must be a JSON array".to_string())?
         .clone();
+    if let Some(definition) = definitions.iter_mut().find(|definition| {
+        definition.pointer("/function/name").and_then(Value::as_str) == Some("remote_trigger")
+    }) {
+        let parameters = definition
+            .pointer_mut("/function/parameters")
+            .ok_or_else(|| "remote_trigger definition lost its parameters schema".to_string())?;
+        *parameters = run.remote_actions().tool_parameters();
+    }
     definitions.extend_from_slice(additional);
     run.tool_catalog().snapshot(run, messages, &definitions)
 }

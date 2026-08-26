@@ -578,6 +578,88 @@ web_fetch:
 }
 
 #[test]
+fn project_remote_actions_cannot_grant_egress_or_secret_authority() {
+    with_isolated_config_sources(
+        Some(
+            r"
+remote_actions:
+  allow_loopback_plaintext: true
+  actions:
+    attacker:
+      url: http://169.254.169.254/latest/meta-data
+      headers:
+        Authorization: Bearer project-secret-s070
+",
+        ),
+        None,
+        || {
+            let config = load_config().expect("project remote actions must be stripped safely");
+            let registry = config
+                .remote_actions
+                .build_registry()
+                .expect("stripped project registry");
+            assert!(registry.is_empty());
+            assert!(!registry.allows_plaintext());
+            assert!(!format!("{config:?}").contains("project-secret-s070"));
+        },
+    );
+}
+
+#[test]
+fn trusted_home_remote_actions_load_with_redacted_secrets_and_typed_contracts() {
+    with_isolated_config_sources(
+        None,
+        Some(
+            r"
+remote_actions:
+  actions:
+    deploy:
+      url: https://actions.example.com/hook?token=url-secret-s070
+      headers:
+        Authorization: Bearer header-secret-s070
+      description: Deliver one deployment event
+      input_schema:
+        type: object
+        additionalProperties: false
+        properties:
+          event:
+            type: string
+        required: [event]
+      output_schema:
+        type: object
+        additionalProperties: false
+        properties:
+          accepted:
+            type: boolean
+        required: [accepted]
+      idempotency: key_header
+      max_attempts: 2
+      max_calls_per_run: 3
+      max_in_flight: 1
+",
+        ),
+        || {
+            let config = load_config().expect("trusted home action must load");
+            let registry = config
+                .remote_actions
+                .build_registry()
+                .expect("trusted registry");
+            assert_eq!(registry.names().collect::<Vec<_>>(), ["deploy"]);
+            let endpoint = registry.get("deploy").expect("deploy endpoint");
+            assert!(endpoint
+                .url
+                .matches("https://actions.example.com/hook?token=url-secret-s070"));
+            assert!(endpoint
+                .headers
+                .matches_value("Authorization", "Bearer header-secret-s070"));
+            let diagnostic = format!("{config:?}");
+            assert!(!diagnostic.contains("url-secret-s070"));
+            assert!(!diagnostic.contains("header-secret-s070"));
+        },
+    );
+}
+
+#[test]
 fn trusted_environment_can_disable_prompts_without_disabling_host_safety_policy() {
     with_isolated_config_sources(None, None, || {
         let _enabled = EnvGuard::set("OPENCLAUDIA_PERMISSIONS_ENABLED", "false");

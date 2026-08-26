@@ -2741,6 +2741,12 @@ async fn build_proxy_state_with_loop_control(
     let run_context = crate::tools::ToolRunContext::builder(typed_session_id, &launch_root)
         .working_directory(&launch_root)
         .host_startup_grants()
+        .remote_actions(
+            config
+                .remote_actions
+                .build_registry()
+                .map_err(|error| anyhow::anyhow!(error))?,
+        )
         .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
         .process(true)
         .network(true)

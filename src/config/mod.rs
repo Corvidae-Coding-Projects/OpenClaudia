@@ -16,6 +16,7 @@ mod path_validation;
 mod permissions;
 mod provider;
 mod proxy;
+mod remote_actions;
 mod session;
 pub mod stop_conditions;
 mod vdd;
@@ -51,6 +52,7 @@ pub use provider::{
     ProviderConfig, ThinkingConfig,
 };
 pub use proxy::ProxyConfig;
+pub use remote_actions::{RemoteActionConfig, RemoteActionsConfig};
 pub use session::{RunBudgetConfig, SessionConfig, TokenTrackingConfig};
 pub use stop_conditions::{StopConditionsConfig, StopReason, TokenTotals};
 pub use vdd::{
@@ -95,6 +97,11 @@ pub struct AppConfig {
     /// allowlist consulted by the permission layer. See crosslink #603.
     #[serde(default)]
     pub web_fetch: WebFetchConfig,
+    /// Trusted host-registered remote actions. Repository configuration is
+    /// stripped before deserialization so a project cannot grant itself
+    /// egress destinations or credentials.
+    #[serde(default)]
+    pub remote_actions: RemoteActionsConfig,
     /// Enterprise policy block (crosslink #637).
     ///
     /// Token caps, per-tool invocation caps, and a model allowlist. All
@@ -236,6 +243,15 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
         .map_err(ConfigError::Message)?;
         if let Some(mapping) = document.as_mapping_mut() {
             mapping.remove(serde_yaml::Value::String("hooks".to_string()));
+            if mapping
+                .remove(serde_yaml::Value::String("remote_actions".to_string()))
+                .is_some()
+            {
+                tracing::warn!(
+                    target: "openclaudia::config",
+                    "Ignored project remote_actions configuration; named remote actions require trusted host configuration"
+                );
+            }
         }
         let inert_project_config = serde_yaml::to_string(&document).map_err(|error| {
             ConfigError::Message(format!(
@@ -306,6 +322,11 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
             )));
         }
     }
+
+    config
+        .remote_actions
+        .build_registry()
+        .map_err(ConfigError::Message)?;
 
     // Diagnose configured persistence paths before subsystem startup. This
     // rejects known system trees, lexical escape, and existing link
@@ -411,6 +432,7 @@ mod tests {
             permissions: PermissionsConfig::default(),
             memory: MemoryConfig::default(),
             web_fetch: WebFetchConfig::default(),
+            remote_actions: RemoteActionsConfig::default(),
             policy: crate::services::policy::EnterprisePolicy::default(),
             managed_settings_path: None,
         };
@@ -459,6 +481,7 @@ mod tests {
             permissions: PermissionsConfig::default(),
             memory: MemoryConfig::default(),
             web_fetch: WebFetchConfig::default(),
+            remote_actions: RemoteActionsConfig::default(),
             policy: crate::services::policy::EnterprisePolicy::default(),
             managed_settings_path: None,
         };
@@ -496,6 +519,7 @@ mod tests {
             permissions: PermissionsConfig::default(),
             memory: MemoryConfig::default(),
             web_fetch: WebFetchConfig::default(),
+            remote_actions: RemoteActionsConfig::default(),
             policy: crate::services::policy::EnterprisePolicy::default(),
             managed_settings_path: None,
         };
@@ -542,6 +566,7 @@ mod tests {
             permissions: PermissionsConfig::default(),
             memory: MemoryConfig::default(),
             web_fetch: WebFetchConfig::default(),
+            remote_actions: RemoteActionsConfig::default(),
             policy: crate::services::policy::EnterprisePolicy::default(),
             managed_settings_path: None,
         };
@@ -591,6 +616,7 @@ mod tests {
             permissions: PermissionsConfig::default(),
             memory: MemoryConfig::default(),
             web_fetch: WebFetchConfig::default(),
+            remote_actions: RemoteActionsConfig::default(),
             policy: crate::services::policy::EnterprisePolicy::default(),
             managed_settings_path: None,
         };
@@ -639,6 +665,7 @@ mod tests {
             permissions: PermissionsConfig::default(),
             memory: MemoryConfig::default(),
             web_fetch: WebFetchConfig::default(),
+            remote_actions: RemoteActionsConfig::default(),
             policy: crate::services::policy::EnterprisePolicy::default(),
             managed_settings_path: None,
         };
@@ -677,6 +704,7 @@ mod tests {
             permissions: PermissionsConfig::default(),
             memory: MemoryConfig::default(),
             web_fetch: WebFetchConfig::default(),
+            remote_actions: RemoteActionsConfig::default(),
             policy: crate::services::policy::EnterprisePolicy::default(),
             managed_settings_path: None,
         };
@@ -703,6 +731,7 @@ mod tests {
             permissions: PermissionsConfig::default(),
             memory: MemoryConfig::default(),
             web_fetch: WebFetchConfig::default(),
+            remote_actions: RemoteActionsConfig::default(),
             policy: crate::services::policy::EnterprisePolicy::default(),
             managed_settings_path: managed,
         }

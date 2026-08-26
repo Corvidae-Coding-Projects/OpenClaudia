@@ -963,6 +963,7 @@ impl AcpServer {
                 .working_directory(&launch_root)
                 .host_startup_grants()
                 .host_home(Some(host_home))
+                .remote_actions(config.remote_actions.build_registry()?)
                 .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
                 .process(true)
                 .network(true)

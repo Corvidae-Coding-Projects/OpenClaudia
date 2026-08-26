@@ -664,6 +664,12 @@ impl ChatRepl {
             tools::ToolRunContext::builder(identity.session_id, identity.project_root)
                 .working_directory(identity.cwd)
                 .host_startup_grants()
+                .remote_actions(
+                    config
+                        .remote_actions
+                        .build_registry()
+                        .map_err(anyhow::Error::msg)?,
+                )
                 .workspace_access(tools::WorkspaceAccess::ReadWrite)
                 .process(true)
                 .network(true)

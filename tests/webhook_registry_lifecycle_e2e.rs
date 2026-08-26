@@ -101,15 +101,13 @@ fn register_with_http_in_strict_registry_returns_insecure_scheme_error() {
 }
 
 #[test]
-fn register_with_http_in_plaintext_registry_succeeds() {
+fn register_with_public_http_in_plaintext_registry_is_rejected() {
     let mut reg = WebhookRegistry::new_allow_plaintext();
-    reg.register("plain", "http://ci.example.com/hook", no_headers())
-        .expect("plaintext registry MUST accept http");
-    assert!(reg
-        .get("plain")
-        .unwrap()
-        .url
-        .matches("http://ci.example.com/hook"));
+    let error = reg
+        .register("plain", "http://ci.example.com/hook", no_headers())
+        .expect_err("plaintext opt-in is limited to exact loopback destinations");
+    assert!(matches!(error, WebhookError::InsecureScheme {}));
+    assert!(reg.get("plain").is_none());
 }
 
 #[test]

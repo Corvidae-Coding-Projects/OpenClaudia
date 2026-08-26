@@ -313,7 +313,9 @@ fn current_task_recall_precedes_stale_history_at_the_explicit_selection_cap() {
         .iter()
         .filter_map(|definition| {
             let name = definition.pointer("/function/name")?.as_str()?;
-            (!bootstrap.contains(&name)).then(|| {
+            // This run deliberately has no host-registered remote actions, so
+            // `remote_trigger` is not an activatable lease candidate.
+            (!bootstrap.contains(&name) && name != "remote_trigger").then(|| {
                 (
                     serde_json::to_vec(definition)
                         .expect("serialize candidate schema")

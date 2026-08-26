@@ -1,5 +1,5 @@
 //! End-to-end tests for `tools::remote_trigger::WebhookError`
-//! `Display` strings — pins all 5 variant message templates
+//! `Display` strings — pins the legacy core variant message templates
 //! exactly, plus `PartialEq`/`Eq` + `Clone` derives.
 //!
 //! Sprint 215 of the verification effort.
@@ -21,7 +21,7 @@ fn invalid_scheme_display_uses_documented_template() {
     assert_eq!(
         s,
         "webhook URL uses an unsupported scheme; \
-         expected https (or http with explicit opt-in)"
+         expected https (or http with explicit loopback opt-in)"
     );
 }
 
@@ -50,7 +50,7 @@ fn insecure_scheme_display_uses_documented_template() {
     assert_eq!(
         s,
         "webhook URL uses insecure http://; \
-         build the registry with new_allow_plaintext() to opt in"
+         only exact loopback destinations may opt in with new_allow_plaintext()"
     );
 }
 
@@ -129,7 +129,7 @@ fn duplicate_includes_name_in_quotes() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn five_variants_have_distinct_display_strings() {
+fn legacy_core_variants_have_distinct_display_strings() {
     let variants = vec![
         WebhookError::InvalidScheme {}.to_string(),
         WebhookError::InsecureScheme {}.to_string(),
@@ -146,7 +146,7 @@ fn five_variants_have_distinct_display_strings() {
     let mut sorted = variants;
     sorted.sort();
     sorted.dedup();
-    assert_eq!(sorted.len(), 5, "5 variants MUST have 5 distinct strings");
+    assert_eq!(sorted.len(), 5, "core variants MUST remain distinct");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

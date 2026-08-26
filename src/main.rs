@@ -1093,11 +1093,15 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
         .session
         .run_budget
         .limits_for_session(&config.session);
-    let mut app = tui::app::App::new_with_policy_and_budget(
+    let mut app = tui::app::App::new_with_policy_budget_and_remote_actions(
         model,
         &config.proxy.target,
         policy_enforcer,
         budget_limits,
+        config
+            .remote_actions
+            .build_registry()
+            .map_err(anyhow::Error::msg)?,
     );
     app.hook_engine = Some(hook_engine);
     app.vdd_engine =
@@ -2916,6 +2920,7 @@ mod tests {
             permissions: config::PermissionsConfig::default(),
             memory: config::MemoryConfig::default(),
             web_fetch: config::WebFetchConfig::default(),
+            remote_actions: config::RemoteActionsConfig::default(),
             policy: openclaudia::services::policy::EnterprisePolicy::default(),
             managed_settings_path: None,
         }

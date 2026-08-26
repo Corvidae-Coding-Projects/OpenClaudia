@@ -1514,6 +1514,7 @@ mod tests {
             permissions: config::PermissionsConfig::default(),
             memory: config::MemoryConfig::default(),
             web_fetch: config::WebFetchConfig::default(),
+            remote_actions: config::RemoteActionsConfig::default(),
             policy: crate::services::policy::EnterprisePolicy::default(),
             managed_settings_path: None,
         }
