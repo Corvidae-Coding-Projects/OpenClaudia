@@ -3889,12 +3889,13 @@
       "display_id": 1147,
       "title": "S-068B: Wire LSP tools, continuations, and plugin server configuration",
       "description": "Route the production lsp tool through the run-owned service, preserve all current actions, return complete bounded CallHierarchyItem values plus opaque generation-bound continuation tokens, reject stale tokens, and register enabled plugin LSP configs without ambient authority. Parent #1145.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "6ea4d98d-679e-4078-b6b1-125fa8b5ab9b",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T06:00:18.673070701Z",
-      "updated_at": "2026-08-26T07:07:43.588341723Z",
+      "updated_at": "2026-08-26T07:07:48.611747926Z",
+      "closed_at": "2026-08-26T07:07:48.611741913Z",
       "labels": [
         "feature",
         "remediation"
@@ -42189,11 +42190,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1765,
       "timestamp": "2026-08-26T07:07:43.588341723Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1766,
+      "timestamp": "2026-08-26T07:07:48.611747926Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T07:07:43.588341723Z",
+    "timestamp": "2026-08-26T07:07:48.611747926Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1765
+    "agent_seq": 1766
   }
 }
