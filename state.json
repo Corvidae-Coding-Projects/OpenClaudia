@@ -3204,11 +3204,12 @@
       "uuid": "120b8c21-e346-4c66-a811-27b1b81507bc",
       "display_id": 1149,
       "title": "Monitor PR #66 runners for the S-068 push",
-      "status": "open",
+      "status": "closed",
       "priority": "low",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T07:11:57.787255559Z",
-      "updated_at": "2026-08-26T07:34:26.828438298Z",
+      "updated_at": "2026-08-26T07:34:35.072671706Z",
+      "closed_at": "2026-08-26T07:34:35.072670054Z",
       "labels": [
         "ci"
       ],
@@ -42350,11 +42351,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1782,
       "timestamp": "2026-08-26T07:34:26.828438298Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1783,
+      "timestamp": "2026-08-26T07:34:35.072671706Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T07:34:26.828438298Z",
+    "timestamp": "2026-08-26T07:34:35.072671706Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1782
+    "agent_seq": 1783
   }
 }
