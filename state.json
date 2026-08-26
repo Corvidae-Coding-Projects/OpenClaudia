@@ -1,6 +1,6 @@
 {
   "next_display_id": 1154,
-  "next_comment_id": 1711,
+  "next_comment_id": 1712,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -23604,7 +23604,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T15:38:01.221799065Z",
-      "updated_at": "2026-08-26T17:28:47.281764440Z",
+      "updated_at": "2026-08-26T17:29:48.409872135Z",
       "closed_at": "2026-08-26T17:28:47.281758388Z",
       "labels": [
         "feature"
@@ -23711,6 +23711,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA7Y8Ba6C1FKnajQJPhyspi1VszQIlKh+beufRgEfhRTvy7xZsaUQZKPnhgLGxu4XQvGIqbCaQcKI0mdmWirIZDw=="
+        },
+        "dc5fa758-fb57-416f-9e76-bf94567573e4": {
+          "display_id": 1711,
+          "author": "6Vw9",
+          "content": "Signed commit 36fb8d25 feat(web): enforce connection-boundary egress policy (#1153) contains the completed S-071 implementation, skeptical fixtures, completion evidence, and exact Crosslink-generated changelog entry. Verification: Rust 1.98 strict Clippy; clean complete serialized all-target/all-feature suite; real Chromium 2/2; focused web/config, fuzz, policy, sandbox/session, Windows GNU, formatting, and diff gates all passed. No push performed; runners deferred by user.",
+          "created_at": "2026-08-26T17:29:48.407076048Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAIBH5k8LqMKIxWPWaZnOZdEf6V7pNPZhuwe0bfmWrMkPw+rnxUCwJNMXR5+0WjnN/W0YXe5IgZM2wcEsYzzMRCQ=="
         },
         "e3e9d23c-b381-48de-a4fe-00a96312fce1": {
           "display_id": 1709,
@@ -43111,10 +43120,15 @@
       "agent_id": "6Vw9",
       "agent_seq": 1849,
       "timestamp": "2026-08-26T17:29:42.853819390Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1849,
+      "timestamp": "2026-08-26T17:29:48.409872135Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T17:29:42.853819390Z",
+    "timestamp": "2026-08-26T17:29:48.409872135Z",
     "agent_id": "6Vw9",
     "agent_seq": 1849
   }
