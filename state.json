@@ -14949,13 +14949,12 @@
       "display_id": 1145,
       "title": "S-068: Create a stateful workspace LSP service",
       "description": "Production-wire the preserved LSP pool and current LSP tool into a supervised per-workspace, per-language, configuration/version/capability/generation service. Own initialization, health, restart, cancellation, shutdown, and versioned document synchronization; preserve full call-hierarchy continuation data with generation-bound opaque tokens and explicit stale failure. Retain plugin configuration, run capabilities, budgets, guardrails, grounding, and current behavior. S-069 transport hardening and unrelated cleanup remain out of scope. Verify realistic compiled local fixtures on Rust 1.98 under resource-aware gates; S-088 VDD remains pending.",
-      "status": "closed",
+      "status": "open",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T05:52:47.734576672Z",
-      "updated_at": "2026-08-26T07:08:06.506080189Z",
-      "closed_at": "2026-08-26T07:08:06.506074078Z",
+      "updated_at": "2026-08-26T07:09:07.779964263Z",
       "labels": [
         "feature",
         "remediation"
@@ -42236,11 +42235,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1771,
       "timestamp": "2026-08-26T07:08:10.933973040Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1772,
+      "timestamp": "2026-08-26T07:09:07.779964263Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T07:08:10.933973040Z",
+    "timestamp": "2026-08-26T07:09:07.779964263Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1771
+    "agent_seq": 1772
   }
 }
