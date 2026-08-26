@@ -1,6 +1,6 @@
 {
   "next_display_id": 1146,
-  "next_comment_id": 1660,
+  "next_comment_id": 1661,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -14890,11 +14890,22 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T05:52:47.734576672Z",
-      "updated_at": "2026-08-26T05:52:56.488830062Z",
+      "updated_at": "2026-08-26T05:53:23.418388040Z",
       "labels": [
         "feature",
         "remediation"
-      ]
+      ],
+      "comments": {
+        "6f14e427-1eff-4e92-8491-569211653f5f": {
+          "display_id": 1660,
+          "author": "6Vw9",
+          "content": "The provider hook blocked read-only session verification immediately after issue creation because the new issue was not selected despite --work. Session #79 now explicitly works #1145. The installed Crosslink build has no intervene subcommand, so this observation records the required provenance.",
+          "created_at": "2026-08-26T05:53:23.415946211Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABARw03e1g/n2vC0kI4XXKefjT9TD2U4gMwawk/2hr9lI+aVA9vOshfOMTtwvYu95HSUQ2zeJ4FycrZoQ9PZ71GBA=="
+        }
+      }
     },
     "6eca7e6f-d207-4b09-a3a2-23942f86c6a1": {
       "uuid": "6eca7e6f-d207-4b09-a3a2-23942f86c6a1",
@@ -41981,11 +41992,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1754,
       "timestamp": "2026-08-26T05:53:01.917464277Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1755,
+      "timestamp": "2026-08-26T05:53:23.418388040Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-26T05:53:01.917464277Z",
+    "timestamp": "2026-08-26T05:53:23.418388040Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1754
+    "agent_seq": 1755
   }
 }
