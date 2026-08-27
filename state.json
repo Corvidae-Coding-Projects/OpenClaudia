@@ -1,6 +1,6 @@
 {
   "next_display_id": 1161,
-  "next_comment_id": 1750,
+  "next_comment_id": 1751,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -25496,7 +25496,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T04:57:18.848877241Z",
-      "updated_at": "2026-08-27T07:06:47.383633760Z",
+      "updated_at": "2026-08-27T07:09:44.926994574Z",
       "labels": [
         "feature",
         "remediation"
@@ -25555,6 +25555,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAcU575UjMyzbmHcoagZjGAGdtzNA/f0hbAnhjJx8Q2PETnH2XgrkHi/d+oV03kJHjAZlz07bRt0u4UbtTcxQvDg=="
+        },
+        "a33c29e7-d8bd-4359-8184-967b40706c8a": {
+          "display_id": 1750,
+          "author": "6Vw9",
+          "content": "S-074 implementation generation S074-G1 is complete on parent 95137ef2530f1d3044e7456556b69290b39c21a6. Opaque generation-bound descriptors now atomically bind enter, exit, and resume across file/process/LSP/task/permission/ledger/grounding/verification/relative-path/child-run consumers while preserving S-073 worktree transactions. Skeptical review found and repaired ordinary-path TUI follow-up propagation, task-observation ledger rebinding in TUI/CLI/ACP, cross-owner exit, and nested enter before creation. Final evidence: S-074 10/10; pipeline 16/16, 26/26, 16/16; strict all-target/all-feature Clippy passed; complete all-target/all-feature suite passed with library 2944 passed/1 ignored of 2945, binary 227/227, all remaining targets green; fuzz check/Clippy/4 tests passed; cargo-deny root/fuzz passed; policy 27/27 and hygiene verified. Sorted 23-file manifest SHA-256 is 90a92a8317871eb391529ee1378528321425fb356bded378e951f79db6609701. VDD was not run and no approval is claimed; exact artifact review remains queued to #1157/S-088. Adjacent provider/session replacement gap remains #1160. Platform evidence awaits exact-head PR #66 after user push.",
+          "created_at": "2026-08-27T07:09:44.923438373Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA8K5Rr/87qfH8d0DBULPZaBzXZLcUrcNDwRwQrM2IW3YbuFhmSmFqPDVSxfofUMPi2nQijZwtjB2Vj5IzOtwzBA=="
         },
         "afbe7b05-7e1c-4389-bf88-8184b7590b31": {
           "display_id": 1747,
@@ -43962,11 +43971,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1920,
       "timestamp": "2026-08-27T07:06:47.383633760Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1921,
+      "timestamp": "2026-08-27T07:09:44.926994574Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T07:06:47.383633760Z",
+    "timestamp": "2026-08-27T07:09:44.926994574Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1920
+    "agent_seq": 1921
   }
 }
