@@ -20463,12 +20463,13 @@
       "display_id": 1184,
       "title": "Bind canonical VDD identity to the actual resolved verifier route",
       "description": "S-088 builds verifier identity from configured provider/base_url/requested model before dispatch and never retains or checks the actual response route/model. Router aliases, OpenAI-compatible remaps, redirects, or provider fallback can therefore produce a Pass receipt under a requested alternate identity even when another model family answered. Resolve and record the effective endpoint/model identity at transport time, compare it to the worker and requested verifier identities, and return inconclusive/verifier_error on ambiguity, alias drift, fallback, or collision. Cover direct HTTP, native JSON, and account-backed SDK routes with deterministic transport fixtures.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T22:18:11.166741687Z",
-      "updated_at": "2026-08-27T22:37:46.258029271Z",
+      "updated_at": "2026-08-27T22:37:53.367455293Z",
+      "closed_at": "2026-08-27T22:37:53.367449636Z",
       "labels": [
         "bug",
         "vdd"
@@ -46837,11 +46838,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2160,
       "timestamp": "2026-08-27T22:37:46.258029271Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2161,
+      "timestamp": "2026-08-27T22:37:53.367455293Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T22:37:46.258029271Z",
+    "timestamp": "2026-08-27T22:37:53.367455293Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2160
+    "agent_seq": 2161
   }
 }
