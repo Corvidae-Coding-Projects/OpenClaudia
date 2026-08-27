@@ -1,6 +1,6 @@
 {
   "next_display_id": 1160,
-  "next_comment_id": 1744,
+  "next_comment_id": 1745,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -25479,7 +25479,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T04:57:18.848877241Z",
-      "updated_at": "2026-08-27T05:06:11.840490812Z",
+      "updated_at": "2026-08-27T05:06:53.504874815Z",
       "labels": [
         "feature",
         "remediation"
@@ -25493,6 +25493,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAmQMuBIF/0nAru1GqxbFGk24nRGHp30Vtrwmhw9CZNTnbZGewIxhrc2NIE8+OFO6tYMkuS7IUrIPIkoyLcx4PAQ=="
+        },
+        "8642f063-e778-4ef8-a491-16e8992f1687": {
+          "display_id": 1744,
+          "author": "6Vw9",
+          "content": "Preflight/design boundary: the production defect has two live forms: registry enter_worktree creates a path but never replaces the caller's run, and subagent isolation creates a separate path-only WorktreeIsolation whose resume path creates another tree. Preferred S-074 design: create an opaque, validated workspace record (repository/worktree identities, canonical target/workspace roots, creation base/target commits, branch, stable owner, handle and lifecycle generation), carry a non-forgeable workspace-transition request only inside the trusted in-memory ToolResult, and replace the complete immutable ToolRunContext generation at frontend/subagent boundaries. A shared transition gate fences concurrent operations; old generations become suspended, removed roots and identity/symlink changes fail closed, and exit restores the retained parent generation. Persist only the validated resume record in canonical session/subagent state and reacquire a fresh run lease on resume. File/process/sandbox/LSP/freshness/verification/relative paths and child derivation then follow the new run automatically; task actors, ledger path, approvals, guardrails and MCP are explicitly rebound by each owning frontend. Credible alternative rejected: mutating working_directory or adding a copied path to ToolRunContext would leave RunDescriptor.workspace, pinned roots, capability digest, approvals, evidence, LSP and child runs on different generations and cannot make concurrent transitions safe. S-073 transaction phases remain intact; S-075/076/077 stay out of scope.",
+          "created_at": "2026-08-27T05:06:53.500575291Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAf/Ol+1hNR13j46E1hnRWFK1fbPUiNjk0YnqooGMHejC+EkYEec5RMcoyrK2V1f7XT6hQmrYRcQTb1vsIoFwiBA=="
         },
         "dfb733db-2d4c-477a-ac2f-a75532ab3be3": {
           "display_id": 1743,
@@ -43846,11 +43855,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1911,
       "timestamp": "2026-08-27T05:06:11.840490812Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1912,
+      "timestamp": "2026-08-27T05:06:53.504874815Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T05:06:11.840490812Z",
+    "timestamp": "2026-08-27T05:06:53.504874815Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1911
+    "agent_seq": 1912
   }
 }
