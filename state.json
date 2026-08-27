@@ -1,6 +1,6 @@
 {
   "next_display_id": 1170,
-  "next_comment_id": 1791,
+  "next_comment_id": 1792,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -27359,11 +27359,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T11:25:05.507985757Z",
-      "updated_at": "2026-08-27T11:28:04.654610441Z",
+      "updated_at": "2026-08-27T12:01:14.960558678Z",
       "labels": [
         "feature"
       ],
       "comments": {
+        "418281e8-7eeb-4cdf-a6ec-792daa4b945f": {
+          "display_id": 1791,
+          "author": "Xnwv",
+          "content": "Implemented S-091 ACP capability consistency. ACP now derives initializer, coding, plan, and read-only mode options from canonical RuntimeMode profiles; rotates real negotiated mode changes onto fresh run capability generations; returns exact capability/runtime/catalog generations, effective capability metadata, active tool names, and schemas; enforces plan-only write targets; preserves legacy implicit active-session mode/config behavior; composes per-run plugin-discovered MCP/LSP managers and publishes healthy dynamic MCP schemas through the same progressive catalog used by other frontends; rebinds integrations on prompt and workspace generations; handles enter/exit plan follow-ups without silently granting effects; and rejects calls from stale or unadvertised catalog/mode generations. Added focused ACP policy/generation tests and a catalog stale-mode admission regression. Supporting generic catalog admission now validates the exact executing run, with the two required ToolExecutor call-site argument updates. No unresolved integration point identified. Verification was intentionally not run under the assigned worker boundary.",
+          "created_at": "2026-08-27T12:01:14.957346097Z",
+          "kind": "result",
+          "signed_by": "SHA256:zTtjHuXn+qXDxqwia8mUyqtt179LC3330nJcVV8jlA4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgq1t2m6Y2g5L1OfTmmrvNR1OFxd3vsIfINLVmrwCSa1MAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAPt3uV86MABPZZjdHet9SKPhuNA6gVD9Lsyb9UYF8lsN3WHPnxiJ4ATAYRLjOds6ibDzvaAyhVMgcxnU1ot/9AA=="
+        },
         "5b47c493-78d9-4214-b515-1bb16cf120ad": {
           "display_id": 1789,
           "author": "6Vw9",
@@ -45074,11 +45083,16 @@
       "agent_id": "NeZq",
       "agent_seq": 1,
       "timestamp": "2026-08-27T11:31:59.346769129Z"
+    },
+    {
+      "agent_id": "Xnwv",
+      "agent_seq": 2,
+      "timestamp": "2026-08-27T12:01:14.960558678Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T11:31:59.346769129Z",
-    "agent_id": "NeZq",
-    "agent_seq": 1
+    "timestamp": "2026-08-27T12:01:14.960558678Z",
+    "agent_id": "Xnwv",
+    "agent_seq": 2
   }
 }
