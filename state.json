@@ -23488,12 +23488,13 @@
       "display_id": 1161,
       "title": "Monitor exact-head PR #66 runners for S-074",
       "description": "After Laurelai publishes signed S-074 commits a2fbf85a and ab3bf207, verify PR #66 head is exactly ab3bf207, monitor every check to terminal success, investigate and fix only genuine failures, preserve the draft PR, and close this monitoring task when all exact-head runners pass.",
-      "status": "open",
+      "status": "closed",
       "priority": "medium",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T07:12:28.746774970Z",
-      "updated_at": "2026-08-27T07:37:56.467841258Z",
+      "updated_at": "2026-08-27T07:38:04.742055291Z",
+      "closed_at": "2026-08-27T07:38:04.742044708Z",
       "labels": [
         "verification"
       ],
@@ -44085,11 +44086,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1931,
       "timestamp": "2026-08-27T07:37:56.467841258Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1932,
+      "timestamp": "2026-08-27T07:38:04.742055291Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T07:37:56.467841258Z",
+    "timestamp": "2026-08-27T07:38:04.742055291Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1931
+    "agent_seq": 1932
   }
 }
