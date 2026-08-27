@@ -1,6 +1,6 @@
 {
   "next_display_id": 1181,
-  "next_comment_id": 1838,
+  "next_comment_id": 1839,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8085,10 +8085,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T19:00:38.811578718Z",
-      "updated_at": "2026-08-27T19:00:45.511563552Z",
+      "updated_at": "2026-08-27T20:39:47.808124857Z",
       "labels": [
         "feature"
-      ]
+      ],
+      "comments": {
+        "76c835c8-4efe-4f50-86b3-6784b0643791": {
+          "display_id": 1838,
+          "author": "6Vw9",
+          "content": "Implemented one contextual keybinding resolver across the TUI and real Rustyline editor, removed the disconnected synthetic Vim state, preserved native Vi command behavior, generated effective help, and enforced prefix timeout/replay, Unicode, modal/streaming/confirmation restrictions, and consuming none bindings. Resolver coverage passed 32/32 and keybindings_e2e passed 16/16. Rust 1.98 formatting, strict all-target/all-feature Clippy, and the complete serialized all-target/all-feature test suite pass. No VDD self-approval is claimed.",
+          "created_at": "2026-08-27T20:39:47.805578705Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAZGGPiCYBew5zzmiKc18LQ/24FRKBph9FEBswuZaaxZtWIaF0ipOvvmoqWckVMxKr78omcllgrVFtWXTcBNBXDg=="
+        }
+      }
     },
     "3ce0144f-77d7-4257-acd1-281a343f47af": {
       "uuid": "3ce0144f-77d7-4257-acd1-281a343f47af",
@@ -46216,11 +46227,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2098,
       "timestamp": "2026-08-27T20:39:43.044124419Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2099,
+      "timestamp": "2026-08-27T20:39:47.808124857Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T20:39:43.044124419Z",
+    "timestamp": "2026-08-27T20:39:47.808124857Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2098
+    "agent_seq": 2099
   }
 }
