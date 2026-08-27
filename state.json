@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1191,
+  "next_display_id": 1192,
   "next_comment_id": 1861,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -462,6 +462,7 @@
     "68439c81-5c13-4025-9ee7-defaa7337e83": 833,
     "68a6bf01-1269-45dc-aac0-8eb8780e997d": 365,
     "68ad97e8-7aa4-4feb-bf5d-ab7f6339f7d6": 531,
+    "68d4c2e0-fbb2-4f61-bc72-413d7644a4a0": 1191,
     "696fad29-b1b0-4559-b8fc-03789028d7ca": 715,
     "6a00c976-58cb-4e8e-bfca-7031121cf887": 459,
     "6a1ee209-71d2-4218-be95-f5bfa1b18fbe": 1166,
@@ -15720,6 +15721,18 @@
         "parity",
         "phase-1-spec"
       ]
+    },
+    "68d4c2e0-fbb2-4f61-bc72-413d7644a4a0": {
+      "uuid": "68d4c2e0-fbb2-4f61-bc72-413d7644a4a0",
+      "display_id": 1191,
+      "title": "S-095: Fix proxy streaming and VDD delivery parity",
+      "description": "Production-wire protocol-correct bounded streaming, disconnect cancellation, usage/finish/error semantics, and exact-candidate VDD delivery parity across proxy protocols. Worker is code-only; parent owns all execution and verification.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "5ea8af88-cc85-47d9-943c-8e2e851b5e5a",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-27T23:55:23.830113893Z",
+      "updated_at": "2026-08-27T23:55:23.830113893Z"
     },
     "696fad29-b1b0-4559-b8fc-03789028d7ca": {
       "uuid": "696fad29-b1b0-4559-b8fc-03789028d7ca",
@@ -47077,11 +47090,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2186,
       "timestamp": "2026-08-27T23:55:19.073238463Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2187,
+      "timestamp": "2026-08-27T23:55:23.830113893Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T23:55:19.073238463Z",
+    "timestamp": "2026-08-27T23:55:23.830113893Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2186
+    "agent_seq": 2187
   }
 }
