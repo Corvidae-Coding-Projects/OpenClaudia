@@ -1,6 +1,6 @@
 {
   "next_display_id": 1166,
-  "next_comment_id": 1781,
+  "next_comment_id": 1782,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -19275,7 +19275,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T10:48:30.095935585Z",
-      "updated_at": "2026-08-27T10:49:13.168004555Z",
+      "updated_at": "2026-08-27T11:15:26.158604681Z",
       "labels": [
         "maintenance"
       ],
@@ -19291,6 +19291,15 @@
           "driver_key_fingerprint": "SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAo8QGkcnEq3kzVC+D1yVwaSgmFy+HpeHTqRWeVGcCzHPr/TB+5KXl4L8vmtBzcpDtdOaPB2WNGO+G+ebAxuilCg=="
+        },
+        "b408f750-d546-4eb5-a7ac-d284bcf6122c": {
+          "display_id": 1781,
+          "author": "6Vw9",
+          "content": "Replacement CI run 33064558890 passed all five jobs on commit 1ff7bbcf038c260c2c2dc6d428e624c882db2b02: Linux full gate, repository policy, Rust 1.98/MSRV including the locked fuzz manifest, macOS fail-closed, and Windows fail-closed. The prior repository-policy failure was repaired by refreshing fuzz/Cargo.lock for the new archive dependency graph.",
+          "created_at": "2026-08-27T11:15:26.147743100Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAGqVsBnx6ipeyR0gaPpIrlU5p7FBQ/k0+i8W0ZVa/ub5P1COp+K3/fQUvLAWTHrqHYkNUYqiqQ+AgyeK16Tj0Cg=="
         },
         "dd58d417-c493-4de2-aae1-d429542d35c2": {
           "display_id": 1779,
@@ -44742,11 +44751,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1977,
       "timestamp": "2026-08-27T10:49:13.168004555Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1978,
+      "timestamp": "2026-08-27T11:15:26.158604681Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T10:49:13.168004555Z",
+    "timestamp": "2026-08-27T11:15:26.158604681Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1977
+    "agent_seq": 1978
   }
 }
