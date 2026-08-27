@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1179,
+  "next_display_id": 1180,
   "next_comment_id": 1834,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -257,6 +257,7 @@
     "3c303dc7-f87a-49a9-b45d-87f2132da140": 487,
     "3c788b33-8135-40ac-81e8-dcaa055cc672": 134,
     "3c7a7927-5a52-4234-8940-a20ff90918d9": 328,
+    "3c7e57f0-1831-4f9a-b1d5-f0014c88b5f7": 1179,
     "3ce0144f-77d7-4257-acd1-281a343f47af": 1107,
     "3d00c6f8-7f19-4182-8735-3fd145e801c7": 930,
     "3d4d9e2a-0b90-4075-b1a4-c05e2d9699ee": 716,
@@ -8045,6 +8046,18 @@
       "created_at": "2026-04-18T00:33:07.235521192Z",
       "updated_at": "2026-05-19T13:13:51.170668714Z",
       "closed_at": "2026-05-19T13:13:51.170668714Z"
+    },
+    "3c7e57f0-1831-4f9a-b1d5-f0014c88b5f7": {
+      "uuid": "3c7e57f0-1831-4f9a-b1d5-f0014c88b5f7",
+      "display_id": 1179,
+      "title": "S-081: Use one real keybinding engine",
+      "description": "Implement docs/remediation-slices/081-single-real-keybinding-engine.md. Connect configurable contextual keybindings to actual frontend input and the typed command path; preserve working Rustyline Vi behavior, modal/permission/streaming correctness, prefix precedence and replay, and effective help. Do not remove intended behavior or broaden into unrelated TUI cleanup.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-27T19:00:38.811578718Z",
+      "updated_at": "2026-08-27T19:00:38.811578718Z"
     },
     "3ce0144f-77d7-4257-acd1-281a343f47af": {
       "uuid": "3ce0144f-77d7-4257-acd1-281a343f47af",
@@ -46098,11 +46111,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2090,
       "timestamp": "2026-08-27T19:00:33.196404004Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2091,
+      "timestamp": "2026-08-27T19:00:38.811578718Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T19:00:33.196404004Z",
+    "timestamp": "2026-08-27T19:00:38.811578718Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2090
+    "agent_seq": 2091
   }
 }
