@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1187,
+  "next_display_id": 1188,
   "next_comment_id": 1850,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -254,6 +254,7 @@
     "3a19f48b-e04b-4b40-bb5d-6489e8265850": 460,
     "3af1e512-5870-4bbe-a22a-8a561869a713": 235,
     "3b06ddda-4fca-4090-b239-ea203c607079": 1015,
+    "3b151edd-1cbd-4f7e-8ded-7ee2bf4bf20b": 1187,
     "3b61ba85-3cf3-4932-8309-c9220f1a6f60": 593,
     "3b7d7fde-61eb-4a04-8188-15bc8375eace": 1097,
     "3b829f02-7116-4a6d-8e25-0ee0625f8b26": 554,
@@ -7995,6 +7996,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAVvf7DHqmvkgDZCnnFokLxP26ok/qlwQUU9P5GHCSQF9oXqJb049FjG6XJXex6MQh6IHBJ6ZVIafghqLvLgKqBg=="
         }
       }
+    },
+    "3b151edd-1cbd-4f7e-8ded-7ee2bf4bf20b": {
+      "uuid": "3b151edd-1cbd-4f7e-8ded-7ee2bf4bf20b",
+      "display_id": 1187,
+      "title": "Deliver the selected source snapshot to canonical VDD",
+      "description": "S-088 promises the verifier the exact selected source snapshot, but CanonicalVddRequest carries only PlannerEvidenceSourceRecord metadata (id, kind, digest, reference, observing run, timestamp) and the verifier prompt serializes only those records. The fresh verifier has no worker transcript, network, memory, MCP, or parent ledger access, so a criterion depending on user/tool/external evidence outside the reviewed worktree cannot be checked and must remain inconclusive. Add a bounded immutable source-evidence projection or read capability, validate every supplied byte/locator against the source receipt digest and run generation, keep the content subordinate as evidence, and test source-dependent pass plus missing/stale/tampered rejection.",
+      "status": "open",
+      "priority": "medium",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-27T22:19:23.856453007Z",
+      "updated_at": "2026-08-27T22:19:23.856453007Z"
     },
     "3b61ba85-3cf3-4932-8309-c9220f1a6f60": {
       "uuid": "3b61ba85-3cf3-4932-8309-c9220f1a6f60",
@@ -46663,11 +46676,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2142,
       "timestamp": "2026-08-27T22:18:47.459794985Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2143,
+      "timestamp": "2026-08-27T22:19:23.856453007Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T22:18:47.459794985Z",
+    "timestamp": "2026-08-27T22:19:23.856453007Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2142
+    "agent_seq": 2143
   }
 }
