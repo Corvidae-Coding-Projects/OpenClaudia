@@ -1,6 +1,6 @@
 {
   "next_display_id": 1158,
-  "next_comment_id": 1731,
+  "next_comment_id": 1732,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -13527,11 +13527,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T23:02:08.777248190Z",
-      "updated_at": "2026-08-27T00:39:12.488038353Z",
+      "updated_at": "2026-08-27T00:39:48.844491456Z",
       "labels": [
         "feature"
       ],
       "comments": {
+        "0217884d-11ea-418b-aeae-dad0012e4ae9": {
+          "display_id": 1731,
+          "author": "6Vw9",
+          "content": "Delivered signed commit 7e856b23d33bcde085b7b222b0dee6fd220d2cbb (feat(worktree): make apply lifecycle transactional (#1156)), containing nine intentional files including the exact generated CHANGELOG entry. Verified on Rust 1.98.0: focused transaction/failure suites, fmt, locked checks, strict all-target/all-feature Clippy, full serialized all-target/all-feature tests, fuzz check/Clippy/tests, repository policy/hygiene, and root/fuzz cargo-deny all passed. Git signature is valid for dollspace-gay. Final cargo clean removed 41,031 files / 60.9 GiB; zram was reset. Worktree is clean. S-088 handoff remains open as #1157 and parent #1071 remains open.",
+          "created_at": "2026-08-27T00:39:48.841797041Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA9jgQMYiGojNPTrViOL0/BFezJqQabxv/EtBExbEAWJNhH+VMvPIFrU7Ti3BkvearKiJKY2AnPGXo9tu/+5ALAg=="
+        },
         "11175e03-6a91-4e23-90cd-12cc483c0dc1": {
           "display_id": 1728,
           "author": "6Vw9",
@@ -43560,11 +43569,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1887,
       "timestamp": "2026-08-27T00:39:12.488038353Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1888,
+      "timestamp": "2026-08-27T00:39:48.844491456Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T00:39:12.488038353Z",
+    "timestamp": "2026-08-27T00:39:48.844491456Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1887
+    "agent_seq": 1888
   }
 }
