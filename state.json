@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1162,
+  "next_display_id": 1163,
   "next_comment_id": 1761,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -784,6 +784,7 @@
     "b8313ee2-4041-40b7-8583-ddf88ecaea01": 322,
     "b83f3ad5-c56b-4d52-b380-292daf45e47f": 16,
     "b864dcc3-4787-4848-89d1-cdab6a5e9d3d": 99,
+    "b86cb386-0952-47c9-8027-0c7fae8ea75e": 1162,
     "b8dabe61-f6e1-455a-92b8-dc087a583c22": 797,
     "b8e0d6bd-c12a-45cc-9344-c9e4f78b9359": 895,
     "b9152c9c-477c-4ec2-8a44-c6300c9f1cbd": 794,
@@ -25464,6 +25465,18 @@
         "qa"
       ]
     },
+    "b86cb386-0952-47c9-8027-0c7fae8ea75e": {
+      "uuid": "b86cb386-0952-47c9-8027-0c7fae8ea75e",
+      "display_id": 1162,
+      "title": "S-062: Make plugin install and update verifiable transactions",
+      "description": "Implement docs/remediation-slices/062-plugin-supply-chain-transactions.md as production wiring. Code-only worker; parent owns integration and verification.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-27T08:44:18.413311708Z",
+      "updated_at": "2026-08-27T08:44:18.413311708Z"
+    },
     "b8dabe61-f6e1-455a-92b8-dc087a583c22": {
       "uuid": "b8dabe61-f6e1-455a-92b8-dc087a583c22",
       "display_id": 797,
@@ -44216,11 +44229,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1947,
       "timestamp": "2026-08-27T08:43:32.203825937Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1948,
+      "timestamp": "2026-08-27T08:44:18.413311708Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T08:43:32.203825937Z",
+    "timestamp": "2026-08-27T08:44:18.413311708Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1947
+    "agent_seq": 1948
   }
 }
