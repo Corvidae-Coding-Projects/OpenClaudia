@@ -3055,7 +3055,12 @@ mod tests {
             );
         }
         std::fs::write(root.path().join("tracked.txt"), "baseline\n").expect("tracked fixture");
-        for args in [vec!["add", "tracked.txt"], vec!["commit", "-qm", "fixture"]] {
+        std::fs::write(root.path().join(".gitignore"), ".worktrees/\n")
+            .expect("worktree fixture ignore");
+        for args in [
+            vec!["add", "tracked.txt", ".gitignore"],
+            vec!["commit", "-qm", "fixture"],
+        ] {
             let output = std::process::Command::new(&git)
                 .args(args)
                 .current_dir(root.path())
@@ -3536,8 +3541,8 @@ mod tests {
     #[test]
     fn test_get_current_branch_at_cwd() {
         let _lock = cwd_lock();
-        let cwd = std::env::current_dir().unwrap();
-        let branch = get_current_branch_at(test_run(), &cwd);
+        let (_root, run) = isolated_git_fixture();
+        let branch = get_current_branch_at(&run, run.working_directory());
         assert!(branch.is_some());
     }
 
@@ -3562,7 +3567,8 @@ mod tests {
     #[test]
     fn test_list_worktrees() {
         let _lock = cwd_lock();
-        let (msg, is_err) = execute_list_worktrees(test_run());
+        let (_root, run) = isolated_git_fixture();
+        let (msg, is_err) = execute_list_worktrees(&run);
         assert!(!is_err);
         assert!(msg.contains("worktree") || msg.contains("Active"));
     }
@@ -3708,6 +3714,7 @@ mod tests {
     #[test]
     fn enter_worktree_duplicate_call_is_no_op_624() {
         let _lock = cwd_lock();
+        let (_root, run) = isolated_git_fixture();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
@@ -3718,10 +3725,10 @@ mod tests {
             "branch".to_string(),
             serde_json::Value::String(branch.clone()),
         );
-        let (first_msg, first_err) = execute_enter_worktree(test_run(), &args);
+        let (first_msg, first_err) = execute_enter_worktree(&run, &args);
         assert!(!first_err, "first call must succeed; got: {first_msg}");
 
-        let (second_msg, second_err) = execute_enter_worktree(test_run(), &args);
+        let (second_msg, second_err) = execute_enter_worktree(&run, &args);
         assert!(!second_err, "duplicate call must be a no-op (not error)");
         assert!(
             second_msg.contains("already in worktree") && second_msg.contains("No-op"),
@@ -3729,10 +3736,10 @@ mod tests {
         );
 
         // Cleanup.
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = run.project_root().to_path_buf();
         let wt = cwd.join(".worktrees").join(&branch);
-        let _ = transact_cleanup(test_run(), &wt, "discard");
-        let _ = git_in(test_run(), &cwd, &["branch", "-D", &branch]);
+        let _ = transact_cleanup(&run, &wt, "discard");
+        let _ = git_in(&run, &cwd, &["branch", "-D", &branch]);
     }
 
     /// #624: the cwd-cache generation counter advances when a worktree is
@@ -3741,6 +3748,7 @@ mod tests {
     #[test]
     fn enter_and_exit_worktree_bump_cwd_cache_generation_624() {
         let _lock = cwd_lock();
+        let (_root, run) = isolated_git_fixture();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
@@ -3752,7 +3760,7 @@ mod tests {
             "branch".to_string(),
             serde_json::Value::String(branch.clone()),
         );
-        let (msg, is_err) = execute_enter_worktree(test_run(), &args);
+        let (msg, is_err) = execute_enter_worktree(&run, &args);
         assert!(!is_err, "enter must succeed; got: {msg}");
         let after_enter = cwd_cache_generation();
         assert!(
@@ -3760,9 +3768,9 @@ mod tests {
             "cwd_cache_generation must advance on enter (before={before}, after={after_enter})"
         );
 
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = run.project_root().to_path_buf();
         let wt = cwd.join(".worktrees").join(&branch);
-        let result = transact_cleanup(test_run(), &wt, "discard");
+        let result = transact_cleanup(&run, &wt, "discard");
         assert!(
             !handler_is_error(&result),
             "exit must succeed; got: {}",
@@ -3774,7 +3782,7 @@ mod tests {
             "cwd_cache_generation must advance on exit (after_enter={after_enter}, after_exit={after_exit})"
         );
 
-        let _ = git_in(test_run(), &cwd, &["branch", "-D", &branch]);
+        let _ = git_in(&run, &cwd, &["branch", "-D", &branch]);
     }
 
     /// #623: with the worktree dirty and `discard_changes` omitted (or
@@ -3783,6 +3791,7 @@ mod tests {
     #[test]
     fn exit_worktree_refuses_to_destroy_dirty_worktree_without_discard_623() {
         let _lock = cwd_lock();
+        let (_root, run) = isolated_git_fixture();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
@@ -3793,17 +3802,17 @@ mod tests {
             "branch".to_string(),
             serde_json::Value::String(branch.clone()),
         );
-        let (msg, is_err) = execute_enter_worktree(test_run(), &args);
+        let (msg, is_err) = execute_enter_worktree(&run, &args);
         assert!(!is_err, "enter must succeed; got: {msg}");
 
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = run.project_root().to_path_buf();
         let wt = cwd.join(".worktrees").join(&branch);
         // Dirty the worktree by writing an untracked file.
         std::fs::write(wt.join("dirty.txt"), "uncommitted work\n").expect("write dirty");
 
         // A read-only preview never destroys work, and clean removal must
         // refuse this exact dirty generation.
-        let transaction = preview_transaction(test_run(), &wt);
+        let transaction = preview_transaction(&run, &wt);
         let generation = transaction
             .get("generation")
             .and_then(Value::as_str)
@@ -3832,7 +3841,7 @@ mod tests {
                 serde_json::Value::String(target_path),
             ),
         ]);
-        let (msg, is_err) = execute_exit_worktree(test_run(), &exit_args).into_legacy();
+        let (msg, is_err) = execute_exit_worktree(&run, &exit_args).into_legacy();
         assert!(is_err, "dirty remove must error");
         assert!(
             msg.contains("completely clean"),
@@ -3846,7 +3855,7 @@ mod tests {
         );
 
         // Now authorize discard against a fresh exact generation.
-        let result = transact_cleanup(test_run(), &wt, "discard");
+        let result = transact_cleanup(&run, &wt, "discard");
         assert!(
             !handler_is_error(&result),
             "discard must succeed: {}",
@@ -3854,7 +3863,7 @@ mod tests {
         );
         assert!(!wt.exists(), "successful exit must remove the worktree");
 
-        let _ = git_in(test_run(), &cwd, &["branch", "-D", &branch]);
+        let _ = git_in(&run, &cwd, &["branch", "-D", &branch]);
     }
 
     /// #623: a *clean* worktree exits successfully without needing the
@@ -3862,6 +3871,7 @@ mod tests {
     #[test]
     fn exit_worktree_clean_worktree_exits_without_discard_flag_623() {
         let _lock = cwd_lock();
+        let (_root, run) = isolated_git_fixture();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
@@ -3872,14 +3882,14 @@ mod tests {
             "branch".to_string(),
             serde_json::Value::String(branch.clone()),
         );
-        let (msg, is_err) = execute_enter_worktree(test_run(), &args);
+        let (msg, is_err) = execute_enter_worktree(&run, &args);
         assert!(!is_err, "enter must succeed; got: {msg}");
 
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = run.project_root().to_path_buf();
         let wt = cwd.join(".worktrees").join(&branch);
         // No mutations: worktree is clean.
 
-        let result = transact_cleanup(test_run(), &wt, "remove");
+        let result = transact_cleanup(&run, &wt, "remove");
         assert!(
             !handler_is_error(&result),
             "clean remove must succeed: {}",
@@ -3887,7 +3897,7 @@ mod tests {
         );
         assert!(!wt.exists(), "clean exit must remove the worktree");
 
-        let _ = git_in(test_run(), &cwd, &["branch", "-D", &branch]);
+        let _ = git_in(&run, &cwd, &["branch", "-D", &branch]);
     }
 
     struct TransactionFixture {
