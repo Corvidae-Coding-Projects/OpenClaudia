@@ -1,6 +1,6 @@
 {
   "next_display_id": 1183,
-  "next_comment_id": 1847,
+  "next_comment_id": 1848,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -14581,11 +14581,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T22:07:58.866963627Z",
-      "updated_at": "2026-08-27T22:08:36.566427799Z",
+      "updated_at": "2026-08-27T22:15:19.403984283Z",
       "labels": [
         "review"
       ],
       "comments": {
+        "0fc847a0-4a21-4d81-a0d7-2037c505ff40": {
+          "display_id": 1847,
+          "author": "6Vw9",
+          "content": "[action] Confirmed S-088 evidence-ledger key mismatch: verifier tools observe under child run session_id, while grounding/final validation use agent_id; unit test manually seeds agent_id ledger and does not exercise production tool recording.",
+          "created_at": "2026-08-27T22:15:19.399704088Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAGN/9qNkNDH8emypSPD+YVVwh0aTNnzRJz2zvAjQpK3p1dggGnjhmtn+2gLIMOJOqJkQQNfwTjkUWeW0FLyj0BQ=="
+        },
         "7b90bc62-a8bd-4883-9aec-e4210992f58c": {
           "display_id": 1846,
           "author": "6Vw9",
@@ -46493,11 +46502,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2129,
       "timestamp": "2026-08-27T22:08:36.566427799Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2130,
+      "timestamp": "2026-08-27T22:15:19.403984283Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T22:08:36.566427799Z",
+    "timestamp": "2026-08-27T22:15:19.403984283Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2129
+    "agent_seq": 2130
   }
 }
