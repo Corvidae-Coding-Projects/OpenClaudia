@@ -1,6 +1,6 @@
 {
   "next_display_id": 1165,
-  "next_comment_id": 1761,
+  "next_comment_id": 1762,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8524,10 +8524,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T08:44:43.997640377Z",
-      "updated_at": "2026-08-27T08:44:48.311309866Z",
+      "updated_at": "2026-08-27T08:48:23.596827275Z",
       "labels": [
         "feature"
-      ]
+      ],
+      "comments": {
+        "6a55e90d-a497-45e0-8dc2-020dfeed4e0b": {
+          "display_id": 1761,
+          "author": "6Vw9",
+          "content": "[action] Wave one launched: GPT-5.6-Sol xhigh code-only workers /root/wave1_s059 in isolated branch agent/refactor-s059-hook-lifecycle on #1163, /root/wave1_s062 in agent/refactor-s062-plugin-transactions on #1162, and /root/wave1_s086 in agent/refactor-s086-planner-checkpoints on #1164. Workers are forbidden from builds/tests/formatting/runners/commits/docs and from claiming verification; parent will inspect, integrate, build, test, fix, commit, and monitor CI.",
+          "created_at": "2026-08-27T08:48:23.594254419Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAcJ67PoZEzscPgKB7zfXnHAYusja/P1zx0A+WLSJxC/DobAYTmPEwlLqhfcHX+JVRVUVBRFTLeGHWCe64hGUUAQ=="
+        }
+      }
     },
     "44d55ef5-2b88-40b0-a4c6-b035ca79477b": {
       "uuid": "44d55ef5-2b88-40b0-a4c6-b035ca79477b",
@@ -44351,11 +44362,16 @@
       "agent_id": "wave1-s086-sol",
       "agent_seq": 1,
       "timestamp": "2026-08-27T08:46:48.314940188Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1958,
+      "timestamp": "2026-08-27T08:48:23.596827275Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T08:46:48.314940188Z",
-    "agent_id": "wave1-s086-sol",
-    "agent_seq": 1
+    "timestamp": "2026-08-27T08:48:23.596827275Z",
+    "agent_id": "6Vw9",
+    "agent_seq": 1958
   }
 }
