@@ -1,6 +1,6 @@
 {
   "next_display_id": 1183,
-  "next_comment_id": 1846,
+  "next_comment_id": 1847,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -14581,10 +14581,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T22:07:58.866963627Z",
-      "updated_at": "2026-08-27T22:08:04.438847400Z",
+      "updated_at": "2026-08-27T22:08:36.566427799Z",
       "labels": [
         "review"
-      ]
+      ],
+      "comments": {
+        "7b90bc62-a8bd-4883-9aec-e4210992f58c": {
+          "display_id": 1846,
+          "author": "6Vw9",
+          "content": "Manual bootstrap review plan: map the exact S-088 diff and every public caller; read canonical verifier, child harness, provider/model identity, artifact fence, Reality evidence, authority, budget/cancellation, and terminal paths line by line; compare tests to each promised failure mode; use exact-head CI plus focused static or runtime confirmation; make no implementation edits; record concrete severity-ranked findings and a ready or changes-required verdict.",
+          "created_at": "2026-08-27T22:08:36.563747814Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAUCdQ3ijUkCSLcLKTor5WpdQkhOIHLnWj4gSpDiqmNpQbs7srF1tJEIL6qypNAGarbdV/UFDcqgdh1OdcQD51Cw=="
+        }
+      }
     },
     "631fbb46-8e45-470b-b9ce-8f10724b6633": {
       "uuid": "631fbb46-8e45-470b-b9ce-8f10724b6633",
@@ -46477,11 +46488,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2128,
       "timestamp": "2026-08-27T22:08:09.946825672Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2129,
+      "timestamp": "2026-08-27T22:08:36.566427799Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T22:08:09.946825672Z",
+    "timestamp": "2026-08-27T22:08:36.566427799Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2128
+    "agent_seq": 2129
   }
 }
