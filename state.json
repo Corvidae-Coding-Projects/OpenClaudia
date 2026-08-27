@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1164,
+  "next_display_id": 1165,
   "next_comment_id": 1761,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -278,6 +278,7 @@
     "4487296f-3515-465c-89da-e48d899bb322": 338,
     "44c87000-688a-41f8-8583-fdfb7a8e8d6e": 287,
     "44cf2687-5226-4c8c-8d0b-590a6db8f5f5": 298,
+    "44d2ee09-995d-433e-a5cf-930c98efb8fa": 1164,
     "44d55ef5-2b88-40b0-a4c6-b035ca79477b": 1126,
     "44eef0ef-feb7-4072-a59c-2db2e4a7d795": 1001,
     "44fe98de-ca02-4457-8afb-aa1da6a8a9f7": 148,
@@ -8508,6 +8509,18 @@
       "created_at": "2026-04-18T00:31:24.734530561Z",
       "updated_at": "2026-05-19T12:19:10.977315951Z",
       "closed_at": "2026-05-19T12:19:10.977315951Z"
+    },
+    "44d2ee09-995d-433e-a5cf-930c98efb8fa": {
+      "uuid": "44d2ee09-995d-433e-a5cf-930c98efb8fa",
+      "display_id": 1164,
+      "title": "S-086: Implement rotating planner checkpoints",
+      "description": "Implement docs/remediation-slices/086-rotating-planner-checkpoints.md as production wiring. Code-only worker; parent owns integration and verification.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-27T08:44:43.997640377Z",
+      "updated_at": "2026-08-27T08:44:43.997640377Z"
     },
     "44d55ef5-2b88-40b0-a4c6-b035ca79477b": {
       "uuid": "44d55ef5-2b88-40b0-a4c6-b035ca79477b",
@@ -44286,11 +44299,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1951,
       "timestamp": "2026-08-27T08:44:32.939284249Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1952,
+      "timestamp": "2026-08-27T08:44:43.997640377Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T08:44:32.939284249Z",
+    "timestamp": "2026-08-27T08:44:43.997640377Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1951
+    "agent_seq": 1952
   }
 }
