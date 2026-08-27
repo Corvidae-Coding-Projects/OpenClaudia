@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1167,
+  "next_display_id": 1168,
   "next_comment_id": 1786,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -512,6 +512,7 @@
     "795e038e-7ce0-45e6-96df-7ca89f0201b6": 1077,
     "7980bad4-f2d3-4b47-ac40-92cf7478bb91": 11,
     "7981ba52-0389-4ec2-9241-8dfac0bc4fe6": 964,
+    "79a86144-6cad-4e5f-ac35-b3a6b9d17a68": 1167,
     "79f3fb57-dfdc-40a9-8f2d-9bc9b371f0a6": 996,
     "7ace8980-ed9d-4732-8114-ddc6e6778fa4": 744,
     "7b7677f6-2896-4c57-bc57-cd7566fff977": 493,
@@ -17018,6 +17019,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAPFk3kbvmCfAT/57JDBKhYmFNWRzU2pG2+AMlEczvo7zeei2F1e9k6lAdmcOkJhQgWc7l/jfBOVHwg3RmFIpOAg=="
         }
       }
+    },
+    "79a86144-6cad-4e5f-ac35-b3a6b9d17a68": {
+      "uuid": "79a86144-6cad-4e5f-ac35-b3a6b9d17a68",
+      "display_id": 1167,
+      "title": "S-087: Create fresh workers for semantic task slices",
+      "description": "Implement docs/remediation-slices/087-fresh-worker-slice-lifecycle.md on the active refactor branch. Production-wire fresh supervised workers with immutable assignment/workspace/capability/model/budget generations, durable attempt/checkpoint/result handoff, explicit artifact states, bounded cancellation/retry/restart semantics, and cleanup that cannot erase unhanded-off work. Preserve working capabilities; do not remove features. Worker phase writes code and focused tests only; parent coordinator performs all builds, tests, QA, integration fixes, commits, and runner monitoring. Prioritize realistic application paths over hypothetical perfection.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-27T11:24:50.435019544Z",
+      "updated_at": "2026-08-27T11:24:50.435019544Z"
     },
     "79f3fb57-dfdc-40a9-8f2d-9bc9b371f0a6": {
       "uuid": "79f3fb57-dfdc-40a9-8f2d-9bc9b371f0a6",
@@ -44871,11 +44884,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1990,
       "timestamp": "2026-08-27T11:24:37.920799037Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1991,
+      "timestamp": "2026-08-27T11:24:50.435019544Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T11:24:37.920799037Z",
+    "timestamp": "2026-08-27T11:24:50.435019544Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1990
+    "agent_seq": 1991
   }
 }
