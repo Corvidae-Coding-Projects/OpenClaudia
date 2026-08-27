@@ -112,7 +112,7 @@ owned by the audit and remediation slices.
 | `skill` | Load a discovered prompt skill by name |
 | `tool_search` | Select deferred tool schemas by name or keyword |
 | `enter_worktree` | Create an isolated Git worktree record |
-| `exit_worktree` | Remove a clean worktree, or merge/discard changes before removal |
+| `exit_worktree` | Preview and transactionally stage, commit, merge, discard, or remove an isolated worktree |
 | `list_worktrees` | List tracked worktrees |
 | `cron_create` | Create recurring cron metadata for an external scheduler |
 | `cron_delete` | Delete schedule metadata |

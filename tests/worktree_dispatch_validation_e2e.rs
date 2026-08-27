@@ -12,6 +12,7 @@
 #![allow(clippy::unwrap_used)]
 
 use openclaudia::tools::registry::registry;
+use openclaudia::tools::security::ToolResource;
 use openclaudia::tools::worktree::validate_branch_name;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -308,7 +309,7 @@ fn exit_worktree_path_as_null_returns_validation_error() {
 }
 
 #[test]
-fn exit_worktree_with_arbitrary_args_never_panics() {
+fn exit_worktree_with_unadvertised_arguments_never_panics() {
     let args = args_with(&[("worktree", json!("ignored")), ("path", json!("/x"))]);
     let (_msg, _is_err) = dispatch("exit_worktree", &args);
 }
@@ -338,7 +339,7 @@ fn exit_worktree_discard_changes_wrong_type_returns_validation_error() {
 }
 
 #[test]
-fn exit_worktree_schema_exposes_discard_changes_gate() {
+fn exit_worktree_schema_exposes_explicit_transaction_phases() {
     let def = registry()
         .get("exit_worktree")
         .expect("exit_worktree registered")
@@ -346,18 +347,49 @@ fn exit_worktree_schema_exposes_discard_changes_gate() {
     let params = def
         .pointer("/function/parameters")
         .expect("exit_worktree parameters");
-    assert!(
-        params.pointer("/properties/discard_changes").is_some(),
-        "exit_worktree schema must expose discard_changes for dirty worktree removal"
+    assert_eq!(params.get("additionalProperties"), Some(&json!(false)));
+    assert_eq!(
+        params.pointer("/properties/operation/enum"),
+        Some(&json!([
+            "preview", "stage", "commit", "merge", "discard", "remove"
+        ]))
     );
+    for field in ["expected_generation", "target_path", "paths", "message"] {
+        assert!(
+            params.pointer(&format!("/properties/{field}")).is_some(),
+            "exit_worktree schema must expose transaction field {field}"
+        );
+    }
     let apply_desc = params
         .pointer("/properties/apply_changes/description")
         .and_then(Value::as_str)
         .expect("apply_changes description");
     assert!(
-        apply_desc.contains("discard_changes=true"),
-        "apply_changes description must tell callers how to explicitly discard dirty work; got {apply_desc:?}"
+        apply_desc.contains("Deprecated") && apply_desc.contains("rejected"),
+        "legacy apply description must direct callers to the transaction flow; got {apply_desc:?}"
     );
+}
+
+#[test]
+fn exit_worktree_preview_needs_no_write_but_every_mutation_does() {
+    let handler = registry().get("exit_worktree").expect("registered");
+    let preview = args_with(&[("path", json!("/tmp/wt")), ("operation", json!("preview"))]);
+    assert_eq!(
+        handler.required_resources(&preview),
+        &[ToolResource::WorkspaceRead, ToolResource::Process]
+    );
+    for operation in ["stage", "commit", "merge", "discard", "remove"] {
+        let args = args_with(&[("path", json!("/tmp/wt")), ("operation", json!(operation))]);
+        assert_eq!(
+            handler.required_resources(&args),
+            &[
+                ToolResource::WorkspaceRead,
+                ToolResource::WorkspaceWrite,
+                ToolResource::Process,
+            ],
+            "{operation} must require write authority"
+        );
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -383,9 +415,9 @@ fn readme_worktree_claims_match_dispatch_contract() {
     );
     assert!(
         readme.contains(
-            "`exit_worktree` | Remove a clean worktree, or merge/discard changes before removal"
+            "`exit_worktree` | Preview and transactionally stage, commit, merge, discard, or remove an isolated worktree"
         ),
-        "README tool table must describe exit_worktree removal semantics"
+        "README tool table must describe the explicit worktree transaction"
     );
     assert!(
         !readme.contains("switch between isolated git worktrees"),

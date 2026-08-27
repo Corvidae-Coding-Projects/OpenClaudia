@@ -488,9 +488,13 @@ impl ToolExecutor {
 fn tool_requests_git_commit(tool_name: &str, arguments: &Value) -> bool {
     if tool_name == "exit_worktree" {
         return arguments
-            .get("apply_changes")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+            .get("operation")
+            .and_then(Value::as_str)
+            .is_some_and(|operation| operation == "commit")
+            || arguments
+                .get("apply_changes")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
     }
     if tool_name != "bash" {
         return false;
@@ -1413,11 +1417,20 @@ mod tests {
     fn worktree_apply_changes_is_a_commit_boundary() {
         assert!(tool_requests_git_commit(
             "exit_worktree",
+            &serde_json::json!({
+                "path": "/tmp/worktree",
+                "operation": "commit",
+                "expected_generation": format!("sha256:{}", "0".repeat(64)),
+                "message": "reviewed change"
+            })
+        ));
+        assert!(tool_requests_git_commit(
+            "exit_worktree",
             &serde_json::json!({ "path": "/tmp/worktree", "apply_changes": true })
         ));
         assert!(!tool_requests_git_commit(
             "exit_worktree",
-            &serde_json::json!({ "path": "/tmp/worktree", "discard_changes": true })
+            &serde_json::json!({ "path": "/tmp/worktree", "operation": "discard" })
         ));
     }
 }

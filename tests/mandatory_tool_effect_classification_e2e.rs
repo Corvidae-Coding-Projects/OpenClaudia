@@ -216,35 +216,42 @@ fn previously_fail_open_tools_now_reach_an_authorization_decision() {
     }
 }
 
-/// The destructive worktree case F-001 calls out by name.
-///
-/// `discard_changes: true` knowingly throws away uncommitted work. The other
-/// variants also end in `git worktree remove --force`, so argument-only
-/// classification cannot prove that ignored files will survive. All variants
-/// must therefore carry the conservative destructive ceiling, while retaining
-/// distinct operation labels for auditability.
+/// S-073 separates review, mutation, and cleanup so each approval carries the
+/// effect of exactly one transaction phase.
 #[test]
-fn every_exit_worktree_variant_is_classified_destructive() {
-    let discard = resolve_for_call(
-        "exit_worktree",
-        &json!({"path": "/tmp/wt", "discard_changes": true}),
-    )
-    .expect("discard must classify");
-    assert_eq!(discard.effect, ToolEffect::Destructive);
-    assert_eq!(discard.operation.as_deref(), Some("discard"));
+fn exit_worktree_transaction_phases_have_exact_effects() {
+    for (operation, expected) in [
+        ("preview", ToolEffect::ReadOnly),
+        ("stage", ToolEffect::WorkspaceMutation),
+        ("commit", ToolEffect::WorkspaceMutation),
+        ("merge", ToolEffect::WorkspaceMutation),
+        ("discard", ToolEffect::Destructive),
+        ("remove", ToolEffect::Destructive),
+    ] {
+        let resolved = resolve_for_call(
+            "exit_worktree",
+            &json!({"path": "/tmp/wt", "operation": operation}),
+        )
+        .unwrap_or_else(|error| panic!("{operation} must classify: {error:?}"));
+        assert_eq!(resolved.effect, expected, "{operation}");
+        assert_eq!(resolved.operation.as_deref(), Some(operation));
+    }
 
-    let clean = resolve_for_call("exit_worktree", &json!({"path": "/tmp/wt"}))
-        .expect("clean removal must classify");
-    assert_eq!(clean.effect, ToolEffect::Destructive);
-    assert_eq!(clean.operation.as_deref(), Some("remove_clean"));
-
-    let apply = resolve_for_call(
-        "exit_worktree",
-        &json!({"path": "/tmp/wt", "apply_changes": true}),
-    )
-    .expect("apply removal must classify");
-    assert_eq!(apply.effect, ToolEffect::Destructive);
-    assert_eq!(apply.operation.as_deref(), Some("apply"));
+    for (arguments, expected_operation) in [
+        (
+            json!({"path": "/tmp/wt", "apply_changes": true}),
+            "legacy_apply",
+        ),
+        (
+            json!({"path": "/tmp/wt", "discard_changes": true}),
+            "legacy_discard",
+        ),
+    ] {
+        let resolved = resolve_for_call("exit_worktree", &arguments)
+            .expect("deprecated call must classify before execution rejects it");
+        assert_eq!(resolved.effect, ToolEffect::Destructive);
+        assert_eq!(resolved.operation.as_deref(), Some(expected_operation));
+    }
 
     let (mgr, _dir) = gated_manager();
     let outcome = mgr.check(
@@ -254,6 +261,14 @@ fn every_exit_worktree_variant_is_classified_destructive() {
     assert!(
         !matches!(outcome, CheckResult::Allowed),
         "destructive worktree removal must reach a decision, got {outcome:?}"
+    );
+    assert_eq!(
+        mgr.check(
+            "exit_worktree",
+            &json!({"path": "/tmp/wt", "operation": "preview"}),
+        ),
+        CheckResult::Allowed,
+        "read-only preview must not inherit cleanup's destructive ceiling"
     );
 }
 
@@ -794,6 +809,7 @@ fn matrix_covers_each_named_area_with_an_enforced_effect() {
         "the matrix must enumerate every Crosslink operation"
     );
     let worktree_row = row_for("exit_worktree");
+    assert_eq!(worktree_row.operations.len(), 8);
     assert!(
         worktree_row
             .operations
@@ -1342,12 +1358,20 @@ fn every_typed_operation_handler_enumerates_its_operations() {
 #[test]
 fn exit_worktree_table_matches_its_classifier() {
     let cases = [
+        (json!({"path": "/tmp/w", "operation": "preview"}), "preview"),
+        (json!({"path": "/tmp/w", "operation": "stage"}), "stage"),
+        (json!({"path": "/tmp/w", "operation": "commit"}), "commit"),
+        (json!({"path": "/tmp/w", "operation": "merge"}), "merge"),
+        (json!({"path": "/tmp/w", "operation": "discard"}), "discard"),
+        (json!({"path": "/tmp/w", "operation": "remove"}), "remove"),
         (
             json!({"path": "/tmp/w", "discard_changes": true}),
-            "discard",
+            "legacy_discard",
         ),
-        (json!({"path": "/tmp/w", "apply_changes": true}), "apply"),
-        (json!({"path": "/tmp/w"}), "remove_clean"),
+        (
+            json!({"path": "/tmp/w", "apply_changes": true}),
+            "legacy_apply",
+        ),
     ];
 
     let table: HashMap<String, ToolEffect> = registry()
@@ -1378,8 +1402,8 @@ fn exit_worktree_table_matches_its_classifier() {
             "apply_changes": true
         }),
     )
-    .expect("both flags still classify according to execution precedence");
-    assert_eq!(both.operation.as_deref(), Some("apply"));
+    .expect("both legacy flags still classify according to execution precedence");
+    assert_eq!(both.operation.as_deref(), Some("legacy_apply"));
     assert_eq!(both.effect, ToolEffect::Destructive);
 }
 

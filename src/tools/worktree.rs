@@ -31,14 +31,36 @@
 
 use crate::tools::args::ToolArgError;
 use crate::tools::args::ToolArgs as _;
-use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use serde::Serialize;
+use serde_json::{json, Value};
+use sha2::{Digest as _, Sha256};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// Maximum time to wait for a git command (seconds).
 const GIT_TIMEOUT_SECS: u64 = 30;
+
+/// Maximum number of paths that one exact worktree transaction may inspect.
+/// Refusing an oversized transaction preserves the worktree for a narrower,
+/// human-reviewed operation instead of truncating the generation silently.
+const MAX_TRANSACTION_PATHS: usize = 4_096;
+
+/// Maximum aggregate UTF-8 bytes retained across one path category.
+const MAX_TRANSACTION_PATH_BYTES: usize = 2 * 1024 * 1024;
+
+/// Filesystem-state bound for an exact worktree generation. Fingerprinting is
+/// streaming, so this limits I/O rather than resident memory. Refusal leaves
+/// the worktree untouched for manual or narrower recovery.
+const MAX_FINGERPRINT_ENTRIES: u64 = 200_000;
+const MAX_FINGERPRINT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Maximum commit-message bytes accepted by the worktree transaction tool.
+const MAX_COMMIT_MESSAGE_BYTES: usize = 4_096;
+
+const WORKTREE_TRANSACTION_SCHEMA_VERSION: u16 = 1;
 
 /// Resolve `git` through the immutable executable search path captured for the
 /// exact run that owns the worktree operation.
@@ -325,6 +347,7 @@ fn git_in(
         ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
         ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
         ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+        ("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()),
     ]);
     crate::tools::run_sandboxed_with_timeout_with_env(
         run,
@@ -524,406 +547,1745 @@ fn retry_worktree_add_for_existing_branch(
     }
 }
 
-/// Resolved geometry of a worktree-exit request.
-///
-/// Computed by [`validate_exit_request`] before any mutating git command runs
-/// so the orchestration in [`execute_exit_worktree`] stays a flat sequence of
-/// helpers rather than a deeply nested function.
-struct ExitContext {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreeOperation {
+    Preview,
+    Stage,
+    Commit,
+    Merge,
+    Discard,
+    Remove,
+    LegacyApply,
+    LegacyDiscard,
+}
+
+impl WorktreeOperation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preview => "preview",
+            Self::Stage => "stage",
+            Self::Commit => "commit",
+            Self::Merge => "merge",
+            Self::Discard => "discard",
+            Self::Remove => "remove",
+            Self::LegacyApply => "legacy_apply",
+            Self::LegacyDiscard => "legacy_discard",
+        }
+    }
+
+    const fn effect(self) -> crate::tools::effect::ToolEffect {
+        use crate::tools::effect::ToolEffect;
+        match self {
+            Self::Preview => ToolEffect::ReadOnly,
+            Self::Stage | Self::Commit | Self::Merge => ToolEffect::WorkspaceMutation,
+            Self::Discard | Self::Remove | Self::LegacyApply | Self::LegacyDiscard => {
+                ToolEffect::Destructive
+            }
+        }
+    }
+}
+
+fn parse_operation_name(value: &str) -> Result<WorktreeOperation, String> {
+    match value {
+        "preview" => Ok(WorktreeOperation::Preview),
+        "stage" => Ok(WorktreeOperation::Stage),
+        "commit" => Ok(WorktreeOperation::Commit),
+        "merge" => Ok(WorktreeOperation::Merge),
+        "discard" => Ok(WorktreeOperation::Discard),
+        "remove" => Ok(WorktreeOperation::Remove),
+        _ => Err(format!(
+            "invalid worktree operation '{value}'; expected preview, stage, commit, merge, discard, or remove"
+        )),
+    }
+}
+
+fn parse_worktree_operation<S: std::hash::BuildHasher>(
+    args: &HashMap<String, Value, S>,
+) -> Result<WorktreeOperation, String> {
+    let apply = args
+        .arg_bool_or_strict("apply_changes", false)
+        .map_err(|error| error.to_string())?;
+    let discard = args
+        .arg_bool_or_strict("discard_changes", false)
+        .map_err(|error| error.to_string())?;
+    match args.get("operation") {
+        Some(Value::String(operation)) => {
+            if apply || discard {
+                return Err(
+                    "'operation' cannot be combined with deprecated apply_changes/discard_changes flags"
+                        .to_string(),
+                );
+            }
+            parse_operation_name(operation)
+        }
+        Some(_) => Err("Invalid 'operation' argument: expected string".to_string()),
+        None if apply => Ok(WorktreeOperation::LegacyApply),
+        None if discard => Ok(WorktreeOperation::LegacyDiscard),
+        None => Ok(WorktreeOperation::Preview),
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct ChangeState {
+    staged: BTreeSet<String>,
+    unstaged: BTreeSet<String>,
+    untracked: BTreeSet<String>,
+    ignored: BTreeSet<String>,
+    conflicted: BTreeSet<String>,
+}
+
+impl ChangeState {
+    fn reviewable_paths(&self) -> BTreeSet<String> {
+        self.staged
+            .iter()
+            .chain(&self.unstaged)
+            .chain(&self.untracked)
+            .chain(&self.conflicted)
+            .cloned()
+            .collect()
+    }
+
+    fn tracked_and_untracked_clean(&self) -> bool {
+        self.staged.is_empty()
+            && self.unstaged.is_empty()
+            && self.untracked.is_empty()
+            && self.conflicted.is_empty()
+    }
+
+    fn completely_clean(&self) -> bool {
+        self.tracked_and_untracked_clean() && self.ignored.is_empty()
+    }
+}
+
+struct GitStatusObservation {
+    branch: String,
+    head: String,
+    changes: ChangeState,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WorktreeSnapshotView {
+    schema_version: u16,
+    repository_id: String,
+    worktree_id: String,
+    generation: String,
+    path: String,
+    branch: String,
+    worktree_head: String,
+    target_path: String,
+    target_branch: String,
+    target_head: String,
+    worktree_content_digest: String,
+    worktree_index_digest: String,
+    target_change_digest: String,
+    changes: ChangeState,
+    target_changes: ChangeState,
+}
+
+struct WorktreeSnapshot {
+    view: WorktreeSnapshotView,
     worktree_path: PathBuf,
     main_path: PathBuf,
-    current_branch: String,
-    apply_changes: bool,
-    /// `true` iff the caller explicitly passed `discard_changes=true` and is
-    /// willing to lose uncommitted work in the worktree (crosslink #623).
-    discard_changes: bool,
 }
 
-/// Inspect the worktree for uncommitted changes using `git status --porcelain`.
-///
-/// Returns `Ok(true)` if the worktree has tracked or untracked dirty files,
-/// `Ok(false)` if it is clean, and `Err(msg)` if the porcelain status command
-/// itself failed.
-fn worktree_has_uncommitted_changes(
+#[derive(Serialize)]
+struct SnapshotGeneration<'a> {
+    schema_version: u16,
+    repository_id: &'a str,
+    worktree_id: &'a str,
+    path: &'a str,
+    branch: &'a str,
+    worktree_head: &'a str,
+    target_path: &'a str,
+    target_branch: &'a str,
+    target_head: &'a str,
+    worktree_content_digest: &'a str,
+    worktree_index_digest: &'a str,
+    target_change_digest: &'a str,
+    changes: &'a ChangeState,
+    target_changes: &'a ChangeState,
+}
+
+fn git_success(
     run: &crate::tools::security::ToolRunContext,
-    worktree_path: &Path,
-) -> Result<bool, String> {
-    match git_in(run, worktree_path, &["status", "--porcelain"]) {
-        Ok(o) if o.status.success() => {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            Ok(stdout.lines().any(|l| !l.trim().is_empty()))
-        }
-        Ok(o) => Err(format!(
-            "git status --porcelain failed: {}",
-            String::from_utf8_lossy(&o.stderr).trim()
-        )),
-        Err(e) => Err(e),
+    cwd: &Path,
+    args: &[&str],
+) -> Result<std::process::Output, String> {
+    let output = git_in(run, cwd, args)?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
     }
 }
 
-/// Parse and validate the arguments to `exit_worktree`. Returns either a
-/// resolved [`ExitContext`] or an error tuple ready to bubble back to the
-/// caller.
-fn validate_exit_request<S: std::hash::BuildHasher>(
+fn git_text(
     run: &crate::tools::security::ToolRunContext,
-    args: &HashMap<String, Value, S>,
-) -> Result<ExitContext, (String, bool)> {
-    let path_arg = match args.get("path") {
-        None => "",
-        Some(Value::String(path)) => path,
-        Some(_) => {
-            return Err(ToolArgError::WrongType {
-                key: "path",
-                expected: "string",
+    cwd: &Path,
+    args: &[&str],
+) -> Result<String, String> {
+    let output = git_success(run, cwd, args)?;
+    String::from_utf8(output.stdout)
+        .map(|text| text.trim().to_string())
+        .map_err(|_| format!("git {} returned non-UTF-8 output", args.join(" ")))
+}
+
+fn resolve_git_path(base: &Path, raw: &str, label: &str) -> Result<PathBuf, String> {
+    let candidate = Path::new(raw);
+    let candidate = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        base.join(candidate)
+    };
+    std::fs::canonicalize(&candidate)
+        .map_err(|error| format!("Cannot resolve {label} '{}': {error}", candidate.display()))
+}
+
+fn record_status_path(
+    observed: &mut BTreeSet<String>,
+    total_bytes: &mut usize,
+    raw: &[u8],
+) -> Result<String, String> {
+    let path = std::str::from_utf8(raw)
+        .map_err(|_| "git status reported a non-UTF-8 path; refusing mutation".to_string())?;
+    if observed.insert(path.to_string()) {
+        *total_bytes = total_bytes.saturating_add(path.len());
+    }
+    if observed.len() > MAX_TRANSACTION_PATHS || *total_bytes > MAX_TRANSACTION_PATH_BYTES {
+        return Err(format!(
+            "Worktree inspection exceeds the transaction limit of {MAX_TRANSACTION_PATHS} paths or {MAX_TRANSACTION_PATH_BYTES} path bytes"
+        ));
+    }
+    Ok(path.to_string())
+}
+
+fn record_xy(state: &mut ChangeState, path: String, xy: &str) -> Result<(), String> {
+    let bytes = xy.as_bytes();
+    if bytes.len() != 2 {
+        return Err(format!("Malformed Git status code '{xy}'"));
+    }
+    if bytes[0] != b'.' {
+        state.staged.insert(path.clone());
+    }
+    if bytes[1] != b'.' {
+        state.unstaged.insert(path.clone());
+    }
+    if bytes.contains(&b'U') {
+        state.conflicted.insert(path);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // Porcelain-v2 record variants share one bounded parser.
+fn parse_porcelain_v2(bytes: &[u8], include_ignored: bool) -> Result<GitStatusObservation, String> {
+    let records = bytes.split(|byte| *byte == 0).collect::<Vec<_>>();
+    let mut state = ChangeState::default();
+    let mut branch = None;
+    let mut head = None;
+    let mut observed = BTreeSet::new();
+    let mut total_bytes = 0_usize;
+    let mut index = 0_usize;
+    while index < records.len() {
+        let raw = records[index];
+        index = index.saturating_add(1);
+        if raw.is_empty() {
+            continue;
+        }
+        if let Some(value) = raw.strip_prefix(b"# branch.oid ") {
+            head = Some(
+                std::str::from_utf8(value)
+                    .map_err(|_| "Git branch OID is not UTF-8".to_string())?
+                    .to_string(),
+            );
+            continue;
+        }
+        if let Some(value) = raw.strip_prefix(b"# branch.head ") {
+            branch = Some(
+                std::str::from_utf8(value)
+                    .map_err(|_| "Git branch name is not UTF-8".to_string())?
+                    .to_string(),
+            );
+            continue;
+        }
+        if raw.starts_with(b"# ") {
+            continue;
+        }
+        if let Some(path) = raw.strip_prefix(b"? ") {
+            let path = record_status_path(&mut observed, &mut total_bytes, path)?;
+            state.untracked.insert(path);
+            continue;
+        }
+        if let Some(path) = raw.strip_prefix(b"! ") {
+            if include_ignored {
+                let path = record_status_path(&mut observed, &mut total_bytes, path)?;
+                state.ignored.insert(path);
             }
-            .into_tool_error());
+            continue;
         }
-    };
-    if path_arg.is_empty() {
-        return Err((
-            "Error: 'path' is required — exit_worktree no longer reads the \
-             process CWD. Pass the path returned by enter_worktree."
-                .to_string(),
-            true,
-        ));
+        let text = std::str::from_utf8(raw)
+            .map_err(|_| "git status reported non-UTF-8 metadata".to_string())?;
+        if text.starts_with("1 ") {
+            let fields = text.splitn(9, ' ').collect::<Vec<_>>();
+            if fields.len() != 9 {
+                return Err(format!("Malformed ordinary Git status record: {text}"));
+            }
+            let path = record_status_path(&mut observed, &mut total_bytes, fields[8].as_bytes())?;
+            record_xy(&mut state, path, fields[1])?;
+            continue;
+        }
+        if text.starts_with("2 ") {
+            let fields = text.splitn(10, ' ').collect::<Vec<_>>();
+            if fields.len() != 10 || index >= records.len() {
+                return Err(format!("Malformed renamed Git status record: {text}"));
+            }
+            let current =
+                record_status_path(&mut observed, &mut total_bytes, fields[9].as_bytes())?;
+            let original = record_status_path(&mut observed, &mut total_bytes, records[index])?;
+            index = index.saturating_add(1);
+            record_xy(&mut state, current, fields[1])?;
+            record_xy(&mut state, original, fields[1])?;
+            continue;
+        }
+        if text.starts_with("u ") {
+            let fields = text.splitn(11, ' ').collect::<Vec<_>>();
+            if fields.len() != 11 {
+                return Err(format!("Malformed unmerged Git status record: {text}"));
+            }
+            let path = record_status_path(&mut observed, &mut total_bytes, fields[10].as_bytes())?;
+            state.conflicted.insert(path);
+            continue;
+        }
+        return Err(format!("Unsupported Git status record: {text}"));
     }
-    let worktree_path = PathBuf::from(path_arg);
-    if !worktree_path.exists() {
-        return Err((
-            format!(
-                "Error: worktree path does not exist: {}",
-                worktree_path.display()
-            ),
-            true,
-        ));
+    let branch = branch.ok_or_else(|| "Git status omitted branch identity".to_string())?;
+    let head = head.ok_or_else(|| "Git status omitted HEAD identity".to_string())?;
+    if branch == "(detached)" || head == "(initial)" {
+        return Err(
+            "Worktree transaction requires an attached branch with an existing HEAD".to_string(),
+        );
     }
-
-    let apply_changes = args
-        .arg_bool_or_strict("apply_changes", false)
-        .map_err(crate::tools::args::ToolArgError::into_tool_error)?;
-
-    // Crosslink #623: opt-in flag that lets the caller acknowledge the loss
-    // of uncommitted work. Defaults to `false`, which causes the safety
-    // gate in `execute_exit_worktree` to refuse destructive removal when
-    // the worktree is dirty.
-    let discard_changes = args
-        .arg_bool_or_strict("discard_changes", false)
-        .map_err(crate::tools::args::ToolArgError::into_tool_error)?;
-
-    let common_dir = match git_in(run, &worktree_path, &["rev-parse", "--git-common-dir"]) {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        }
-        _ => {
-            return Err((
-                format!(
-                    "Error: path is not inside a git worktree: {}",
-                    worktree_path.display()
-                ),
-                true,
-            ));
-        }
-    };
-
-    // crosslink #983: refuse to proceed if `git rev-parse --git-dir` itself
-    // failed. Previously this branch silently fell through to an empty
-    // string, which then *did not equal* the (non-empty) common_dir — so a
-    // corrupted `.git` was misclassified as an isolated worktree and the
-    // function would happily call `git worktree remove --force` on the
-    // user's main repository. Surface the underlying git failure instead.
-    let git_dir = match git_in(run, &worktree_path, &["rev-parse", "--git-dir"]) {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        Ok(o) => {
-            return Err((
-                format!(
-                    "Error: failed to resolve git directory for '{}': {}",
-                    worktree_path.display(),
-                    String::from_utf8_lossy(&o.stderr).trim()
-                ),
-                true,
-            ));
-        }
-        Err(e) => {
-            return Err((
-                format!(
-                    "Error: failed to run git rev-parse --git-dir on '{}': {e}",
-                    worktree_path.display()
-                ),
-                true,
-            ));
-        }
-    };
-
-    if git_dir == common_dir || git_dir == ".git" {
-        return Err((
-            "Not in an isolated worktree. Use this tool only on a worktree \
-             created by enter_worktree."
-                .to_string(),
-            true,
-        ));
-    }
-
-    let current_branch = get_current_branch_at(run, &worktree_path).unwrap_or_default();
-    let main_path = Path::new(&common_dir)
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf();
-
-    Ok(ExitContext {
-        worktree_path,
-        main_path,
-        current_branch,
-        apply_changes,
-        discard_changes,
+    Ok(GitStatusObservation {
+        branch,
+        head,
+        changes: state,
     })
 }
 
-/// Render a git error from `git_in`'s `Result<Output, String>`.
-fn render_git_failure(res: &Result<std::process::Output, String>) -> String {
-    match res {
-        Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
-        Err(e) => e.clone(),
-    }
-}
-
-/// Outcome of [`merge_into_main`] — distinguishes the three relevant states
-/// the orchestrator must react to (crosslink #858).
-pub(crate) enum MergeOutcome {
-    /// Branch merged cleanly into the main worktree.
-    Merged(String),
-    /// Worktree had no changes to commit; nothing to merge.
-    NothingToMerge,
-    /// A git command produced an error the caller must surface. The message
-    /// already encodes whether `git merge --abort` succeeded — the orchestrator
-    /// only needs to forward the text to the user.
-    Failed { message: String },
-}
-
-/// Stage + commit + merge the worktree branch into the main worktree.
-///
-/// crosslink #858: each git step is now error-propagated rather than
-/// swallowed by `let _ = …`. On merge conflict the function runs
-/// `git merge --abort` in the main worktree so the user is left in a clean
-/// state instead of a half-merged HEAD that the next `worktree remove
-/// --force` would silently throw away.
-fn merge_into_main(
+fn inspect_changes(
     run: &crate::tools::security::ToolRunContext,
-    ctx: &ExitContext,
-) -> MergeOutcome {
-    match git_in(run, &ctx.worktree_path, &["add", "-A"]) {
-        Ok(o) if o.status.success() => {}
-        Ok(o) => {
-            return MergeOutcome::Failed {
-                message: format!(
-                    "git add -A failed in worktree: {}",
-                    String::from_utf8_lossy(&o.stderr).trim()
-                ),
-            };
-        }
-        Err(e) => {
-            return MergeOutcome::Failed {
-                message: format!("git add -A failed in worktree: {e}"),
-            };
-        }
+    cwd: &Path,
+    include_ignored: bool,
+) -> Result<GitStatusObservation, String> {
+    let mut args = vec![
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--branch",
+        "--untracked-files=all",
+    ];
+    if include_ignored {
+        args.push("--ignored=matching");
     }
+    let output = git_success(run, cwd, &args)?;
+    parse_porcelain_v2(&output.stdout, include_ignored)
+}
 
-    let commit = git_in(
+#[derive(Default)]
+struct FingerprintBudget {
+    entries: u64,
+    bytes: u64,
+}
+
+fn hash_framed(hasher: &mut Sha256, label: &[u8], bytes: &[u8]) {
+    hasher.update(label.len().to_le_bytes());
+    hasher.update(label);
+    hasher.update(bytes.len().to_le_bytes());
+    hasher.update(bytes);
+}
+
+#[cfg(unix)]
+fn hash_platform_metadata(hasher: &mut Sha256, metadata: &std::fs::Metadata) {
+    use std::os::unix::fs::MetadataExt as _;
+    hasher.update(metadata.mode().to_le_bytes());
+}
+
+#[cfg(not(unix))]
+fn hash_platform_metadata(hasher: &mut Sha256, metadata: &std::fs::Metadata) {
+    hasher.update([u8::from(metadata.permissions().readonly())]);
+}
+
+fn stable_file_metadata(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    if before.len() != after.len()
+        || before.file_type() != after.file_type()
+        || before.modified().ok() != after.modified().ok()
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        before.dev() == after.dev() && before.ino() == after.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn fingerprint_entry(
+    root: &Path,
+    relative: &Path,
+    hasher: &mut Sha256,
+    budget: &mut FingerprintBudget,
+) -> Result<(), String> {
+    budget.entries = budget.entries.saturating_add(1);
+    if budget.entries > MAX_FINGERPRINT_ENTRIES {
+        return Err(format!(
+            "Worktree fingerprint exceeds {MAX_FINGERPRINT_ENTRIES} filesystem entries"
+        ));
+    }
+    hash_framed(hasher, b"path", relative.as_os_str().as_encoded_bytes());
+    let path = root.join(relative);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            hash_framed(hasher, b"type", b"missing");
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(format!(
+                "Cannot inspect worktree path '{}': {error}",
+                path.display()
+            ));
+        }
+    };
+    hash_platform_metadata(hasher, &metadata);
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        hash_framed(hasher, b"type", b"symlink");
+        let target = std::fs::read_link(&path)
+            .map_err(|error| format!("Cannot read symlink '{}': {error}", path.display()))?;
+        hash_framed(hasher, b"target", target.as_os_str().as_encoded_bytes());
+        return Ok(());
+    }
+    if file_type.is_file() {
+        hash_framed(hasher, b"type", b"file");
+        hasher.update(metadata.len().to_le_bytes());
+        budget.bytes = budget.bytes.saturating_add(metadata.len());
+        if budget.bytes > MAX_FINGERPRINT_BYTES {
+            return Err(format!(
+                "Worktree fingerprint exceeds {MAX_FINGERPRINT_BYTES} file bytes"
+            ));
+        }
+        let mut file = std::fs::File::open(&path)
+            .map_err(|error| format!("Cannot open worktree file '{}': {error}", path.display()))?;
+        let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+        loop {
+            let read = file.read(&mut buffer).map_err(|error| {
+                format!("Cannot read worktree file '{}': {error}", path.display())
+            })?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        let after = std::fs::symlink_metadata(&path).map_err(|error| {
+            format!(
+                "Cannot re-inspect worktree file '{}': {error}",
+                path.display()
+            )
+        })?;
+        if !stable_file_metadata(&metadata, &after) {
+            return Err(format!(
+                "Worktree file changed during inspection: {}",
+                path.display()
+            ));
+        }
+        return Ok(());
+    }
+    if file_type.is_dir() {
+        hash_framed(hasher, b"type", b"directory");
+        let mut children = std::fs::read_dir(&path)
+            .map_err(|error| {
+                format!(
+                    "Cannot list worktree directory '{}': {error}",
+                    path.display()
+                )
+            })?
+            .map(|entry| {
+                entry
+                    .map(|entry| entry.file_name())
+                    .map_err(|error| format!("Cannot enumerate '{}': {error}", path.display()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        children.sort_unstable();
+        for child in children {
+            fingerprint_entry(root, &relative.join(child), hasher, budget)?;
+        }
+        return Ok(());
+    }
+    Err(format!(
+        "Unsupported special filesystem entry in worktree: {}",
+        path.display()
+    ))
+}
+
+fn fingerprint_paths<'a>(
+    root: &Path,
+    paths: impl IntoIterator<Item = &'a Path>,
+) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    hash_framed(&mut hasher, b"domain", b"openclaudia-worktree-state-v1");
+    let mut budget = FingerprintBudget::default();
+    for path in paths {
+        fingerprint_entry(root, path, &mut hasher, &mut budget)?;
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
+    Ok(crate::runtime::ContentDigest::from_sha256_bytes(digest).to_string())
+}
+
+fn fingerprint_changed_paths(root: &Path, changes: &ChangeState) -> Result<String, String> {
+    let paths = changes.reviewable_paths();
+    fingerprint_paths(root, paths.iter().map(Path::new))
+}
+
+fn identity_digest<T: Serialize>(value: &T) -> Result<String, String> {
+    serde_json::to_vec(value)
+        .map(crate::runtime::ContentDigest::sha256)
+        .map(|digest| digest.to_string())
+        .map_err(|error| format!("Cannot encode worktree identity: {error}"))
+}
+
+fn storage_identity(path: &Path, label: &str) -> Result<crate::persistence::StorageRootId, String> {
+    crate::persistence::PersistentStorage::open(path)
+        .map(|storage| storage.root_id())
+        .map_err(|error| format!("Cannot pin {label} '{}': {error}", path.display()))
+}
+
+#[allow(clippy::too_many_lines)] // One observation must bind both linked worktree and target state.
+fn inspect_worktree(
+    run: &crate::tools::security::ToolRunContext,
+    requested_path: &Path,
+) -> Result<WorktreeSnapshot, String> {
+    let worktree_path = std::fs::canonicalize(requested_path).map_err(|error| {
+        format!(
+            "Cannot resolve worktree path '{}': {error}",
+            requested_path.display()
+        )
+    })?;
+    let geometry = git_text(
         run,
-        &ctx.worktree_path,
+        &worktree_path,
         &[
-            "commit",
-            "-m",
-            &format!("Worktree changes from branch '{}'", ctx.current_branch),
+            "rev-parse",
+            "--git-common-dir",
+            "--git-dir",
+            "--show-object-format",
         ],
-    );
-    // A failed commit here is the *expected* signal that there are no staged
-    // changes — git exits non-zero with stderr "nothing to commit, working
-    // tree clean". Treat that as "nothing to merge" rather than a hard error.
-    let committed = commit.as_ref().is_ok_and(|o| o.status.success());
-    if !committed {
-        return MergeOutcome::NothingToMerge;
+    )?;
+    let mut geometry = geometry.lines();
+    let common_raw = geometry
+        .next()
+        .ok_or_else(|| "Git omitted its common directory".to_string())?;
+    let git_dir_raw = geometry
+        .next()
+        .ok_or_else(|| "Git omitted its linked-worktree directory".to_string())?;
+    let object_format = geometry
+        .next()
+        .ok_or_else(|| "Git omitted its object format".to_string())?;
+    if geometry.next().is_some() {
+        return Err("Git returned unexpected repository geometry".to_string());
+    }
+    let common_dir = resolve_git_path(&worktree_path, common_raw, "Git common directory")?;
+    let git_dir = resolve_git_path(&worktree_path, git_dir_raw, "linked-worktree Git directory")?;
+    if git_dir == common_dir {
+        return Err(
+            "Not in an isolated worktree. Use this tool only on a linked worktree.".to_string(),
+        );
+    }
+    let main_path = common_dir
+        .parent()
+        .ok_or_else(|| "Git common directory has no repository parent".to_string())?;
+    let main_path = std::fs::canonicalize(main_path)
+        .map_err(|error| format!("Cannot resolve main worktree: {error}"))?;
+    if main_path == worktree_path {
+        return Err("Refusing to transact against the main worktree".to_string());
     }
 
-    match git_in(
+    // S-108 deliberately publishes Git metadata through transactional
+    // projections, so the common-dir and linked-admin directory inode may
+    // change after a successful sandboxed Git command. Bind repository and
+    // worktree identity to the stable descriptor-pinned content roots plus
+    // the canonical metadata paths; binding to projected metadata inodes
+    // would make every read-only preview invalidate itself.
+    let repository_root_id = storage_identity(&main_path, "main worktree root")?;
+    let worktree_root_id = storage_identity(&worktree_path, "worktree root")?;
+    let repository_id = identity_digest(&(
+        repository_root_id,
+        common_dir.to_string_lossy(),
+        object_format,
+    ))?;
+    let worktree_id =
+        identity_digest(&(worktree_root_id, git_dir.to_string_lossy(), &repository_id))?;
+
+    let worktree_status = inspect_changes(run, &worktree_path, true)?;
+    // Ignored files in the merge target are not touched by any S-073 phase.
+    // Traversing target/, .worktrees/, and other ignored caches would make a
+    // small worktree transaction proportional to unrelated build artifacts.
+    let target_status = inspect_changes(run, &main_path, false)?;
+    let mut target_changes = target_status.changes;
+    if let Ok(relative_worktree) = worktree_path.strip_prefix(&main_path) {
+        let retain_outside_managed_worktree = |path: &String| {
+            let path = Path::new(path);
+            path != relative_worktree && !path.starts_with(relative_worktree)
+        };
+        target_changes
+            .staged
+            .retain(retain_outside_managed_worktree);
+        target_changes
+            .unstaged
+            .retain(retain_outside_managed_worktree);
+        target_changes
+            .untracked
+            .retain(retain_outside_managed_worktree);
+        target_changes
+            .ignored
+            .retain(retain_outside_managed_worktree);
+        target_changes
+            .conflicted
+            .retain(retain_outside_managed_worktree);
+    }
+    let path = worktree_path
+        .to_str()
+        .ok_or_else(|| "Worktree path is not valid UTF-8; refusing mutation".to_string())?
+        .to_string();
+    let target_path = main_path
+        .to_str()
+        .ok_or_else(|| "Main worktree path is not valid UTF-8; refusing mutation".to_string())?
+        .to_string();
+    let branch = worktree_status.branch;
+    let worktree_head = worktree_status.head;
+    let changes = worktree_status.changes;
+    let target_branch = target_status.branch;
+    let target_head = target_status.head;
+    // Bind approvals to bytes, not only status categories. This prevents a
+    // same-path edit from reusing an older destructive approval. The linked
+    // worktree tree includes untracked, ignored, and empty directories; the
+    // separate index digest distinguishes staged content from working bytes.
+    let worktree_content_digest =
+        fingerprint_paths(&worktree_path, std::iter::once(Path::new("")))?;
+    let worktree_index_digest = fingerprint_paths(&git_dir, std::iter::once(Path::new("index")))?;
+    let target_change_digest = fingerprint_changed_paths(&main_path, &target_changes)?;
+    let material = SnapshotGeneration {
+        schema_version: WORKTREE_TRANSACTION_SCHEMA_VERSION,
+        repository_id: &repository_id,
+        worktree_id: &worktree_id,
+        path: &path,
+        branch: &branch,
+        worktree_head: &worktree_head,
+        target_path: &target_path,
+        target_branch: &target_branch,
+        target_head: &target_head,
+        worktree_content_digest: &worktree_content_digest,
+        worktree_index_digest: &worktree_index_digest,
+        target_change_digest: &target_change_digest,
+        changes: &changes,
+        target_changes: &target_changes,
+    };
+    let generation = identity_digest(&material)?;
+    Ok(WorktreeSnapshot {
+        view: WorktreeSnapshotView {
+            schema_version: WORKTREE_TRANSACTION_SCHEMA_VERSION,
+            repository_id,
+            worktree_id,
+            generation,
+            path,
+            branch,
+            worktree_head,
+            target_path,
+            target_branch,
+            target_head,
+            worktree_content_digest,
+            worktree_index_digest,
+            target_change_digest,
+            changes,
+            target_changes,
+        },
+        worktree_path,
+        main_path,
+    })
+}
+
+fn snapshot_payload(operation: WorktreeOperation, snapshot: &WorktreeSnapshot) -> Value {
+    json!({
+        "schema_version": WORKTREE_TRANSACTION_SCHEMA_VERSION,
+        "operation": operation.as_str(),
+        "transaction": snapshot.view,
+    })
+}
+
+fn failure_with_snapshot(
+    code: crate::tools::ToolFailureCode,
+    message: impl Into<String>,
+    retryability: crate::tools::ToolRetryability,
+    operation: WorktreeOperation,
+    snapshot: Option<&WorktreeSnapshot>,
+    next_action: &str,
+) -> crate::tools::ToolHandlerResult {
+    let mut failure = crate::tools::ToolFailure::new(code, message.into(), retryability);
+    failure.recovery = Some(json!({
+        "next_action": next_action,
+        "state": snapshot.map(|state| snapshot_payload(operation, state)),
+    }));
+    crate::tools::ToolHandlerResult::error(failure)
+}
+
+fn partial_with_snapshot(
+    message: impl Into<String>,
+    operation: WorktreeOperation,
+    snapshot: Option<&WorktreeSnapshot>,
+    next_action: &str,
+) -> crate::tools::ToolHandlerResult {
+    let failure = crate::tools::ToolFailure {
+        code: crate::tools::ToolFailureCode::External,
+        message: message.into(),
+        source: Some("git".to_string()),
+        retryability: crate::tools::ToolRetryability::Safe,
+        recovery: Some(json!({"next_action": next_action})),
+    };
+    let structured = snapshot.map_or_else(
+        || json!({"operation": operation.as_str()}),
+        |state| snapshot_payload(operation, state),
+    );
+    crate::tools::ToolHandlerResult::partial_structured(
+        "Worktree operation changed state but did not reach its terminal postcondition",
+        structured,
+        vec![failure],
+        None,
+    )
+}
+
+fn required_string<'a, S: std::hash::BuildHasher>(
+    args: &'a HashMap<String, Value, S>,
+    key: &'static str,
+) -> Result<&'a str, String> {
+    match args.get(key) {
+        Some(Value::String(value)) if !value.is_empty() => Ok(value),
+        Some(Value::String(_)) | None => Err(format!("'{key}' is required")),
+        Some(_) => Err(format!("Invalid '{key}' argument: expected string")),
+    }
+}
+
+fn expected_generation<S: std::hash::BuildHasher>(
+    args: &HashMap<String, Value, S>,
+) -> Result<&str, String> {
+    let generation = required_string(args, "expected_generation")?;
+    generation
+        .parse::<crate::runtime::ContentDigest>()
+        .map_err(|error| format!("Invalid expected_generation: {error}"))?;
+    Ok(generation)
+}
+
+fn requested_paths<S: std::hash::BuildHasher>(
+    args: &HashMap<String, Value, S>,
+) -> Result<BTreeSet<String>, String> {
+    let values = args
+        .get("paths")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "'paths' must be a non-empty array of relative paths".to_string())?;
+    if values.is_empty() || values.len() > MAX_TRANSACTION_PATHS {
+        return Err(format!(
+            "'paths' must contain between 1 and {MAX_TRANSACTION_PATHS} entries"
+        ));
+    }
+    let mut paths = BTreeSet::new();
+    let mut total_bytes = 0_usize;
+    for value in values {
+        let path = value
+            .as_str()
+            .ok_or_else(|| "Every 'paths' entry must be a string".to_string())?;
+        let parsed = Path::new(path);
+        if path.is_empty()
+            || parsed.is_absolute()
+            || parsed
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(format!("Invalid transaction path '{path}'"));
+        }
+        total_bytes = total_bytes.saturating_add(path.len());
+        if total_bytes > MAX_TRANSACTION_PATH_BYTES {
+            return Err(format!(
+                "Transaction path bytes exceed {MAX_TRANSACTION_PATH_BYTES}"
+            ));
+        }
+        if !paths.insert(path.to_string()) {
+            return Err(format!("Duplicate transaction path '{path}'"));
+        }
+    }
+    Ok(paths)
+}
+
+fn generation_matches(expected: &str, snapshot: &WorktreeSnapshot) -> bool {
+    expected == snapshot.view.generation
+}
+
+fn recovery_ref(expected: &str) -> Result<String, String> {
+    let suffix = expected
+        .strip_prefix("sha256:")
+        .ok_or_else(|| "expected_generation has no sha256 prefix".to_string())?;
+    Ok(format!("refs/openclaudia/worktree-recovery/{suffix}"))
+}
+
+fn cleanup_ref(expected: &str, worktree_path: &str) -> Result<String, String> {
+    let generation = expected
+        .strip_prefix("sha256:")
+        .ok_or_else(|| "expected_generation has no sha256 prefix".to_string())?;
+    let path_digest = identity_digest(&worktree_path)?;
+    let path = path_digest
+        .strip_prefix("sha256:")
+        .ok_or_else(|| "worktree path digest has no sha256 prefix".to_string())?;
+    Ok(format!(
+        "refs/openclaudia/worktree-cleanup/{generation}/{path}"
+    ))
+}
+
+fn ensure_recovery_ref(
+    run: &crate::tools::security::ToolRunContext,
+    snapshot: &WorktreeSnapshot,
+    expected: &str,
+    commit: &str,
+) -> Result<String, String> {
+    let reference = recovery_ref(expected)?;
+    if let Ok(observed) = git_text(
         run,
-        &ctx.main_path,
-        &["merge", &ctx.current_branch, "--no-edit"],
+        &snapshot.worktree_path,
+        &["rev-parse", "--verify", &reference],
     ) {
-        Ok(o) if o.status.success() => MergeOutcome::Merged(format!(
-            "Merged branch '{}' into main worktree.",
-            ctx.current_branch
+        return if observed == commit {
+            Ok(reference)
+        } else {
+            Err(format!(
+                "Recovery ref {reference} resolved to {observed}, expected {commit}"
+            ))
+        };
+    }
+    git_success(
+        run,
+        &snapshot.worktree_path,
+        &["update-ref", &reference, commit, ""],
+    )?;
+    let observed = git_text(
+        run,
+        &snapshot.worktree_path,
+        &["rev-parse", "--verify", &reference],
+    )?;
+    if observed != commit {
+        return Err(format!(
+            "Recovery ref {reference} resolved to {observed}, expected {commit}"
+        ));
+    }
+    Ok(reference)
+}
+
+fn ensure_cleanup_ref(
+    run: &crate::tools::security::ToolRunContext,
+    snapshot: &WorktreeSnapshot,
+    expected: &str,
+) -> Result<String, String> {
+    let reference = cleanup_ref(expected, &snapshot.view.path)?;
+    if let Ok(observed) = git_text(
+        run,
+        &snapshot.main_path,
+        &["rev-parse", "--verify", &reference],
+    ) {
+        return if observed == snapshot.view.worktree_head {
+            Ok(reference)
+        } else {
+            Err(format!(
+                "cleanup ref {reference} resolved to {observed}, expected {}",
+                snapshot.view.worktree_head
+            ))
+        };
+    }
+    git_success(
+        run,
+        &snapshot.main_path,
+        &["update-ref", &reference, &snapshot.view.worktree_head, ""],
+    )?;
+    let observed = git_text(
+        run,
+        &snapshot.main_path,
+        &["rev-parse", "--verify", &reference],
+    )?;
+    if observed != snapshot.view.worktree_head {
+        return Err(format!(
+            "cleanup ref {reference} resolved to {observed}, expected {}",
+            snapshot.view.worktree_head
+        ));
+    }
+    Ok(reference)
+}
+
+fn worktree_is_registered(
+    run: &crate::tools::security::ToolRunContext,
+    main_path: &Path,
+    worktree_path: &str,
+) -> Result<bool, String> {
+    let output = git_success(run, main_path, &["worktree", "list", "--porcelain", "-z"])?;
+    let expected = worktree_path.as_bytes();
+    Ok(output.stdout.split(|byte| *byte == 0).any(|record| {
+        record
+            .strip_prefix(b"worktree ")
+            .is_some_and(|path| path == expected)
+    }))
+}
+
+fn validate_cleanup_target(provided: &str, snapshot: &WorktreeSnapshot) -> Result<(), String> {
+    let canonical = std::fs::canonicalize(provided)
+        .map_err(|error| format!("Cannot resolve target_path '{provided}': {error}"))?;
+    if canonical != snapshot.main_path {
+        return Err(format!(
+            "target_path does not match the reviewed target (expected {})",
+            snapshot.main_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn reconcile_absent_cleanup(
+    run: &crate::tools::security::ToolRunContext,
+    operation: WorktreeOperation,
+    worktree_path: &str,
+    target_path: &str,
+    expected: &str,
+) -> crate::tools::ToolHandlerResult {
+    let main_path = match std::fs::canonicalize(target_path) {
+        Ok(path) => path,
+        Err(error) => {
+            return failure_with_snapshot(
+                crate::tools::ToolFailureCode::InvalidArguments,
+                format!("Cannot resolve target_path '{target_path}': {error}"),
+                crate::tools::ToolRetryability::Never,
+                operation,
+                None,
+                "Pass the exact target_path returned by the approved preview",
+            );
+        }
+    };
+    let reference = match cleanup_ref(expected, worktree_path) {
+        Ok(reference) => reference,
+        Err(error) => {
+            return failure_with_snapshot(
+                crate::tools::ToolFailureCode::InvalidArguments,
+                error,
+                crate::tools::ToolRetryability::Never,
+                operation,
+                None,
+                "Pass the exact generation returned by the approved cleanup call",
+            );
+        }
+    };
+    if git_text(run, &main_path, &["rev-parse", "--verify", &reference]).is_err() {
+        return failure_with_snapshot(
+            crate::tools::ToolFailureCode::Conflict,
+            "The worktree path is absent but this repository has no matching durable cleanup receipt",
+            crate::tools::ToolRetryability::Never,
+            operation,
+            None,
+            "Inspect the target repository and worktree metadata manually; no cleanup was attempted",
+        );
+    }
+    match worktree_is_registered(run, &main_path, worktree_path) {
+        Ok(false) => crate::tools::ToolHandlerResult::success_structured(
+            "Cleanup retry was already satisfied and verified by its repository-bound receipt",
+            json!({
+                "schema_version": WORKTREE_TRANSACTION_SCHEMA_VERSION,
+                "operation": operation.as_str(),
+                "terminal": "already_absent",
+                "generation": expected,
+                "path": worktree_path,
+                "target_path": main_path,
+                "cleanup_ref": reference,
+            }),
+        ),
+        Ok(true) => partial_with_snapshot(
+            "Worktree files are absent but Git still registers the linked worktree",
+            operation,
+            None,
+            "Keep the cleanup receipt and repair the stale Git worktree registration manually",
+        ),
+        Err(error) => partial_with_snapshot(
+            format!("Could not verify cleanup retry against Git worktree metadata: {error}"),
+            operation,
+            None,
+            "Do not assume cleanup completed; inspect the target repository and retained cleanup ref",
+        ),
+    }
+}
+
+fn is_ancestor(
+    run: &crate::tools::security::ToolRunContext,
+    cwd: &Path,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<bool, String> {
+    let output = git_in(
+        run,
+        cwd,
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+    )?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "git merge-base --is-ancestor failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
         )),
-        Ok(o) => {
-            // crosslink #858: leaving the main worktree mid-merge is the
-            // worst possible failure mode — `worktree remove --force` would
-            // then discard the user's uncommitted (conflict-resolution)
-            // edits. Abort the merge first so HEAD is clean again.
-            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-            let abort = git_in(run, &ctx.main_path, &["merge", "--abort"]);
-            let aborted = abort.is_ok_and(|out| out.status.success());
-            MergeOutcome::Failed {
-                message: format!(
-                    "Merge had conflicts: {stderr}{}",
-                    if aborted {
-                        " (merge aborted; main worktree restored)"
-                    } else {
-                        " (warning: git merge --abort also failed; main worktree may be in a half-merged state)"
-                    }
-                ),
+    }
+}
+
+fn inspect_after(
+    run: &crate::tools::security::ToolRunContext,
+    path: &Path,
+) -> Option<WorktreeSnapshot> {
+    inspect_worktree(run, path).ok()
+}
+
+#[allow(clippy::too_many_lines)] // Keep one auditable stage state machine and its postconditions.
+fn execute_stage<S: std::hash::BuildHasher>(
+    run: &crate::tools::security::ToolRunContext,
+    args: &HashMap<String, Value, S>,
+    snapshot: &WorktreeSnapshot,
+) -> crate::tools::ToolHandlerResult {
+    let expected = match expected_generation(args) {
+        Ok(value) => value,
+        Err(error) => {
+            return failure_with_snapshot(
+                crate::tools::ToolFailureCode::InvalidArguments,
+                error,
+                crate::tools::ToolRetryability::Never,
+                WorktreeOperation::Stage,
+                Some(snapshot),
+                "Run operation=preview and pass its exact generation and path list",
+            );
+        }
+    };
+    let paths = match requested_paths(args) {
+        Ok(paths) => paths,
+        Err(error) => {
+            return failure_with_snapshot(
+                crate::tools::ToolFailureCode::InvalidArguments,
+                error,
+                crate::tools::ToolRetryability::Never,
+                WorktreeOperation::Stage,
+                Some(snapshot),
+                "Run operation=preview and review every returned non-ignored path",
+            );
+        }
+    };
+    if !generation_matches(expected, snapshot) {
+        return failure_with_snapshot(
+            crate::tools::ToolFailureCode::Conflict,
+            "Worktree generation changed before stage",
+            crate::tools::ToolRetryability::Safe,
+            WorktreeOperation::Stage,
+            Some(snapshot),
+            "Review the returned state and request stage again with its new generation",
+        );
+    }
+    if !snapshot.view.changes.conflicted.is_empty() {
+        return failure_with_snapshot(
+            crate::tools::ToolFailureCode::Conflict,
+            "Cannot stage a worktree with unresolved conflicts",
+            crate::tools::ToolRetryability::Safe,
+            WorktreeOperation::Stage,
+            Some(snapshot),
+            "Resolve conflicts, preview the resulting generation, and retry",
+        );
+    }
+    let observed_paths = snapshot.view.changes.reviewable_paths();
+    if paths != observed_paths {
+        return failure_with_snapshot(
+            crate::tools::ToolFailureCode::Conflict,
+            "Stage paths do not exactly match the reviewed worktree generation",
+            crate::tools::ToolRetryability::Safe,
+            WorktreeOperation::Stage,
+            Some(snapshot),
+            "Use exactly the non-ignored paths returned by preview; ignored data requires an explicit discard or manual preservation decision",
+        );
+    }
+    let mut owned = vec!["add", "-A", "--"];
+    owned.extend(paths.iter().map(String::as_str));
+    let result = git_in(run, &snapshot.worktree_path, &owned);
+    let after = inspect_after(run, &snapshot.worktree_path);
+    match result {
+        Ok(output) if output.status.success() => {
+            let Some(after) = after else {
+                return partial_with_snapshot(
+                    "Stage completed but the resulting worktree state could not be inspected",
+                    WorktreeOperation::Stage,
+                    None,
+                    "Do not clean up; inspect the worktree manually, then run preview",
+                );
+            };
+            let reached = after.view.changes.staged == paths
+                && after.view.changes.unstaged.is_empty()
+                && after.view.changes.untracked.is_empty()
+                && after.view.changes.conflicted.is_empty();
+            let reviewed_inputs_unchanged = after.view.repository_id == snapshot.view.repository_id
+                && after.view.worktree_id == snapshot.view.worktree_id
+                && after.view.path == snapshot.view.path
+                && after.view.branch == snapshot.view.branch
+                && after.view.worktree_head == snapshot.view.worktree_head
+                && after.view.target_path == snapshot.view.target_path
+                && after.view.target_branch == snapshot.view.target_branch
+                && after.view.target_head == snapshot.view.target_head
+                && after.view.worktree_content_digest == snapshot.view.worktree_content_digest
+                && after.view.target_change_digest == snapshot.view.target_change_digest
+                && after.view.target_changes == snapshot.view.target_changes;
+            if !reached || !reviewed_inputs_unchanged {
+                return partial_with_snapshot(
+                    "Git stage changed state without reaching the exact reviewed postcondition",
+                    WorktreeOperation::Stage,
+                    Some(&after),
+                    "Keep the worktree; review the returned generation before another operation",
+                );
+            }
+            crate::tools::ToolHandlerResult::success_structured(
+                "Staged the exact reviewed worktree paths",
+                snapshot_payload(WorktreeOperation::Stage, &after),
+            )
+        }
+        Ok(output) => {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if after
+                .as_ref()
+                .is_some_and(|state| state.view.generation != snapshot.view.generation)
+            {
+                partial_with_snapshot(
+                    format!("Git stage failed after changing the index: {detail}"),
+                    WorktreeOperation::Stage,
+                    after.as_ref(),
+                    "The worktree was retained; preview and review the partially staged state",
+                )
+            } else {
+                failure_with_snapshot(
+                    crate::tools::ToolFailureCode::External,
+                    format!("Git stage failed without changing the reviewed generation: {detail}"),
+                    crate::tools::ToolRetryability::Safe,
+                    WorktreeOperation::Stage,
+                    after.as_ref().or(Some(snapshot)),
+                    "Fix the reported Git/filter condition; the worktree remains intact",
+                )
             }
         }
-        Err(e) => MergeOutcome::Failed {
-            message: format!("Merge failed: {e}"),
-        },
+        Err(error) => partial_with_snapshot(
+            format!("Git stage did not reach a confirmed terminal result: {error}"),
+            WorktreeOperation::Stage,
+            after.as_ref(),
+            "The worktree was retained; preview before retrying",
+        ),
     }
 }
 
-/// Issue `git worktree remove --force` from the main worktree and return
-/// `(removed_ok, detail_string)`. On success, drop the worktree from the
-/// active set and bump the cwd-cache generation (crosslink #624).
-fn remove_worktree(
+#[allow(clippy::too_many_lines)] // Keep commit, ambiguity reconciliation, and recovery-ref checks together.
+fn execute_commit<S: std::hash::BuildHasher>(
     run: &crate::tools::security::ToolRunContext,
-    ctx: &ExitContext,
-) -> (bool, String) {
-    let removed = git_in(
-        run,
-        &ctx.main_path,
-        &[
-            "worktree",
-            "remove",
-            ctx.worktree_path.to_str().unwrap_or(""),
-            "--force",
-        ],
-    );
-    let ok = removed.as_ref().is_ok_and(|o| o.status.success());
-    if ok {
-        unregister_active_worktree(&ctx.worktree_path);
+    args: &HashMap<String, Value, S>,
+    snapshot: &WorktreeSnapshot,
+) -> crate::tools::ToolHandlerResult {
+    let expected = match expected_generation(args) {
+        Ok(value) => value,
+        Err(error) => {
+            return failure_with_snapshot(
+                crate::tools::ToolFailureCode::InvalidArguments,
+                error,
+                crate::tools::ToolRetryability::Never,
+                WorktreeOperation::Commit,
+                Some(snapshot),
+                "Stage first, then pass that exact generation to commit",
+            );
+        }
+    };
+    let message = match required_string(args, "message") {
+        Ok(message) if message.len() <= MAX_COMMIT_MESSAGE_BYTES => message,
+        Ok(_) => {
+            return failure_with_snapshot(
+                crate::tools::ToolFailureCode::InvalidArguments,
+                format!("Commit message exceeds {MAX_COMMIT_MESSAGE_BYTES} bytes"),
+                crate::tools::ToolRetryability::Never,
+                WorktreeOperation::Commit,
+                Some(snapshot),
+                "Provide a bounded commit message",
+            );
+        }
+        Err(error) => {
+            return failure_with_snapshot(
+                crate::tools::ToolFailureCode::InvalidArguments,
+                error,
+                crate::tools::ToolRetryability::Never,
+                WorktreeOperation::Commit,
+                Some(snapshot),
+                "Provide the exact reviewed commit message",
+            );
+        }
+    };
+    let reference = match recovery_ref(expected) {
+        Ok(reference) => reference,
+        Err(error) => {
+            return failure_with_snapshot(
+                crate::tools::ToolFailureCode::InvalidArguments,
+                error,
+                crate::tools::ToolRetryability::Never,
+                WorktreeOperation::Commit,
+                Some(snapshot),
+                "Use the generation returned by stage",
+            );
+        }
+    };
+    if !generation_matches(expected, snapshot) {
+        if let Ok(commit) = git_text(
+            run,
+            &snapshot.worktree_path,
+            &["rev-parse", "--verify", &reference],
+        ) {
+            if commit == snapshot.view.worktree_head {
+                return crate::tools::ToolHandlerResult::success_structured(
+                    "Commit retry was already satisfied; the recovery ref and branch still name the commit",
+                    json!({
+                        "operation": "commit",
+                        "recovery_ref": reference,
+                        "transaction": snapshot.view,
+                    }),
+                );
+            }
+        }
+        return failure_with_snapshot(
+            crate::tools::ToolFailureCode::Conflict,
+            "Worktree generation changed before commit",
+            crate::tools::ToolRetryability::Safe,
+            WorktreeOperation::Commit,
+            Some(snapshot),
+            "Preview and review the new generation; no cleanup was attempted",
+        );
     }
-    (ok, render_git_failure(&removed))
+    if snapshot.view.changes.staged.is_empty()
+        || !snapshot.view.changes.unstaged.is_empty()
+        || !snapshot.view.changes.untracked.is_empty()
+        || !snapshot.view.changes.conflicted.is_empty()
+    {
+        return failure_with_snapshot(
+            crate::tools::ToolFailureCode::Conflict,
+            "Commit requires a non-empty, fully staged, conflict-free reviewed generation",
+            crate::tools::ToolRetryability::Safe,
+            WorktreeOperation::Commit,
+            Some(snapshot),
+            "Preview and stage the exact non-ignored path set before commit",
+        );
+    }
+    let commit_result = git_in(
+        run,
+        &snapshot.worktree_path,
+        &["commit", "--no-verify", "-m", message],
+    );
+    let after = inspect_after(run, &snapshot.worktree_path);
+    let Some(after) = after else {
+        return partial_with_snapshot(
+            "Commit attempt completed but its resulting state could not be inspected",
+            WorktreeOperation::Commit,
+            None,
+            "Do not remove the worktree; inspect its branch and index manually",
+        );
+    };
+    let head_changed = after.view.worktree_head != snapshot.view.worktree_head;
+    if !commit_result
+        .as_ref()
+        .is_ok_and(|output| output.status.success())
+        || !head_changed
+    {
+        let detail = match commit_result {
+            Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            Err(error) => error,
+        };
+        return if head_changed {
+            partial_with_snapshot(
+                format!("Commit changed HEAD but did not report an unambiguous success: {detail}"),
+                WorktreeOperation::Commit,
+                Some(&after),
+                "The branch retains the commit; preview and verify it before any merge",
+            )
+        } else {
+            failure_with_snapshot(
+                crate::tools::ToolFailureCode::External,
+                format!("Git commit failed; staged work was retained: {detail}"),
+                crate::tools::ToolRetryability::Safe,
+                WorktreeOperation::Commit,
+                Some(&after),
+                "Fix identity, signing, filter, or lock configuration and retry this exact staged generation",
+            )
+        };
+    }
+    match ensure_recovery_ref(run, &after, expected, &after.view.worktree_head) {
+        Ok(reference) => crate::tools::ToolHandlerResult::success_structured(
+            "Committed the exact staged generation and pinned a recovery ref",
+            json!({
+                "operation": "commit",
+                "recovery_ref": reference,
+                "transaction": after.view,
+            }),
+        ),
+        Err(error) => partial_with_snapshot(
+            format!("Commit succeeded but its recovery ref could not be verified: {error}"),
+            WorktreeOperation::Commit,
+            Some(&after),
+            "The branch still retains the commit; repair or create a recovery ref before merge",
+        ),
+    }
 }
 
-/// Exit (remove) an isolated git worktree.
+#[allow(clippy::too_many_lines)] // Merge success, conflict abort, and retained-ref recovery are one state machine.
+fn execute_merge<S: std::hash::BuildHasher>(
+    run: &crate::tools::security::ToolRunContext,
+    args: &HashMap<String, Value, S>,
+    snapshot: &WorktreeSnapshot,
+) -> crate::tools::ToolHandlerResult {
+    let expected = match expected_generation(args) {
+        Ok(value) => value,
+        Err(error) => {
+            return failure_with_snapshot(
+                crate::tools::ToolFailureCode::InvalidArguments,
+                error,
+                crate::tools::ToolRetryability::Never,
+                WorktreeOperation::Merge,
+                Some(snapshot),
+                "Commit first, then pass its exact generation to merge",
+            );
+        }
+    };
+    if !generation_matches(expected, snapshot) {
+        if let Ok(reference) = recovery_ref(expected) {
+            if let Ok(approved_commit) = git_text(
+                run,
+                &snapshot.main_path,
+                &["rev-parse", "--verify", &reference],
+            ) {
+                if is_ancestor(
+                    run,
+                    &snapshot.main_path,
+                    &approved_commit,
+                    &snapshot.view.target_head,
+                )
+                .unwrap_or(false)
+                {
+                    return crate::tools::ToolHandlerResult::success_structured(
+                        "Merge retry was already satisfied; the target contains the receipt-bound approved commit",
+                        json!({
+                            "operation": "merge",
+                            "recovery_ref": reference,
+                            "approved_commit": approved_commit,
+                            "transaction": snapshot.view,
+                        }),
+                    );
+                }
+            }
+        }
+        return failure_with_snapshot(
+            crate::tools::ToolFailureCode::Conflict,
+            "Worktree or target generation changed before merge",
+            crate::tools::ToolRetryability::Safe,
+            WorktreeOperation::Merge,
+            Some(snapshot),
+            "Review both returned generations before authorizing another merge",
+        );
+    }
+    if !snapshot.view.changes.tracked_and_untracked_clean() {
+        return failure_with_snapshot(
+            crate::tools::ToolFailureCode::Conflict,
+            "Merge requires a committed, conflict-free worktree",
+            crate::tools::ToolRetryability::Safe,
+            WorktreeOperation::Merge,
+            Some(snapshot),
+            "Stage and commit all reviewed non-ignored paths first",
+        );
+    }
+    if !snapshot.view.target_changes.tracked_and_untracked_clean() {
+        return failure_with_snapshot(
+            crate::tools::ToolFailureCode::Conflict,
+            "Target worktree changed or is dirty; merge refused",
+            crate::tools::ToolRetryability::Safe,
+            WorktreeOperation::Merge,
+            Some(snapshot),
+            "Preserve or finish the target work, then preview a new exact generation",
+        );
+    }
+    let reference = match ensure_recovery_ref(run, snapshot, expected, &snapshot.view.worktree_head)
+    {
+        Ok(reference) => reference,
+        Err(error) => {
+            return failure_with_snapshot(
+                crate::tools::ToolFailureCode::External,
+                format!("Cannot establish recovery ref before merge: {error}"),
+                crate::tools::ToolRetryability::Safe,
+                WorktreeOperation::Merge,
+                Some(snapshot),
+                "The worktree and branch remain intact; repair ref storage and retry",
+            );
+        }
+    };
+    let merge = git_in(
+        run,
+        &snapshot.main_path,
+        &["merge", "--no-edit", &snapshot.view.branch],
+    );
+    let after = inspect_after(run, &snapshot.worktree_path);
+    if let Some(after) = &after {
+        if is_ancestor(
+            run,
+            &after.main_path,
+            &snapshot.view.worktree_head,
+            &after.view.target_head,
+        )
+        .unwrap_or(false)
+            && after.view.repository_id == snapshot.view.repository_id
+            && after.view.worktree_id == snapshot.view.worktree_id
+            && after.view.worktree_head == snapshot.view.worktree_head
+            && after.view.target_path == snapshot.view.target_path
+            && after.view.target_branch == snapshot.view.target_branch
+            && after.view.worktree_content_digest == snapshot.view.worktree_content_digest
+            && after.view.changes.tracked_and_untracked_clean()
+            && after.view.target_changes.tracked_and_untracked_clean()
+        {
+            return crate::tools::ToolHandlerResult::success_structured(
+                "Merged the committed worktree generation into the exact target",
+                json!({
+                    "operation": "merge",
+                    "recovery_ref": reference,
+                    "transaction": after.view,
+                }),
+            );
+        }
+    }
+    let merge_detail = match merge {
+        Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        Err(error) => error,
+    };
+    let merge_in_progress = git_in(
+        run,
+        &snapshot.main_path,
+        &["rev-parse", "--quiet", "--verify", "MERGE_HEAD"],
+    )
+    .is_ok_and(|output| output.status.success());
+    if merge_in_progress {
+        let abort = git_in(run, &snapshot.main_path, &["merge", "--abort"]);
+        if !abort.is_ok_and(|output| output.status.success()) {
+            return partial_with_snapshot(
+                format!("Merge failed and merge --abort did not restore the target: {merge_detail}"),
+                WorktreeOperation::Merge,
+                after.as_ref(),
+                "Do not remove either worktree; recover the target merge state manually using the recovery ref",
+            );
+        }
+    }
+    let restored = inspect_after(run, &snapshot.worktree_path);
+    if restored
+        .as_ref()
+        .is_none_or(|state| state.view.generation != snapshot.view.generation)
+    {
+        partial_with_snapshot(
+            format!(
+                "Merge did not complete and the exact pre-merge generation was not restored: {merge_detail}"
+            ),
+            WorktreeOperation::Merge,
+            restored.as_ref().or(after.as_ref()),
+            "Do not remove either worktree; inspect the target and retained recovery ref before retrying",
+        )
+    } else {
+        failure_with_snapshot(
+            crate::tools::ToolFailureCode::Conflict,
+            format!(
+                "Merge did not complete; the pre-merge generation and recovery ref were retained: {merge_detail}"
+            ),
+            crate::tools::ToolRetryability::Safe,
+            WorktreeOperation::Merge,
+            restored.as_ref(),
+            "Resolve the target/branch conflict without deleting the worktree, then preview and retry",
+        )
+    }
+}
+
+#[allow(clippy::too_many_lines)] // Cleanup receipt creation and terminal reconciliation must remain adjacent.
+fn execute_remove(
+    run: &crate::tools::security::ToolRunContext,
+    expected: &str,
+    target_path: &str,
+    snapshot: &WorktreeSnapshot,
+    force: bool,
+) -> crate::tools::ToolHandlerResult {
+    let operation = if force {
+        WorktreeOperation::Discard
+    } else {
+        WorktreeOperation::Remove
+    };
+    if !generation_matches(expected, snapshot) {
+        return failure_with_snapshot(
+            crate::tools::ToolFailureCode::Conflict,
+            format!(
+                "Worktree generation changed before cleanup (expected {expected}, observed {})",
+                snapshot.view.generation
+            ),
+            crate::tools::ToolRetryability::Safe,
+            operation,
+            Some(snapshot),
+            "Review the returned state and explicitly approve its exact generation",
+        );
+    }
+    if let Err(error) = validate_cleanup_target(target_path, snapshot) {
+        return failure_with_snapshot(
+            crate::tools::ToolFailureCode::Conflict,
+            error,
+            crate::tools::ToolRetryability::Safe,
+            operation,
+            Some(snapshot),
+            "Pass the exact canonical target_path returned by the approved preview",
+        );
+    }
+    if !force && !snapshot.view.changes.completely_clean() {
+        return failure_with_snapshot(
+            crate::tools::ToolFailureCode::Conflict,
+            "Remove requires a completely clean worktree, including no ignored files",
+            crate::tools::ToolRetryability::Safe,
+            operation,
+            Some(snapshot),
+            "Preserve or explicitly discard the returned exact generation",
+        );
+    }
+    let cleanup_reference = match ensure_cleanup_ref(run, snapshot, expected) {
+        Ok(reference) => reference,
+        Err(error) => {
+            return failure_with_snapshot(
+                crate::tools::ToolFailureCode::External,
+                format!("Cannot establish durable cleanup receipt: {error}"),
+                crate::tools::ToolRetryability::Safe,
+                operation,
+                Some(snapshot),
+                "The worktree remains intact; repair ref storage before retrying cleanup",
+            );
+        }
+    };
+    let path = snapshot.view.path.as_str();
+    let args = if force {
+        vec!["worktree", "remove", path, "--force"]
+    } else {
+        vec!["worktree", "remove", path]
+    };
+    let result = git_in(run, &snapshot.main_path, &args);
+    let path_absent = !snapshot.worktree_path.exists();
+    let registered = worktree_is_registered(run, &snapshot.main_path, path);
+    if path_absent && matches!(registered, Ok(false)) {
+        unregister_active_worktree(&snapshot.worktree_path);
+        return crate::tools::ToolHandlerResult::success_structured(
+            if force {
+                "Discarded the exact approved worktree generation"
+            } else {
+                "Removed the verified clean worktree without force"
+            },
+            json!({
+                "schema_version": WORKTREE_TRANSACTION_SCHEMA_VERSION,
+                "operation": operation.as_str(),
+                "terminal": "removed",
+                "repository_id": snapshot.view.repository_id,
+                "worktree_id": snapshot.view.worktree_id,
+                "generation": snapshot.view.generation,
+                "target_path": snapshot.view.target_path,
+                "cleanup_ref": cleanup_reference,
+                "branch_retained": snapshot.view.branch,
+                "worktree_head": snapshot.view.worktree_head,
+                "target_head": snapshot.view.target_head,
+            }),
+        );
+    }
+    let detail = match result {
+        Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        Err(error) => error,
+    };
+    let registration_detail = match registered {
+        Ok(true) => "Git still registers the worktree".to_string(),
+        Ok(false) => "Git no longer registers the worktree".to_string(),
+        Err(error) => format!("Git registration could not be verified: {error}"),
+    };
+    let after = inspect_after(run, &snapshot.worktree_path);
+    partial_with_snapshot(
+        format!(
+            "Worktree cleanup failed or was interrupted: {detail}; {registration_detail}; durable receipt {cleanup_reference} was retained"
+        ),
+        operation,
+        after.as_ref(),
+        "Do not retry destructively until preview confirms the exact retained state",
+    )
+}
+
+/// Execute one generation-bound worktree transaction operation.
 ///
-/// **Phase 1 (#345) behavior**: this function does NOT read or mutate the
-/// process CWD. The caller must pass `path` naming the worktree to remove.
-/// All git commands run against that path explicitly via `current_dir`.
-///
-/// Arguments:
-/// * `path` (string, required) — absolute path to the worktree that
-///   [`execute_enter_worktree`] previously created.
-/// * `apply_changes` (bool, optional, default `false`) — if true, commit
-///   uncommitted changes inside the worktree and merge the worktree branch
-///   into the main worktree before removing the worktree.
-/// * `discard_changes` (bool, optional, default `false`) — opt-in safety
-///   gate (crosslink #623). When `apply_changes=false`, the worktree is
-///   destroyed by `git worktree remove --force`. The previous behaviour
-///   silently destroyed uncommitted work; the gate now refuses removal
-///   unless `discard_changes=true` is set explicitly. Ignored when
-///   `apply_changes=true` because the merge path commits the work first.
+/// Mutations are deliberately split across calls. The canonical permission
+/// receipt hashes the full argument object, so an approval covers one exact
+/// path, operation, observed generation, reviewed path set, and commit message.
 #[must_use]
+#[allow(clippy::too_many_lines)] // Dispatch keeps all terminal operation choices auditable together.
 pub fn execute_exit_worktree<S: std::hash::BuildHasher>(
     run: &crate::tools::security::ToolRunContext,
     args: &HashMap<String, Value, S>,
-) -> (String, bool) {
-    let ctx = match validate_exit_request(run, args) {
-        Ok(ctx) => ctx,
-        Err(err) => return err,
-    };
-
-    // Crosslink #623: refuse silent destruction of uncommitted work. The
-    // gate fires only on the discard path; `apply_changes=true` commits
-    // work before removal so dirty state is not lost there.
-    if !ctx.apply_changes && !ctx.discard_changes {
-        match worktree_has_uncommitted_changes(run, &ctx.worktree_path) {
-            Ok(true) => {
-                return (
-                    format!(
-                        "worktree has uncommitted changes; pass discard_changes=true to force \
-                         removal of {} (or apply_changes=true to merge them first)",
-                        ctx.worktree_path.display()
-                    ),
-                    true,
-                );
-            }
-            Ok(false) => {}
-            Err(e) => {
-                return (
-                    format!(
-                        "Refusing to remove worktree {}: could not verify clean state ({e})",
-                        ctx.worktree_path.display()
-                    ),
-                    true,
-                );
-            }
-        }
-    }
-
-    if ctx.apply_changes {
-        let merge_result = merge_into_main(run, &ctx);
-
-        // crosslink #858: on merge conflict, refuse the destructive
-        // `worktree remove --force` and surface the conflict to the caller.
-        // The conflicting branch is still present; the user can resolve it
-        // manually or invoke exit_worktree again with `discard_changes=true`.
-        if let MergeOutcome::Failed { message, .. } = &merge_result {
-            return (
-                format!(
-                    "Exit worktree at {} aborted: {}\nMain worktree: {}\n\
-                     The worktree was NOT removed; resolve the conflict and \
-                     retry, or pass `discard_changes:true` to discard the \
-                     branch.",
-                    ctx.worktree_path.display(),
-                    message,
-                    ctx.main_path.display()
-                ),
-                true,
+) -> crate::tools::ToolHandlerResult {
+    let operation = match parse_worktree_operation(args) {
+        Ok(operation) => operation,
+        Err(error) => {
+            return failure_with_snapshot(
+                crate::tools::ToolFailureCode::InvalidArguments,
+                error,
+                crate::tools::ToolRetryability::Never,
+                WorktreeOperation::Preview,
+                None,
+                "Use one explicit operation and no deprecated composite flags",
             );
         }
-
-        let summary = match &merge_result {
-            MergeOutcome::Merged(msg) => msg.clone(),
-            MergeOutcome::NothingToMerge => "No changes to commit.".to_string(),
-            MergeOutcome::Failed { .. } => unreachable!("returned above"),
-        };
-
-        let (removed_ok, detail) = remove_worktree(run, &ctx);
-        let warning = if removed_ok {
-            String::new()
-        } else {
-            format!(" WARNING: worktree removal failed: {detail}")
-        };
-        return (
-            format!(
-                "Exited worktree at {}. {}{}\nMain worktree: {}",
-                ctx.worktree_path.display(),
-                summary,
-                warning,
-                ctx.main_path.display()
-            ),
-            !removed_ok,
+    };
+    if matches!(
+        operation,
+        WorktreeOperation::LegacyApply | WorktreeOperation::LegacyDiscard
+    ) {
+        return failure_with_snapshot(
+            crate::tools::ToolFailureCode::InvalidArguments,
+            "Composite apply_changes/discard_changes calls are deprecated because they cannot bind each destructive transition to an exact reviewed generation",
+            crate::tools::ToolRetryability::Never,
+            operation,
+            None,
+            "Call operation=preview, then authorize stage, commit, merge, and remove separately; use operation=discard only for an exact reviewed generation",
         );
     }
-
-    let (removed_ok, detail) = remove_worktree(run, &ctx);
-    if removed_ok {
-        (
-            format!(
-                "Discarded worktree on branch '{}' at {}. Main worktree: {}",
-                ctx.current_branch,
-                ctx.worktree_path.display(),
-                ctx.main_path.display()
-            ),
-            false,
+    let path_argument = match required_string(args, "path") {
+        Ok(path) => path,
+        Err(error) => {
+            return failure_with_snapshot(
+                crate::tools::ToolFailureCode::InvalidArguments,
+                error,
+                crate::tools::ToolRetryability::Never,
+                operation,
+                None,
+                "Pass the absolute path returned by enter_worktree",
+            );
+        }
+    };
+    let path = PathBuf::from(path_argument);
+    if !path.exists()
+        && matches!(
+            operation,
+            WorktreeOperation::Remove | WorktreeOperation::Discard
         )
-    } else {
-        (
+    {
+        let expected = match expected_generation(args) {
+            Ok(expected) => expected,
+            Err(error) => {
+                return failure_with_snapshot(
+                    crate::tools::ToolFailureCode::InvalidArguments,
+                    error,
+                    crate::tools::ToolRetryability::Never,
+                    operation,
+                    None,
+                    "Pass the exact generation and target_path returned by the cleanup transaction",
+                );
+            }
+        };
+        let target_path = match required_string(args, "target_path") {
+            Ok(target_path) => target_path,
+            Err(error) => {
+                return failure_with_snapshot(
+                    crate::tools::ToolFailureCode::InvalidArguments,
+                    error,
+                    crate::tools::ToolRetryability::Never,
+                    operation,
+                    None,
+                    "Pass the exact target_path returned by the approved preview",
+                );
+            }
+        };
+        return reconcile_absent_cleanup(run, operation, path_argument, target_path, expected);
+    }
+    let snapshot = match inspect_worktree(run, &path) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return failure_with_snapshot(
+                crate::tools::ToolFailureCode::Conflict,
+                format!("Worktree inspection failed; no cleanup was attempted: {error}"),
+                crate::tools::ToolRetryability::Safe,
+                operation,
+                None,
+                "Preserve the path and repair inspection before retrying",
+            );
+        }
+    };
+    if operation != WorktreeOperation::Preview && path_argument != snapshot.view.path {
+        return failure_with_snapshot(
+            crate::tools::ToolFailureCode::Conflict,
             format!(
-                "Failed to remove worktree at {}: {}",
-                ctx.worktree_path.display(),
-                detail
+                "Mutation path is not the exact canonical worktree path (use {})",
+                snapshot.view.path
             ),
-            true,
-        )
+            crate::tools::ToolRetryability::Safe,
+            operation,
+            Some(&snapshot),
+            "Repeat the operation with the canonical path returned by preview",
+        );
+    }
+    match operation {
+        WorktreeOperation::Preview => crate::tools::ToolHandlerResult::success_structured(
+            "Reviewed the exact worktree and target generations; no mutation was performed",
+            snapshot_payload(operation, &snapshot),
+        ),
+        WorktreeOperation::Stage => execute_stage(run, args, &snapshot),
+        WorktreeOperation::Commit => execute_commit(run, args, &snapshot),
+        WorktreeOperation::Merge => execute_merge(run, args, &snapshot),
+        WorktreeOperation::Discard | WorktreeOperation::Remove => {
+            let expected = match expected_generation(args) {
+                Ok(expected) => expected,
+                Err(error) => {
+                    return failure_with_snapshot(
+                        crate::tools::ToolFailureCode::InvalidArguments,
+                        error,
+                        crate::tools::ToolRetryability::Never,
+                        operation,
+                        Some(&snapshot),
+                        "Preview first and pass its exact generation",
+                    );
+                }
+            };
+            let target_path = match required_string(args, "target_path") {
+                Ok(target_path) => target_path,
+                Err(error) => {
+                    return failure_with_snapshot(
+                        crate::tools::ToolFailureCode::InvalidArguments,
+                        error,
+                        crate::tools::ToolRetryability::Never,
+                        operation,
+                        Some(&snapshot),
+                        "Pass the exact target_path returned by the approved preview",
+                    );
+                }
+            };
+            execute_remove(
+                run,
+                expected,
+                target_path,
+                &snapshot,
+                operation == WorktreeOperation::Discard,
+            )
+        }
+        WorktreeOperation::LegacyApply | WorktreeOperation::LegacyDiscard => {
+            unreachable!("legacy operations returned before inspection")
+        }
     }
 }
 
@@ -1009,23 +2371,12 @@ fn get_current_branch_at(
 
 /// Classify one `exit_worktree` invocation before authorization (S-016).
 ///
-/// `exit_worktree` multiplexes three operations with materially different
-/// blast radii behind one wire-level name, and F-001 records that it declared
-/// no permission target at all:
-///
-/// * `discard_changes: true` knowingly throws away uncommitted work;
-/// * `apply_changes: true` commits and merges non-ignored work first;
-/// * neither flag refuses when ordinary `git status --porcelain` reports a
-///   dirty worktree.
-///
-/// All three are classified [`ToolEffect::Destructive`]. Execution ultimately
-/// calls `git worktree remove --force`, and classification is deliberately
-/// argument-only: it cannot inspect the filesystem to prove that the worktree
-/// contains no ignored files that `git status --porcelain` omitted. Such files
-/// can be irreversibly deleted even on the nominally clean or apply paths, so a
-/// lower pre-authorization effect would be an optimistic lie. S-073 owns
-/// replacing that executor behavior with a transactional, ignored-file-aware
-/// workflow; until then the honest ceiling is destructive.
+/// `exit_worktree` multiplexes six explicit transaction operations behind one
+/// wire-level name. Preview is read-only; stage, commit, and merge mutate Git
+/// state; discard and removal retain the destructive ceiling because they
+/// remove a filesystem tree. Deprecated composite flags are also classified
+/// destructive before execution rejects them, so an old call can never evade
+/// authorization while receiving its migration error.
 ///
 /// Classification reads only the typed argument shape, so it completes before
 /// the handler runs and before any filesystem access.
@@ -1038,7 +2389,7 @@ fn get_current_branch_at(
 pub fn classify_exit_worktree(
     args: &serde_json::Value,
 ) -> Result<crate::tools::effect::TypedEffect, String> {
-    use crate::tools::effect::{ToolEffect, TypedEffect};
+    use crate::tools::effect::TypedEffect;
 
     let flag = |key: &str| -> Result<bool, String> {
         match args.get(key) {
@@ -1065,31 +2416,43 @@ pub fn classify_exit_worktree(
         _ => return Err("'path' must be a non-empty string".to_string()),
     };
 
-    let discard = flag("discard_changes")?;
     let apply = flag("apply_changes")?;
-
-    // Execution gives apply_changes precedence and explicitly ignores
-    // discard_changes on that path. Classification must mirror that order: a
-    // call with both flags set commits/merges, it does not discard.
-    let operation = if apply {
-        "apply"
-    } else if discard {
-        "discard"
-    } else {
-        "remove_clean"
+    let discard = flag("discard_changes")?;
+    let operation = match args.get("operation") {
+        Some(Value::String(operation)) => {
+            if apply || discard {
+                return Err(
+                    "'operation' cannot be combined with deprecated apply_changes/discard_changes flags"
+                        .to_string(),
+                );
+            }
+            parse_operation_name(operation)?
+        }
+        Some(_) => return Err("'operation' must be a string".to_string()),
+        None if apply => WorktreeOperation::LegacyApply,
+        None if discard => WorktreeOperation::LegacyDiscard,
+        None => WorktreeOperation::Preview,
     };
 
-    Ok(TypedEffect::new(ToolEffect::Destructive, operation, path))
+    Ok(TypedEffect::new(
+        operation.effect(),
+        operation.as_str(),
+        path,
+    ))
 }
 
 /// Every operation `exit_worktree` can resolve to, for the generated matrix.
 #[must_use]
 pub fn exit_worktree_operations() -> Vec<(&'static str, crate::tools::effect::ToolEffect)> {
-    use crate::tools::effect::ToolEffect;
     vec![
-        ("discard", ToolEffect::Destructive),
-        ("apply", ToolEffect::Destructive),
-        ("remove_clean", ToolEffect::Destructive),
+        ("preview", WorktreeOperation::Preview.effect()),
+        ("stage", WorktreeOperation::Stage.effect()),
+        ("commit", WorktreeOperation::Commit.effect()),
+        ("merge", WorktreeOperation::Merge.effect()),
+        ("discard", WorktreeOperation::Discard.effect()),
+        ("remove", WorktreeOperation::Remove.effect()),
+        ("legacy_apply", WorktreeOperation::LegacyApply.effect()),
+        ("legacy_discard", WorktreeOperation::LegacyDiscard.effect()),
     ]
 }
 
@@ -1101,6 +2464,64 @@ mod tests {
 
     fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
         crate::tools::security::test_run_context()
+    }
+
+    fn preview_transaction(run: &crate::tools::ToolRunContext, path: &Path) -> Value {
+        let args = HashMap::from([
+            (
+                "path".to_string(),
+                Value::String(path.to_string_lossy().into_owned()),
+            ),
+            (
+                "operation".to_string(),
+                Value::String("preview".to_string()),
+            ),
+        ]);
+        let result = execute_exit_worktree(run, &args);
+        let crate::tools::ToolOutcome::Success { content } = &result.outcome else {
+            panic!("preview failed: {}", result.content());
+        };
+        content
+            .structured
+            .as_ref()
+            .and_then(|value| value.get("transaction"))
+            .expect("preview transaction")
+            .clone()
+    }
+
+    fn transact_cleanup(
+        run: &crate::tools::ToolRunContext,
+        path: &Path,
+        operation: &str,
+    ) -> crate::tools::ToolHandlerResult {
+        let transaction = preview_transaction(run, path);
+        let generation = transaction
+            .get("generation")
+            .and_then(Value::as_str)
+            .expect("preview generation")
+            .to_string();
+        let target_path = transaction
+            .get("target_path")
+            .and_then(Value::as_str)
+            .expect("preview target path")
+            .to_string();
+        let args = HashMap::from([
+            (
+                "path".to_string(),
+                Value::String(path.to_string_lossy().into_owned()),
+            ),
+            (
+                "operation".to_string(),
+                Value::String(operation.to_string()),
+            ),
+            ("expected_generation".to_string(), Value::String(generation)),
+            ("target_path".to_string(), Value::String(target_path)),
+        ]);
+        execute_exit_worktree(run, &args)
+    }
+
+    fn handler_is_error(result: &crate::tools::ToolHandlerResult) -> bool {
+        matches!(&result.outcome, crate::tools::ToolOutcome::Error { .. })
     }
 
     /// Local alias preserving call-site readability while delegating to the
@@ -1146,17 +2567,16 @@ mod tests {
         enter_args.insert("branch".to_string(), Value::String(branch.to_string()));
         let (message, is_error) = execute_enter_worktree(&run, &enter_args);
         assert!(!is_error, "enter worktree failed: {message}");
-        let worktree = root.path().join(".worktrees").join(branch);
+        let worktree = std::fs::canonicalize(root.path().join(".worktrees").join(branch))
+            .expect("canonical fixture worktree");
         assert!(worktree.join("tracked.txt").exists());
 
-        let mut exit_args = HashMap::new();
-        exit_args.insert(
-            "path".to_string(),
-            Value::String(worktree.to_string_lossy().into_owned()),
+        let result = transact_cleanup(&run, &worktree, "discard");
+        assert!(
+            !handler_is_error(&result),
+            "exit worktree failed: {}",
+            result.content()
         );
-        exit_args.insert("discard_changes".to_string(), Value::Bool(true));
-        let (message, is_error) = execute_exit_worktree(&run, &exit_args);
-        assert!(!is_error, "exit worktree failed: {message}");
         assert!(!worktree.exists());
     }
 
@@ -1244,7 +2664,7 @@ mod tests {
     fn exit_worktree_without_path_is_error() {
         let _lock = cwd_lock();
         let args = HashMap::new();
-        let (msg, is_err) = execute_exit_worktree(test_run(), &args);
+        let (msg, is_err) = execute_exit_worktree(test_run(), &args).into_legacy();
         assert!(is_err, "missing path must produce is_error=true");
         assert!(
             msg.contains("'path' is required"),
@@ -1256,7 +2676,7 @@ mod tests {
     fn exit_worktree_rejects_wrong_type_path() {
         let mut args = HashMap::new();
         args.insert("path".to_string(), serde_json::json!(42));
-        let (msg, is_err) = execute_exit_worktree(test_run(), &args);
+        let (msg, is_err) = execute_exit_worktree(test_run(), &args).into_legacy();
         assert!(is_err);
         assert!(msg.contains("Invalid 'path' argument: expected string"));
     }
@@ -1274,7 +2694,7 @@ mod tests {
             serde_json::Value::String("true".to_string()),
         );
 
-        let (msg, is_err) = execute_exit_worktree(test_run(), &args);
+        let (msg, is_err) = execute_exit_worktree(test_run(), &args).into_legacy();
         assert!(is_err, "non-boolean apply_changes must error: {msg}");
         assert!(
             msg.contains("Invalid 'apply_changes' argument: expected boolean"),
@@ -1287,7 +2707,7 @@ mod tests {
             serde_json::Value::String("true".to_string()),
         );
 
-        let (msg, is_err) = execute_exit_worktree(test_run(), &args);
+        let (msg, is_err) = execute_exit_worktree(test_run(), &args).into_legacy();
         assert!(is_err, "non-boolean discard_changes must error: {msg}");
         assert!(
             msg.contains("Invalid 'discard_changes' argument: expected boolean"),
@@ -1318,7 +2738,7 @@ mod tests {
             "path".to_string(),
             serde_json::Value::String(main.display().to_string()),
         );
-        let (msg, is_err) = execute_exit_worktree(test_run(), &args);
+        let (msg, is_err) = execute_exit_worktree(test_run(), &args).into_legacy();
         assert!(is_err, "exit on main worktree must produce is_error=true");
         assert!(
             msg.contains("Not in an isolated worktree")
@@ -1358,13 +2778,7 @@ mod tests {
         // Cleanup.
         let cwd = std::env::current_dir().unwrap();
         let wt = cwd.join(".worktrees").join(&branch);
-        let mut exit_args = HashMap::new();
-        exit_args.insert(
-            "path".to_string(),
-            serde_json::Value::String(wt.display().to_string()),
-        );
-        exit_args.insert("discard_changes".to_string(), serde_json::Value::Bool(true));
-        let _ = execute_exit_worktree(test_run(), &exit_args);
+        let _ = transact_cleanup(test_run(), &wt, "discard");
         let _ = git_in(test_run(), &cwd, &["branch", "-D", &branch]);
     }
 
@@ -1395,14 +2809,12 @@ mod tests {
 
         let cwd = std::env::current_dir().unwrap();
         let wt = cwd.join(".worktrees").join(&branch);
-        let mut exit_args = HashMap::new();
-        exit_args.insert(
-            "path".to_string(),
-            serde_json::Value::String(wt.display().to_string()),
+        let result = transact_cleanup(test_run(), &wt, "discard");
+        assert!(
+            !handler_is_error(&result),
+            "exit must succeed; got: {}",
+            result.content()
         );
-        exit_args.insert("discard_changes".to_string(), serde_json::Value::Bool(true));
-        let (msg, is_err) = execute_exit_worktree(test_run(), &exit_args);
-        assert!(!is_err, "exit must succeed; got: {msg}");
         let after_exit = cwd_cache_generation();
         assert!(
             after_exit > after_enter,
@@ -1436,17 +2848,42 @@ mod tests {
         // Dirty the worktree by writing an untracked file.
         std::fs::write(wt.join("dirty.txt"), "uncommitted work\n").expect("write dirty");
 
-        // Default `discard_changes=false` must refuse.
-        let mut exit_args = HashMap::new();
-        exit_args.insert(
-            "path".to_string(),
-            serde_json::Value::String(wt.display().to_string()),
-        );
-        let (msg, is_err) = execute_exit_worktree(test_run(), &exit_args);
-        assert!(is_err, "dirty exit without discard must error");
+        // A read-only preview never destroys work, and clean removal must
+        // refuse this exact dirty generation.
+        let transaction = preview_transaction(test_run(), &wt);
+        let generation = transaction
+            .get("generation")
+            .and_then(Value::as_str)
+            .expect("preview generation")
+            .to_string();
+        let target_path = transaction
+            .get("target_path")
+            .and_then(Value::as_str)
+            .expect("preview target path")
+            .to_string();
+        let exit_args = HashMap::from([
+            (
+                "path".to_string(),
+                serde_json::Value::String(wt.display().to_string()),
+            ),
+            (
+                "operation".to_string(),
+                serde_json::Value::String("remove".to_string()),
+            ),
+            (
+                "expected_generation".to_string(),
+                serde_json::Value::String(generation),
+            ),
+            (
+                "target_path".to_string(),
+                serde_json::Value::String(target_path),
+            ),
+        ]);
+        let (msg, is_err) = execute_exit_worktree(test_run(), &exit_args).into_legacy();
+        assert!(is_err, "dirty remove must error");
         assert!(
-            msg.contains("uncommitted changes") && msg.contains("discard_changes=true"),
-            "safety message must name the gap & the override; got: {msg}"
+            msg.contains("completely clean"),
+            "safety message must name the clean-state requirement; got: {msg}"
         );
         // Worktree still exists because we refused to destroy it.
         assert!(
@@ -1455,10 +2892,13 @@ mod tests {
             wt.display()
         );
 
-        // Now opt in: discard_changes=true must succeed.
-        exit_args.insert("discard_changes".to_string(), serde_json::Value::Bool(true));
-        let (msg, is_err) = execute_exit_worktree(test_run(), &exit_args);
-        assert!(!is_err, "discard_changes=true must succeed; got: {msg}");
+        // Now authorize discard against a fresh exact generation.
+        let result = transact_cleanup(test_run(), &wt, "discard");
+        assert!(
+            !handler_is_error(&result),
+            "discard must succeed: {}",
+            result.content()
+        );
         assert!(!wt.exists(), "successful exit must remove the worktree");
 
         let _ = git_in(test_run(), &cwd, &["branch", "-D", &branch]);
@@ -1486,19 +2926,567 @@ mod tests {
         let wt = cwd.join(".worktrees").join(&branch);
         // No mutations: worktree is clean.
 
-        let mut exit_args = HashMap::new();
-        exit_args.insert(
-            "path".to_string(),
-            serde_json::Value::String(wt.display().to_string()),
-        );
-        let (msg, is_err) = execute_exit_worktree(test_run(), &exit_args);
+        let result = transact_cleanup(test_run(), &wt, "remove");
         assert!(
-            !is_err,
-            "clean exit without discard_changes must succeed; got: {msg}"
+            !handler_is_error(&result),
+            "clean remove must succeed: {}",
+            result.content()
         );
         assert!(!wt.exists(), "clean exit must remove the worktree");
 
         let _ = git_in(test_run(), &cwd, &["branch", "-D", &branch]);
+    }
+
+    struct TransactionFixture {
+        _root: tempfile::TempDir,
+        run: std::sync::Arc<crate::tools::ToolRunContext>,
+        git: PathBuf,
+        main: PathBuf,
+        worktree: PathBuf,
+    }
+
+    impl TransactionFixture {
+        fn new(with_identity: bool) -> Self {
+            let root = tempfile::tempdir().expect("transaction fixture");
+            let main = root.path().to_path_buf();
+            let git = which::which("git").expect("git test dependency");
+            fixture_git(&git, &main, &["init", "-q"]);
+            std::fs::write(main.join("tracked.txt"), "baseline\n").expect("baseline fixture");
+            std::fs::write(main.join(".gitignore"), ".worktrees/\n")
+                .expect("worktree fixture ignore");
+            fixture_git(&git, &main, &["add", "tracked.txt", ".gitignore"]);
+            fixture_git(
+                &git,
+                &main,
+                &[
+                    "-c",
+                    "user.name=OpenClaudia Test",
+                    "-c",
+                    "user.email=openclaudia@example.invalid",
+                    "commit",
+                    "-qm",
+                    "baseline",
+                ],
+            );
+            if with_identity {
+                fixture_git(&git, &main, &["config", "user.name", "OpenClaudia Test"]);
+                fixture_git(
+                    &git,
+                    &main,
+                    &["config", "user.email", "openclaudia@example.invalid"],
+                );
+            } else {
+                fixture_git(&git, &main, &["config", "user.useConfigOnly", "true"]);
+            }
+            let run = crate::tools::security::test_run_context_for(&main);
+            let branch = "s073-transaction";
+            let enter = HashMap::from([("branch".to_string(), Value::String(branch.to_string()))]);
+            let (message, error) = execute_enter_worktree(&run, &enter);
+            assert!(!error, "fixture worktree creation failed: {message}");
+            let worktree = main.join(".worktrees").join(branch);
+            Self {
+                _root: root,
+                run,
+                git,
+                main,
+                worktree,
+            }
+        }
+
+        fn restarted_run(&self) -> std::sync::Arc<crate::tools::ToolRunContext> {
+            crate::tools::security::test_run_context_for(&self.main)
+        }
+    }
+
+    fn fixture_git(git: &Path, cwd: &Path, args: &[&str]) -> std::process::Output {
+        let output = std::process::Command::new(git)
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("run fixture git");
+        assert!(
+            output.status.success(),
+            "fixture git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    fn structured_result(result: &crate::tools::ToolHandlerResult) -> &Value {
+        match &result.outcome {
+            crate::tools::ToolOutcome::Success { content }
+            | crate::tools::ToolOutcome::Partial { content, .. } => content
+                .structured
+                .as_ref()
+                .expect("transaction result must be structured"),
+            crate::tools::ToolOutcome::Error { failure } => {
+                panic!("expected structured result, got error: {}", failure.message)
+            }
+        }
+    }
+
+    fn result_generation(result: &crate::tools::ToolHandlerResult) -> String {
+        structured_result(result)
+            .pointer("/transaction/generation")
+            .and_then(Value::as_str)
+            .expect("transaction generation")
+            .to_string()
+    }
+
+    fn result_target_path(result: &crate::tools::ToolHandlerResult) -> String {
+        structured_result(result)
+            .pointer("/transaction/target_path")
+            .and_then(Value::as_str)
+            .expect("transaction target path")
+            .to_string()
+    }
+
+    fn result_reviewable_paths(result: &crate::tools::ToolHandlerResult) -> Vec<Value> {
+        let transaction = structured_result(result)
+            .get("transaction")
+            .expect("transaction payload");
+        let mut paths = BTreeSet::new();
+        for category in ["staged", "unstaged", "untracked", "conflicted"] {
+            for path in transaction
+                .pointer(&format!("/changes/{category}"))
+                .and_then(Value::as_array)
+                .expect("change path array")
+            {
+                paths.insert(path.as_str().expect("change path string").to_string());
+            }
+        }
+        paths.into_iter().map(Value::String).collect()
+    }
+
+    fn invoke_phase(
+        run: &crate::tools::ToolRunContext,
+        worktree: &Path,
+        operation: &str,
+        generation: &str,
+        paths: Option<Vec<Value>>,
+        message: Option<&str>,
+        target_path: Option<&str>,
+    ) -> crate::tools::ToolHandlerResult {
+        let mut args = HashMap::from([
+            (
+                "path".to_string(),
+                Value::String(worktree.to_string_lossy().into_owned()),
+            ),
+            (
+                "operation".to_string(),
+                Value::String(operation.to_string()),
+            ),
+            (
+                "expected_generation".to_string(),
+                Value::String(generation.to_string()),
+            ),
+        ]);
+        if let Some(paths) = paths {
+            args.insert("paths".to_string(), Value::Array(paths));
+        }
+        if let Some(message) = message {
+            args.insert("message".to_string(), Value::String(message.to_string()));
+        }
+        if let Some(target_path) = target_path {
+            args.insert(
+                "target_path".to_string(),
+                Value::String(target_path.to_string()),
+            );
+        }
+        execute_exit_worktree(run, &args)
+    }
+
+    fn preview_result(
+        run: &crate::tools::ToolRunContext,
+        worktree: &Path,
+    ) -> crate::tools::ToolHandlerResult {
+        let args = HashMap::from([
+            (
+                "path".to_string(),
+                Value::String(worktree.to_string_lossy().into_owned()),
+            ),
+            (
+                "operation".to_string(),
+                Value::String("preview".to_string()),
+            ),
+        ]);
+        execute_exit_worktree(run, &args)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One end-to-end test keeps every fresh-run boundary visible.
+    fn transactional_apply_survives_fresh_run_boundaries_and_is_idempotent() {
+        let fixture = TransactionFixture::new(true);
+        std::fs::write(fixture.worktree.join("tracked.txt"), "changed\n")
+            .expect("change tracked file");
+        std::fs::write(fixture.worktree.join("new.txt"), "new\n").expect("create untracked file");
+
+        let preview = preview_result(&fixture.run, &fixture.worktree);
+        let paths = result_reviewable_paths(&preview);
+        assert_eq!(paths.len(), 2, "preview must enumerate both changed paths");
+        let staged = invoke_phase(
+            &fixture.run,
+            &fixture.worktree,
+            "stage",
+            &result_generation(&preview),
+            Some(paths),
+            None,
+            None,
+        );
+        assert!(
+            !handler_is_error(&staged),
+            "stage failed: {}",
+            staged.content()
+        );
+
+        let restarted = fixture.restarted_run();
+        let committed = invoke_phase(
+            &restarted,
+            &fixture.worktree,
+            "commit",
+            &result_generation(&staged),
+            None,
+            Some("transactional worktree fixture"),
+            None,
+        );
+        assert!(
+            !handler_is_error(&committed),
+            "commit failed: {}",
+            committed.content()
+        );
+        let recovery_ref = structured_result(&committed)
+            .get("recovery_ref")
+            .and_then(Value::as_str)
+            .expect("commit recovery ref");
+        let branch_head = fixture_git(
+            &fixture.git,
+            &fixture.worktree,
+            &["rev-parse", "--verify", "HEAD"],
+        );
+        let recovery_head = fixture_git(
+            &fixture.git,
+            &fixture.worktree,
+            &["rev-parse", "--verify", recovery_ref],
+        );
+        assert_eq!(branch_head.stdout, recovery_head.stdout);
+
+        let restarted = fixture.restarted_run();
+        let merged = invoke_phase(
+            &restarted,
+            &fixture.worktree,
+            "merge",
+            &result_generation(&committed),
+            None,
+            None,
+            None,
+        );
+        assert!(
+            !handler_is_error(&merged),
+            "merge failed: {}",
+            merged.content()
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.main.join("tracked.txt")).expect("merged tracked"),
+            "changed\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.main.join("new.txt")).expect("merged untracked"),
+            "new\n"
+        );
+
+        let restarted = fixture.restarted_run();
+        let merge_retry = invoke_phase(
+            &restarted,
+            &fixture.worktree,
+            "merge",
+            &result_generation(&committed),
+            None,
+            None,
+            None,
+        );
+        assert!(
+            !handler_is_error(&merge_retry),
+            "merge retry failed: {}",
+            merge_retry.content()
+        );
+
+        let restarted = fixture.restarted_run();
+        let generation = result_generation(&merge_retry);
+        let target_path = result_target_path(&merge_retry);
+        let removed = invoke_phase(
+            &restarted,
+            &fixture.worktree,
+            "remove",
+            &generation,
+            None,
+            None,
+            Some(&target_path),
+        );
+        assert!(
+            !handler_is_error(&removed),
+            "remove failed: {}",
+            removed.content()
+        );
+        assert!(!fixture.worktree.exists());
+        let restarted = fixture.restarted_run();
+        let retry = invoke_phase(
+            &restarted,
+            &fixture.worktree,
+            "remove",
+            &generation,
+            None,
+            None,
+            Some(&target_path),
+        );
+        assert!(
+            !handler_is_error(&retry),
+            "remove retry failed: {}",
+            retry.content()
+        );
+        assert_eq!(
+            structured_result(&retry)
+                .get("terminal")
+                .and_then(Value::as_str),
+            Some("already_absent")
+        );
+    }
+
+    #[test]
+    fn commit_identity_failure_retains_staged_work_and_worktree() {
+        let fixture = TransactionFixture::new(false);
+        std::fs::write(fixture.worktree.join("tracked.txt"), "identity failure\n")
+            .expect("change fixture");
+        let preview = preview_result(&fixture.run, &fixture.worktree);
+        let staged = invoke_phase(
+            &fixture.run,
+            &fixture.worktree,
+            "stage",
+            &result_generation(&preview),
+            Some(result_reviewable_paths(&preview)),
+            None,
+            None,
+        );
+        assert!(
+            !handler_is_error(&staged),
+            "stage failed: {}",
+            staged.content()
+        );
+        let before_head = fixture_git(&fixture.git, &fixture.worktree, &["rev-parse", "HEAD"]);
+        let committed = invoke_phase(
+            &fixture.run,
+            &fixture.worktree,
+            "commit",
+            &result_generation(&staged),
+            None,
+            Some("must fail without identity"),
+            None,
+        );
+        assert!(handler_is_error(&committed));
+        assert!(committed.content().contains("staged work was retained"));
+        assert!(fixture.worktree.exists());
+        let after_head = fixture_git(&fixture.git, &fixture.worktree, &["rev-parse", "HEAD"]);
+        assert_eq!(before_head.stdout, after_head.stdout);
+        let staged_diff = fixture_git(
+            &fixture.git,
+            &fixture.worktree,
+            &["diff", "--cached", "--name-only"],
+        );
+        assert!(
+            !staged_diff.stdout.is_empty(),
+            "staged work must remain recoverable"
+        );
+        let cleanup = transact_cleanup(&fixture.run, &fixture.worktree, "discard");
+        assert!(
+            !handler_is_error(&cleanup),
+            "cleanup failed: {}",
+            cleanup.content()
+        );
+    }
+
+    #[test]
+    fn required_clean_filter_failure_never_triggers_cleanup() {
+        let fixture = TransactionFixture::new(true);
+        fixture_git(
+            &fixture.git,
+            &fixture.main,
+            &["config", "filter.reject.clean", "false"],
+        );
+        fixture_git(
+            &fixture.git,
+            &fixture.main,
+            &["config", "filter.reject.required", "true"],
+        );
+        std::fs::write(
+            fixture.worktree.join(".gitattributes"),
+            "*.filterme filter=reject\n",
+        )
+        .expect("attributes fixture");
+        std::fs::write(fixture.worktree.join("data.filterme"), "must survive\n")
+            .expect("filtered fixture");
+        let preview = preview_result(&fixture.run, &fixture.worktree);
+        let stage = invoke_phase(
+            &fixture.run,
+            &fixture.worktree,
+            "stage",
+            &result_generation(&preview),
+            Some(result_reviewable_paths(&preview)),
+            None,
+            None,
+        );
+        assert!(
+            handler_is_error(&stage)
+                || matches!(stage.outcome, crate::tools::ToolOutcome::Partial { .. }),
+            "required clean filter must prevent a false stage success"
+        );
+        assert!(fixture.worktree.exists());
+        assert_eq!(
+            std::fs::read_to_string(fixture.worktree.join("data.filterme"))
+                .expect("filtered data retained"),
+            "must survive\n"
+        );
+        let cleanup = transact_cleanup(&fixture.run, &fixture.worktree, "discard");
+        assert!(
+            !handler_is_error(&cleanup),
+            "cleanup failed: {}",
+            cleanup.content()
+        );
+    }
+
+    #[test]
+    fn merge_conflict_aborts_target_and_retains_recovery_ref() {
+        let fixture = TransactionFixture::new(true);
+        std::fs::write(fixture.worktree.join("tracked.txt"), "worktree version\n")
+            .expect("worktree change");
+        let preview = preview_result(&fixture.run, &fixture.worktree);
+        let staged = invoke_phase(
+            &fixture.run,
+            &fixture.worktree,
+            "stage",
+            &result_generation(&preview),
+            Some(result_reviewable_paths(&preview)),
+            None,
+            None,
+        );
+        let committed = invoke_phase(
+            &fixture.run,
+            &fixture.worktree,
+            "commit",
+            &result_generation(&staged),
+            None,
+            Some("conflicting worktree commit"),
+            None,
+        );
+        assert!(
+            !handler_is_error(&committed),
+            "commit failed: {}",
+            committed.content()
+        );
+        let recovery_ref = structured_result(&committed)
+            .get("recovery_ref")
+            .and_then(Value::as_str)
+            .expect("recovery ref")
+            .to_string();
+
+        std::fs::write(fixture.main.join("tracked.txt"), "target version\n")
+            .expect("target change");
+        fixture_git(&fixture.git, &fixture.main, &["add", "tracked.txt"]);
+        fixture_git(
+            &fixture.git,
+            &fixture.main,
+            &["commit", "-qm", "target conflict"],
+        );
+        let merge_preview = preview_result(&fixture.run, &fixture.worktree);
+        let merged = invoke_phase(
+            &fixture.run,
+            &fixture.worktree,
+            "merge",
+            &result_generation(&merge_preview),
+            None,
+            None,
+            None,
+        );
+        assert!(
+            handler_is_error(&merged),
+            "conflicting merge must not succeed"
+        );
+        assert!(fixture.worktree.exists());
+        let main_status = fixture_git(&fixture.git, &fixture.main, &["status", "--porcelain"]);
+        assert!(
+            main_status.stdout.is_empty(),
+            "merge abort must restore clean target; status: {}",
+            String::from_utf8_lossy(&main_status.stdout)
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.main.join("tracked.txt")).expect("target retained"),
+            "target version\n"
+        );
+        let recovery = fixture_git(
+            &fixture.git,
+            &fixture.main,
+            &["rev-parse", "--verify", &recovery_ref],
+        );
+        assert!(!recovery.stdout.is_empty());
+        let cleanup = transact_cleanup(&fixture.run, &fixture.worktree, "remove");
+        assert!(
+            !handler_is_error(&cleanup),
+            "cleanup failed: {}",
+            cleanup.content()
+        );
+    }
+
+    #[test]
+    fn stale_discard_generation_preserves_newer_work() {
+        let fixture = TransactionFixture::new(true);
+        std::fs::write(fixture.worktree.join("tracked.txt"), "first\n").expect("first generation");
+        let preview = preview_result(&fixture.run, &fixture.worktree);
+        let generation = result_generation(&preview);
+        std::fs::write(fixture.worktree.join("tracked.txt"), "newer\n").expect("newer generation");
+        let discard = invoke_phase(
+            &fixture.run,
+            &fixture.worktree,
+            "discard",
+            &generation,
+            None,
+            None,
+            Some(&result_target_path(&preview)),
+        );
+        assert!(handler_is_error(&discard));
+        assert!(discard.content().contains("generation changed"));
+        assert!(fixture.worktree.exists());
+        assert_eq!(
+            std::fs::read_to_string(fixture.worktree.join("tracked.txt"))
+                .expect("newer work retained"),
+            "newer\n"
+        );
+        let cleanup = transact_cleanup(&fixture.run, &fixture.worktree, "discard");
+        assert!(
+            !handler_is_error(&cleanup),
+            "cleanup failed: {}",
+            cleanup.content()
+        );
+    }
+
+    #[test]
+    fn porcelain_parser_preserves_ordinary_rename_untracked_ignored_and_conflict_paths() {
+        let ordinary = concat!(
+            "# branch.oid 0123456789012345678901234567890123456789\0",
+            "# branch.head topic\0",
+            "1 .M N... 100644 100644 100644 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 tracked file\0",
+            "2 R. N... 100644 100644 100644 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 R100 renamed\0original\0",
+            "? untracked\0",
+            "! target/\0",
+            "u UU N... 100644 100644 100644 100644 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000 conflict\0"
+        );
+        let parsed = parse_porcelain_v2(ordinary.as_bytes(), true).expect("parse fixture");
+        assert_eq!(parsed.branch, "topic");
+        assert_eq!(parsed.head, "0123456789012345678901234567890123456789");
+        assert!(parsed.changes.unstaged.contains("tracked file"));
+        assert!(parsed.changes.staged.contains("renamed"));
+        assert!(parsed.changes.staged.contains("original"));
+        assert!(parsed.changes.untracked.contains("untracked"));
+        assert!(parsed.changes.ignored.contains("target/"));
+        assert!(parsed.changes.conflicted.contains("conflict"));
     }
 
     // ─── #408 regression tests: branch-name validation ────────────────────────
@@ -1693,7 +3681,7 @@ mod tests {
         let _lock = cwd_lock();
         let before = std::env::current_dir().expect("cwd before");
 
-        let (_, is_err) = execute_exit_worktree(test_run(), &HashMap::new());
+        let (_, is_err) = execute_exit_worktree(test_run(), &HashMap::new()).into_legacy();
         assert!(is_err);
         let after_missing = std::env::current_dir().expect("cwd after missing-path");
         assert_eq!(before, after_missing, "CWD changed on missing-path error");
@@ -1703,7 +3691,7 @@ mod tests {
             "path".to_string(),
             serde_json::Value::String("/nonexistent/path/for/345".to_string()),
         );
-        let (_, is_err) = execute_exit_worktree(test_run(), &args);
+        let (_, is_err) = execute_exit_worktree(test_run(), &args).into_legacy();
         assert!(is_err);
         let after_nonexistent = std::env::current_dir().expect("cwd after nonexistent");
         assert_eq!(
@@ -1716,7 +3704,7 @@ mod tests {
             "path".to_string(),
             serde_json::Value::String(before.display().to_string()),
         );
-        let (_, is_err) = execute_exit_worktree(test_run(), &args);
+        let (_, is_err) = execute_exit_worktree(test_run(), &args).into_legacy();
         assert!(is_err);
         let after_main = std::env::current_dir().expect("cwd after main");
         assert_eq!(before, after_main, "CWD changed on main-worktree error");

@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- S-073: Make worktree apply and cleanup transactional (#1156)
 - S-072: Supervise browser and web work (#1154)
 - S-071: Enforce web policy at the connection boundary (#1153)
 - S-070: Implement named remote actions safely (#1152)

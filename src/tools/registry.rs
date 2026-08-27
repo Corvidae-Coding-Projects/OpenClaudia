@@ -2320,20 +2320,31 @@ impl ToolHandler for ExitWorktreeHandler {
     }
     fn required_resources(
         &self,
-        _args: &HashMap<String, Value>,
+        args: &HashMap<String, Value>,
     ) -> &'static [super::security::ToolResource] {
-        REQUIRES_PROCESS_AND_WRITE
+        if args
+            .get("operation")
+            .is_none_or(|operation| operation == "preview")
+            && !args
+                .get("apply_changes")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            && !args
+                .get("discard_changes")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            REQUIRES_PROCESS
+        } else {
+            REQUIRES_PROCESS_AND_WRITE
+        }
     }
     fn effect_spec(&self) -> ToolEffectSpec {
         ToolEffectSpec::typed_operation_path(ToolEffect::Destructive, "Worktree")
     }
-    /// `exit_worktree` is two different operations behind one name.
-    ///
-    /// F-001 calls this out by name: every path ultimately removes a worktree,
-    /// yet the handler declared no target at all. The operation label remains
-    /// typed for auditability, while every variant uses the destructive
-    /// ceiling because `git worktree remove --force` can delete ignored files
-    /// that argument-only classification cannot prove absent.
+    /// Every transaction phase has a separate typed operation. The canonical
+    /// approval lifecycle binds the operation and all exact-generation
+    /// arguments before the handler inspects or mutates Git state.
     fn resolve_typed_effect(&self, args: &Value) -> Option<Result<TypedEffect, String>> {
         Some(worktree::classify_exit_worktree(args))
     }
@@ -2345,21 +2356,51 @@ impl ToolHandler for ExitWorktreeHandler {
             "type": "function",
             "function": {
                 "name": "exit_worktree",
-                "description": "Remove an isolated git worktree previously created by enter_worktree. Optionally commits and merges changes back, or explicitly discards dirty work. Does NOT change the process working directory.",
+                "description": "Review and transactionally stage, commit, merge, discard, or remove an isolated git worktree. Start with operation=preview, then pass each returned exact generation into one separately approved mutation. Failed or ambiguous operations retain recoverable work and never trigger cleanup.",
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "path": {
                             "type": "string",
                             "description": "Absolute path to the worktree to exit (as returned by enter_worktree)."
                         },
+                        "operation": {
+                            "type": "string",
+                            "enum": ["preview", "stage", "commit", "merge", "discard", "remove"],
+                            "description": "One transaction phase. Omission is a read-only preview for compatibility; every mutation must name its phase explicitly."
+                        },
+                        "expected_generation": {
+                            "type": "string",
+                            "pattern": "^sha256:[0-9a-f]{64}$",
+                            "description": "Exact worktree/repository/diff/base/target generation returned by the immediately preceding preview or phase. Required for every mutation."
+                        },
+                        "target_path": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "For discard/remove: the exact canonical target_path returned by preview. It locates and verifies the durable repository-bound cleanup receipt on retries after the worktree path is gone."
+                        },
+                        "paths": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 4096,
+                            "uniqueItems": true,
+                            "items": {"type": "string", "minLength": 1, "maxLength": 4096},
+                            "description": "For stage only: the exact complete non-ignored path set returned by the approved preview generation."
+                        },
+                        "message": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 4096,
+                            "description": "For commit only: the exact approved commit message."
+                        },
                         "apply_changes": {
                             "type": "boolean",
-                            "description": "If true, commit any uncommitted changes and merge the worktree branch into the main branch before removal. If false (default), removal succeeds only when the worktree is clean unless discard_changes=true is also passed."
+                            "description": "Deprecated compatibility input. Composite apply is rejected with recovery instructions because it cannot authorize stage, commit, merge, and removal separately."
                         },
                         "discard_changes": {
                             "type": "boolean",
-                            "description": "If true with apply_changes=false, explicitly discard uncommitted work and remove the worktree. Defaults to false to prevent accidental data loss."
+                            "description": "Deprecated compatibility input. Use operation=discard with an exact preview generation."
                         }
                     },
                     "required": ["path"]
@@ -2367,12 +2408,12 @@ impl ToolHandler for ExitWorktreeHandler {
             }
         })
     }
-    fn execute_legacy(
+    fn execute(
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
-    ) -> (String, bool) {
+    ) -> ToolHandlerResult {
         worktree::execute_exit_worktree(ctx.run, args)
     }
 }

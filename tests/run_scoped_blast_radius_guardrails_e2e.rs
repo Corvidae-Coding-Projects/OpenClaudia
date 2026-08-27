@@ -94,7 +94,7 @@ fn path_normalization_is_declared_metadata_not_tool_name_guessing() {
     .expect("LSP classification");
     let worktree = resolve_for_call(
         "exit_worktree",
-        &json!({"path":".worktrees/agent-fix","discard_changes":true}),
+        &json!({"path":".worktrees/agent-fix","operation":"discard"}),
     )
     .expect("worktree classification");
     let grep = resolve_for_call("grep", &json!({"path":".","pattern":"needle"}))
