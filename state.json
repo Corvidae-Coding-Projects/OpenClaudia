@@ -1,6 +1,6 @@
 {
   "next_display_id": 1175,
-  "next_comment_id": 1823,
+  "next_comment_id": 1824,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -7046,7 +7046,7 @@
       "priority": "medium",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T15:04:57.438590597Z",
-      "updated_at": "2026-08-27T15:16:26.700745524Z",
+      "updated_at": "2026-08-27T15:42:46.926669993Z",
       "labels": [
         "defect"
       ],
@@ -7068,6 +7068,15 @@
           "kind": "result",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAKeo2OUdCGIqHAsUJrDCCKG9JjGCgAVcpA+d4eqmbAviDHXYJoIO5Ysc3W2qXzDzXWAfPqeiwmNlx9hwrpqKsCg=="
+        },
+        "f64948a5-f404-4fa9-9b32-04d40580b812": {
+          "display_id": 1823,
+          "author": "6Vw9",
+          "content": "Exact-head CI run 33087112791 passed all five jobs on e2bb49805847afe1795459f1f29954ca609194c8: repository-policy, Rust 1.98/MSRV, Linux full suite plus fuzz/sandbox checks, macOS, and Windows. The previously failing hooks_permissions_e2e command hook test passed in the Linux suite.",
+          "created_at": "2026-08-27T15:42:46.923882174Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAfOam9ZV6OzJNFTbRnR5Ay8+ptFi75byPhzxgFZB1OBFFxsm1GHNwm795wOFfCrXTO1iOrBo2kPs3zJBsXoB9AA=="
         }
       }
     },
@@ -45777,11 +45786,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2061,
       "timestamp": "2026-08-27T15:16:26.700745524Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2062,
+      "timestamp": "2026-08-27T15:42:46.926669993Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T15:16:26.700745524Z",
+    "timestamp": "2026-08-27T15:42:46.926669993Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2061
+    "agent_seq": 2062
   }
 }
