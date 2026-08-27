@@ -1,6 +1,6 @@
 {
   "next_display_id": 1160,
-  "next_comment_id": 1746,
+  "next_comment_id": 1747,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -25479,7 +25479,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T04:57:18.848877241Z",
-      "updated_at": "2026-08-27T05:32:07.463971519Z",
+      "updated_at": "2026-08-27T05:49:37.864075245Z",
       "labels": [
         "feature",
         "remediation"
@@ -25502,6 +25502,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAf/Ol+1hNR13j46E1hnRWFK1fbPUiNjk0YnqooGMHejC+EkYEec5RMcoyrK2V1f7XT6hQmrYRcQTb1vsIoFwiBA=="
+        },
+        "94b784e2-83a4-4402-9923-391a79de33c6": {
+          "display_id": 1746,
+          "author": "6Vw9",
+          "content": "S-074 focused functional verification passes on Rust 1.98 with CARGO_BUILD_JOBS=2: 7 new capability tests cover real worktree-relative file/process execution without main-tree mutation, stale source, cross-owner, concurrent publication, removed/symlink-replaced roots, transactional exit/parent restore, and serialized-descriptor resume to a fresh generation. Existing worktree_dispatch_validation_e2e (36/36) and worktree_lsp_e2e (9/9) pass. A normal-path exit defect was found and fixed: trusted exit publication no longer requires a tree already removed by successful cleanup, while ordinary operations/enter/resume still require exact live canonical roots.",
+          "created_at": "2026-08-27T05:49:37.859849015Z",
+          "kind": "progress",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAqVcGSUHUb21CBWiiNgr2wB8kTTXu/r59TcUEe98PQ4GHqXm5Q8ULUg87ghrhe0NViwj5F35HJK6QkBqYamlKAQ=="
         },
         "a1372669-37c0-4bee-ac1a-35aa25438763": {
           "display_id": 1745,
@@ -43874,11 +43883,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1913,
       "timestamp": "2026-08-27T05:32:07.463971519Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1914,
+      "timestamp": "2026-08-27T05:49:37.864075245Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T05:32:07.463971519Z",
+    "timestamp": "2026-08-27T05:49:37.864075245Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1913
+    "agent_seq": 1914
   }
 }
