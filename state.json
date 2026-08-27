@@ -1,6 +1,6 @@
 {
   "next_display_id": 1166,
-  "next_comment_id": 1784,
+  "next_comment_id": 1785,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -19275,7 +19275,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T10:48:30.095935585Z",
-      "updated_at": "2026-08-27T11:16:48.987706874Z",
+      "updated_at": "2026-08-27T11:17:09.274385234Z",
       "closed_at": "2026-08-27T11:15:34.785911180Z",
       "labels": [
         "maintenance"
@@ -19292,6 +19292,15 @@
           "driver_key_fingerprint": "SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAo8QGkcnEq3kzVC+D1yVwaSgmFy+HpeHTqRWeVGcCzHPr/TB+5KXl4L8vmtBzcpDtdOaPB2WNGO+G+ebAxuilCg=="
+        },
+        "14ad7a7a-d592-49c8-bdd7-cc58d8b45ac8": {
+          "display_id": 1784,
+          "author": "6Vw9",
+          "content": "[action] Wave-one CI run 33064558890 passed all five jobs on 1ff7bbcf; closed #1165 and preserved its generated changelog entry unchanged in signed commit 24352bc1. All three wave subagents are terminal.",
+          "created_at": "2026-08-27T11:17:09.271811135Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAuVixBb2T9aKfYXdPTEZYctLlNACrGdBNLen1NLoaI7pMkcGlupUJzDJvWACMuXRRwxdCP4Vb1w1E5mtjDhDNAg=="
         },
         "b408f750-d546-4eb5-a7ac-d284bcf6122c": {
           "display_id": 1781,
@@ -44800,11 +44809,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1983,
       "timestamp": "2026-08-27T11:16:48.987706874Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1984,
+      "timestamp": "2026-08-27T11:17:09.274385234Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T11:16:48.987706874Z",
+    "timestamp": "2026-08-27T11:17:09.274385234Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1983
+    "agent_seq": 1984
   }
 }
