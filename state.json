@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1176,
+  "next_display_id": 1177,
   "next_comment_id": 1827,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -140,6 +140,7 @@
     "21c48962-2690-49e5-a402-64da78746f24": 1080,
     "21d57899-92a9-4751-b4c5-76ccc394f85e": 1042,
     "21e13dad-6fac-4ae8-9f1c-62788c0392cb": 538,
+    "21e9f315-fd14-44ee-ab4b-e3532bcefc20": 1176,
     "229161ac-804a-46d0-bd0f-7db135965396": 457,
     "229c6659-0de7-4d63-b0f5-04fde1b686a0": 676,
     "22a3dc41-b354-4a3c-9e22-ed0355024460": 278,
@@ -4938,6 +4939,17 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAuSqUlAhBZoMcxtawauFJdk97TLS+MsiQoJQVWDc40dsWacPbWdEDmKiuiXa7rZK6faVmtLx/gUeQPs1UWzVICw=="
         }
       }
+    },
+    "21e9f315-fd14-44ee-ab4b-e3532bcefc20": {
+      "uuid": "21e9f315-fd14-44ee-ab4b-e3532bcefc20",
+      "display_id": 1176,
+      "title": "Audit the next parallel remediation wave",
+      "description": "Read-only reconstruction of remaining open remediation slices, dependencies, locks, and repository state to recommend the next coherent parallel wave. Do not start implementation or change code. Close with --no-changelog after reporting.",
+      "status": "open",
+      "priority": "low",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-27T18:53:39.721099449Z",
+      "updated_at": "2026-08-27T18:53:39.721099449Z"
     },
     "229161ac-804a-46d0-bd0f-7db135965396": {
       "uuid": "229161ac-804a-46d0-bd0f-7db135965396",
@@ -45883,11 +45895,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2072,
       "timestamp": "2026-08-27T16:08:53.120463475Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2073,
+      "timestamp": "2026-08-27T18:53:39.721099449Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T16:08:53.120463475Z",
+    "timestamp": "2026-08-27T18:53:39.721099449Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2072
+    "agent_seq": 2073
   }
 }
