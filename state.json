@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1174,
+  "next_display_id": 1175,
   "next_comment_id": 1821,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -225,6 +225,7 @@
     "33650c2c-917c-4ae3-bfb6-b19cf3a79e34": 891,
     "337fa137-aae2-4295-94ed-66b42ed2a22d": 14,
     "33cb00b4-7df0-49dd-b16c-3cafe2595a7d": 807,
+    "33ddbc8c-ecd2-44f0-b296-f0e09cd7c2df": 1174,
     "341e49f0-ad6a-48d3-aa1e-057ff907b982": 52,
     "342218b1-909d-46d6-ac09-6bd04ecd5cea": 364,
     "34f3c26d-31c8-4e3f-9e30-d98f53383158": 1131,
@@ -7031,6 +7032,17 @@
         "dry",
         "qa-review"
       ]
+    },
+    "33ddbc8c-ecd2-44f0-b296-f0e09cd7c2df": {
+      "uuid": "33ddbc8c-ecd2-44f0-b296-f0e09cd7c2df",
+      "display_id": 1174,
+      "title": "Treat successful hook stdin EPIPE as an early close",
+      "description": "Linux CI run 33083812957 failed hooks_permissions_e2e::command_hook_runs_and_returns_allowed_by_default because a successful command hook exited without reading its JSON stdin, and the shared process supervisor converted BrokenPipe into CommandFailed. Preserve strict stdin-delivery errors by default, allow hook invocations to opt into truthful early-close handling, keep timeouts/cancellation/output bounds intact, add deterministic regression coverage, and restore all five exact-head runners.",
+      "status": "open",
+      "priority": "medium",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-27T15:04:57.438590597Z",
+      "updated_at": "2026-08-27T15:04:57.438590597Z"
     },
     "341e49f0-ad6a-48d3-aa1e-057ff907b982": {
       "uuid": "341e49f0-ad6a-48d3-aa1e-057ff907b982",
@@ -45713,11 +45725,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2056,
       "timestamp": "2026-08-27T15:04:45.207797366Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2057,
+      "timestamp": "2026-08-27T15:04:57.438590597Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T15:04:45.207797366Z",
+    "timestamp": "2026-08-27T15:04:57.438590597Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2056
+    "agent_seq": 2057
   }
 }
