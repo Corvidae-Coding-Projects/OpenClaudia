@@ -27503,12 +27503,13 @@
       "display_id": 1168,
       "title": "S-091: Make ACP modes and advertised tools effective",
       "description": "Implement docs/remediation-slices/091-acp-effective-capabilities.md on the active refactor branch. Generate ACP modes/tool schemas from effective registries, bind negotiated changes to validated run capability generations, and enforce the same canonical policy as other frontends so nothing forbidden is advertised or callable. Preserve working ACP behavior and capabilities; do not remove features. Worker phase writes code and focused tests only; parent coordinator performs all builds, tests, QA, integration fixes, commits, and runner monitoring. Prioritize realistic application paths over hypothetical perfection.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T11:25:05.507985757Z",
-      "updated_at": "2026-08-27T12:59:21.200748057Z",
+      "updated_at": "2026-08-27T12:59:44.485885763Z",
+      "closed_at": "2026-08-27T12:59:44.485884129Z",
       "labels": [
         "feature"
       ],
@@ -45375,11 +45376,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2020,
       "timestamp": "2026-08-27T12:59:40.008419062Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2021,
+      "timestamp": "2026-08-27T12:59:44.485885763Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T12:59:40.008419062Z",
+    "timestamp": "2026-08-27T12:59:44.485885763Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2020
+    "agent_seq": 2021
   }
 }
