@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1190,
+  "next_display_id": 1191,
   "next_comment_id": 1861,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -1109,6 +1109,7 @@
     "fd427573-136e-445b-81a4-bd3e1d02c701": 861,
     "fda3220c-a6f5-4cc4-afcd-960aa866cd91": 243,
     "fdc554f8-3e97-4c05-8ed1-3aa6b64de1da": 197,
+    "fdf22f4f-8f7a-47a3-857d-346d2bcc6c1a": 1190,
     "fe21a89e-76fb-452e-9aad-bb250d045362": 847,
     "fe2e523d-0b01-4948-817c-25cc0308c0ed": 5,
     "fec0d62b-cb4d-401e-97bc-96e41ebb62c1": 777,
@@ -35322,6 +35323,18 @@
         }
       }
     },
+    "fdf22f4f-8f7a-47a3-857d-346d2bcc6c1a": {
+      "uuid": "fdf22f4f-8f7a-47a3-857d-346d2bcc6c1a",
+      "display_id": 1190,
+      "title": "S-085: Implement speculation as a measured transaction",
+      "description": "Production-wire safe artifact-bound speculation only for deterministic idempotent read-only snapshot operations, with exact-match reuse, owned cancellation/join, bounded budgets, and measurement against baseline. Worker is code-only; parent owns all execution and verification.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "5ea8af88-cc85-47d9-943c-8e2e851b5e5a",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-27T23:55:14.145458322Z",
+      "updated_at": "2026-08-27T23:55:14.145458322Z"
+    },
     "fe21a89e-76fb-452e-9aad-bb250d045362": {
       "uuid": "fe21a89e-76fb-452e-9aad-bb250d045362",
       "display_id": 847,
@@ -47051,11 +47064,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2184,
       "timestamp": "2026-08-27T23:55:09.656426541Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2185,
+      "timestamp": "2026-08-27T23:55:14.145458322Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T23:55:09.656426541Z",
+    "timestamp": "2026-08-27T23:55:14.145458322Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2184
+    "agent_seq": 2185
   }
 }
