@@ -17285,11 +17285,12 @@
       "uuid": "7affeebf-2e4d-4376-ae71-74483ede9b0c",
       "display_id": 1171,
       "title": "Commit, push, and monitor wave-two integration",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T13:00:35.834567825Z",
-      "updated_at": "2026-08-27T13:29:30.881440496Z",
+      "updated_at": "2026-08-27T13:29:36.239457113Z",
+      "closed_at": "2026-08-27T13:29:36.239450956Z",
       "labels": [
         "workflow"
       ],
@@ -45478,11 +45479,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2032,
       "timestamp": "2026-08-27T13:29:30.881440496Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2033,
+      "timestamp": "2026-08-27T13:29:36.239457113Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T13:29:30.881440496Z",
+    "timestamp": "2026-08-27T13:29:36.239457113Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2032
+    "agent_seq": 2033
   }
 }
