@@ -1,6 +1,6 @@
 {
   "next_display_id": 1182,
-  "next_comment_id": 1843,
+  "next_comment_id": 1844,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -26846,11 +26846,20 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T20:47:39.842404779Z",
-      "updated_at": "2026-08-27T20:48:06.610141135Z",
+      "updated_at": "2026-08-27T20:58:09.433040873Z",
       "labels": [
         "maintenance"
       ],
       "comments": {
+        "7849eb5a-9b6b-47ef-98bb-3e8ec97fd81e": {
+          "display_id": 1843,
+          "author": "6Vw9",
+          "content": "Root-cause dependency repair: refreshed crates.io metadata confirmed chacha20 0.10.1 was yanked through rand 0.10.2 in both the main and fuzz lock graphs. Updated only Cargo.lock and fuzz/Cargo.lock to compatible chacha20 0.10.2 with its registry checksum; no policy exception or source behavior change. Verified both pinned cargo-deny policy commands, Rust 1.98 format/diff checks, strict locked all-target/all-feature Clippy, fuzz all-target check, and the complete locked serialized all-target/all-feature test suite.",
+          "created_at": "2026-08-27T20:58:09.429057909Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA7GHYObVgRvoU2lovlrJY0ChIYKzr/87+6JHNVpvzhCD5ooCTSaP5kSpfxYaewrGzGuPkm4nUm/IgdUInFYueDg=="
+        },
         "b9a52bf3-c02b-4431-bc7f-c7c4adc3ba63": {
           "display_id": 1842,
           "author": "6Vw9",
@@ -46373,11 +46382,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2116,
       "timestamp": "2026-08-27T20:48:06.610141135Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2117,
+      "timestamp": "2026-08-27T20:58:09.433040873Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T20:48:06.610141135Z",
+    "timestamp": "2026-08-27T20:58:09.433040873Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2116
+    "agent_seq": 2117
   }
 }
