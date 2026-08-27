@@ -1,6 +1,6 @@
 {
   "next_display_id": 1170,
-  "next_comment_id": 1800,
+  "next_comment_id": 1801,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8400,10 +8400,21 @@
       "priority": "medium",
       "created_by": "s004-wave",
       "created_at": "2026-08-20T22:59:13.451175121Z",
-      "updated_at": "2026-08-20T22:59:18.073500549Z",
+      "updated_at": "2026-08-27T12:41:33.018147570Z",
       "labels": [
         "defect"
-      ]
+      ],
+      "comments": {
+        "ae5da985-5175-4110-a2b4-7ba2fb6d6a9a": {
+          "display_id": 1800,
+          "author": "6Vw9",
+          "content": "2026-08-27 wave-two verification reproduced the defect from the primary checkout on Rust 1.98 after removing every stale cache-gen-624/clean-623/dirty-623/dup-guard-624 fixture worktree. Exact command: CARGO_BUILD_JOBS=4 cargo +1.98.0 test --locked --all-features --lib tools::worktree::tests::enter_and_exit_worktree_bump_cwd_cache_generation_624 -- --exact --test-threads=1. Failure: sandboxed git creates the absolute host .worktrees destination while workspace projection is active, then reconciliation rejects that same host generation as changed. This is independent of S-087 worker artifact inspection.",
+          "created_at": "2026-08-27T12:41:33.015245398Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAdEzlG6II4xOK2MiIppALrNRNjnoSSb1LXIZAjKbTDU/VXgrx+TYUurz2V9lIb5HtSDjBxOIZd0mkj6fivozIBA=="
+        }
+      }
     },
     "437da932-14ad-476d-85d5-f8342043107b": {
       "uuid": "437da932-14ad-476d-85d5-f8342043107b",
@@ -45206,11 +45217,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2007,
       "timestamp": "2026-08-27T12:40:41.815979207Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2008,
+      "timestamp": "2026-08-27T12:41:33.018147570Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T12:40:41.815979207Z",
+    "timestamp": "2026-08-27T12:41:33.018147570Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2007
+    "agent_seq": 2008
   }
 }
