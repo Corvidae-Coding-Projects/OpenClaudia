@@ -25500,12 +25500,13 @@
       "display_id": 1159,
       "title": "S-074: Bind isolated workspaces to run capabilities",
       "description": "Goal: \n\nAcceptance criteria:\n- \n\nImplement docs/remediation-slices/074-workspace-capability-binding.md without removing existing worktree behavior. Introduce an opaque generation-bound workspace capability with exact repository identity, canonical roots, base/target commits, branch, owner, and lifecycle. Atomically rebind file, process, LSP, task, ledger, verification, relative-path, and child-run operations across enter/exit/resume. Prove realistic stale-handle, removed-tree, symlink, concurrent-transition, and cross-owner failures. Keep S-075/S-076/S-077 out of scope. Rust 1.98, resource-aware complete verification, exact generated changelog, signed dollspace-gay commit, no push, exact-head PR #66 runners after user publication, and artifact-bound S-088 handoff without fabricated approval.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T04:57:18.848877241Z",
-      "updated_at": "2026-08-27T07:09:44.926994574Z",
+      "updated_at": "2026-08-27T07:10:16.261125868Z",
+      "closed_at": "2026-08-27T07:10:16.261119358Z",
       "labels": [
         "feature",
         "remediation"
@@ -43990,11 +43991,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1922,
       "timestamp": "2026-08-27T07:10:11.533815264Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1923,
+      "timestamp": "2026-08-27T07:10:16.261125868Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T07:10:11.533815264Z",
+    "timestamp": "2026-08-27T07:10:16.261125868Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1922
+    "agent_seq": 1923
   }
 }
