@@ -195,6 +195,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- Replace yanked chacha20 dependency blocking repository policy (#1181)
 - Treat successful hook stdin EPIPE as an early close (#1174)
 - Make sandboxed worktree tests support linked checkout git metadata (#1055)
 - Commit, push, and monitor wave-two integration (#1171)
