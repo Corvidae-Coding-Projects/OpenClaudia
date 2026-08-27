@@ -1,6 +1,6 @@
 {
   "next_display_id": 1173,
-  "next_comment_id": 1817,
+  "next_comment_id": 1818,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8403,7 +8403,7 @@
       "priority": "medium",
       "created_by": "s004-wave",
       "created_at": "2026-08-20T22:59:13.451175121Z",
-      "updated_at": "2026-08-27T14:37:31.489175073Z",
+      "updated_at": "2026-08-27T14:42:58.547027843Z",
       "labels": [
         "defect"
       ],
@@ -8443,6 +8443,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAlkGaWcXmi2XtJNjWdbkqncO5egBCIYU45+kKkq2O76fJR4PZSkbZC+FP4HpH8zWVgMWkQowoy1ooAh4y0fMgDw=="
+        },
+        "f05d9c00-3d8d-4d15-9075-7af28161dd02": {
+          "display_id": 1817,
+          "author": "6Vw9",
+          "content": "Linked-checkout acceptance found and fixed one final ambient test in follow-up commit 0b8796b6 test(worktree): isolate main-tree refusal fixture. The test now uses its disposable repository and requires the exact Not in an isolated worktree refusal. Verification on 0b8796b6: primary worktree module 44/44; Rust 1.98 all-target/all-feature Clippy with -D warnings; detached linked checkout at .worktrees/harness-1055-verify using the committed head 44/44. The temporary verification worktree was clean and removed afterward.",
+          "created_at": "2026-08-27T14:42:58.544426119Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAh66wnqqeNwjwv61OTvN/oXPNwnHBB4rebVSRQivObxMgn087WUdsb2EyWcuDlg5K92CtYsCK2C7GHDl0ZwULBQ=="
         },
         "f4f66897-e0bd-4926-aa90-fb763f158805": {
           "display_id": 1814,
@@ -45607,11 +45616,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2045,
       "timestamp": "2026-08-27T14:37:31.489175073Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2046,
+      "timestamp": "2026-08-27T14:42:58.547027843Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T14:37:31.489175073Z",
+    "timestamp": "2026-08-27T14:42:58.547027843Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2045
+    "agent_seq": 2046
   }
 }
