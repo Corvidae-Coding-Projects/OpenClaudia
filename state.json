@@ -1115,10 +1115,6 @@
     "1051": {
       "agent_id": "s005-wave",
       "claimed_at": "2026-08-20T22:15:50.142601512Z"
-    },
-    "1174": {
-      "agent_id": "6Vw9",
-      "claimed_at": "2026-08-27T15:05:08.466052316Z"
     }
   },
   "issues": {
@@ -45797,11 +45793,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2063,
       "timestamp": "2026-08-27T15:42:58.382628575Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2064,
+      "timestamp": "2026-08-27T15:43:04.082247524Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T15:42:58.382628575Z",
+    "timestamp": "2026-08-27T15:43:04.082247524Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2063
+    "agent_seq": 2064
   }
 }
