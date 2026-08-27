@@ -1,6 +1,6 @@
 {
   "next_display_id": 1159,
-  "next_comment_id": 1738,
+  "next_comment_id": 1739,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11359,7 +11359,7 @@
       "priority": "medium",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T00:41:06.296173668Z",
-      "updated_at": "2026-08-27T01:40:27.570124217Z",
+      "updated_at": "2026-08-27T01:40:36.756311542Z",
       "labels": [
         "maintenance"
       ],
@@ -11399,6 +11399,15 @@
           "kind": "blocker",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAuNW9FnsK3HIoBThhIuK6ME4HE455Wid30lmq144gcLnIs8T76YLT2aagAadL+vm/Y5rGC/WKqvlitNs1NwRIAg=="
+        },
+        "6ce67363-d061-410e-b51b-483e89aea533": {
+          "display_id": 1738,
+          "author": "6Vw9",
+          "content": "Exact-head run 33028224853 at 7e856b23 passed repository-policy, MSRV, macOS, and Windows; Linux failed four worktree lifecycle tests because PR checkout left the main target detached and inspection rejected all detached targets. Root repair: permit an existing detached target for exact preview and cleanup, retain attached-source requirement, and reject merge before mutation until the target branch is attached. Focused module 34/34, strict Rust 1.98 Clippy, and complete serialized Rust 1.98 all-target/all-feature suite are green. One earlier full-suite attempt safely refused a worktree operation because the user's concurrent push changed host .git during sandbox reconciliation; the exact test and clean full rerun passed unchanged.",
+          "created_at": "2026-08-27T01:40:36.753550007Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAa/og1sdbhMCC0wPZiJJiJtGGkLRbSGMHqm2Iw4DPfwMVRD7VQpm0xXtncJ0Y7e6cGKAcoeQdP20JphaxOSwGCw=="
         },
         "c5d7b8b3-350f-4f12-bc00-b5579218915f": {
           "display_id": 1734,
@@ -43712,10 +43721,15 @@
       "agent_id": "6Vw9",
       "agent_seq": 1900,
       "timestamp": "2026-08-27T01:40:32.318006131Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1900,
+      "timestamp": "2026-08-27T01:40:36.756311542Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T01:40:32.318006131Z",
+    "timestamp": "2026-08-27T01:40:36.756311542Z",
     "agent_id": "6Vw9",
     "agent_seq": 1900
   }
