@@ -1,6 +1,6 @@
 {
   "next_display_id": 1165,
-  "next_comment_id": 1771,
+  "next_comment_id": 1772,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -13195,7 +13195,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T08:44:23.359623873Z",
-      "updated_at": "2026-08-27T09:19:00.693459494Z",
+      "updated_at": "2026-08-27T10:35:33.555347992Z",
       "labels": [
         "feature"
       ],
@@ -13208,6 +13208,15 @@
           "kind": "handoff",
           "signed_by": "SHA256:XSQDkH4HQispEYLsa3eDy3UxEbAFG+pPgDBOgQYzznE",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgQFA1r6nhvks6bCW46+z2i8+ilMLcc5LDDM6EjijB7u0AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA5kqZrCQSSXv9wg8d1l60l0P5JmM1IrTPA8xJptqZBRXo3zc00sWgYcWScSvoaeq+J17TpJEuFLVHIRvjlK6SDg=="
+        },
+        "41f50dde-a133-4595-934f-6d167329161c": {
+          "display_id": 1771,
+          "author": "6Vw9",
+          "content": "Parent integration completed S-059. Canonical typed hook receipts now drive ACP new/load, legacy REPL, print mode, TUI, proxy, and subagent lifecycle paths; blocked starts retire run state, terminal paths emit SessionEnd/SubagentStop, TUI restores terminal state, and per-run sequence state is pruned. Rust 1.98 verification: fmt clean, all-target/all-feature Clippy with -D warnings passed; focused hooks 82/82, ACP 105/105, subagent 82/82, proxy 50/50, TUI 82/82, config 147/147, and selected frontend integration binaries passed. Serialized full library run: 2948 passed, 4 unrelated real-worktree fixture failures under the dirty active repository, 1 ignored; the known isolation boundary remains tracked separately in #1055/#1062. S-088 VDD receipt remains unavailable by declared dependency.",
+          "created_at": "2026-08-27T10:35:33.551641177Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAyNpF36mF0Glo1jZCf530VMn+9lAvhptjBxuK8flq44xj5cLDDl4TVueapHrLHQGLkQDAaWYshKPATMz1d3QlCQ=="
         },
         "b6e427ad-6676-4a78-957c-26598bbdefc5": {
           "display_id": 1765,
@@ -44540,11 +44549,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1960,
       "timestamp": "2026-08-27T09:42:55.305276254Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1961,
+      "timestamp": "2026-08-27T10:35:33.555347992Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T09:42:55.305276254Z",
+    "timestamp": "2026-08-27T10:35:33.555347992Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1960
+    "agent_seq": 1961
   }
 }
