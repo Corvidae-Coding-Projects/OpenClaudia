@@ -1,6 +1,6 @@
 {
   "next_display_id": 1178,
-  "next_comment_id": 1832,
+  "next_comment_id": 1833,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -27182,10 +27182,24 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T18:59:46.335046185Z",
-      "updated_at": "2026-08-27T18:59:50.836765894Z",
+      "updated_at": "2026-08-27T19:00:08.699378908Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "40dffbde-63b4-4c4a-9976-9c68f5b9c7e9": {
+          "display_id": 1832,
+          "author": "6Vw9",
+          "content": "Session did not select newly created coordination issue",
+          "created_at": "2026-08-27T19:00:08.696940443Z",
+          "kind": "intervention",
+          "trigger_type": "tool_blocked",
+          "intervention_context": "Started implementation wave three after issue creation; explicitly selecting #1177 before preflight and worker dispatch.",
+          "driver_key_fingerprint": "SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABASRVAXjz+I60OfpAfSsjcZMhtGyb2K5KwcVl4ZpieNx4RNDjTDCfQ/ft6OinYPM8/Fyp0jHxmKHcM7lh+1rXeAQ=="
+        }
+      }
     },
     "bfbb8f4b-a4f4-4b1d-871d-cec84a8ec41a": {
       "uuid": "bfbb8f4b-a4f4-4b1d-871d-cec84a8ec41a",
@@ -46039,11 +46053,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2086,
       "timestamp": "2026-08-27T18:59:56.156276280Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2087,
+      "timestamp": "2026-08-27T19:00:08.699378908Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T18:59:56.156276280Z",
+    "timestamp": "2026-08-27T19:00:08.699378908Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2086
+    "agent_seq": 2087
   }
 }
