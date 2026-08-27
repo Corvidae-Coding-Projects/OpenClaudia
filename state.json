@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1184,
+  "next_display_id": 1185,
   "next_comment_id": 1850,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -593,6 +593,7 @@
     "89e84c5e-00ee-42da-a47c-9c195ab62c8f": 1035,
     "8a03a034-8008-4b5c-8594-6005d2f534c0": 976,
     "8ac4fb5b-b5d1-4ba9-9fe8-2ce1c4675d17": 1057,
+    "8b08ab47-5455-4082-9720-7b8fceb04427": 1184,
     "8b1a21f2-7f4f-46ad-8108-aeca11053ab8": 877,
     "8bc856af-681a-4fe6-bcac-c808b7f71afd": 844,
     "8bf9bbad-f57c-40db-a794-14070216fc96": 280,
@@ -20359,6 +20360,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAqXRjmoiQM3zTZidTB7QvkrWdpNSgwdFwN6wIPHZzG3ujmdkMIzv3zMMw2pNhrRJr1nlIM5P3ma+Ok5H5oMtRCQ=="
         }
       }
+    },
+    "8b08ab47-5455-4082-9720-7b8fceb04427": {
+      "uuid": "8b08ab47-5455-4082-9720-7b8fceb04427",
+      "display_id": 1184,
+      "title": "Bind canonical VDD identity to the actual resolved verifier route",
+      "description": "S-088 builds verifier identity from configured provider/base_url/requested model before dispatch and never retains or checks the actual response route/model. Router aliases, OpenAI-compatible remaps, redirects, or provider fallback can therefore produce a Pass receipt under a requested alternate identity even when another model family answered. Resolve and record the effective endpoint/model identity at transport time, compare it to the worker and requested verifier identities, and return inconclusive/verifier_error on ambiguity, alias drift, fallback, or collision. Cover direct HTTP, native JSON, and account-backed SDK routes with deterministic transport fixtures.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-27T22:18:11.166741687Z",
+      "updated_at": "2026-08-27T22:18:11.166741687Z"
     },
     "8b1a21f2-7f4f-46ad-8108-aeca11053ab8": {
       "uuid": "8b1a21f2-7f4f-46ad-8108-aeca11053ab8",
@@ -46567,11 +46580,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2135,
       "timestamp": "2026-08-27T22:18:05.715795259Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2136,
+      "timestamp": "2026-08-27T22:18:11.166741687Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T22:18:05.715795259Z",
+    "timestamp": "2026-08-27T22:18:11.166741687Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2135
+    "agent_seq": 2136
   }
 }
