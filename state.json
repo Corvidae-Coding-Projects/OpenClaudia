@@ -1,6 +1,6 @@
 {
   "next_display_id": 1188,
-  "next_comment_id": 1851,
+  "next_comment_id": 1852,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -14656,7 +14656,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T22:07:58.866963627Z",
-      "updated_at": "2026-08-27T22:20:19.183409963Z",
+      "updated_at": "2026-08-27T22:20:23.723455941Z",
       "labels": [
         "review"
       ],
@@ -14687,6 +14687,15 @@
           "kind": "observation",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABANS5m0pR1BudlUf9qtp5hSlalPzaVQFucxay6yITIdQ3YGGRfd6jwUVZK6hcHGzzDcR0memK8GNmeaE2TgBWnBA=="
+        },
+        "4a398c12-d01c-4403-b6aa-12d7a2657296": {
+          "display_id": 1851,
+          "author": "6Vw9",
+          "content": "Confirmed MEDIUM completeness gap: the design requires the selected source snapshot, but CanonicalVddRequest carries/serializes only PlannerEvidenceSourceRecord metadata; that record contains id/kind/digest/reference/run/time, not source bytes. Because the fresh verifier intentionally has no parent transcript/network/memory/MCP access, source-dependent criteria outside the reviewed worktree cannot be checked. Also confirmed the seven tests do not invoke run_canonical_verification or ToolExecutor; the Reality test manually seeds the ledger, so exact-head green CI does not establish the runtime path.",
+          "created_at": "2026-08-27T22:20:23.720963132Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAQsoCuBxNx1G/WqoeY/VhSYQ/SPFwcX51u9yyzTAVpbQoPqtkgoVldpjwJMkKGK1d+t9oaqrjHNZv52L3gAkcBg=="
         },
         "50d0a193-6350-43e4-afdc-9a6b8efb6401": {
           "display_id": 1849,
@@ -46745,11 +46754,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2150,
       "timestamp": "2026-08-27T22:20:19.183409963Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2151,
+      "timestamp": "2026-08-27T22:20:23.723455941Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T22:20:19.183409963Z",
+    "timestamp": "2026-08-27T22:20:23.723455941Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2150
+    "agent_seq": 2151
   }
 }
