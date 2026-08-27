@@ -1,6 +1,6 @@
 {
   "next_display_id": 1175,
-  "next_comment_id": 1821,
+  "next_comment_id": 1822,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -7046,10 +7046,21 @@
       "priority": "medium",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T15:04:57.438590597Z",
-      "updated_at": "2026-08-27T15:05:02.542248014Z",
+      "updated_at": "2026-08-27T15:05:38.514535913Z",
       "labels": [
         "defect"
-      ]
+      ],
+      "comments": {
+        "c987f6f8-b26b-4ecb-a934-d987250800e3": {
+          "display_id": 1821,
+          "author": "6Vw9",
+          "content": "Keep the shared process supervisor strict by default. Add an explicit ProcessLimits opt-in for callers whose stdin is advisory, represent a child-closes-stdin condition truthfully instead of claiming full delivery, have command hooks enable that mode, and add deterministic large-payload supervisor coverage plus the existing real-hook integration test. Do not change timeout, cancellation, output bounds, or non-hook callers.",
+          "created_at": "2026-08-27T15:05:38.512044888Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABATK8MDIZxMTPdB8uO1MawbNc9iMQ82nrnlQfRopAdsKWgBsX3S0vLPcLj1j33qNs+PgP1vg+bbxiWHAcFlsSdAg=="
+        }
+      }
     },
     "341e49f0-ad6a-48d3-aa1e-057ff907b982": {
       "uuid": "341e49f0-ad6a-48d3-aa1e-057ff907b982",
@@ -45747,11 +45758,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2059,
       "timestamp": "2026-08-27T15:05:08.466052316Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2060,
+      "timestamp": "2026-08-27T15:05:38.514535913Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T15:05:08.466052316Z",
+    "timestamp": "2026-08-27T15:05:38.514535913Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2059
+    "agent_seq": 2060
   }
 }
