@@ -1119,10 +1119,6 @@
       "agent_id": "xdNo",
       "claimed_at": "2026-08-27T11:31:44.035157477Z"
     },
-    "1168": {
-      "agent_id": "Xnwv",
-      "claimed_at": "2026-08-27T11:31:54.294188823Z"
-    },
     "1169": {
       "agent_id": "NeZq",
       "claimed_at": "2026-08-27T11:31:59.346769129Z"
@@ -45088,11 +45084,16 @@
       "agent_id": "Xnwv",
       "agent_seq": 2,
       "timestamp": "2026-08-27T12:01:14.960558678Z"
+    },
+    {
+      "agent_id": "Xnwv",
+      "agent_seq": 3,
+      "timestamp": "2026-08-27T12:01:19.594737804Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T12:01:14.960558678Z",
+    "timestamp": "2026-08-27T12:01:19.594737804Z",
     "agent_id": "Xnwv",
-    "agent_seq": 2
+    "agent_seq": 3
   }
 }
