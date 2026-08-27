@@ -1,6 +1,6 @@
 {
   "next_display_id": 1159,
-  "next_comment_id": 1737,
+  "next_comment_id": 1738,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -19727,10 +19727,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T00:36:32.320359690Z",
-      "updated_at": "2026-08-27T00:36:36.614680095Z",
+      "updated_at": "2026-08-27T01:40:32.318006131Z",
       "labels": [
         "feature"
-      ]
+      ],
+      "comments": {
+        "eb7a01c1-1e1c-4e83-99cb-c62a037b4d32": {
+          "display_id": 1737,
+          "author": "6Vw9",
+          "content": "S-073 artifact generation S073-G1 was rebound after exact-head Linux CI exposed detached-target inspection semantics. Superseding sorted seven-file manifest SHA-256: d0d9118004ef73192c9a174397988ade905d5aab611cb3fe856d710443dcaf95. Updated src/tools/worktree.rs SHA-256: 3c04e4395b61bd0c6beca8a091ab1ef29772f671973ffb18df6cc6cc2ac60aaf. The canonical S-088 verifier must review this generation; the earlier digest is stale and must not approve anything.",
+          "created_at": "2026-08-27T01:40:32.315510657Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAPJJa9jtbzLB9HcQ4IIXIGsbnRXl/L2fD4oBEL5+zxaOrBrUl2m2GbjmgiFJNgD/LsEA4f+s+DVxKjVTDpBAHDw=="
+        }
+      }
     },
     "8e4a5961-7f8d-4650-81ff-7ea7d29be200": {
       "uuid": "8e4a5961-7f8d-4650-81ff-7ea7d29be200",
@@ -43696,10 +43707,15 @@
       "agent_id": "6Vw9",
       "agent_seq": 1900,
       "timestamp": "2026-08-27T01:40:27.570124217Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1900,
+      "timestamp": "2026-08-27T01:40:32.318006131Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T01:40:27.570124217Z",
+    "timestamp": "2026-08-27T01:40:32.318006131Z",
     "agent_id": "6Vw9",
     "agent_seq": 1900
   }
