@@ -19270,12 +19270,13 @@
       "display_id": 1165,
       "title": "Monitor and repair wave-one CI",
       "description": "Monitor draft PR #66 runners for wave-one commits 399a19e9 and 1ff7bbcf, diagnose concrete failures, and apply only necessary runner repairs.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T10:48:30.095935585Z",
-      "updated_at": "2026-08-27T11:15:26.158604681Z",
+      "updated_at": "2026-08-27T11:15:34.785912657Z",
+      "closed_at": "2026-08-27T11:15:34.785911180Z",
       "labels": [
         "maintenance"
       ],
@@ -44756,11 +44757,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1978,
       "timestamp": "2026-08-27T11:15:26.158604681Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1979,
+      "timestamp": "2026-08-27T11:15:34.785912657Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T11:15:26.158604681Z",
+    "timestamp": "2026-08-27T11:15:34.785912657Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1978
+    "agent_seq": 1979
   }
 }
