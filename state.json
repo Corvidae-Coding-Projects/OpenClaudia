@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1161,
+  "next_display_id": 1162,
   "next_comment_id": 1754,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -721,6 +721,7 @@
     "ab0ccb3b-b087-4808-b007-fe5fa42a4024": 902,
     "ab2ae097-c0c4-4c0c-9b84-99ebead283ad": 350,
     "ab8f9c0a-721b-497c-bb07-b3c6947da57b": 739,
+    "ab968304-0c95-4a8d-b362-467cccf098ac": 1161,
     "abad47c5-b1f1-4126-97b3-ab3bb18ca9c0": 642,
     "abb7a9c5-9db5-4700-ba7a-0eb00202bb8f": 378,
     "abc3671e-fe2a-4ce1-82c7-146e4de6ad5e": 1025,
@@ -23478,6 +23479,18 @@
         }
       }
     },
+    "ab968304-0c95-4a8d-b362-467cccf098ac": {
+      "uuid": "ab968304-0c95-4a8d-b362-467cccf098ac",
+      "display_id": 1161,
+      "title": "Monitor exact-head PR #66 runners for S-074",
+      "description": "After Laurelai publishes signed S-074 commits a2fbf85a and ab3bf207, verify PR #66 head is exactly ab3bf207, monitor every check to terminal success, investigate and fix only genuine failures, preserve the draft PR, and close this monitoring task when all exact-head runners pass.",
+      "status": "open",
+      "priority": "medium",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-27T07:12:28.746774970Z",
+      "updated_at": "2026-08-27T07:12:28.746774970Z"
+    },
     "abad47c5-b1f1-4126-97b3-ab3bb18ca9c0": {
       "uuid": "abad47c5-b1f1-4126-97b3-ab3bb18ca9c0",
       "display_id": 642,
@@ -44034,11 +44047,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1927,
       "timestamp": "2026-08-27T07:11:32.013933521Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1928,
+      "timestamp": "2026-08-27T07:12:28.746774970Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T07:11:32.013933521Z",
+    "timestamp": "2026-08-27T07:12:28.746774970Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1927
+    "agent_seq": 1928
   }
 }
