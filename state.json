@@ -1,6 +1,6 @@
 {
   "next_display_id": 1159,
-  "next_comment_id": 1732,
+  "next_comment_id": 1733,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11359,10 +11359,21 @@
       "priority": "medium",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T00:41:06.296173668Z",
-      "updated_at": "2026-08-27T00:41:10.824536620Z",
+      "updated_at": "2026-08-27T00:41:51.920414367Z",
       "labels": [
         "maintenance"
-      ]
+      ],
+      "comments": {
+        "026aa2bb-d2c7-4d68-a001-fd1ffd8c10ff": {
+          "display_id": 1732,
+          "author": "6Vw9",
+          "content": "Exact-head preflight: local signed S-073 head is 7e856b23d33bcde085b7b222b0dee6fd220d2cbb. After fetching origin, the remote branch and draft PR #66 still point to 9792e9a8a03d6bd950e01585b855d8969ea16436. The five displayed checks are green only for that older head, so they are not S-073 evidence. Waiting for the user-authorized push before monitoring the new exact-head run.",
+          "created_at": "2026-08-27T00:41:51.917953078Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAOILKTaejj4G/ws37XBx5zvZQoJQknG3XyJ9i97+Yd3kKT68OPdWBhGPqff72/6Pw90Ht7asjggyRcjbG6lChBA=="
+        }
+      }
     },
     "520463dd-a97d-4333-b04d-1a1da6a66d17": {
       "uuid": "520463dd-a97d-4333-b04d-1a1da6a66d17",
@@ -43614,11 +43625,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1893,
       "timestamp": "2026-08-27T00:41:16.008339865Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1894,
+      "timestamp": "2026-08-27T00:41:51.920414367Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T00:41:16.008339865Z",
+    "timestamp": "2026-08-27T00:41:51.920414367Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1893
+    "agent_seq": 1894
   }
 }
