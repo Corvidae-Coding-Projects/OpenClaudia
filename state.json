@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1173,
+  "next_display_id": 1174,
   "next_comment_id": 1819,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -441,6 +441,7 @@
     "6664a57f-d35f-4b00-9e84-c2473a88d2e6": 818,
     "66ad6d37-42af-4133-830d-fdf7d4cb67ac": 1083,
     "66da9b0b-6a96-4aa7-8f13-8d44fde26ece": 448,
+    "676ba339-0d4b-4f88-b1a3-bf12751a6994": 1173,
     "677346b3-ae1a-4f69-9dc3-159a190351e7": 353,
     "67998364-68fd-452c-a117-3263ced8e4af": 911,
     "67bb6128-fa29-4254-8d15-dffc2ab01275": 95,
@@ -15054,6 +15055,17 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAEtK2waaYHu/rUcX7/3GJIpnrWC5f8D2EMdn64ZQW5JBG+mA5mRk/aLuWIaBOTXqPR7Xrw43nUEIzeseL6lIQAw=="
         }
       }
+    },
+    "676ba339-0d4b-4f88-b1a3-bf12751a6994": {
+      "uuid": "676ba339-0d4b-4f88-b1a3-bf12751a6994",
+      "display_id": 1173,
+      "title": "Record generated changelog for #1055",
+      "description": "Commit the exact CHANGELOG.md line emitted when Crosslink closed #1055. Do not edit or regenerate the line; close this bookkeeping issue with --no-changelog to avoid recursive output.",
+      "status": "open",
+      "priority": "low",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-27T15:03:47.832262144Z",
+      "updated_at": "2026-08-27T15:03:47.832262144Z"
     },
     "677346b3-ae1a-4f69-9dc3-159a190351e7": {
       "uuid": "677346b3-ae1a-4f69-9dc3-159a190351e7",
@@ -45642,11 +45654,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2049,
       "timestamp": "2026-08-27T15:03:12.951182625Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2050,
+      "timestamp": "2026-08-27T15:03:47.832262144Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T15:03:12.951182625Z",
+    "timestamp": "2026-08-27T15:03:47.832262144Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2049
+    "agent_seq": 2050
   }
 }
