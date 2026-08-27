@@ -469,6 +469,7 @@ pub struct ProcessLimits {
     stdout_bytes: usize,
     stderr_bytes: usize,
     stdin_bytes: usize,
+    allow_stdin_early_close: bool,
     stdout_truncated_marker: &'static [u8],
     stderr_truncated_marker: &'static [u8],
 }
@@ -481,6 +482,7 @@ impl ProcessLimits {
             stdout_bytes: MAX_CAPTURE_BYTES_PER_STREAM,
             stderr_bytes: MAX_CAPTURE_BYTES_PER_STREAM,
             stdin_bytes: MAX_STDIN_BYTES,
+            allow_stdin_early_close: false,
             stdout_truncated_marker: OUTPUT_TRUNCATED_MARKER,
             stderr_truncated_marker: OUTPUT_TRUNCATED_MARKER,
         }
@@ -498,6 +500,16 @@ impl ProcessLimits {
         self.stderr_truncated_marker = truncated_marker;
         self
     }
+
+    /// Allow a child to close stdin without consuming the complete payload,
+    /// while preserving its exit status as the authoritative outcome. This is
+    /// appropriate only when stdin is advisory, such as hook context that a
+    /// command is not required to read.
+    #[must_use]
+    pub const fn with_stdin_early_close_allowed(mut self) -> Self {
+        self.allow_stdin_early_close = true;
+        self
+    }
 }
 
 /// How much of the supplied stdin payload reached the child.
@@ -510,6 +522,10 @@ pub enum StdinDelivery {
     },
     Complete {
         bytes: usize,
+    },
+    ClosedEarly {
+        written: usize,
+        total: usize,
     },
     Failed {
         written: usize,
@@ -558,7 +574,9 @@ impl SupervisedProcessOutput {
     pub fn into_std_output(self) -> Output {
         debug_assert!(matches!(
             self.stdin,
-            StdinDelivery::NotRequested | StdinDelivery::Complete { .. }
+            StdinDelivery::NotRequested
+                | StdinDelivery::Complete { .. }
+                | StdinDelivery::ClosedEarly { .. }
         ));
         Output {
             status: self.status,
@@ -817,7 +835,12 @@ async fn supervise_prepared_process(
                 )),
             });
         };
-        io_tasks.spawn(write_stdin(stdin, input, Arc::clone(&stdin_state)));
+        io_tasks.spawn(write_stdin(
+            stdin,
+            input,
+            Arc::clone(&stdin_state),
+            limits.allow_stdin_early_close,
+        ));
     }
 
     let mut status = None;
@@ -962,12 +985,20 @@ async fn write_stdin(
     mut stdin: tokio::process::ChildStdin,
     input: Vec<u8>,
     state: Arc<Mutex<StdinDelivery>>,
+    allow_early_close: bool,
 ) -> Result<(), String> {
     let total = input.len();
     let mut written = 0_usize;
     while written < total {
         match stdin.write(&input[written..]).await {
             Ok(0) => {
+                if allow_early_close {
+                    *state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        StdinDelivery::ClosedEarly { written, total };
+                    return Ok(());
+                }
                 let error = "stdin closed before the input payload was delivered".to_string();
                 *state
                     .lock()
@@ -985,6 +1016,13 @@ async fn write_stdin(
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
                     StdinDelivery::Pending { written, total };
             }
+            Err(error) if allow_early_close && error.kind() == std::io::ErrorKind::BrokenPipe => {
+                *state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    StdinDelivery::ClosedEarly { written, total };
+                return Ok(());
+            }
             Err(error) => {
                 let error = format!("stdin write failed: {error}");
                 *state
@@ -999,6 +1037,13 @@ async fn write_stdin(
         }
     }
     if let Err(error) = stdin.shutdown().await {
+        if allow_early_close && error.kind() == std::io::ErrorKind::BrokenPipe {
+            *state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                StdinDelivery::ClosedEarly { written, total };
+            return Ok(());
+        }
         let error = format!("stdin close failed: {error}");
         *state
             .lock()
@@ -1231,6 +1276,53 @@ mod tests {
         .expect("cat must echo stdin");
         assert!(out.status.success(), "cat exit status must be 0");
         assert_eq!(out.stdout, b"alpha\nbeta\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn strict_stdin_delivery_rejects_a_child_that_closes_early() {
+        let payload = vec![b'x'; 1024 * 1024];
+        let result = run_with_timeout_with_input(
+            "true",
+            &Vec::<&str>::new(),
+            None,
+            Duration::from_secs(5),
+            &payload,
+        );
+
+        let Err(CommandError::WaitFailed { partial, .. }) = result else {
+            panic!("strict stdin must reject early closure, got {result:?}");
+        };
+        assert!(matches!(partial.stdin, StdinDelivery::Failed { .. }));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn advisory_stdin_allows_a_successful_child_to_close_early() {
+        let root = tempfile::TempDir::new().expect("temporary run root");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        let payload = vec![b'x'; 1024 * 1024];
+        let total = payload.len();
+        let command = Command::new("true");
+
+        let output = run_prepared_run_owned(
+            &run,
+            PreparedProcessCommand::host(command),
+            "advisory-stdin-test",
+            ProcessLimits::new(Duration::from_secs(5)).with_stdin_early_close_allowed(),
+            Some(payload),
+        )
+        .await
+        .expect("successful child may ignore advisory stdin");
+
+        assert!(output.status.success());
+        assert!(matches!(
+            output.stdin,
+            StdinDelivery::ClosedEarly {
+                written,
+                total: observed_total,
+            } if written < observed_total && observed_total == total
+        ));
     }
 
     #[test]

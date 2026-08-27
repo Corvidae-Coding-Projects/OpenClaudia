@@ -1459,7 +1459,8 @@ impl HookEngine {
             .with_output_limit(
                 MAX_HOOK_OUTPUT_BYTES_PER_STREAM,
                 HOOK_OUTPUT_TRUNCATED_MARKER,
-            );
+            )
+            .with_stdin_early_close_allowed();
         match crate::tools::command::run_prepared_run_owned(
             run,
             prepared_command,
