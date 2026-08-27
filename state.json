@@ -20647,11 +20647,12 @@
       "uuid": "910d63d1-4aab-40f9-b5e1-448633faff7e",
       "display_id": 1170,
       "title": "Allow trusted Codex Git mutations in repository hooks",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T12:44:51.073286792Z",
-      "updated_at": "2026-08-27T12:56:38.432046754Z",
+      "updated_at": "2026-08-27T12:59:53.833811579Z",
+      "closed_at": "2026-08-27T12:59:53.833810136Z",
       "labels": [
         "workflow"
       ],
@@ -45387,11 +45388,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2022,
       "timestamp": "2026-08-27T12:59:49.071750747Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2023,
+      "timestamp": "2026-08-27T12:59:53.833811579Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T12:59:49.071750747Z",
+    "timestamp": "2026-08-27T12:59:53.833811579Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2022
+    "agent_seq": 2023
   }
 }
