@@ -10,16 +10,16 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use thiserror::Error;
 
 use crate::runtime::{
     Actor, ActorId, ActorRole, BudgetGeneration, BudgetId, BudgetLimits, CapabilityBinding,
-    CapabilityGeneration, CapabilityKind, ContentDigest, ProviderContinuation, ProviderId,
-    RunBudget, RunContext, RunDescriptor, RunDescriptorParts, RunId, StateGeneration,
-    StateSnapshot, TracingTraceSink, WorkspaceBinding, WorkspaceGeneration,
+    CapabilityGeneration, CapabilityKind, ContentDigest, IsolatedWorkspaceDescriptor,
+    ProviderContinuation, ProviderId, RunBudget, RunContext, RunDescriptor, RunDescriptorParts,
+    RunId, StateGeneration, StateSnapshot, TracingTraceSink, WorkspaceBinding, WorkspaceGeneration,
 };
 use crate::state::SessionId;
 
@@ -66,6 +66,34 @@ pub enum ToolCapabilityError {
     },
     #[error("run capability binding does not match its canonical descriptor: {detail}")]
     BindingMismatch { detail: String },
+    #[error("run {run_id} generation {generation} is no longer the active workspace generation ({state})")]
+    InactiveWorkspaceGeneration {
+        run_id: RunId,
+        generation: CapabilityGeneration,
+        state: &'static str,
+    },
+    #[error("isolated workspace capability is stale: {detail}")]
+    StaleWorkspace { detail: String },
+}
+
+/// Failure to publish a host-only isolated-workspace run transition.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum WorkspaceTransitionError {
+    #[error("workspace transition gate is unavailable: {0}")]
+    GateUnavailable(String),
+    #[error("workspace transition does not belong to the active run: {0}")]
+    WrongSource(String),
+    #[error("workspace transition conflicts with current lifecycle: {0}")]
+    LifecycleConflict(String),
+    #[error("isolated workspace identity is invalid or stale: {0}")]
+    StaleWorkspace(String),
+    #[error("cannot transition while background effects are active: shells={shell_ids:?}, agents={agent_ids:?}")]
+    InFlightBackgroundEffects {
+        shell_ids: Vec<String>,
+        agent_ids: Vec<String>,
+    },
+    #[error("cannot construct the replacement run generation: {0}")]
+    Construction(String),
 }
 
 /// Failure to install a new run-scoped behavioral capability generation.
@@ -90,6 +118,58 @@ pub enum RuntimeModeTransitionError {
 /// Holds the run lifecycle boundary until one background effect is registered.
 pub(crate) struct BackgroundEffectRegistration<'a> {
     _guard: MutexGuard<'a, ()>,
+}
+
+const WORKSPACE_RUN_ACTIVE: u8 = 0;
+const WORKSPACE_RUN_SUSPENDED: u8 = 1;
+const WORKSPACE_RUN_RETIRED: u8 = 2;
+
+#[derive(Default)]
+struct WorkspaceTransitionGate {
+    state: Mutex<WorkspaceGateState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct WorkspaceGateState {
+    active_operations: usize,
+    transitioning: bool,
+}
+
+/// Keeps one ordinary tool operation inside a single workspace generation.
+pub(crate) struct WorkspaceOperationGuard {
+    gate: Arc<WorkspaceTransitionGate>,
+}
+
+impl Drop for WorkspaceOperationGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active_operations = state.active_operations.saturating_sub(1);
+        if state.active_operations == 0 {
+            self.gate.changed.notify_all();
+        }
+    }
+}
+
+struct WorkspaceTransitionLease {
+    gate: Arc<WorkspaceTransitionGate>,
+}
+
+impl Drop for WorkspaceTransitionLease {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.transitioning = false;
+        drop(state);
+        self.gate.changed.notify_all();
+    }
 }
 
 /// Failure to resolve an executable through one run's immutable process
@@ -139,6 +219,10 @@ pub struct ToolRunContextBuilder {
     runtime_mode: crate::modes::RuntimeMode,
     behavior_scope_targets: crate::modes::BehaviorScopeTargets,
     background_job_storage: BackgroundJobStorage,
+    isolated_workspace: Option<IsolatedWorkspaceDescriptor>,
+    workspace_parent: Option<Arc<ToolRunContext>>,
+    workspace_control: Option<Arc<ToolRunContext>>,
+    workspace_transition_gate: Option<Arc<WorkspaceTransitionGate>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -181,6 +265,10 @@ impl ToolRunContextBuilder {
             } else {
                 BackgroundJobStorage::Durable
             },
+            isolated_workspace: None,
+            workspace_parent: None,
+            workspace_control: None,
+            workspace_transition_gate: None,
         }
     }
 
@@ -411,6 +499,20 @@ impl ToolRunContextBuilder {
         self
     }
 
+    fn isolated_workspace_binding(
+        mut self,
+        descriptor: IsolatedWorkspaceDescriptor,
+        parent: Arc<ToolRunContext>,
+        control: Arc<ToolRunContext>,
+        transition_gate: Arc<WorkspaceTransitionGate>,
+    ) -> Self {
+        self.isolated_workspace = Some(descriptor);
+        self.workspace_parent = Some(parent);
+        self.workspace_control = Some(control);
+        self.workspace_transition_gate = Some(transition_gate);
+        self
+    }
+
     /// Construct and validate the complete immutable run capability.
     ///
     /// # Errors
@@ -430,6 +532,11 @@ pub struct ToolRunContext {
     lsp_service: crate::services::LspServerManager,
     runtime_mode: crate::modes::RuntimeModeAuthority,
     background_effect_lifecycle: Mutex<()>,
+    workspace_transition_gate: Arc<WorkspaceTransitionGate>,
+    workspace_lifecycle: AtomicU8,
+    isolated_workspace: Option<IsolatedWorkspaceDescriptor>,
+    workspace_parent: Option<Arc<Self>>,
+    workspace_control: Option<Arc<Self>>,
     tool_catalog: super::catalog::RunToolCatalog,
     project_root: PathBuf,
     working_directory: PathBuf,
@@ -562,7 +669,19 @@ impl ToolRunContext {
             runtime_mode,
             behavior_scope_targets,
             background_job_storage,
+            isolated_workspace,
+            workspace_parent,
+            workspace_control,
+            workspace_transition_gate,
         } = builder;
+        if isolated_workspace.is_some() != workspace_parent.is_some()
+            || isolated_workspace.is_some() != workspace_control.is_some()
+        {
+            return Err(
+                "Isolated workspace construction requires descriptor, parent, and control generations"
+                    .to_string(),
+            );
+        }
         let workspace_access = workspace_access.ok_or_else(|| {
             "Run construction requires an explicit workspace access capability".to_string()
         })?;
@@ -796,6 +915,7 @@ impl ToolRunContext {
             network_policy,
             &grants,
             &process_owner,
+            isolated_workspace.as_ref(),
         );
         let cancellation = crate::runtime::CancellationTree::new();
         let descriptor = RunDescriptor::new(RunDescriptorParts {
@@ -846,6 +966,12 @@ impl ToolRunContext {
             lsp_service: crate::services::LspServerManager::new(),
             runtime_mode,
             background_effect_lifecycle: Mutex::new(()),
+            workspace_transition_gate: workspace_transition_gate
+                .unwrap_or_else(|| Arc::new(WorkspaceTransitionGate::default())),
+            workspace_lifecycle: AtomicU8::new(WORKSPACE_RUN_ACTIVE),
+            isolated_workspace,
+            workspace_parent,
+            workspace_control,
             tool_catalog: super::catalog::RunToolCatalog::default(),
             project_root,
             working_directory,
@@ -1143,6 +1269,266 @@ impl ToolRunContext {
         &self.process_owner
     }
 
+    /// Active isolated-workspace descriptor, if this run is rebound.
+    #[must_use]
+    pub const fn isolated_workspace(&self) -> Option<&IsolatedWorkspaceDescriptor> {
+        self.isolated_workspace.as_ref()
+    }
+
+    /// Private main-tree capability used only by the transactional worktree
+    /// lifecycle handler while the user-visible parent generation is suspended.
+    pub(crate) fn workspace_control_run(&self) -> &Self {
+        self.workspace_control.as_deref().unwrap_or(self)
+    }
+
+    /// Admit one operation against this exact workspace generation.
+    ///
+    /// The returned guard prevents enter/exit publication until the operation
+    /// finishes. It owns only an `Arc`, so it remains safe across async waits.
+    pub(crate) fn begin_workspace_operation(
+        &self,
+    ) -> Result<WorkspaceOperationGuard, ToolCapabilityError> {
+        self.require_active_workspace_generation()?;
+        let mut state = self
+            .workspace_transition_gate
+            .state
+            .lock()
+            .map_err(|error| ToolCapabilityError::BindingMismatch {
+                detail: format!("workspace transition gate is unavailable: {error}"),
+            })?;
+        if state.transitioning {
+            return Err(ToolCapabilityError::BindingMismatch {
+                detail: "workspace generation is currently transitioning".to_string(),
+            });
+        }
+        self.require_active_workspace_generation()?;
+        state.active_operations = state.active_operations.saturating_add(1);
+        drop(state);
+        Ok(WorkspaceOperationGuard {
+            gate: Arc::clone(&self.workspace_transition_gate),
+        })
+    }
+
+    /// Atomically publish a trusted enter/exit transition after its tool call
+    /// has completed and all ordinary calls on the source generation drained.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal for forged/stale ownership, active background
+    /// effects, removed/replaced roots, or invalid lifecycle order.
+    #[allow(clippy::too_many_lines)] // Keep authentication and lifecycle publication in one auditable transaction.
+    pub fn apply_workspace_transition(
+        current: &Arc<Self>,
+        transition: &crate::tools::WorkspaceTransition,
+    ) -> Result<Arc<Self>, WorkspaceTransitionError> {
+        if transition.source_run() != current.run_id()
+            || transition.source_generation() != current.generation()
+        {
+            return Err(WorkspaceTransitionError::WrongSource(format!(
+                "expected run {} generation {}, got run {} generation {}",
+                current.run_id(),
+                current.generation(),
+                transition.source_run(),
+                transition.source_generation()
+            )));
+        }
+        let require_live_root = matches!(
+            transition.kind(),
+            crate::tools::WorkspaceTransitionKind::Enter
+        );
+        let lease = current.begin_workspace_transition(require_live_root)?;
+        let descriptor = transition.descriptor();
+        let result = match transition.kind() {
+            crate::tools::WorkspaceTransitionKind::Enter => {
+                if current.isolated_workspace.is_some() {
+                    return Err(WorkspaceTransitionError::LifecycleConflict(
+                        "enter_worktree cannot replace an already isolated generation".to_string(),
+                    ));
+                }
+                if descriptor.owner_session().as_str() != current.session_id()
+                    || descriptor.owner_run() != current.run_id()
+                    || descriptor.owner_actor() != current.runtime.descriptor().actor.id
+                    || descriptor.repository_root() != current.project_root()
+                {
+                    return Err(WorkspaceTransitionError::WrongSource(
+                        "descriptor owner or repository root differs from the source run"
+                            .to_string(),
+                    ));
+                }
+                validate_isolated_workspace_roots(descriptor)
+                    .map_err(WorkspaceTransitionError::StaleWorkspace)?;
+                current.reject_background_workspace_transition()?;
+                let replacement = current
+                    .derive_isolated_workspace(descriptor.clone())
+                    .map_err(WorkspaceTransitionError::Construction)?;
+                current
+                    .workspace_lifecycle
+                    .compare_exchange(
+                        WORKSPACE_RUN_ACTIVE,
+                        WORKSPACE_RUN_SUSPENDED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .map_err(|state| {
+                        WorkspaceTransitionError::LifecycleConflict(format!(
+                            "source generation is {}",
+                            workspace_lifecycle_name(state)
+                        ))
+                    })?;
+                replacement
+            }
+            crate::tools::WorkspaceTransitionKind::Exit => {
+                let Some(bound) = current.isolated_workspace.as_ref() else {
+                    return Err(WorkspaceTransitionError::LifecycleConflict(
+                        "exit_worktree transition requires an isolated generation".to_string(),
+                    ));
+                };
+                if bound != descriptor {
+                    return Err(WorkspaceTransitionError::WrongSource(
+                        "exit descriptor differs from the active isolated capability".to_string(),
+                    ));
+                }
+                current.reject_background_workspace_transition()?;
+                let parent = current.workspace_parent.as_ref().ok_or_else(|| {
+                    WorkspaceTransitionError::LifecycleConflict(
+                        "isolated generation has no retained parent".to_string(),
+                    )
+                })?;
+                current
+                    .workspace_lifecycle
+                    .compare_exchange(
+                        WORKSPACE_RUN_ACTIVE,
+                        WORKSPACE_RUN_RETIRED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .map_err(|state| {
+                        WorkspaceTransitionError::LifecycleConflict(format!(
+                            "isolated generation is {}",
+                            workspace_lifecycle_name(state)
+                        ))
+                    })?;
+                if let Err(state) = parent.workspace_lifecycle.compare_exchange(
+                    WORKSPACE_RUN_SUSPENDED,
+                    WORKSPACE_RUN_ACTIVE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    current
+                        .workspace_lifecycle
+                        .store(WORKSPACE_RUN_ACTIVE, Ordering::Release);
+                    return Err(WorkspaceTransitionError::LifecycleConflict(format!(
+                        "retained parent generation is {}",
+                        workspace_lifecycle_name(state)
+                    )));
+                }
+                Arc::clone(parent)
+            }
+        };
+        drop(lease);
+        Ok(result)
+    }
+
+    /// Reacquire a persisted isolated workspace for a freshly constructed
+    /// session run. Repository identity is inspected again and ownership is
+    /// rebound to the new run before the ordinary enter transition executes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when persisted identity, ownership, repository
+    /// state, or lifecycle publication can no longer be validated.
+    pub fn resume_isolated_workspace(
+        current: &Arc<Self>,
+        persisted: &IsolatedWorkspaceDescriptor,
+    ) -> Result<Arc<Self>, WorkspaceTransitionError> {
+        let rebound = super::worktree::rebind_workspace_descriptor(current, persisted)
+            .map_err(WorkspaceTransitionError::StaleWorkspace)?;
+        let transition = crate::tools::WorkspaceTransition::enter(
+            current.run_id(),
+            current.generation(),
+            rebound,
+        );
+        Self::apply_workspace_transition(current, &transition)
+    }
+
+    fn begin_workspace_transition(
+        &self,
+        require_live_root: bool,
+    ) -> Result<WorkspaceTransitionLease, WorkspaceTransitionError> {
+        self.require_active_workspace_lifecycle().map_err(|state| {
+            WorkspaceTransitionError::LifecycleConflict(format!("source generation is {state}"))
+        })?;
+        if require_live_root {
+            self.require_active_workspace_generation()
+                .map_err(|error| WorkspaceTransitionError::LifecycleConflict(error.to_string()))?;
+        }
+        let gate = Arc::clone(&self.workspace_transition_gate);
+        let mut state = gate
+            .state
+            .lock()
+            .map_err(|error| WorkspaceTransitionError::GateUnavailable(error.to_string()))?;
+        if state.transitioning {
+            return Err(WorkspaceTransitionError::LifecycleConflict(
+                "another workspace transition is already in progress".to_string(),
+            ));
+        }
+        self.require_active_workspace_lifecycle().map_err(|state| {
+            WorkspaceTransitionError::LifecycleConflict(format!("source generation is {state}"))
+        })?;
+        state.transitioning = true;
+        while state.active_operations != 0 {
+            state = gate
+                .changed
+                .wait(state)
+                .map_err(|error| WorkspaceTransitionError::GateUnavailable(error.to_string()))?;
+        }
+        drop(state);
+        Ok(WorkspaceTransitionLease { gate })
+    }
+
+    fn reject_background_workspace_transition(&self) -> Result<(), WorkspaceTransitionError> {
+        let _lifecycle = self.background_effect_lifecycle.lock().map_err(|error| {
+            WorkspaceTransitionError::LifecycleConflict(format!(
+                "background-effect lifecycle is unavailable: {error}"
+            ))
+        })?;
+        let shell_ids = crate::tools::BACKGROUND_SHELLS.active_ids_for_run(self);
+        let agent_ids = crate::subagent::BACKGROUND_AGENTS
+            .active_ids_for_run(self)
+            .map_err(WorkspaceTransitionError::LifecycleConflict)?;
+        if shell_ids.is_empty() && agent_ids.is_empty() {
+            Ok(())
+        } else {
+            Err(WorkspaceTransitionError::InFlightBackgroundEffects {
+                shell_ids,
+                agent_ids,
+            })
+        }
+    }
+
+    fn require_active_workspace_generation(&self) -> Result<(), ToolCapabilityError> {
+        self.require_active_workspace_lifecycle().map_err(|state| {
+            ToolCapabilityError::InactiveWorkspaceGeneration {
+                run_id: self.run_id(),
+                generation: self.generation,
+                state,
+            }
+        })?;
+        if let Some(descriptor) = self.isolated_workspace.as_ref() {
+            validate_isolated_workspace_roots(descriptor)
+                .map_err(|detail| ToolCapabilityError::StaleWorkspace { detail })?;
+        }
+        Ok(())
+    }
+
+    fn require_active_workspace_lifecycle(&self) -> Result<(), &'static str> {
+        let state = self.workspace_lifecycle.load(Ordering::Acquire);
+        if state != WORKSPACE_RUN_ACTIVE {
+            return Err(workspace_lifecycle_name(state));
+        }
+        Ok(())
+    }
+
     /// Require one concrete resource or return a typed unavailable error.
     ///
     /// # Errors
@@ -1151,6 +1537,7 @@ impl ToolRunContext {
     /// descriptor no longer matches its concrete resources, or
     /// [`ToolCapabilityError::Unavailable`] when the requested grant is absent.
     pub fn require(&self, resource: ToolResource) -> Result<(), ToolCapabilityError> {
+        self.require_active_workspace_generation()?;
         if let Err(error) = self.validate_binding() {
             tracing::error!(
                 target: "openclaudia::capabilities",
@@ -1223,6 +1610,22 @@ impl ToolRunContext {
                 detail: "workspace generation differs".to_string(),
             });
         }
+        if let Some(isolated) = self.isolated_workspace.as_ref() {
+            if isolated.workspace_root() != self.project_root
+                || isolated.owner_session().as_str() != self.session_id()
+                || self.workspace_parent.is_none()
+                || self.workspace_control.is_none()
+            {
+                return Err(ToolCapabilityError::BindingMismatch {
+                    detail: "isolated workspace descriptor differs from concrete run resources"
+                        .to_string(),
+                });
+            }
+        } else if self.workspace_parent.is_some() || self.workspace_control.is_some() {
+            return Err(ToolCapabilityError::BindingMismatch {
+                detail: "workspace parent exists without an isolated descriptor".to_string(),
+            });
+        }
         let grants = &descriptor.capabilities.grants;
         let binding_pairs = [
             (
@@ -1261,6 +1664,7 @@ impl ToolRunContext {
             self.network_policy,
             grants,
             &self.process_owner,
+            self.isolated_workspace.as_ref(),
         );
         if descriptor.capabilities.manifest_digest != expected_manifest {
             return Err(ToolCapabilityError::BindingMismatch {
@@ -1346,6 +1750,69 @@ impl ToolRunContext {
             ));
         }
 
+        self.build_derived_frontend(
+            session_id,
+            &project_root,
+            &working_directory,
+            provider,
+            None,
+        )
+    }
+
+    fn derive_isolated_workspace(
+        self: &Arc<Self>,
+        descriptor: IsolatedWorkspaceDescriptor,
+    ) -> Result<Arc<Self>, String> {
+        descriptor.validate().map_err(|error| error.to_string())?;
+        validate_isolated_workspace_roots(&descriptor)?;
+        if descriptor.owner_session().as_str() != self.session_id()
+            || descriptor.owner_run() != self.run_id()
+            || descriptor.owner_actor() != self.runtime.descriptor().actor.id
+            || descriptor.owner_label() != self.process_owner()
+        {
+            return Err("isolated workspace descriptor does not belong to this run".to_string());
+        }
+        let workspace_root = descriptor.workspace_root().to_path_buf();
+        let permitted = if self.grants_resource(ToolResource::WorkspaceWrite) {
+            self.permits_write(&workspace_root)
+        } else {
+            self.permits_read(&workspace_root)
+        };
+        if !permitted {
+            return Err(format!(
+                "isolated workspace '{}' is outside the source run authority",
+                workspace_root.display()
+            ));
+        }
+        let control = self.build_derived_frontend(
+            self.runtime.descriptor().session_id.clone(),
+            &self.project_root,
+            &self.working_directory,
+            self.provider_id(),
+            None,
+        )?;
+        self.build_derived_frontend(
+            self.runtime.descriptor().session_id.clone(),
+            &workspace_root,
+            &workspace_root,
+            self.provider_id(),
+            Some((descriptor, Arc::clone(self), control)),
+        )
+    }
+
+    fn build_derived_frontend(
+        &self,
+        session_id: SessionId,
+        project_root: &Path,
+        working_directory: &Path,
+        provider: &str,
+        isolated: Option<(IsolatedWorkspaceDescriptor, Arc<Self>, Arc<Self>)>,
+    ) -> Result<Arc<Self>, String> {
+        let workspace_access = if self.grants_resource(ToolResource::WorkspaceWrite) {
+            WorkspaceAccess::ReadWrite
+        } else {
+            WorkspaceAccess::ReadOnly
+        };
         let is_parent_intrinsic_root = |root: &&PathBuf| {
             root.as_path() == self.project_root || root.as_path() == self.private_temp.path()
         };
@@ -1364,7 +1831,7 @@ impl ToolRunContext {
         let process_owner = session_id.as_str().to_string();
         let runtime_mode = self.runtime_mode();
 
-        let child = Self::builder(session_id, &project_root)
+        let mut builder = Self::builder(session_id, project_root)
             .working_directory(working_directory)
             .read_only_roots(read_only_roots)
             .read_write_roots(read_write_roots)
@@ -1387,8 +1854,16 @@ impl ToolRunContext {
             .parent_budget(self.runtime.budget().clone())
             .runtime_mode(runtime_mode.mode)
             .behavior_scope_targets(runtime_mode.scope_targets)
-            .background_job_storage(self.background_job_storage)
-            .build()?;
+            .background_job_storage(self.background_job_storage);
+        if let Some((descriptor, parent, control)) = isolated {
+            builder = builder.isolated_workspace_binding(
+                descriptor,
+                parent,
+                control,
+                Arc::clone(&self.workspace_transition_gate),
+            );
+        }
+        let child = builder.build()?;
         child
             .lsp_service()
             .configure_plugins(self.lsp_service.plugin_servers());
@@ -1708,8 +2183,55 @@ fn normalize_lexical_path(path: &Path) -> PathBuf {
     normalized
 }
 
+const fn workspace_lifecycle_name(state: u8) -> &'static str {
+    match state {
+        WORKSPACE_RUN_ACTIVE => "active",
+        WORKSPACE_RUN_SUSPENDED => "suspended",
+        WORKSPACE_RUN_RETIRED => "retired",
+        _ => "invalid",
+    }
+}
+
+fn validate_isolated_workspace_roots(
+    descriptor: &IsolatedWorkspaceDescriptor,
+) -> Result<(), String> {
+    descriptor.validate().map_err(|error| error.to_string())?;
+    let repository_root = std::fs::canonicalize(descriptor.repository_root()).map_err(|error| {
+        format!(
+            "cannot resolve repository root '{}': {error}",
+            descriptor.repository_root().display()
+        )
+    })?;
+    let workspace_root = std::fs::canonicalize(descriptor.workspace_root()).map_err(|error| {
+        format!(
+            "cannot resolve isolated root '{}': {error}",
+            descriptor.workspace_root().display()
+        )
+    })?;
+    if repository_root != descriptor.repository_root()
+        || workspace_root != descriptor.workspace_root()
+    {
+        return Err("isolated workspace roots no longer resolve to their bound paths".to_string());
+    }
+    let repository_id = crate::persistence::PersistentStorage::open(&repository_root)
+        .map_err(|error| format!("cannot pin repository root: {error}"))?
+        .root_id();
+    let workspace_id = crate::persistence::PersistentStorage::open(&workspace_root)
+        .map_err(|error| format!("cannot pin isolated root: {error}"))?
+        .root_id();
+    if repository_id != descriptor.repository_root_id()
+        || workspace_id != descriptor.workspace_root_id()
+    {
+        return Err("isolated workspace root identity changed".to_string());
+    }
+    Ok(())
+}
+
 impl Drop for ToolRunContext {
     fn drop(&mut self) {
+        if self.isolated_workspace.is_some() {
+            let _ = super::worktree::release_workspace_descriptor_owner(self);
+        }
         self.lsp_service.shutdown();
         // The last `Arc` is the run lifecycle boundary. Remove the exact-run
         // read-before-edit bucket so completed runs cannot accumulate process-
@@ -1749,6 +2271,7 @@ fn capability_manifest_digest(
     network_policy: AgentNetworkPolicy,
     grants: &BTreeSet<CapabilityKind>,
     process_owner: &str,
+    isolated_workspace: Option<&IsolatedWorkspaceDescriptor>,
 ) -> ContentDigest {
     let mut manifest = format!(
         "run={run_id}\ngeneration={generation}\nproject={}\nworking={}\nscratch={}\n",
@@ -1758,6 +2281,13 @@ fn capability_manifest_digest(
     );
     manifest.push_str("process_owner=");
     manifest.push_str(process_owner);
+    manifest.push('\n');
+    manifest.push_str("isolated_workspace=");
+    if let Some(descriptor) = isolated_workspace {
+        let encoded = serde_json::to_vec(descriptor)
+            .expect("validated isolated-workspace descriptor serialization cannot fail");
+        manifest.push_str(&ContentDigest::sha256(encoded).to_string());
+    }
     manifest.push('\n');
     for root in read_only_roots {
         manifest.push_str("read_only=");
@@ -2934,6 +3464,7 @@ mod tests {
             AgentNetworkPolicy::Denied,
             &grants,
             "owner",
+            None,
         );
         let second = capability_manifest_digest(
             run_id,
@@ -2954,6 +3485,7 @@ mod tests {
             AgentNetworkPolicy::Denied,
             &grants,
             "owner",
+            None,
         );
         assert_ne!(first, second, "environment values must bind the manifest");
     }

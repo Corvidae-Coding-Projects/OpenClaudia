@@ -486,6 +486,23 @@ struct UnrestrictedSafetyDenial {
 }
 
 impl PermissionManager {
+    /// Recreate this policy for a new immutable run generation. Exact permits
+    /// and transient session approvals are intentionally not carried across
+    /// the workspace boundary.
+    #[must_use]
+    pub fn rebind_for_run(&self, run: &crate::tools::ToolRunContext) -> Self {
+        if self.enabled {
+            Self::trusted_for_run(
+                run,
+                true,
+                self.default_allow.clone(),
+                self.web_fetch_preapproved_domains.clone(),
+            )
+        } else {
+            Self::unrestricted_for_run(run)
+        }
+    }
+
     /// Create a new `PermissionManager`, loading persisted rules from disk.
     pub fn new(
         persist_path: impl Into<PathBuf>,
@@ -1528,6 +1545,23 @@ mod tests {
         let (mgr, _dir) = make_manager(false, vec![]);
         let result = mgr.check("bash", &json!({"command": "ls -la"}));
         assert_eq!(result, CheckResult::Allowed);
+    }
+
+    #[test]
+    fn workspace_rebind_preserves_unrestricted_posture() {
+        let root = tempfile::tempdir().expect("permission rebind root");
+        let first = crate::tools::security::test_run_context_for(root.path());
+        let second = crate::tools::security::test_run_context_for(root.path());
+        let manager = PermissionManager::unrestricted_for_run(&first);
+
+        let rebound = manager.rebind_for_run(&second);
+
+        assert!(!rebound.is_enabled());
+        assert!(rebound.persisted_rules().is_empty());
+        assert_eq!(
+            rebound.check("bash", &json!({"command": "pwd"})),
+            CheckResult::Allowed
+        );
     }
 
     #[test]

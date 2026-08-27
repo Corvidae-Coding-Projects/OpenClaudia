@@ -27,7 +27,7 @@ pub fn execute_grounding_context(
         });
         hydrate_from_ledger(run, session_key, &ledger, &ids, include_stale)
     } else {
-        match RealityLedger::open_existing_project_session(session_key) {
+        match RealityLedger::open_existing_project_session_for_run(run, session_key) {
             Ok(ledger) => hydrate_from_ledger(run, session_key, &ledger, &ids, include_stale),
             Err(
                 crate::ledger::LedgerError::InvalidSessionKey { .. }

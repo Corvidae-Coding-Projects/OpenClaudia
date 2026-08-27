@@ -125,6 +125,19 @@ impl Session {
         self.state.inspect(inspect)
     }
 
+    /// Publish the exact active run root and optional isolated-workspace
+    /// descriptor into resumable session identity.
+    pub fn bind_workspace_run(&self, run: &crate::tools::ToolRunContext) {
+        self.state.update(|state, _| {
+            let root = run.project_root().to_path_buf();
+            state.identity.cwd = run.working_directory().to_path_buf();
+            state.identity.project_root.clone_from(&root);
+            state.identity.session_project_dir = root;
+            state.identity.active_workspace = run.isolated_workspace().cloned();
+            state.transcript.transcript_cwd = run.working_directory().to_path_buf();
+        });
+    }
+
     pub fn update_state<R>(
         &self,
         update: impl FnOnce(&mut SessionState, &mut Vec<StateEvent>) -> R,

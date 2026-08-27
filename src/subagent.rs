@@ -3069,7 +3069,7 @@ fn validate_subagent_tool_decision_for_session(
     if !requires_subagent_typed_decision(&tool_call.function.name) {
         return Ok(());
     }
-    let ledger = crate::ledger::RealityLedger::open_project_session(agent_id)
+    let ledger = crate::ledger::RealityLedger::open_project_session_for_run(run, agent_id)
         .map_err(|err| format!("typed decision requires reality ledger: {err}"))?;
     let args = crate::services::tool_executor::ToolExecutor::parse_arguments(
         &tool_call.function.name,

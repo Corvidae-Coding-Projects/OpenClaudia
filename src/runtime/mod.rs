@@ -26,8 +26,8 @@ pub use cancellation::{
 };
 pub use context::{
     Actor, ActorRole, BudgetLimits, CapabilityBinding, CapabilityKind, ContentDigest,
-    DigestParseError, ProviderContinuation, ProviderId, RunBudget, RunContextError, RunDescriptor,
-    RunDescriptorParts, StateSnapshot, WorkspaceBinding,
+    DigestParseError, IsolatedWorkspaceDescriptor, ProviderContinuation, ProviderId, RunBudget,
+    RunContextError, RunDescriptor, RunDescriptorParts, StateSnapshot, WorkspaceBinding,
 };
 pub use event::{
     CallKind, CallOutcome, EventScope, FailureImpact, RunFailure, RunFailureCode, RuntimeEvent,
@@ -35,7 +35,7 @@ pub use event::{
 };
 pub use ids::{
     ActorId, BudgetGeneration, BudgetId, CallId, CancellationId, CapabilityGeneration,
-    ContinuationGeneration, RunId, StateGeneration, WorkspaceGeneration,
+    ContinuationGeneration, RunId, StateGeneration, WorkspaceGeneration, WorkspaceHandleId,
 };
 pub use kernel::{KernelError, ReplayError, RunContext, RunPhase, RunSnapshot, RuntimeKernel};
 pub use provider_state::{

@@ -744,8 +744,17 @@ fn build_startup_session_run_context(
     web_egress_grants: crate::web_egress::WebEgressGrants,
 ) -> Result<std::sync::Arc<crate::tools::ToolRunContext>, String> {
     let identity = session.inspect_state(|state| state.identity.clone());
-    crate::tools::ToolRunContext::builder(identity.session_id, identity.project_root)
-        .working_directory(identity.cwd)
+    let active_workspace = identity.active_workspace.clone();
+    let project_root = active_workspace.as_ref().map_or_else(
+        || identity.project_root.clone(),
+        |workspace| workspace.repository_root().to_path_buf(),
+    );
+    let working_directory = active_workspace.as_ref().map_or_else(
+        || identity.cwd.clone(),
+        |workspace| workspace.repository_root().to_path_buf(),
+    );
+    let base_run = crate::tools::ToolRunContext::builder(identity.session_id, project_root)
+        .working_directory(working_directory)
         .host_startup_grants()
         .remote_actions(remote_actions)
         .web_egress_grants(web_egress_grants)
@@ -757,7 +766,13 @@ fn build_startup_session_run_context(
         .runtime_mode(runtime_mode_for_tui_session(session))
         .behavior_scope_targets(session.behavior_scope_targets())
         .budget_limits(budget_limits)
-        .build()
+        .build()?;
+    active_workspace
+        .as_ref()
+        .map_or(Ok(base_run.clone()), |workspace| {
+            crate::tools::ToolRunContext::resume_isolated_workspace(&base_run, workspace)
+                .map_err(|error| error.to_string())
+        })
 }
 
 fn runtime_mode_for_tui_session(session: &Session) -> crate::modes::RuntimeMode {
@@ -776,10 +791,16 @@ fn parse_behavior_scope_targets(
         return Ok(None);
     }
     let identity = session.inspect_state(|state| state.identity.clone());
-    let project_root = std::fs::canonicalize(&identity.project_root).map_err(|error| {
+    let requested_project = identity
+        .active_workspace
+        .as_ref()
+        .map_or(identity.project_root.as_path(), |workspace| {
+            workspace.repository_root()
+        });
+    let project_root = std::fs::canonicalize(requested_project).map_err(|error| {
         format!(
             "Cannot bind behavioral scope to project '{}': {error}",
-            identity.project_root.display()
+            requested_project.display()
         )
     })?;
     let working_directory = std::fs::canonicalize(&identity.cwd).map_err(|error| {
@@ -817,17 +838,29 @@ fn derive_session_run_context(
             parent.project_root().display()
         ));
     }
+    let base_cwd = identity
+        .active_workspace
+        .as_ref()
+        .map_or(identity.cwd.as_path(), |workspace| {
+            workspace.repository_root()
+        });
     let run = parent.derive_frontend_session(
         identity.session_id,
         &project_root,
-        &identity.cwd,
+        base_cwd,
         active_provider,
     )?;
     run.transition_runtime_mode_scoped(
         runtime_mode_for_tui_session(session),
         session.behavior_scope_targets(),
     )?;
-    Ok(run)
+    identity
+        .active_workspace
+        .as_ref()
+        .map_or(Ok(run.clone()), |workspace| {
+            crate::tools::ToolRunContext::resume_isolated_workspace(&run, workspace)
+                .map_err(|error| error.to_string())
+        })
 }
 
 struct TuiMcpRuntime {
@@ -1234,6 +1267,7 @@ impl App {
         let Some(runtime) = self.mcp_runtime.as_mut() else {
             return;
         };
+        runtime.plugin_manager.configure_lsp_service_for_run(run);
         let next_manager = std::sync::Arc::new(tokio::sync::RwLock::new(
             crate::mcp::McpManager::new_with_permissions(
                 std::sync::Arc::clone(run),
@@ -1265,6 +1299,39 @@ impl App {
             )
             .await;
         }));
+    }
+
+    fn apply_workspace_run_transition(
+        &mut self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
+    ) {
+        // The pipeline has already published this generation, which makes the
+        // previous run stale. Rebind the application first so a task-store
+        // failure cannot accidentally route later operations through it.
+        self.run_context = Ok(std::sync::Arc::clone(run));
+        let manager = match crate::session::TaskManager::open_for_run(run) {
+            Ok(manager) => manager,
+            Err(error) => {
+                self.messages.add(DisplayMessage::error(format!(
+                    "Workspace changed, but its durable task graph could not be opened; using a run-bound ephemeral graph: {error}"
+                )));
+                match crate::session::TaskManager::for_run(run) {
+                    Ok(manager) => manager,
+                    Err(fallback_error) => {
+                        self.messages.add(DisplayMessage::error(format!(
+                            "Workspace task graph binding failed: {fallback_error}"
+                        )));
+                        return;
+                    }
+                }
+            }
+        };
+        self.task_mgr = std::sync::Arc::new(std::sync::Mutex::new(manager));
+        self.chat_session.bind_workspace_run(run);
+        self.rebind_permission_manager(run);
+        self.refresh_prompt_context_for_run();
+        self.rebind_mcp_runtime(run);
+        self.persist_session();
     }
 
     /// Install the explicit lifecycle-service composition for this frontend.
@@ -1811,6 +1878,9 @@ impl App {
                     },
                     content: preview,
                 });
+            }
+            Ok(AppEvent::WorkspaceTransition { run_context }) => {
+                self.apply_workspace_run_transition(&run_context);
             }
             Ok(AppEvent::ResponseDone) => self.handle_response_done(),
             Ok(AppEvent::ApiError(msg)) => {
@@ -4961,6 +5031,7 @@ fn describe_event(event: &super::events::AppEvent) -> String {
         super::events::AppEvent::ToolDone { name, success, .. } => {
             format!("ToolDone({name}, ok={success})")
         }
+        super::events::AppEvent::WorkspaceTransition { .. } => "WorkspaceTransition".to_string(),
         super::events::AppEvent::FollowUp => "FollowUp".to_string(),
         super::events::AppEvent::PermissionRequest { tool_name, .. } => {
             format!("PermissionRequest({tool_name})")
@@ -5119,9 +5190,14 @@ async fn run_agentic_loop(
     ctx: &AgenticCtx<'_>,
     session_messages: &mut Vec<serde_json::Value>,
     provider_native_state: &mut Option<crate::runtime::ProviderNativeState>,
-) -> Result<(), String> {
+) -> Result<std::sync::Arc<crate::tools::ToolRunContext>, String> {
     const MAX_ITER: u32 = 25;
     let mut iteration = 0u32;
+    let mut run_context = std::sync::Arc::clone(ctx.run_context);
+    let mut permission_mgr = ctx.permission_mgr.clone();
+    let mut task_mgr = std::sync::Arc::clone(&ctx.task_mgr);
+    let mut mcp_manager = ctx.mcp_manager;
+    let mut task_obs = ctx.task_obs;
     loop {
         iteration += 1;
         tracing::debug!(iteration, "Agentic loop iteration");
@@ -5134,9 +5210,9 @@ async fn run_agentic_loop(
             return Err("Reached maximum tool iterations (25)".to_string());
         }
         let request_messages = match request_messages_with_grounding(
-            ctx.run_context,
+            &run_context,
             ctx.session_id,
-            ctx.task_obs,
+            task_obs,
             session_messages,
         ) {
             Ok(messages) => messages,
@@ -5151,7 +5227,7 @@ async fn run_agentic_loop(
             }
         };
         if !check_provider_request_policy_for_messages(
-            ctx.run_context,
+            &run_context,
             &ctx.policy_enforcer,
             ctx.model,
             &request_messages,
@@ -5161,7 +5237,7 @@ async fn run_agentic_loop(
             return Err("Provider request blocked by policy".to_string());
         }
         let body = match build_request_with_live_mcp(LiveMcpRequest {
-            run: ctx.run_context,
+            run: &run_context,
             wire_api: ctx.wire_api,
             provider: ctx.provider,
             model: ctx.model,
@@ -5171,7 +5247,7 @@ async fn run_agentic_loop(
             prompt_blocks: ctx.prompt_blocks,
             provider_native_state: provider_native_state.as_ref(),
             hook_engine: ctx.hook_engine.as_deref(),
-            mcp_manager: ctx.mcp_manager,
+            mcp_manager,
         })
         .await
         {
@@ -5199,7 +5275,7 @@ async fn run_agentic_loop(
                 }
             };
         match crate::pipeline::run_turn(crate::pipeline::RunTurnParams {
-            run_context: std::sync::Arc::clone(ctx.run_context),
+            run_context: std::sync::Arc::clone(&run_context),
             client: ctx.client,
             endpoint: ctx.endpoint,
             headers: ctx.headers,
@@ -5213,11 +5289,11 @@ async fn run_agentic_loop(
             assistant_message_ordinal,
             memory_db: ctx.memory_db.clone(),
             app_config: ctx.app_config.clone(),
-            permission_mgr: ctx.permission_mgr.clone(),
+            permission_mgr: permission_mgr.clone(),
             transient_allowed_tool_rules: ctx.transient_allowed_tool_rules,
             hook_engine: ctx.hook_engine.clone(),
             policy_enforcer: Some(std::sync::Arc::clone(&ctx.policy_enforcer)),
-            task_mgr: ctx.task_mgr.clone(),
+            task_mgr: std::sync::Arc::clone(&task_mgr),
             session_id: Some(ctx.session_id.to_string()),
             tx: ctx.tx.clone(),
         })
@@ -5246,6 +5322,27 @@ async fn run_agentic_loop(
                         return Err(error);
                     }
                 };
+                if let Some(bindings) = followup.execution_bindings.take() {
+                    let run_changed = !std::sync::Arc::ptr_eq(&run_context, &bindings.run_context);
+                    if run_changed {
+                        // The application event owns deterministic MCP/LSP
+                        // reconstruction for the new run. Until that arrives,
+                        // omit the stale manager from this immediate follow-up.
+                        mcp_manager = None;
+                        task_obs =
+                            latest_user_message_content(session_messages).and_then(|content| {
+                                crate::grounded_loop::observe_session_user_task(
+                                    &bindings.run_context,
+                                    ctx.session_id,
+                                    content,
+                                    ctx.model,
+                                )
+                            });
+                    }
+                    run_context = bindings.run_context;
+                    permission_mgr = bindings.permission_mgr;
+                    task_mgr = bindings.task_mgr;
+                }
                 if followup.needs_followup {
                     let asst = crate::pipeline::build_assistant_message_with_tools(
                         &followup.content,
@@ -5271,7 +5368,7 @@ async fn run_agentic_loop(
                         return Err(error.to_string());
                     }
                     let rendered_content = match render_final_response_for_history(
-                        ctx.run_context,
+                        &run_context,
                         ctx.session_id,
                         &followup.content,
                         ctx.model,
@@ -5298,7 +5395,7 @@ async fn run_agentic_loop(
                     }
                     session_messages.push(message);
                     *provider_native_state = next_provider_state;
-                    return Ok(());
+                    return Ok(run_context);
                 }
             }
             Err(e) => {
@@ -5678,6 +5775,7 @@ async fn handle_turn_result(
     }
 }
 
+#[allow(clippy::too_many_lines)] // Keep one follow-up's provider state and run rebinding in wire order.
 async fn handle_followup_turn(
     mut turn_result: crate::pipeline::TurnResult,
     mut session_messages: Vec<serde_json::Value>,
@@ -5695,6 +5793,32 @@ async fn handle_followup_turn(
             return;
         }
     };
+    let initial_bindings = turn_result.execution_bindings.take().unwrap_or_else(|| {
+        crate::pipeline::TurnExecutionBindings {
+            run_context: std::sync::Arc::clone(ctx.run_context),
+            permission_mgr: ctx.permission_mgr.clone(),
+            task_mgr: std::sync::Arc::clone(&ctx.task_mgr),
+        }
+    });
+    let initial_run_changed =
+        !std::sync::Arc::ptr_eq(ctx.run_context, &initial_bindings.run_context);
+    let followup_mcp_manager = if initial_run_changed {
+        None
+    } else {
+        ctx.mcp_manager.as_ref()
+    };
+    let followup_task_obs = if initial_run_changed {
+        latest_user_message_content(&session_messages).and_then(|content| {
+            crate::grounded_loop::observe_session_user_task(
+                &initial_bindings.run_context,
+                ctx.session_id,
+                content,
+                ctx.model,
+            )
+        })
+    } else {
+        ctx.task_obs
+    };
     let assistant = crate::pipeline::build_assistant_message_with_tools(
         &turn_result.content,
         turn_result.reasoning_content.as_deref(),
@@ -5709,7 +5833,7 @@ async fn handle_followup_turn(
         "Starting agentic follow-up loop"
     );
     let agentic = AgenticCtx {
-        run_context: ctx.run_context,
+        run_context: &initial_bindings.run_context,
         client: ctx.client,
         endpoint: ctx.endpoint,
         headers: ctx.headers,
@@ -5723,19 +5847,19 @@ async fn handle_followup_turn(
         prompt_blocks: ctx.prompt_blocks,
         memory_db: ctx.memory_db.clone(),
         app_config: ctx.app_config.clone(),
-        permission_mgr: ctx.permission_mgr.clone(),
+        permission_mgr: initial_bindings.permission_mgr,
         transient_allowed_tool_rules: ctx.transient_allowed_tool_rules,
         hook_engine: ctx.hook_engine.clone(),
         policy_enforcer: std::sync::Arc::clone(&ctx.policy_enforcer),
-        task_mgr: ctx.task_mgr.clone(),
-        mcp_manager: ctx.mcp_manager.as_ref(),
+        task_mgr: initial_bindings.task_mgr,
+        mcp_manager: followup_mcp_manager,
         session_id: ctx.session_id,
-        task_obs: ctx.task_obs,
+        task_obs: followup_task_obs,
         tx: ctx.tx,
     };
-    let loop_outcome =
-        run_agentic_loop(&agentic, &mut session_messages, &mut provider_native_state).await;
-    if loop_outcome.is_err() {
+    let Ok(final_run) =
+        run_agentic_loop(&agentic, &mut session_messages, &mut provider_native_state).await
+    else {
         send_or_warn(
             ctx.tx,
             super::events::AppEvent::SyncSession {
@@ -5746,9 +5870,9 @@ async fn handle_followup_turn(
             ctx.session_id,
         );
         return;
-    }
+    };
     if let Some(content) = latest_assistant_message_content(&session_messages).map(str::to_string) {
-        run_tui_vdd_review(ctx, &content, &mut session_messages).await;
+        run_tui_vdd_review(ctx, &final_run, &content, &mut session_messages).await;
     }
     send_or_warn(
         ctx.tx,
@@ -5810,7 +5934,13 @@ async fn handle_direct_turn(
         message["reasoning_content"] = serde_json::Value::String(reasoning.to_string());
     }
     session_messages.push(message);
-    run_tui_vdd_review(ctx, &rendered_content, &mut session_messages).await;
+    run_tui_vdd_review(
+        ctx,
+        ctx.run_context,
+        &rendered_content,
+        &mut session_messages,
+    )
+    .await;
     send_or_warn(
         ctx.tx,
         super::events::AppEvent::SyncSession {
@@ -5829,6 +5959,7 @@ async fn handle_direct_turn(
 
 async fn run_tui_vdd_review(
     ctx: &TurnContext<'_>,
+    run: &std::sync::Arc<crate::tools::ToolRunContext>,
     content: &str,
     session_messages: &mut Vec<serde_json::Value>,
 ) {
@@ -5852,10 +5983,7 @@ async fn run_tui_vdd_review(
         .unwrap_or_default()
         .to_string();
     let builder = crate::vdd::BuilderProvider::with_auth(ctx.provider, ctx.vdd_builder_auth);
-    match engine
-        .review_text(ctx.run_context, content, &user_task, builder)
-        .await
-    {
+    match engine.review_text(run, content, &user_task, builder).await {
         Ok(result) => {
             let genuine_count = result
                 .findings
@@ -6772,6 +6900,7 @@ mod tests {
             terminal_outcome: crate::pipeline::ProviderTerminalOutcome::Completed,
             finish_reason: None,
             provider_native_state: None,
+            execution_bindings: None,
         }
     }
 

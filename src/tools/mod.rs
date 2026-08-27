@@ -149,7 +149,8 @@ pub use result::{
     ToolDisplay, ToolExecutionResult, ToolFailure, ToolFailureCode, ToolFollowUp,
     ToolFollowUpState, ToolHandlerResult, ToolInvocation, ToolObservation, ToolOutcome,
     ToolQuestion, ToolQuestionOption, ToolResult, ToolResultError, ToolRetryability,
-    ToolSensitivity, ToolUsage, TOOL_RESULT_SCHEMA_VERSION,
+    ToolSensitivity, ToolUsage, WorkspaceTransition, WorkspaceTransitionKind,
+    TOOL_RESULT_SCHEMA_VERSION,
 };
 pub use security::{
     RuntimeModeTransitionError, ToolCapabilityError, ToolExecutableError, ToolResource,

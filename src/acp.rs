@@ -1605,12 +1605,38 @@ impl AcpServer {
         // A prompt is one cancellable run generation. Rotate the capability
         // rather than clearing a process-global cancellation bit so a prior
         // cancelled turn can never poison or revive another turn.
-        let run_context = match self.build_run_context(&oc_session_id) {
+        let persisted_workspace = self
+            .run_contexts
+            .get(&acp_session_id)
+            .and_then(|run| run.isolated_workspace().cloned());
+        if persisted_workspace.is_some() {
+            if let Some(retired) = self.run_contexts.remove(&acp_session_id) {
+                if let Err(error) =
+                    crate::tools::worktree::release_workspace_descriptor_owner(&retired)
+                {
+                    self.send_error(id, _INTERNAL_ERROR, &error);
+                    return;
+                }
+                crate::tools::retire_run(&retired);
+            }
+        }
+        let base_run = match self.build_run_context(&oc_session_id) {
             Ok(run) => run,
             Err(error) => {
                 self.send_error(id, _INTERNAL_ERROR, &error);
                 return;
             }
+        };
+        let run_context = if let Some(workspace) = persisted_workspace.as_ref() {
+            match crate::tools::ToolRunContext::resume_isolated_workspace(&base_run, workspace) {
+                Ok(run) => run,
+                Err(error) => {
+                    self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                    return;
+                }
+            }
+        } else {
+            base_run
         };
         self.replace_run_context(acp_session_id.clone(), Arc::clone(&run_context));
 
@@ -1628,7 +1654,7 @@ impl AcpServer {
 
         // Run the agentic loop
         let stop_reason = self
-            .run_prompt_loop(&run_context, &acp_session_id, &oc_session_id, task_obs)
+            .run_prompt_loop(run_context, &acp_session_id, &oc_session_id, task_obs)
             .await;
 
         // Record turn metrics
@@ -1651,10 +1677,10 @@ impl AcpServer {
     #[allow(clippy::too_many_lines)]
     async fn run_prompt_loop(
         &mut self,
-        run: &Arc<crate::tools::ToolRunContext>,
+        mut run: Arc<crate::tools::ToolRunContext>,
         acp_session_id: &str,
         oc_session_id: &str,
-        task_obs: Option<crate::ledger::ObsId>,
+        mut task_obs: Option<crate::ledger::ObsId>,
     ) -> String {
         // Crosslink #433: a typo in `proxy.target` now surfaces here as
         // an explicit error instead of being silently mapped to
@@ -1706,7 +1732,7 @@ impl AcpServer {
 
             // Build the request
             let tools =
-                match crate::tools::get_progressive_tool_definitions(run, &self.messages, false)
+                match crate::tools::get_progressive_tool_definitions(&run, &self.messages, false)
                     .and_then(|snapshot| {
                         acp_tool_definitions_for_chat_request(snapshot.definitions_value())
                     }) {
@@ -1719,9 +1745,9 @@ impl AcpServer {
             // The exact generation-bound run supplies both the model-visible
             // working directory and the bounded project skill layer.
             let ide_state = self.ide_state();
-            let prompt_context = build_acp_prompt_context(run, &ide_state);
+            let prompt_context = build_acp_prompt_context(&run, &ide_state);
             let grounded_messages = match crate::grounded_loop::request_messages_with_grounding(
-                run,
+                &run,
                 oc_session_id,
                 task_obs,
                 &self.messages,
@@ -1784,7 +1810,7 @@ impl AcpServer {
                             &mut chat_request,
                             None,
                             Some(&self.hook_engine),
-                            run,
+                            &run,
                             Some(oc_session_id),
                             Some(Arc::clone(&self.memory_db)),
                         )
@@ -1939,7 +1965,7 @@ impl AcpServer {
             };
 
             let provider_budget = match crate::provider_budget::reserve_provider_call(
-                run,
+                &run,
                 &self.config.proxy.target,
                 &self.model,
                 &mut transformed,
@@ -2181,7 +2207,7 @@ impl AcpServer {
             match stream_result {
                 StreamResult::EndTurn { content } => {
                     let rendered_content = match validate_and_render_acp_final_response(
-                        run,
+                        &run,
                         oc_session_id,
                         &content,
                         &self.model,
@@ -2269,16 +2295,66 @@ impl AcpServer {
                             }),
                         );
 
-                        let result = self
+                        let mut result = self
                             .execute_tool_via_acp(
-                                run,
+                                &run,
                                 oc_session_id,
                                 &tc.id,
                                 &tc.name,
                                 &tc.arguments,
                             )
                             .await;
-                        record_acp_tool_result_observation(run, oc_session_id, &result);
+                        record_acp_tool_result_observation(&run, oc_session_id, &result);
+                        if let Some(transition) = result.workspace_transition() {
+                            match crate::tools::ToolRunContext::apply_workspace_transition(
+                                &run, transition,
+                            ) {
+                                Ok(next_run) => {
+                                    if let Err(error) = crate::guardrails::configure(
+                                        &next_run,
+                                        &self.config.guardrails,
+                                    ) {
+                                        result = result.with_postcondition_failure(
+                                            ToolFailure::new(
+                                                ToolFailureCode::Internal,
+                                                format!(
+                                                    "Workspace changed, but ACP guardrail rebinding failed: {error}"
+                                                ),
+                                                ToolRetryability::Never,
+                                            ),
+                                        );
+                                    }
+                                    self.task_managers
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .remove(oc_session_id);
+                                    self.run_contexts
+                                        .insert(acp_session_id.to_string(), Arc::clone(&next_run));
+                                    task_obs = self.messages.iter().rev().find_map(|message| {
+                                        (message.get("role").and_then(Value::as_str)
+                                            == Some("user"))
+                                        .then(|| message.get("content").and_then(Value::as_str))
+                                        .flatten()
+                                        .and_then(|content| {
+                                            crate::grounded_loop::observe_session_user_task(
+                                                &next_run,
+                                                oc_session_id,
+                                                content,
+                                                &self.model,
+                                            )
+                                        })
+                                    });
+                                    run = next_run;
+                                }
+                                Err(error) => {
+                                    result = result.with_postcondition_failure(ToolFailure::new(
+                                        ToolFailureCode::Conflict,
+                                        format!("Workspace transition was not published: {error}"),
+                                        ToolRetryability::Safe,
+                                    ));
+                                }
+                            }
+                        }
 
                         self.send_session_update(
                             acp_session_id,
@@ -2293,7 +2369,7 @@ impl AcpServer {
                     }
 
                     if let Some(report) = crate::guardrails::run_quality_gates_at(
-                        run,
+                        &run,
                         &self.model,
                         crate::config::RunAfter::EveryTurn,
                     ) {
@@ -3228,18 +3304,19 @@ fn record_acp_background_command_start(
     cwd: &std::path::Path,
     command: &str,
 ) {
-    let mut ledger = match crate::ledger::RealityLedger::open_project_session(session_id) {
-        Ok(ledger) => ledger,
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                command,
-                error = %err,
-                "failed to open session reality ledger for ACP background command"
-            );
-            return;
-        }
-    };
+    let mut ledger =
+        match crate::ledger::RealityLedger::open_project_session_for_run(run, session_id) {
+            Ok(ledger) => ledger,
+            Err(err) => {
+                tracing::warn!(
+                    session_id,
+                    command,
+                    error = %err,
+                    "failed to open session reality ledger for ACP background command"
+                );
+                return;
+            }
+        };
     if let Err(err) = ledger.observe_command_run(
         run,
         cwd.to_string_lossy().to_string(),
@@ -3262,18 +3339,19 @@ fn record_acp_tool_result_observation(
     session_id: &str,
     result: &ToolResult,
 ) {
-    let mut ledger = match crate::ledger::RealityLedger::open_project_session(session_id) {
-        Ok(ledger) => ledger,
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                tool = result.handler(),
-                error = %err,
-                "failed to open session reality ledger for ACP tool result"
-            );
-            return;
-        }
-    };
+    let mut ledger =
+        match crate::ledger::RealityLedger::open_project_session_for_run(run, session_id) {
+            Ok(ledger) => ledger,
+            Err(err) => {
+                tracing::warn!(
+                    session_id,
+                    tool = result.handler(),
+                    error = %err,
+                    "failed to open session reality ledger for ACP tool result"
+                );
+                return;
+            }
+        };
     if let Err(err) = crate::grounded_loop::append_tool_result_observation(run, &mut ledger, result)
     {
         tracing::warn!(

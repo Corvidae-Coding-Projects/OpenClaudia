@@ -220,6 +220,17 @@ impl ToolExecutor {
         // stable agent id). Host authority comes only from `run_context` and
         // must never be inferred from this caller-controlled label.
         let session_id = session_id.or_else(|| Some(run_context.session_id()));
+        let _workspace_operation = match run_context.begin_workspace_operation() {
+            Ok(guard) => guard,
+            Err(error) => {
+                return ToolResult::failure(
+                    tool_call,
+                    ToolFailureCode::Unavailable,
+                    format!("Workspace generation is unavailable: {error}"),
+                    ToolRetryability::Safe,
+                )
+            }
+        };
 
         if let Err(reason) = run_context
             .tool_catalog()
@@ -266,8 +277,9 @@ impl ToolExecutor {
             );
         }
 
-        let _ledger_guard =
-            session_id.and_then(crate::grounded_loop::install_active_project_ledger_for_session);
+        let _ledger_guard = session_id.and_then(|session_id| {
+            crate::grounded_loop::install_active_project_ledger_for_session(run_context, session_id)
+        });
 
         let authorization = match authorization {
             Some(permit) => permit,
@@ -400,6 +412,17 @@ impl ToolExecutor {
             policy_enforcer,
         } = request;
         let session_id = session_id.or_else(|| Some(run_context.session_id()));
+        let _workspace_operation = match run_context.begin_workspace_operation() {
+            Ok(guard) => guard,
+            Err(error) => {
+                return ToolResult::failure(
+                    tool_call,
+                    ToolFailureCode::Unavailable,
+                    format!("Workspace generation is unavailable: {error}"),
+                    ToolRetryability::Safe,
+                )
+            }
+        };
         let Some(manager) = crate::mcp::registered_manager(run_context) else {
             return ToolResult::failure(
                 tool_call,
@@ -539,13 +562,14 @@ fn record_quality_gate_report(
     let Some(session_id) = session_id else {
         return;
     };
-    let mut ledger = match crate::ledger::RealityLedger::open_project_session(session_id) {
-        Ok(ledger) => ledger,
-        Err(error) => {
-            tracing::warn!(session_id, %error, "failed to open quality-gate ledger");
-            return;
-        }
-    };
+    let mut ledger =
+        match crate::ledger::RealityLedger::open_project_session_for_run(run, session_id) {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                tracing::warn!(session_id, %error, "failed to open quality-gate ledger");
+                return;
+            }
+        };
     for gate in report.results() {
         if let Err(error) =
             crate::grounded_loop::append_quality_gate_observations(run, &mut ledger, gate)

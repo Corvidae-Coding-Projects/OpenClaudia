@@ -112,6 +112,9 @@ pub struct Identity {
     /// included in the system prompt. Matches CC's `--add-dir`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_directories_for_claude_md: Vec<PathBuf>,
+    /// Host-validated isolated-workspace capability retained for exact resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_workspace: Option<crate::runtime::IsolatedWorkspaceDescriptor>,
 }
 
 impl Identity {
@@ -127,6 +130,7 @@ impl Identity {
             project_root: cwd.clone(),
             session_project_dir: cwd,
             additional_directories_for_claude_md: Vec::new(),
+            active_workspace: None,
         }
     }
 }

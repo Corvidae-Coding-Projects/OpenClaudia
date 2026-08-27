@@ -592,6 +592,25 @@ impl RealityLedger {
     /// directory cannot be created, or `SQLite` cannot be opened.
     pub fn open_project_session(session_key: &str) -> Result<Self, LedgerError> {
         let path = project_session_ledger_path(session_key)?;
+        Self::open_project_session_path(path)
+    }
+
+    /// Open a session ledger beneath the exact immutable run root instead of
+    /// consulting the process working directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session key, selected ledger directory, or
+    /// `SQLite` store cannot be opened safely.
+    pub fn open_project_session_for_run(
+        run: &crate::tools::ToolRunContext,
+        session_key: &str,
+    ) -> Result<Self, LedgerError> {
+        let path = project_session_ledger_path_for_run(run, session_key)?;
+        Self::open_project_session_path(path)
+    }
+
+    fn open_project_session_path(path: PathBuf) -> Result<Self, LedgerError> {
         if let Some(parent) = path.parent() {
             if let Err(source) = std::fs::create_dir_all(parent) {
                 // The project directory can be read-only (an external
@@ -645,6 +664,39 @@ impl RealityLedger {
             }) {
                 if fallback.is_file() {
                     return Self::open_read_only(fallback);
+                }
+            }
+        }
+        Err(LedgerError::MissingSessionLedger { path })
+    }
+
+    /// Open an existing session ledger through the exact run workspace
+    /// binding. Isolated runs use the host-local handle-scoped ledger path so
+    /// grounding never falls back to the main checkout's observations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session key is invalid, the exact run-bound
+    /// ledger does not exist, or it cannot be opened read-only.
+    pub fn open_existing_project_session_for_run(
+        run: &crate::tools::ToolRunContext,
+        session_key: &str,
+    ) -> Result<Self, LedgerError> {
+        let path = project_session_ledger_path_for_run(run, session_key)?;
+        if path.is_file() {
+            return Self::open_read_only(path);
+        }
+        if run.isolated_workspace().is_none() {
+            if let Some(file_name) = path.file_name() {
+                if let Some(fallback) = dirs::data_local_dir().map(|data_dir| {
+                    data_dir
+                        .join("openclaudia")
+                        .join("reality-ledgers")
+                        .join(file_name)
+                }) {
+                    if fallback.is_file() {
+                        return Self::open_read_only(fallback);
+                    }
                 }
             }
         }
@@ -1336,6 +1388,33 @@ pub fn project_session_ledger_path(session_key: &str) -> Result<PathBuf, LedgerE
         reason,
     })?;
     Ok(Path::new(SESSION_LEDGER_DIR).join(format!("{session_key}.sqlite3")))
+}
+
+pub(crate) fn project_session_ledger_path_for_run(
+    run: &crate::tools::ToolRunContext,
+    session_key: &str,
+) -> Result<PathBuf, LedgerError> {
+    validate_session_key(session_key).map_err(|reason| LedgerError::InvalidSessionKey {
+        session_key: session_key.to_string(),
+        reason,
+    })?;
+    run.isolated_workspace().map_or_else(
+        || {
+            Ok(run
+                .project_root()
+                .join(SESSION_LEDGER_DIR)
+                .join(format!("{session_key}.sqlite3")))
+        },
+        |workspace| {
+            let host_root = dirs::data_local_dir()
+                .unwrap_or_else(|| run.private_temp_root().to_path_buf())
+                .join("openclaudia")
+                .join("reality-ledgers")
+                .join("workspaces")
+                .join(workspace.handle_id().to_string());
+            Ok(host_root.join(format!("{session_key}.sqlite3")))
+        },
+    )
 }
 
 fn initialize_schema(conn: &Connection) -> Result<(), LedgerError> {

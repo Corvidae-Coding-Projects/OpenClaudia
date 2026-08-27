@@ -119,7 +119,7 @@ pub fn observe_session_user_task(
     content: &str,
     model_identity: &str,
 ) -> Option<ObsId> {
-    let mut ledger = match RealityLedger::open_project_session(session_id) {
+    let mut ledger = match RealityLedger::open_project_session_for_run(run, session_id) {
         Ok(ledger) => ledger,
         Err(err) => {
             tracing::warn!(
@@ -145,12 +145,13 @@ pub fn observe_session_user_task(
 
 #[must_use]
 pub fn install_active_project_ledger_for_session(
+    run: &crate::tools::ToolRunContext,
     session_id: &str,
 ) -> Option<ActiveRealityLedgerGuard> {
     if crate::ledger::active_ledger_for_session(session_id).is_some() {
         return None;
     }
-    let ledger = match RealityLedger::open_project_session(session_id) {
+    let ledger = match RealityLedger::open_project_session_for_run(run, session_id) {
         Ok(ledger) => ledger,
         Err(err) => {
             tracing::warn!(
@@ -191,7 +192,7 @@ pub fn observe_tool_result_for_session(
         };
     }
 
-    let mut ledger = match RealityLedger::open_project_session(session_id) {
+    let mut ledger = match RealityLedger::open_project_session_for_run(run, session_id) {
         Ok(ledger) => ledger,
         Err(err) => {
             tracing::warn!(
@@ -357,7 +358,7 @@ pub fn session_grounding_system_content_checked(
     session_id: &str,
     task_obs: ObsId,
 ) -> Result<String, String> {
-    let ledger = RealityLedger::open_project_session(session_id).map_err(|err| {
+    let ledger = RealityLedger::open_project_session_for_run(run, session_id).map_err(|err| {
         tracing::warn!(
             session_id,
             error = %err,
@@ -453,7 +454,7 @@ pub fn validate_and_render_agentic_final_response(
     if content.trim().is_empty() {
         return Ok(String::new());
     }
-    let mut ledger = match RealityLedger::open_project_session(session_id) {
+    let mut ledger = match RealityLedger::open_project_session_for_run(run, session_id) {
         Ok(ledger) => ledger,
         Err(err) => {
             let reason = format!("final answer requires reality ledger: {err}");
@@ -656,7 +657,7 @@ pub fn observe_policy_decision_for_session(
         return append_policy_decision_observation(run, &mut ledger, allowed, reason, session_id);
     }
 
-    let mut ledger = match RealityLedger::open_project_session(session_id) {
+    let mut ledger = match RealityLedger::open_project_session_for_run(run, session_id) {
         Ok(ledger) => ledger,
         Err(err) => {
             tracing::warn!(

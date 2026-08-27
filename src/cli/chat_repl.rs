@@ -282,10 +282,16 @@ fn derive_repl_session_run(
         ));
     }
     let identity = session.inspect_state(|state| state.identity.clone());
-    let project_root = std::fs::canonicalize(&identity.project_root).map_err(|error| {
+    let requested_project = identity
+        .active_workspace
+        .as_ref()
+        .map_or(identity.project_root.as_path(), |workspace| {
+            workspace.repository_root()
+        });
+    let project_root = std::fs::canonicalize(requested_project).map_err(|error| {
         format!(
             "Cannot resume project root '{}': {error}",
-            identity.project_root.display()
+            requested_project.display()
         )
     })?;
     if project_root != parent.project_root() {
@@ -295,17 +301,29 @@ fn derive_repl_session_run(
             parent.project_root().display()
         ));
     }
+    let base_cwd = identity
+        .active_workspace
+        .as_ref()
+        .map_or(identity.cwd.as_path(), |workspace| {
+            workspace.repository_root()
+        });
     let run = parent.derive_frontend_session(
         identity.session_id,
         &project_root,
-        &identity.cwd,
+        base_cwd,
         configured_provider,
     )?;
     run.transition_runtime_mode_scoped(
         runtime_mode_for_repl_session(session, coordinator),
         session.behavior_scope_targets(),
     )?;
-    Ok(run)
+    identity
+        .active_workspace
+        .as_ref()
+        .map_or(Ok(run.clone()), |workspace| {
+            tools::ToolRunContext::resume_isolated_workspace(&run, workspace)
+                .map_err(|error| error.to_string())
+        })
 }
 
 fn fresh_repl_session_in_run(current: &Session, model: &str, provider: &str) -> Session {
@@ -536,6 +554,64 @@ fn effectful_slash_operation(input: &str) -> Option<&'static str> {
 }
 
 impl ChatRepl {
+    fn apply_workspace_transition_from_result(
+        &mut self,
+        result: &tools::ToolResult,
+    ) -> Result<(), String> {
+        let Some(transition) = result.workspace_transition() else {
+            return Ok(());
+        };
+        let next_run =
+            tools::ToolRunContext::apply_workspace_transition(&self.run_context, transition)
+                .map_err(|error| error.to_string())?;
+        // Publishing the workspace generation retires or suspends the prior
+        // run. Install it immediately so a secondary component failure can
+        // never leave later tool calls attached to that stale capability.
+        self.run_context = next_run;
+        let mut rebind_errors = Vec::new();
+        if let Err(error) = guardrails::configure(&self.run_context, &self.config.guardrails) {
+            rebind_errors.push(format!("cannot configure workspace guardrails: {error}"));
+        }
+        let next_tasks = match session::TaskManager::open_for_run(&self.run_context) {
+            Ok(manager) => manager,
+            Err(error) => {
+                rebind_errors.push(format!(
+                    "cannot open the durable workspace task graph; using a run-bound ephemeral graph: {error}"
+                ));
+                session::TaskManager::for_run(&self.run_context).map_err(|fallback_error| {
+                    format!(
+                        "cannot bind the workspace task graph: {error}; fallback failed: {fallback_error}"
+                    )
+                })?
+            }
+        };
+        self.plugin_manager
+            .configure_lsp_service_for_run(&self.run_context);
+        let permission_bypass = self.chat_session.permission_bypass_enabled();
+        self.task_manager = std::sync::Mutex::new(next_tasks);
+        self.permission_mgr =
+            init_permission_manager(&self.config, permission_bypass, &self.run_context);
+        self.permissions = openclaudia::permissions::LocalApprovalCache::for_run(&self.run_context);
+        self.chat_session.bind_workspace_run(&self.run_context);
+        let task_messages = self.chat_session.messages_snapshot();
+        self.current_task_obs = latest_user_message_content(&task_messages).and_then(|content| {
+            observe_cli_user_task(
+                &self.run_context,
+                &self.chat_session.id(),
+                content,
+                &self.model,
+            )
+        });
+        if let Err(error) = save_chat_session(&self.chat_session) {
+            rebind_errors.push(format!("cannot persist workspace transition: {error}"));
+        }
+        if rebind_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(rebind_errors.join("; "))
+        }
+    }
+
     /// Resolve config + auth + provider + session and return a fully
     /// initialized REPL. Setup failures return an error after printing the
     /// same user-facing diagnostics as the default TUI path, so the process
@@ -660,36 +736,50 @@ impl ChatRepl {
         let vdd_engine: Option<vdd::VddEngine> = init_vdd_engine_if_enabled(&config);
         let identity = chat_session.inspect_state(|state| state.identity.clone());
         let runtime_mode = runtime_mode_for_repl_session(&chat_session, args.coordinator);
-        let run_context =
-            tools::ToolRunContext::builder(identity.session_id, identity.project_root)
-                .working_directory(identity.cwd)
-                .host_startup_grants()
-                .remote_actions(
-                    config
-                        .remote_actions
-                        .build_registry()
-                        .map_err(anyhow::Error::msg)?,
-                )
-                .web_egress_grants(
-                    config
-                        .build_web_egress_grants()
-                        .map_err(anyhow::Error::msg)?,
-                )
-                .workspace_access(tools::WorkspaceAccess::ReadWrite)
-                .process(true)
-                .network(true)
-                .secrets(true)
-                .provider(config.proxy.target.clone())
-                .runtime_mode(runtime_mode)
-                .behavior_scope_targets(chat_session.behavior_scope_targets())
-                .budget_limits(
-                    config
-                        .session
-                        .run_budget
-                        .limits_for_session(&config.session),
-                )
-                .build()
-                .map_err(anyhow::Error::msg)?;
+        let active_workspace = identity.active_workspace.clone();
+        let project_root = active_workspace.as_ref().map_or_else(
+            || identity.project_root.clone(),
+            |workspace| workspace.repository_root().to_path_buf(),
+        );
+        let working_directory = active_workspace.as_ref().map_or_else(
+            || identity.cwd.clone(),
+            |workspace| workspace.repository_root().to_path_buf(),
+        );
+        let base_run = tools::ToolRunContext::builder(identity.session_id, project_root)
+            .working_directory(working_directory)
+            .host_startup_grants()
+            .remote_actions(
+                config
+                    .remote_actions
+                    .build_registry()
+                    .map_err(anyhow::Error::msg)?,
+            )
+            .web_egress_grants(
+                config
+                    .build_web_egress_grants()
+                    .map_err(anyhow::Error::msg)?,
+            )
+            .workspace_access(tools::WorkspaceAccess::ReadWrite)
+            .process(true)
+            .network(true)
+            .secrets(true)
+            .provider(config.proxy.target.clone())
+            .runtime_mode(runtime_mode)
+            .behavior_scope_targets(chat_session.behavior_scope_targets())
+            .budget_limits(
+                config
+                    .session
+                    .run_budget
+                    .limits_for_session(&config.session),
+            )
+            .build()
+            .map_err(anyhow::Error::msg)?;
+        let run_context = if let Some(workspace) = active_workspace.as_ref() {
+            tools::ToolRunContext::resume_isolated_workspace(&base_run, workspace)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        } else {
+            base_run
+        };
         let memory_db = Some(init_memory_with_banner(&run_context, &config)?);
         let task_manager = std::sync::Mutex::new(
             session::TaskManager::open_for_run(&run_context).map_err(anyhow::Error::msg)?,
@@ -2555,7 +2645,7 @@ impl ChatRepl {
         tool_call: &tools::ToolCall,
         result: &tools::ToolResult,
     ) -> serde_json::Value {
-        let (final_result, approved_plan_context) = process_tool_follow_up(
+        let (mut final_result, approved_plan_context) = process_tool_follow_up(
             &self.run_context,
             &self.chat_session,
             &self.task_manager,
@@ -2577,6 +2667,13 @@ impl ChatRepl {
             Some(&self.chat_session.id()),
         )
         .await;
+        if let Err(error) = self.apply_workspace_transition_from_result(&final_result) {
+            final_result = final_result.with_postcondition_failure(tools::ToolFailure::new(
+                tools::ToolFailureCode::Conflict,
+                format!("Workspace transition was not fully rebound: {error}"),
+                tools::ToolRetryability::Safe,
+            ));
+        }
         display_tool_result(&final_result);
         push_observed_cli_typed_tool_result_message(
             &self.run_context,
@@ -3164,7 +3261,7 @@ impl ChatRepl {
         };
         let result = self.run_tool_with_audit(tool_call, memory_db, authorization);
 
-        let (final_result, approved_plan_context) = process_tool_follow_up(
+        let (mut final_result, approved_plan_context) = process_tool_follow_up(
             &self.run_context,
             &self.chat_session,
             &self.task_manager,
@@ -3198,6 +3295,13 @@ impl ChatRepl {
             Some(&self.chat_session.id()),
         )
         .await;
+        if let Err(error) = self.apply_workspace_transition_from_result(&final_result) {
+            final_result = final_result.with_postcondition_failure(tools::ToolFailure::new(
+                tools::ToolFailureCode::Conflict,
+                format!("Workspace transition was not fully rebound: {error}"),
+                tools::ToolRetryability::Safe,
+            ));
+        }
         display_tool_result(&final_result);
         push_observed_cli_typed_tool_result_message(
             &self.run_context,
@@ -3860,7 +3964,7 @@ impl ChatRepl {
         };
         let result = self.run_openai_tool_unaudited(tool_call, memory_db, authorization);
 
-        let (final_result, approved_plan_context) = process_tool_follow_up(
+        let (mut final_result, approved_plan_context) = process_tool_follow_up(
             &self.run_context,
             &self.chat_session,
             &self.task_manager,
@@ -3889,6 +3993,13 @@ impl ChatRepl {
             Some(&self.chat_session.id()),
         )
         .await;
+        if let Err(error) = self.apply_workspace_transition_from_result(&final_result) {
+            final_result = final_result.with_postcondition_failure(tools::ToolFailure::new(
+                tools::ToolFailureCode::Conflict,
+                format!("Workspace transition was not fully rebound: {error}"),
+                tools::ToolRetryability::Safe,
+            ));
+        }
         display_tool_result(&final_result);
         push_observed_cli_typed_tool_result_message(
             &self.run_context,
@@ -4016,19 +4127,20 @@ impl ChatRepl {
         if qg_results.is_empty() {
             return;
         }
-        let mut ledger =
-            match openclaudia::ledger::RealityLedger::open_project_session(&self.chat_session.id())
-            {
-                Ok(ledger) => ledger,
-                Err(err) => {
-                    tracing::warn!(
-                        session_id = %self.chat_session.id(),
-                        error = %err,
-                        "failed to open session reality ledger for CLI quality gates"
-                    );
-                    return;
-                }
-            };
+        let mut ledger = match openclaudia::ledger::RealityLedger::open_project_session_for_run(
+            &self.run_context,
+            &self.chat_session.id(),
+        ) {
+            Ok(ledger) => ledger,
+            Err(err) => {
+                tracing::warn!(
+                    session_id = %self.chat_session.id(),
+                    error = %err,
+                    "failed to open session reality ledger for CLI quality gates"
+                );
+                return;
+            }
+        };
         for gate in qg_results {
             if let Err(err) = openclaudia::grounded_loop::append_quality_gate_observations(
                 &self.run_context,

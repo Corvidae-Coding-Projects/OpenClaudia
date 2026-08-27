@@ -2289,7 +2289,7 @@ impl ToolHandler for EnterWorktreeHandler {
             "type": "function",
             "function": {
                 "name": "enter_worktree",
-                "description": "Create an isolated git worktree under .worktrees/<branch>/ based on the current HEAD. Returns the new worktree path. Does NOT change the process working directory — pass the returned path to subsequent bash/file calls (and to exit_worktree) to operate inside the worktree.",
+                "description": "Create an isolated git worktree and enter a new run capability bound to that exact repository, branch, owner, and filesystem generation. Subsequent file, process, LSP, task, ledger, verification, relative-path, and child-run operations use the isolated root until exit_worktree completes.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -2303,13 +2303,13 @@ impl ToolHandler for EnterWorktreeHandler {
             }
         })
     }
-    fn execute_legacy(
+    fn execute(
         &self,
         _permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
-    ) -> (String, bool) {
-        worktree::execute_enter_worktree(ctx.run, args)
+    ) -> ToolHandlerResult {
+        worktree::execute_enter_worktree_bound(ctx.run, args)
     }
 }
 
@@ -2365,6 +2365,11 @@ impl ToolHandler for ExitWorktreeHandler {
                             "type": "string",
                             "description": "Absolute path to the worktree to exit (as returned by enter_worktree)."
                         },
+                        "workspace_handle": {
+                            "type": "string",
+                            "format": "uuid",
+                            "description": "Opaque owner capability returned by enter_worktree. Required while the run is inside an isolated workspace."
+                        },
                         "operation": {
                             "type": "string",
                             "enum": ["preview", "stage", "commit", "merge", "discard", "remove"],
@@ -2414,7 +2419,7 @@ impl ToolHandler for ExitWorktreeHandler {
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
     ) -> ToolHandlerResult {
-        worktree::execute_exit_worktree(ctx.run, args)
+        worktree::execute_exit_worktree_bound(ctx.run, args)
     }
 }
 

@@ -51,6 +51,10 @@ macro_rules! uuid_id {
 
 uuid_id!(RunId, "Identity of one canonical agent run.");
 uuid_id!(
+    WorkspaceHandleId,
+    "Opaque identity of one isolated workspace lifecycle."
+);
+uuid_id!(
     CallId,
     "Identity of one provider, tool, hook, or persistence call."
 );

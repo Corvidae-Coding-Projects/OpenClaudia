@@ -128,6 +128,10 @@ pub enum AppEvent {
         success: bool,
         content: String,
     },
+    /// A trusted worktree tool published a replacement immutable run.
+    WorkspaceTransition {
+        run_context: std::sync::Arc<crate::tools::ToolRunContext>,
+    },
     /// API response completed
     ResponseDone,
     /// API error

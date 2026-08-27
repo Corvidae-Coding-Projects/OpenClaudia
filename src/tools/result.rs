@@ -12,6 +12,74 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use super::ToolCall;
 
+/// Host-only request to replace one immutable run workspace generation.
+///
+/// This value is deliberately omitted from serialized tool results. A model
+/// can observe the opaque handle in structured output, but it cannot mint a
+/// transition by replaying or editing provider-visible JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceTransition {
+    kind: WorkspaceTransitionKind,
+    source_run: crate::runtime::RunId,
+    source_generation: crate::runtime::CapabilityGeneration,
+    descriptor: crate::runtime::IsolatedWorkspaceDescriptor,
+}
+
+/// Direction of an isolated-workspace capability transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceTransitionKind {
+    Enter,
+    Exit,
+}
+
+impl WorkspaceTransition {
+    pub(crate) const fn enter(
+        source_run: crate::runtime::RunId,
+        source_generation: crate::runtime::CapabilityGeneration,
+        descriptor: crate::runtime::IsolatedWorkspaceDescriptor,
+    ) -> Self {
+        Self {
+            kind: WorkspaceTransitionKind::Enter,
+            source_run,
+            source_generation,
+            descriptor,
+        }
+    }
+
+    pub(crate) const fn exit(
+        source_run: crate::runtime::RunId,
+        source_generation: crate::runtime::CapabilityGeneration,
+        descriptor: crate::runtime::IsolatedWorkspaceDescriptor,
+    ) -> Self {
+        Self {
+            kind: WorkspaceTransitionKind::Exit,
+            source_run,
+            source_generation,
+            descriptor,
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> WorkspaceTransitionKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn source_run(&self) -> crate::runtime::RunId {
+        self.source_run
+    }
+
+    #[must_use]
+    pub const fn source_generation(&self) -> crate::runtime::CapabilityGeneration {
+        self.source_generation
+    }
+
+    #[must_use]
+    pub const fn descriptor(&self) -> &crate::runtime::IsolatedWorkspaceDescriptor {
+        &self.descriptor
+    }
+}
+
 /// Current serialized tool-result schema.
 pub const TOOL_RESULT_SCHEMA_VERSION: u16 = 1;
 
@@ -60,6 +128,32 @@ impl TransientAttachmentStore {
 
 static TRANSIENT_ATTACHMENTS: LazyLock<Mutex<TransientAttachmentStore>> =
     LazyLock::new(|| Mutex::new(TransientAttachmentStore::default()));
+
+const WORKSPACE_TRANSITION_OBSERVATION: &str = "_openclaudia_workspace_transition";
+
+fn workspace_transition_sidecar() -> &'static Mutex<HashMap<String, WorkspaceTransition>> {
+    static TRANSITIONS: LazyLock<Mutex<HashMap<String, WorkspaceTransition>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    &TRANSITIONS
+}
+
+fn take_workspace_transition(
+    observations: &mut Vec<ToolObservation>,
+) -> Option<WorkspaceTransition> {
+    let token = observations.iter().find_map(|observation| {
+        (observation.kind == WORKSPACE_TRANSITION_OBSERVATION)
+            .then(|| observation.data.get("token").and_then(Value::as_str))
+            .flatten()
+            .map(str::to_string)
+    });
+    observations.retain(|observation| observation.kind != WORKSPACE_TRANSITION_OBSERVATION);
+    token.and_then(|token| {
+        workspace_transition_sidecar()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&token)
+    })
+}
 
 /// Exact invocation identity bound to a tool result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -711,6 +805,21 @@ impl ToolHandlerResult {
     }
 
     #[must_use]
+    pub(crate) fn with_workspace_transition(mut self, transition: WorkspaceTransition) -> Self {
+        let token = uuid::Uuid::new_v4().to_string();
+        workspace_transition_sidecar()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(token.clone(), transition);
+        self.observations.push(ToolObservation {
+            kind: WORKSPACE_TRANSITION_OBSERVATION.to_string(),
+            authoritative: false,
+            data: json!({"token": token}),
+        });
+        self
+    }
+
+    #[must_use]
     pub fn content(&self) -> &str {
         match &self.outcome {
             ToolOutcome::Success { content } | ToolOutcome::Partial { content, .. } => {
@@ -744,6 +853,8 @@ pub struct ToolExecutionResult {
     follow_up: ToolFollowUp,
     usage: ToolUsage,
     sensitivity: ToolSensitivity,
+    #[serde(skip)]
+    workspace_transition: Option<WorkspaceTransition>,
 }
 
 /// Existing public name retained as a type alias; its representation is now
@@ -753,6 +864,8 @@ pub type ToolResult = ToolExecutionResult;
 impl ToolExecutionResult {
     #[must_use]
     pub fn bind(tool_call: &ToolCall, handler: &str, result: ToolHandlerResult) -> Self {
+        let mut observations = result.observations;
+        let workspace_transition = take_workspace_transition(&mut observations);
         let arguments = serde_json::from_str::<Value>(&tool_call.function.arguments)
             .ok()
             .filter(Value::is_object);
@@ -767,11 +880,12 @@ impl ToolExecutionResult {
             outcome: result.outcome,
             artifacts: result.artifacts,
             attachments: result.attachments,
-            observations: result.observations,
+            observations,
             display: result.display,
             follow_up: result.follow_up,
             usage: result.usage,
             sensitivity: result.sensitivity,
+            workspace_transition,
         }
     }
 
@@ -948,7 +1062,7 @@ impl ToolExecutionResult {
     /// failed after publication. Existing errors and partial outcomes retain
     /// their stronger/earlier failure state.
     #[must_use]
-    pub(crate) fn with_postcondition_failure(mut self, failure: ToolFailure) -> Self {
+    pub fn with_postcondition_failure(mut self, failure: ToolFailure) -> Self {
         if matches!(self.outcome, ToolOutcome::Success { .. }) {
             let ToolOutcome::Success { content } = std::mem::replace(
                 &mut self.outcome,
@@ -975,6 +1089,15 @@ impl ToolExecutionResult {
     #[must_use]
     pub const fn follow_up(&self) -> &ToolFollowUp {
         &self.follow_up
+    }
+
+    /// Trusted in-memory workspace transition emitted by the handler.
+    ///
+    /// Deserialized/provider-originated results always return `None` because
+    /// this authority is excluded from the wire representation.
+    #[must_use]
+    pub const fn workspace_transition(&self) -> Option<&WorkspaceTransition> {
+        self.workspace_transition.as_ref()
     }
 
     #[must_use]

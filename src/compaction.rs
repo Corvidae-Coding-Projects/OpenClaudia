@@ -1454,17 +1454,18 @@ fn record_compaction_summary_observation(
     let Some(session_id) = session_id else {
         return;
     };
-    let mut ledger = match crate::ledger::RealityLedger::open_project_session(session_id) {
-        Ok(ledger) => ledger,
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                error = %err,
-                "failed to open session reality ledger for compaction summary"
-            );
-            return;
-        }
-    };
+    let mut ledger =
+        match crate::ledger::RealityLedger::open_project_session_for_run(run, session_id) {
+            Ok(ledger) => ledger,
+            Err(err) => {
+                tracing::warn!(
+                    session_id,
+                    error = %err,
+                    "failed to open session reality ledger for compaction summary"
+                );
+                return;
+            }
+        };
     let source_obs = ledger
         .observation_index(crate::grounded_loop::DEFAULT_GROUNDING_INDEX_LIMIT)
         .into_iter()

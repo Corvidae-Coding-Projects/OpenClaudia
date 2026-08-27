@@ -868,7 +868,10 @@ fn enforce_on_commit_quality_gate(
         return Ok(());
     };
     if !report.results().is_empty() {
-        match openclaudia::ledger::RealityLedger::open_project_session(run.session_id()) {
+        match openclaudia::ledger::RealityLedger::open_project_session_for_run(
+            run,
+            run.session_id(),
+        ) {
             Ok(mut ledger) => {
                 for check in report.results() {
                     if let Err(error) = openclaudia::grounded_loop::append_quality_gate_observations(

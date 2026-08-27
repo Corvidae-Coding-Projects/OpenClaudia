@@ -3,7 +3,7 @@
 //! Provides tools to create and manage isolated git worktrees so agents can
 //! work on branches without affecting the main working tree.
 //!
-//! # Phase 1: no CWD mutation (crosslink #345)
+//! # Run-bound isolation (crosslink #345, S-074)
 //!
 //! Earlier revisions called [`std::env::set_current_dir`] inside the enter
 //! and exit handlers. That is process-wide global state: any other thread
@@ -12,12 +12,11 @@
 //! directory. POSIX, Rust, and Go all document `chdir` as fundamentally
 //! unsafe for concurrent processes.
 //!
-//! In Phase 1 of the fix:
+//! The compatibility leaf functions retain the original explicit-path API:
 //!
-//! * `execute_enter_worktree` never mutates the process CWD. It creates the
-//!   git worktree and returns the new path in its success message. The
-//!   caller (REPL / session layer) is responsible for tracking the active
-//!   worktree on the session.
+//! * `execute_enter_worktree` never mutates the process CWD. The registry's
+//!   capability-bearing adapter creates an immutable replacement run rooted
+//!   at the new worktree.
 //! * `execute_exit_worktree` no longer reads CWD to discover which worktree
 //!   to clean up. It requires an explicit `path` argument naming the
 //!   worktree to remove.
@@ -25,9 +24,9 @@
 //!   `Command::current_dir`, so no `git` subprocess depends on the parent's
 //!   CWD either.
 //!
-//! Phase 2 (passing the active worktree through `ToolContext` to bash /
-//! file / lsp tool calls) is tracked separately — see the follow-up issue
-//! filed against #345.
+//! Application frontends must apply the trusted in-memory transition emitted
+//! by the registry result; serialized/provider-originated output cannot mint
+//! that authority.
 
 use crate::tools::args::ToolArgError;
 use crate::tools::args::ToolArgs as _;
@@ -96,6 +95,19 @@ fn active_worktrees_guard(
     }
 }
 
+fn workspace_capability_lifecycle() -> &'static Mutex<()> {
+    static GATE: OnceLock<Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(()))
+}
+
+fn active_workspace_capabilities(
+) -> &'static Mutex<HashMap<PathBuf, crate::runtime::IsolatedWorkspaceDescriptor>> {
+    static CAPABILITIES: OnceLock<
+        Mutex<HashMap<PathBuf, crate::runtime::IsolatedWorkspaceDescriptor>>,
+    > = OnceLock::new();
+    CAPABILITIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Best-effort canonicalisation that falls back to the original path. Used
 /// for *comparison* keys in [`active_worktrees`] so two equivalent spellings
 /// of the same path collide on the duplicate-guard check (crosslink #624).
@@ -114,6 +126,17 @@ fn canonical_or_self(p: &Path) -> PathBuf {
 /// but exposing the generation now means a future cache only needs to
 /// subscribe — it won't need a parallel invalidation mechanism wired in.
 static CWD_CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
+static NEXT_WORKSPACE_CAPABILITY_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_workspace_capability_generation() -> Result<crate::runtime::WorkspaceGeneration, String> {
+    let generation = NEXT_WORKSPACE_CAPABILITY_GENERATION
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| "isolated workspace generation space exhausted".to_string())?;
+    crate::runtime::WorkspaceGeneration::new(generation)
+        .ok_or_else(|| "isolated workspace generation must be non-zero".to_string())
+}
 
 /// Current generation of the cwd/canonicalize invalidation token. Bumped by
 /// every successful [`execute_enter_worktree`] / [`execute_exit_worktree`]
@@ -451,6 +474,302 @@ pub fn execute_enter_worktree<S: std::hash::BuildHasher>(
     create_worktree_on_disk(run, &cwd, &worktree_dir, branch, &base_branch)
 }
 
+/// Create an isolated worktree and bind it to an opaque, owner-specific host
+/// transition.
+///
+/// The legacy tuple entry point remains available for compatibility, while
+/// application registries use this capability-bearing path.
+#[must_use]
+#[allow(clippy::too_many_lines)] // Creation, inspection, ownership, and publication are one transaction.
+pub fn execute_enter_worktree_bound<S: std::hash::BuildHasher>(
+    run: &crate::tools::security::ToolRunContext,
+    args: &HashMap<String, Value, S>,
+) -> crate::tools::ToolHandlerResult {
+    if run.isolated_workspace().is_some() {
+        return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+            crate::tools::ToolFailureCode::Conflict,
+            "The active run is already bound to an isolated workspace; exit it before entering another"
+                .to_string(),
+            crate::tools::ToolRetryability::Never,
+        ));
+    }
+    let _lifecycle = match workspace_capability_lifecycle().lock() {
+        Ok(guard) => guard,
+        Err(error) => {
+            return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+                crate::tools::ToolFailureCode::Unavailable,
+                format!("Worktree capability lifecycle is unavailable: {error}"),
+                crate::tools::ToolRetryability::Safe,
+            ));
+        }
+    };
+    let branch = match args.get("branch") {
+        Some(Value::String(branch)) if !branch.is_empty() => branch.as_str(),
+        _ => {
+            let (message, is_error) = execute_enter_worktree(run, args);
+            return crate::tools::ToolHandlerResult::legacy(message, is_error);
+        }
+    };
+    let (message, is_error) = execute_enter_worktree(run, args);
+    if is_error {
+        return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+            crate::tools::ToolFailureCode::InvalidInput,
+            message,
+            crate::tools::ToolRetryability::Never,
+        ));
+    }
+    let expected_path = run.project_root().join(".worktrees").join(branch);
+    let snapshot = match inspect_worktree(run, &expected_path) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return crate::tools::ToolHandlerResult::partial_text(
+                "The Git worktree was created, but its workspace capability could not be pinned",
+                vec![crate::tools::ToolFailure::new(
+                    crate::tools::ToolFailureCode::Conflict,
+                    error,
+                    crate::tools::ToolRetryability::Safe,
+                )],
+            );
+        }
+    };
+    let mut active = match active_workspace_capabilities().lock() {
+        Ok(active) => active,
+        Err(error) => {
+            return crate::tools::ToolHandlerResult::partial_text(
+                "The Git worktree exists, but its owner registry is unavailable",
+                vec![crate::tools::ToolFailure::new(
+                    crate::tools::ToolFailureCode::Unavailable,
+                    error.to_string(),
+                    crate::tools::ToolRetryability::Safe,
+                )],
+            );
+        }
+    };
+    let descriptor = if let Some(existing) = active.get(&snapshot.worktree_path) {
+        if existing.owner_session().as_str() != run.session_id()
+            || existing.owner_run() != run.run_id()
+            || existing.owner_actor() != run.runtime().descriptor().actor.id
+        {
+            return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+                crate::tools::ToolFailureCode::Conflict,
+                "The requested worktree is already owned by another run capability".to_string(),
+                crate::tools::ToolRetryability::Never,
+            ));
+        }
+        existing.clone()
+    } else {
+        let base_commit = match git_text(
+            run,
+            &snapshot.worktree_path,
+            &[
+                "merge-base",
+                &snapshot.view.worktree_head,
+                &snapshot.view.target_head,
+            ],
+        ) {
+            Ok(base) => base,
+            Err(error) => {
+                return crate::tools::ToolHandlerResult::partial_text(
+                    "The Git worktree exists, but its base commit could not be pinned",
+                    vec![crate::tools::ToolFailure::new(
+                        crate::tools::ToolFailureCode::Conflict,
+                        error,
+                        crate::tools::ToolRetryability::Safe,
+                    )],
+                );
+            }
+        };
+        let repository_id = match snapshot
+            .view
+            .repository_id
+            .parse::<crate::runtime::ContentDigest>()
+        {
+            Ok(identity) => identity,
+            Err(error) => {
+                return crate::tools::ToolHandlerResult::partial_text(
+                    "The Git worktree exists, but its repository identity is malformed",
+                    vec![crate::tools::ToolFailure::new(
+                        crate::tools::ToolFailureCode::Internal,
+                        error.to_string(),
+                        crate::tools::ToolRetryability::Never,
+                    )],
+                );
+            }
+        };
+        let worktree_id = match snapshot
+            .view
+            .worktree_id
+            .parse::<crate::runtime::ContentDigest>()
+        {
+            Ok(identity) => identity,
+            Err(error) => {
+                return crate::tools::ToolHandlerResult::partial_text(
+                    "The Git worktree exists, but its worktree identity is malformed",
+                    vec![crate::tools::ToolFailure::new(
+                        crate::tools::ToolFailureCode::Internal,
+                        error.to_string(),
+                        crate::tools::ToolRetryability::Never,
+                    )],
+                );
+            }
+        };
+        let descriptor = match crate::runtime::IsolatedWorkspaceDescriptor::new(
+            crate::runtime::WorkspaceHandleId::new(),
+            repository_id,
+            worktree_id,
+            snapshot.repository_root_id,
+            snapshot.worktree_root_id,
+            snapshot.main_path.clone(),
+            snapshot.worktree_path.clone(),
+            base_commit,
+            snapshot.view.target_head.clone(),
+            snapshot.view.branch.clone(),
+            run.runtime().descriptor().session_id.clone(),
+            run.process_owner().to_string(),
+            run.run_id(),
+            run.runtime().descriptor().actor.id,
+            match next_workspace_capability_generation() {
+                Ok(generation) => generation,
+                Err(error) => {
+                    return crate::tools::ToolHandlerResult::partial_text(
+                        "The Git worktree exists, but no workspace generation was available",
+                        vec![crate::tools::ToolFailure::new(
+                            crate::tools::ToolFailureCode::Internal,
+                            error,
+                            crate::tools::ToolRetryability::Never,
+                        )],
+                    );
+                }
+            },
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                return crate::tools::ToolHandlerResult::partial_text(
+                    "The Git worktree exists, but its capability descriptor was rejected",
+                    vec![crate::tools::ToolFailure::new(
+                        crate::tools::ToolFailureCode::Internal,
+                        error.to_string(),
+                        crate::tools::ToolRetryability::Never,
+                    )],
+                );
+            }
+        };
+        active.insert(snapshot.worktree_path.clone(), descriptor.clone());
+        descriptor
+    };
+    drop(active);
+    crate::tools::ToolHandlerResult::success_structured(
+        format!(
+            "Entered isolated workspace on branch '{}'",
+            descriptor.branch()
+        ),
+        json!({
+            "workspace_handle": descriptor.handle_id().to_string(),
+            "generation": descriptor.generation().get(),
+            "branch": descriptor.branch(),
+            "path": descriptor.workspace_root(),
+            "lifecycle": "active",
+        }),
+    )
+    .with_workspace_transition(crate::tools::WorkspaceTransition::enter(
+        run.run_id(),
+        run.generation(),
+        descriptor,
+    ))
+}
+
+pub(crate) fn rebind_workspace_descriptor(
+    run: &crate::tools::ToolRunContext,
+    persisted: &crate::runtime::IsolatedWorkspaceDescriptor,
+) -> Result<crate::runtime::IsolatedWorkspaceDescriptor, String> {
+    let _lifecycle = workspace_capability_lifecycle()
+        .lock()
+        .map_err(|error| format!("worktree capability lifecycle is unavailable: {error}"))?;
+    persisted.validate().map_err(|error| error.to_string())?;
+    if persisted.owner_session().as_str() != run.session_id()
+        || persisted.repository_root() != run.project_root()
+    {
+        return Err("persisted workspace belongs to another session or repository".to_string());
+    }
+    let snapshot = inspect_worktree(run, persisted.workspace_root())?;
+    let repository_id = snapshot
+        .view
+        .repository_id
+        .parse::<crate::runtime::ContentDigest>()
+        .map_err(|error| error.to_string())?;
+    let worktree_id = snapshot
+        .view
+        .worktree_id
+        .parse::<crate::runtime::ContentDigest>()
+        .map_err(|error| error.to_string())?;
+    if repository_id != persisted.repository_id()
+        || worktree_id != persisted.worktree_id()
+        || snapshot.repository_root_id != persisted.repository_root_id()
+        || snapshot.worktree_root_id != persisted.workspace_root_id()
+        || snapshot.main_path != persisted.repository_root()
+        || snapshot.worktree_path != persisted.workspace_root()
+        || snapshot.view.branch != persisted.branch()
+    {
+        return Err("persisted isolated workspace identity changed".to_string());
+    }
+    for commit in [persisted.base_commit(), persisted.target_commit()] {
+        git_success(
+            run,
+            persisted.repository_root(),
+            &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+        )?;
+    }
+    let mut active = active_workspace_capabilities()
+        .lock()
+        .map_err(|error| format!("worktree owner registry is unavailable: {error}"))?;
+    if let Some(existing) = active.get(persisted.workspace_root()) {
+        if existing.owner_run() != run.run_id() {
+            return Err("isolated workspace is still owned by another live run".to_string());
+        }
+    }
+    let rebound = crate::runtime::IsolatedWorkspaceDescriptor::new(
+        persisted.handle_id(),
+        repository_id,
+        worktree_id,
+        snapshot.repository_root_id,
+        snapshot.worktree_root_id,
+        snapshot.main_path,
+        snapshot.worktree_path.clone(),
+        persisted.base_commit().to_string(),
+        persisted.target_commit().to_string(),
+        persisted.branch().to_string(),
+        run.runtime().descriptor().session_id.clone(),
+        run.process_owner().to_string(),
+        run.run_id(),
+        run.runtime().descriptor().actor.id,
+        next_workspace_capability_generation()?,
+    )
+    .map_err(|error| error.to_string())?;
+    active.insert(snapshot.worktree_path, rebound.clone());
+    drop(active);
+    Ok(rebound)
+}
+
+pub(crate) fn release_workspace_descriptor_owner(
+    run: &crate::tools::ToolRunContext,
+) -> Result<(), String> {
+    let Some(descriptor) = run.isolated_workspace() else {
+        return Ok(());
+    };
+    let _lifecycle = workspace_capability_lifecycle()
+        .lock()
+        .map_err(|error| format!("worktree capability lifecycle is unavailable: {error}"))?;
+    let mut active = active_workspace_capabilities()
+        .lock()
+        .map_err(|error| format!("worktree owner registry is unavailable: {error}"))?;
+    if active.get(descriptor.workspace_root()) != Some(descriptor) {
+        return Err("cannot release a workspace owned by another generation".to_string());
+    }
+    active.remove(descriptor.workspace_root());
+    drop(active);
+    Ok(())
+}
+
 /// Run `git worktree add` (with the existing-branch retry path) and surface
 /// the resulting `(message, is_error)` tuple. Extracted from
 /// [`execute_enter_worktree`] so the orchestrator stays under the
@@ -686,6 +1005,8 @@ struct WorktreeSnapshot {
     view: WorktreeSnapshotView,
     worktree_path: PathBuf,
     main_path: PathBuf,
+    repository_root_id: crate::persistence::StorageRootId,
+    worktree_root_id: crate::persistence::StorageRootId,
 }
 
 #[derive(Serialize)]
@@ -1221,6 +1542,8 @@ fn inspect_worktree(
         },
         worktree_path,
         main_path,
+        repository_root_id,
+        worktree_root_id,
     })
 }
 
@@ -2303,6 +2626,153 @@ pub fn execute_exit_worktree<S: std::hash::BuildHasher>(
     }
 }
 
+/// Execute worktree transactions through the active opaque workspace
+/// capability. Calls outside an isolated generation retain the existing
+/// path-based compatibility behavior.
+#[must_use]
+#[allow(clippy::too_many_lines)] // Authenticate, inject trusted roots, execute, and publish together.
+pub fn execute_exit_worktree_bound<S: std::hash::BuildHasher>(
+    run: &crate::tools::security::ToolRunContext,
+    args: &HashMap<String, Value, S>,
+) -> crate::tools::ToolHandlerResult {
+    let Some(descriptor) = run.isolated_workspace() else {
+        if let Some(Value::String(path)) = args.get("path") {
+            let key = canonical_or_self(Path::new(path));
+            let active = match active_workspace_capabilities().lock() {
+                Ok(active) => active,
+                Err(error) => {
+                    return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+                        crate::tools::ToolFailureCode::Unavailable,
+                        format!("Worktree owner registry is unavailable: {error}"),
+                        crate::tools::ToolRetryability::Safe,
+                    ));
+                }
+            };
+            if let Some(owner) = active.get(&key) {
+                return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+                    crate::tools::ToolFailureCode::Conflict,
+                    format!(
+                        "Worktree '{}' is owned by isolated workspace capability {}; exit it from that bound run",
+                        owner.workspace_root().display(),
+                        owner.handle_id()
+                    ),
+                    crate::tools::ToolRetryability::Never,
+                ));
+            }
+        }
+        return execute_exit_worktree(run, args);
+    };
+    let supplied_handle = match required_string(args, "workspace_handle") {
+        Ok(handle) => handle,
+        Err(error) => {
+            return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+                crate::tools::ToolFailureCode::InvalidArguments,
+                error,
+                crate::tools::ToolRetryability::Never,
+            ));
+        }
+    };
+    let supplied_handle = match uuid::Uuid::parse_str(supplied_handle) {
+        Ok(handle) => crate::runtime::WorkspaceHandleId::from_uuid(handle),
+        Err(_) => {
+            return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+                crate::tools::ToolFailureCode::InvalidArguments,
+                "'workspace_handle' must be a UUID returned by enter_worktree".to_string(),
+                crate::tools::ToolRetryability::Never,
+            ));
+        }
+    };
+    if supplied_handle != descriptor.handle_id() {
+        return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+            crate::tools::ToolFailureCode::Conflict,
+            "The supplied workspace handle does not own this run generation".to_string(),
+            crate::tools::ToolRetryability::Never,
+        ));
+    }
+    if let Some(Value::String(path)) = args.get("path") {
+        if Path::new(path) != descriptor.workspace_root() {
+            return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+                crate::tools::ToolFailureCode::Conflict,
+                "The supplied path differs from the active workspace capability".to_string(),
+                crate::tools::ToolRetryability::Never,
+            ));
+        }
+    }
+    if let Some(Value::String(path)) = args.get("target_path") {
+        if Path::new(path) != descriptor.repository_root() {
+            return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+                crate::tools::ToolFailureCode::Conflict,
+                "The supplied target path differs from the active repository capability"
+                    .to_string(),
+                crate::tools::ToolRetryability::Never,
+            ));
+        }
+    }
+    let _lifecycle = match workspace_capability_lifecycle().lock() {
+        Ok(guard) => guard,
+        Err(error) => {
+            return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+                crate::tools::ToolFailureCode::Unavailable,
+                format!("Worktree capability lifecycle is unavailable: {error}"),
+                crate::tools::ToolRetryability::Safe,
+            ));
+        }
+    };
+    let active = match active_workspace_capabilities().lock() {
+        Ok(active) => active,
+        Err(error) => {
+            return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+                crate::tools::ToolFailureCode::Unavailable,
+                format!("Worktree owner registry is unavailable: {error}"),
+                crate::tools::ToolRetryability::Safe,
+            ));
+        }
+    };
+    if active.get(descriptor.workspace_root()) != Some(descriptor) {
+        return crate::tools::ToolHandlerResult::error(crate::tools::ToolFailure::new(
+            crate::tools::ToolFailureCode::Conflict,
+            "The active worktree owner record is missing or belongs to another generation"
+                .to_string(),
+            crate::tools::ToolRetryability::Never,
+        ));
+    }
+    drop(active);
+
+    let mut bound_args = args
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<HashMap<_, _>>();
+    bound_args.insert(
+        "path".to_string(),
+        Value::String(descriptor.workspace_root().to_string_lossy().into_owned()),
+    );
+    bound_args.insert(
+        "target_path".to_string(),
+        Value::String(descriptor.repository_root().to_string_lossy().into_owned()),
+    );
+    let terminal = parse_worktree_operation(&bound_args).is_ok_and(|operation| {
+        matches!(
+            operation,
+            WorktreeOperation::Remove | WorktreeOperation::Discard
+        )
+    });
+    let mut result = execute_exit_worktree(run.workspace_control_run(), &bound_args);
+    if terminal
+        && !descriptor.workspace_root().exists()
+        && matches!(&result.outcome, crate::tools::ToolOutcome::Success { .. })
+    {
+        if let Ok(mut active) = active_workspace_capabilities().lock() {
+            active.remove(descriptor.workspace_root());
+        }
+        result = result.with_workspace_transition(crate::tools::WorkspaceTransition::exit(
+            run.run_id(),
+            run.generation(),
+            descriptor.clone(),
+        ));
+    }
+    result
+}
+
 /// List active worktrees.
 ///
 /// Runs `git worktree list` from the process CWD (read-only) — this queries
@@ -2478,6 +2948,393 @@ mod tests {
 
     fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
         crate::tools::security::test_run_context()
+    }
+
+    fn isolated_git_fixture() -> (
+        tempfile::TempDir,
+        std::sync::Arc<crate::tools::ToolRunContext>,
+    ) {
+        let root = tempfile::tempdir().expect("isolated Git fixture");
+        let git = which::which("git").expect("git test dependency");
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.name", "OpenClaudia Test"],
+            vec!["config", "user.email", "openclaudia@example.invalid"],
+        ] {
+            let output = std::process::Command::new(&git)
+                .args(args)
+                .current_dir(root.path())
+                .output()
+                .expect("run fixture Git");
+            assert!(
+                output.status.success(),
+                "fixture Git failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::fs::write(root.path().join("tracked.txt"), "baseline\n").expect("tracked fixture");
+        for args in [vec!["add", "tracked.txt"], vec!["commit", "-qm", "fixture"]] {
+            let output = std::process::Command::new(&git)
+                .args(args)
+                .current_dir(root.path())
+                .output()
+                .expect("commit fixture");
+            assert!(
+                output.status.success(),
+                "fixture Git failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let run = crate::tools::security::test_run_context_for(root.path());
+        (root, run)
+    }
+
+    fn bound_enter_result(
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
+        branch: &str,
+    ) -> crate::tools::ToolResult {
+        let call = crate::tools::ToolCall {
+            id: format!("enter-{branch}"),
+            call_type: "function".to_string(),
+            function: crate::tools::FunctionCall {
+                name: "enter_worktree".to_string(),
+                arguments: json!({"branch": branch}).to_string(),
+            },
+        };
+        let args = HashMap::from([("branch".to_string(), Value::String(branch.to_string()))]);
+        crate::tools::ToolResult::bind(
+            &call,
+            "enter_worktree",
+            execute_enter_worktree_bound(run, &args),
+        )
+    }
+
+    #[test]
+    fn s074_bound_enter_replaces_root_and_rejects_stale_source_generation() {
+        let (_root, source) = isolated_git_fixture();
+        let result = bound_enter_result(&source, "s074-bound-root");
+        assert!(
+            !result.is_error(),
+            "bound enter failed: {}",
+            result.content()
+        );
+        let transition = result.workspace_transition().expect("host transition");
+        let isolated =
+            crate::tools::ToolRunContext::apply_workspace_transition(&source, transition)
+                .expect("publish isolated run");
+
+        assert_eq!(
+            isolated.project_root(),
+            transition.descriptor().workspace_root()
+        );
+        assert_eq!(isolated.working_directory(), isolated.project_root());
+        assert!(isolated.permits_write(&isolated.project_root().join("new.txt")));
+        let write_args = HashMap::from([
+            ("path".to_string(), Value::String("new.txt".to_string())),
+            (
+                "content".to_string(),
+                Value::String("isolated workspace\n".to_string()),
+            ),
+        ]);
+        let (write_output, write_failed) =
+            crate::tools::file::execute_write_file(&isolated, &write_args).into_legacy();
+        assert!(
+            !write_failed,
+            "isolated relative write failed: {write_output}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(isolated.project_root().join("new.txt"))
+                .expect("worktree-relative write"),
+            "isolated workspace\n"
+        );
+        assert!(
+            !source.project_root().join("new.txt").exists(),
+            "relative write escaped into the repository root"
+        );
+        let process_args =
+            HashMap::from([("command".to_string(), Value::String("pwd".to_string()))]);
+        let (process_output, process_failed) =
+            crate::tools::bash::execute_bash(&isolated, &process_args);
+        assert!(
+            !process_failed,
+            "isolated relative process failed: {process_output}"
+        );
+        assert!(
+            process_output.contains(&isolated.project_root().to_string_lossy().into_owned()),
+            "process did not run in the isolated root: {process_output}"
+        );
+        assert!(matches!(
+            source.require(crate::tools::ToolResource::WorkspaceRead),
+            Err(crate::tools::ToolCapabilityError::InactiveWorkspaceGeneration { .. })
+        ));
+    }
+
+    #[test]
+    fn s074_bound_enter_rejects_cross_owner_for_same_worktree() {
+        let (_root, first) = isolated_git_fixture();
+        let second = crate::tools::security::test_run_context_for(first.project_root());
+        let first_result = bound_enter_result(&first, "s074-cross-owner");
+        assert!(!first_result.is_error());
+
+        let second_result = bound_enter_result(&second, "s074-cross-owner");
+        assert!(second_result.is_error());
+        assert!(second_result.content().contains("owned by another run"));
+    }
+
+    #[test]
+    fn s074_registered_workspace_rejects_cross_owner_exit() {
+        let (_root, owner) = isolated_git_fixture();
+        let other = crate::tools::security::test_run_context_for(owner.project_root());
+        let enter = bound_enter_result(&owner, "s074-cross-owner-exit");
+        let descriptor = enter
+            .workspace_transition()
+            .expect("owner transition")
+            .descriptor();
+        let args = HashMap::from([
+            (
+                "path".to_string(),
+                Value::String(descriptor.workspace_root().to_string_lossy().into_owned()),
+            ),
+            (
+                "operation".to_string(),
+                Value::String("preview".to_string()),
+            ),
+        ]);
+
+        let result = execute_exit_worktree_bound(&other, &args);
+
+        assert!(matches!(
+            result.outcome,
+            crate::tools::ToolOutcome::Error { .. }
+        ));
+        assert!(result
+            .content()
+            .contains("owned by isolated workspace capability"));
+        assert!(descriptor.workspace_root().is_dir());
+    }
+
+    #[test]
+    fn s074_isolated_run_rejects_nested_enter_before_creating_a_tree() {
+        let (_root, source) = isolated_git_fixture();
+        let enter = bound_enter_result(&source, "s074-parent-workspace");
+        let isolated = crate::tools::ToolRunContext::apply_workspace_transition(
+            &source,
+            enter.workspace_transition().expect("parent transition"),
+        )
+        .expect("publish parent workspace");
+        let nested_path = isolated
+            .project_root()
+            .join(".worktrees")
+            .join("s074-nested-workspace");
+
+        let nested = bound_enter_result(&isolated, "s074-nested-workspace");
+
+        assert!(nested.is_error());
+        assert!(nested.content().contains("already bound"));
+        assert!(
+            !nested_path.exists(),
+            "nested worktree was created before refusal"
+        );
+    }
+
+    #[test]
+    fn s074_concurrent_publication_allows_only_one_workspace_generation() {
+        let (_root, source) = isolated_git_fixture();
+        let result = bound_enter_result(&source, "s074-concurrent-enter");
+        let transition = result
+            .workspace_transition()
+            .expect("host transition")
+            .clone();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let source = std::sync::Arc::clone(&source);
+            let transition = transition.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                crate::tools::ToolRunContext::apply_workspace_transition(&source, &transition)
+            }));
+        }
+        barrier.wait();
+        let outcomes = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("transition worker"))
+            .collect::<Vec<_>>();
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_err()).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn s074_removed_isolated_tree_invalidates_the_live_capability() {
+        let (_root, source) = isolated_git_fixture();
+        let result = bound_enter_result(&source, "s074-removed-root");
+        let isolated = crate::tools::ToolRunContext::apply_workspace_transition(
+            &source,
+            result.workspace_transition().expect("host transition"),
+        )
+        .expect("publish isolated run");
+        std::fs::remove_dir_all(isolated.project_root()).expect("remove isolated root fixture");
+
+        assert!(matches!(
+            isolated.require(crate::tools::ToolResource::WorkspaceRead),
+            Err(crate::tools::ToolCapabilityError::StaleWorkspace { .. })
+        ));
+    }
+
+    #[test]
+    fn s074_resume_rebinds_the_persisted_handle_to_a_fresh_run() {
+        let (_root, source) = isolated_git_fixture();
+        let result = bound_enter_result(&source, "s074-resume");
+        let isolated = crate::tools::ToolRunContext::apply_workspace_transition(
+            &source,
+            result.workspace_transition().expect("host transition"),
+        )
+        .expect("publish isolated run");
+        let persisted: crate::runtime::IsolatedWorkspaceDescriptor = serde_json::from_value(
+            serde_json::to_value(isolated.isolated_workspace().expect("descriptor"))
+                .expect("serialize descriptor"),
+        )
+        .expect("deserialize descriptor");
+        release_workspace_descriptor_owner(&isolated).expect("release prior process owner");
+
+        let session_id = crate::state::SessionId::from_raw(source.session_id())
+            .expect("source session identifier");
+        let fresh_base = crate::tools::ToolRunContext::builder(session_id, source.project_root())
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::new())
+            .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+            .process(true)
+            .network(true)
+            .secrets(true)
+            .provider("unit-test")
+            .build()
+            .expect("fresh resume base run");
+        let resumed =
+            crate::tools::ToolRunContext::resume_isolated_workspace(&fresh_base, &persisted)
+                .expect("resume isolated workspace");
+        let rebound = resumed.isolated_workspace().expect("rebound descriptor");
+
+        assert_eq!(rebound.handle_id(), persisted.handle_id());
+        assert_ne!(rebound.owner_run(), persisted.owner_run());
+        assert!(rebound.generation() > persisted.generation());
+        assert_eq!(resumed.project_root(), persisted.workspace_root());
+        assert!(fresh_base
+            .require(crate::tools::ToolResource::WorkspaceRead)
+            .is_err());
+    }
+
+    #[test]
+    fn s074_bound_exit_restores_parent_and_retires_isolated_generation() {
+        let (_root, source) = isolated_git_fixture();
+        let enter = bound_enter_result(&source, "s074-bound-exit");
+        let isolated = crate::tools::ToolRunContext::apply_workspace_transition(
+            &source,
+            enter.workspace_transition().expect("enter transition"),
+        )
+        .expect("publish isolated run");
+        let ledger_path =
+            crate::ledger::project_session_ledger_path_for_run(&isolated, isolated.session_id())
+                .expect("isolated ledger path");
+        assert!(
+            !ledger_path.starts_with(isolated.project_root()),
+            "run ledger would contaminate the removable worktree: {}",
+            ledger_path.display()
+        );
+        let descriptor = isolated.isolated_workspace().expect("descriptor").clone();
+        let preview_args = HashMap::from([
+            (
+                "workspace_handle".to_string(),
+                Value::String(descriptor.handle_id().to_string()),
+            ),
+            (
+                "path".to_string(),
+                Value::String(descriptor.workspace_root().to_string_lossy().into_owned()),
+            ),
+            (
+                "operation".to_string(),
+                Value::String("preview".to_string()),
+            ),
+        ]);
+        let preview = execute_exit_worktree_bound(&isolated, &preview_args);
+        let crate::tools::ToolOutcome::Success { content } = &preview.outcome else {
+            panic!("bound preview failed: {}", preview.content());
+        };
+        let transaction = content
+            .structured
+            .as_ref()
+            .and_then(|value| value.get("transaction"))
+            .expect("preview transaction");
+        let generation = transaction["generation"]
+            .as_str()
+            .expect("preview generation")
+            .to_string();
+        let cleanup_args = HashMap::from([
+            (
+                "workspace_handle".to_string(),
+                Value::String(descriptor.handle_id().to_string()),
+            ),
+            (
+                "path".to_string(),
+                Value::String(descriptor.workspace_root().to_string_lossy().into_owned()),
+            ),
+            ("operation".to_string(), Value::String("remove".to_string())),
+            ("expected_generation".to_string(), Value::String(generation)),
+        ]);
+        let call = crate::tools::ToolCall {
+            id: "exit-s074-bound-exit".to_string(),
+            call_type: "function".to_string(),
+            function: crate::tools::FunctionCall {
+                name: "exit_worktree".to_string(),
+                arguments: serde_json::to_string(&cleanup_args).expect("cleanup arguments"),
+            },
+        };
+        let exit = crate::tools::ToolResult::bind(
+            &call,
+            "exit_worktree",
+            execute_exit_worktree_bound(&isolated, &cleanup_args),
+        );
+        assert!(!exit.is_error(), "bound cleanup failed: {}", exit.content());
+        let restored = crate::tools::ToolRunContext::apply_workspace_transition(
+            &isolated,
+            exit.workspace_transition().expect("exit transition"),
+        )
+        .expect("restore parent run");
+        assert_eq!(restored.run_id(), source.run_id());
+        assert!(restored
+            .require(crate::tools::ToolResource::WorkspaceRead)
+            .is_ok());
+        assert!(matches!(
+            isolated.require(crate::tools::ToolResource::WorkspaceRead),
+            Err(crate::tools::ToolCapabilityError::InactiveWorkspaceGeneration { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn s074_symlink_replacement_invalidates_the_live_capability() {
+        use std::os::unix::fs::symlink;
+
+        let (root, source) = isolated_git_fixture();
+        let result = bound_enter_result(&source, "s074-symlink-root");
+        let isolated = crate::tools::ToolRunContext::apply_workspace_transition(
+            &source,
+            result.workspace_transition().expect("host transition"),
+        )
+        .expect("publish isolated run");
+        let original = isolated.project_root().to_path_buf();
+        let moved = root.path().join("moved-worktree");
+        std::fs::rename(&original, &moved).expect("move isolated root fixture");
+        symlink(root.path(), &original).expect("replace isolated root with symlink");
+
+        assert!(matches!(
+            isolated.require(crate::tools::ToolResource::WorkspaceRead),
+            Err(crate::tools::ToolCapabilityError::StaleWorkspace { .. })
+        ));
     }
 
     fn preview_transaction(run: &crate::tools::ToolRunContext, path: &Path) -> Value {

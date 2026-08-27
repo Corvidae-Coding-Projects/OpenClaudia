@@ -461,6 +461,32 @@ pub struct TurnResult {
     /// protocol requires native state. Construction and bounds validation
     /// happen before tool effects are dispatched.
     pub provider_native_state: Option<crate::runtime::ProviderNativeState>,
+    /// Exact run-scoped services to use for an immediate agentic follow-up.
+    /// This stays host-local and is never projected into provider state.
+    pub(crate) execution_bindings: Option<TurnExecutionBindings>,
+}
+
+pub(crate) struct TurnExecutionBindings {
+    pub(crate) run_context: Arc<tools::ToolRunContext>,
+    pub(crate) permission_mgr: Option<Arc<PermissionManager>>,
+    pub(crate) task_mgr: Arc<Mutex<crate::session::TaskManager>>,
+}
+
+impl std::fmt::Debug for TurnExecutionBindings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TurnExecutionBindings")
+            .field("run_id", &self.run_context.run_id())
+            .field("generation", &self.run_context.generation())
+            .field("has_permission_manager", &self.permission_mgr.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+struct ToolCallBatch {
+    results: Vec<Value>,
+    has_tools: bool,
+    bindings: TurnExecutionBindings,
 }
 
 // ─── Request building ───────────────────────────────────────────────────────
@@ -2005,7 +2031,7 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
             ProviderTerminalOutcome::ToolCalls
         };
         ensure_provider_turn_succeeded(terminal_outcome, sdk_turn.tool_calls.len())?;
-        let (tool_results, needs_followup) = execute_tool_calls_for_tui(
+        let tool_batch = execute_tool_calls_for_tui(
             run_context,
             &sdk_turn.tool_calls,
             memory_db,
@@ -2024,12 +2050,13 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
             content: sdk_turn.content,
             reasoning_content: None,
             tool_calls: sdk_turn.tool_calls,
-            tool_results,
+            tool_results: tool_batch.results,
             usage: sdk_turn.usage,
-            needs_followup,
+            needs_followup: tool_batch.has_tools,
             terminal_outcome,
             finish_reason: None,
             provider_native_state: None,
+            execution_bindings: Some(tool_batch.bindings),
         });
     }
 
@@ -2060,7 +2087,7 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
             ProviderTerminalOutcome::ToolCalls
         };
         ensure_provider_turn_succeeded(terminal_outcome, sdk_turn.tool_calls.len())?;
-        let (tool_results, needs_followup) = execute_tool_calls_for_tui(
+        let tool_batch = execute_tool_calls_for_tui(
             run_context,
             &sdk_turn.tool_calls,
             memory_db,
@@ -2079,12 +2106,13 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
             content: sdk_turn.content,
             reasoning_content: None,
             tool_calls: sdk_turn.tool_calls,
-            tool_results,
+            tool_results: tool_batch.results,
             usage: sdk_turn.usage,
-            needs_followup,
+            needs_followup: tool_batch.has_tools,
             terminal_outcome,
             finish_reason: None,
             provider_native_state: None,
+            execution_bindings: Some(tool_batch.bindings),
         });
     }
 
@@ -2530,7 +2558,7 @@ async fn handle_provider_native_json_response(
     ensure_provider_turn_succeeded(terminal_outcome, tool_calls.len())?;
 
     // Execute tool calls if any
-    let (tool_results, needs_followup) = execute_tool_calls_for_tui(
+    let tool_batch = execute_tool_calls_for_tui(
         run_context,
         &tool_calls,
         memory_db,
@@ -2550,12 +2578,13 @@ async fn handle_provider_native_json_response(
         content,
         reasoning_content,
         tool_calls,
-        tool_results,
+        tool_results: tool_batch.results,
         usage,
-        needs_followup,
+        needs_followup: tool_batch.has_tools,
         terminal_outcome,
         finish_reason,
         provider_native_state: Some(provider_native_state),
+        execution_bindings: Some(tool_batch.bindings),
     })
 }
 
@@ -2857,7 +2886,7 @@ async fn finalize_sse_stream(f: SseFinalize<'_>) -> Result<TurnResult, String> {
     ensure_provider_turn_succeeded(f.terminal_outcome, tool_calls.len())?;
 
     // Execute tool calls if any
-    let (tool_results, has_tools) = execute_tool_calls_for_tui(
+    let tool_batch = execute_tool_calls_for_tui(
         f.run_context,
         &tool_calls,
         f.memory_db,
@@ -2877,15 +2906,16 @@ async fn finalize_sse_stream(f: SseFinalize<'_>) -> Result<TurnResult, String> {
         content: f.full_content,
         reasoning_content: (!f.reasoning_content.is_empty()).then_some(f.reasoning_content),
         tool_calls,
-        tool_results,
+        tool_results: tool_batch.results,
         usage: f.stream_usage,
-        needs_followup: has_tools,
+        needs_followup: tool_batch.has_tools,
         terminal_outcome: f.terminal_outcome,
         // The typed terminal outcome above carries the normalized state.
         // This legacy string field remains `None` for Anthropic/OpenAI SSE;
         // only the native JSON path populates it today (crosslink #788).
         finish_reason: None,
         provider_native_state: None,
+        execution_bindings: Some(tool_batch.bindings),
     })
 }
 
@@ -3616,7 +3646,7 @@ async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnRes
 
     ensure_provider_turn_succeeded(terminal_outcome, tool_calls.len())?;
 
-    let (tool_results, needs_followup) = execute_tool_calls_for_tui(
+    let tool_batch = execute_tool_calls_for_tui(
         run_context,
         &tool_calls,
         memory_db,
@@ -3635,12 +3665,13 @@ async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnRes
         content,
         reasoning_content,
         tool_calls,
-        tool_results,
+        tool_results: tool_batch.results,
         usage,
-        needs_followup,
+        needs_followup: tool_batch.has_tools,
         terminal_outcome,
         finish_reason: None,
         provider_native_state: Some(next_provider_state),
+        execution_bindings: Some(tool_batch.bindings),
     })
 }
 
@@ -4336,18 +4367,19 @@ fn record_quality_gate_verification(
     let Some(session_id) = session_id else {
         return;
     };
-    let mut ledger = match crate::ledger::RealityLedger::open_project_session(session_id) {
-        Ok(ledger) => ledger,
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                gate = %gate.name(),
-                error = %err,
-                "failed to open session reality ledger for quality-gate verification"
-            );
-            return;
-        }
-    };
+    let mut ledger =
+        match crate::ledger::RealityLedger::open_project_session_for_run(run, session_id) {
+            Ok(ledger) => ledger,
+            Err(err) => {
+                tracing::warn!(
+                    session_id,
+                    gate = %gate.name(),
+                    error = %err,
+                    "failed to open session reality ledger for quality-gate verification"
+                );
+                return;
+            }
+        };
     if let Err(err) = crate::grounded_loop::append_quality_gate_observations(run, &mut ledger, gate)
     {
         tracing::warn!(
@@ -4363,11 +4395,11 @@ fn record_quality_gate_verification(
 /// handshake: sends `PermissionRequest` to the TUI and blocks until
 /// the user responds with y/n/a/d.
 ///
-/// Returns the tool result messages (for appending to conversation history)
-/// and a boolean indicating whether there were any tool calls.
+/// Returns the tool result messages plus the exact run-scoped services that
+/// must drive the immediate follow-up turn.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn execute_tool_calls_for_tui(
-    run_context: Arc<tools::ToolRunContext>,
+    mut run_context: Arc<tools::ToolRunContext>,
     tool_calls: &[ToolCall],
     memory_db: Option<Arc<MemoryDb>>,
     app_config: Option<Arc<AppConfig>>,
@@ -4375,17 +4407,25 @@ async fn execute_tool_calls_for_tui(
     transient_allowed_tool_rules: &[PermissionRule],
     hook_engine: Option<Arc<crate::hooks::HookEngine>>,
     policy_enforcer: Option<Arc<PolicyEnforcer>>,
-    task_mgr: Arc<Mutex<crate::session::TaskManager>>,
+    mut task_mgr: Arc<Mutex<crate::session::TaskManager>>,
     session_id: Option<&str>,
     model_identity: &str,
     tx: &mpsc::Sender<AppEvent>,
-) -> (Vec<Value>, bool) {
+) -> ToolCallBatch {
     // Session-level "always allow/deny" cache (lives for this agentic loop)
     if tool_calls.is_empty() {
-        return (vec![], false);
+        return ToolCallBatch {
+            results: Vec::new(),
+            has_tools: false,
+            bindings: TurnExecutionBindings {
+                run_context,
+                permission_mgr,
+                task_mgr,
+            },
+        };
     }
 
-    let Some(permission_mgr) = permission_mgr else {
+    let Some(mut permission_mgr) = permission_mgr else {
         let mut results = Vec::with_capacity(tool_calls.len());
         for tool_call in tool_calls {
             let result = tools::ToolResult::failure(
@@ -4407,7 +4447,15 @@ async fn execute_tool_calls_for_tui(
             observe_tool_result(&run_context, session_id, &result);
             results.push(result.openai_message());
         }
-        return (results, true);
+        return ToolCallBatch {
+            results,
+            has_tools: true,
+            bindings: TurnExecutionBindings {
+                run_context,
+                permission_mgr: None,
+                task_mgr,
+            },
+        };
     };
 
     let mut results = Vec::new();
@@ -4553,6 +4601,79 @@ async fn execute_tool_calls_for_tui(
                 let Ok(approved_plan_context) = resolve_tui_follow_up(&mut result, tx).await else {
                     break;
                 };
+                if let Some(transition) = result.workspace_transition() {
+                    match tools::ToolRunContext::apply_workspace_transition(
+                        &run_context,
+                        transition,
+                    ) {
+                        Ok(next_run) => {
+                            if let Some(config) = app_config.as_deref() {
+                                if let Err(error) =
+                                    crate::guardrails::configure(&next_run, &config.guardrails)
+                                {
+                                    result = result.with_postcondition_failure(
+                                        tools::ToolFailure::new(
+                                            tools::ToolFailureCode::Internal,
+                                            format!(
+                                                "Workspace changed, but guardrail rebinding failed: {error}"
+                                            ),
+                                            tools::ToolRetryability::Never,
+                                        ),
+                                    );
+                                }
+                            }
+                            match crate::session::TaskManager::open_for_run(&next_run) {
+                                Ok(manager) => {
+                                    task_mgr = Arc::new(Mutex::new(manager));
+                                }
+                                Err(error) => {
+                                    result = result.with_postcondition_failure(
+                                        tools::ToolFailure::new(
+                                            tools::ToolFailureCode::Unavailable,
+                                            format!(
+                                                "Workspace changed, but task graph rebinding failed: {error}"
+                                            ),
+                                            tools::ToolRetryability::Safe,
+                                        ),
+                                    );
+                                    match crate::session::TaskManager::for_run(&next_run) {
+                                        Ok(manager) => {
+                                            task_mgr = Arc::new(Mutex::new(manager));
+                                        }
+                                        Err(fallback_error) => {
+                                            result = result.with_postcondition_failure(
+                                                tools::ToolFailure::new(
+                                                    tools::ToolFailureCode::Internal,
+                                                    format!(
+                                                        "Workspace task graph binding failed: {fallback_error}"
+                                                    ),
+                                                    tools::ToolRetryability::Never,
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            permission_mgr = Arc::new(permission_mgr.rebind_for_run(&next_run));
+                            run_context = next_run;
+                            if tx
+                                .send(AppEvent::WorkspaceTransition {
+                                    run_context: Arc::clone(&run_context),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            result = result.with_postcondition_failure(tools::ToolFailure::new(
+                                tools::ToolFailureCode::Conflict,
+                                format!("Workspace transition was not published: {error}"),
+                                tools::ToolRetryability::Safe,
+                            ));
+                        }
+                    }
+                }
                 observe_tool_result(&run_context, session_id, &result);
                 results.push(result.openai_message());
                 if let Some(context) = approved_plan_context {
@@ -4568,7 +4689,15 @@ async fn execute_tool_calls_for_tui(
         results.push(finding);
     }
 
-    (results, true)
+    ToolCallBatch {
+        results,
+        has_tools: true,
+        bindings: TurnExecutionBindings {
+            run_context,
+            permission_mgr: Some(permission_mgr),
+            task_mgr,
+        },
+    }
 }
 
 fn observe_tool_result_json(
@@ -5227,7 +5356,9 @@ memory:
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
         let permission_mgr = Some(Arc::new(PermissionManager::unrestricted()));
 
-        let (results, has_tools) = execute_tool_calls_for_tui(
+        let ToolCallBatch {
+            results, has_tools, ..
+        } = execute_tool_calls_for_tui(
             test_run(),
             &[tool_call],
             None,
@@ -5293,6 +5424,93 @@ memory:
                 .is_some_and(|content| content.contains("Invalid tool arguments JSON")),
             "ledgered tool result should carry the parse error: {result}"
         );
+    }
+
+    #[tokio::test]
+    async fn s074_tui_tool_batch_returns_rebound_execution_services() {
+        use std::sync::mpsc as std_mpsc;
+
+        let root = tempfile::tempdir().expect("TUI workspace fixture");
+        let git = which::which("git").expect("Git test dependency");
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.name", "OpenClaudia Test"],
+            vec!["config", "user.email", "openclaudia@example.invalid"],
+        ] {
+            let output = std::process::Command::new(&git)
+                .args(args)
+                .current_dir(root.path())
+                .output()
+                .expect("run fixture Git");
+            assert!(
+                output.status.success(),
+                "fixture Git failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::fs::write(root.path().join("tracked.txt"), "baseline\n").expect("tracked fixture");
+        for args in [vec!["add", "tracked.txt"], vec!["commit", "-qm", "fixture"]] {
+            let output = std::process::Command::new(&git)
+                .args(args)
+                .current_dir(root.path())
+                .output()
+                .expect("commit fixture");
+            assert!(
+                output.status.success(),
+                "fixture Git failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let source = crate::tools::security::test_run_context_for(root.path());
+        let permission_mgr = Arc::new(PermissionManager::unrestricted_for_run(&source));
+        let task_mgr = Arc::new(Mutex::new(
+            crate::session::TaskManager::for_run(&source).expect("source task manager"),
+        ));
+        let tool_call = ToolCall {
+            id: "s074-tui-enter".to_string(),
+            call_type: "function".to_string(),
+            function: tools::FunctionCall {
+                name: "enter_worktree".to_string(),
+                arguments: serde_json::json!({"branch": "s074-tui-followup"}).to_string(),
+            },
+        };
+        let (tx, rx) = std_mpsc::channel::<AppEvent>();
+
+        let batch = execute_tool_calls_for_tui(
+            Arc::clone(&source),
+            &[tool_call],
+            None,
+            None,
+            Some(permission_mgr),
+            &[],
+            None,
+            None,
+            task_mgr,
+            Some(source.session_id()),
+            "test-model",
+            &tx,
+        )
+        .await;
+
+        assert!(batch.has_tools);
+        assert_eq!(batch.results.len(), 1);
+        assert_eq!(batch.results[0]["is_error"], false);
+        let isolated = batch.bindings.run_context;
+        assert!(isolated.isolated_workspace().is_some());
+        assert_eq!(isolated.project_root(), isolated.working_directory());
+        assert!(matches!(
+            source.require(crate::tools::ToolResource::WorkspaceRead),
+            Err(crate::tools::ToolCapabilityError::InactiveWorkspaceGeneration { .. })
+        ));
+        let event_run = rx
+            .try_iter()
+            .find_map(|event| match event {
+                AppEvent::WorkspaceTransition { run_context } => Some(run_context),
+                _ => None,
+            })
+            .expect("workspace transition event");
+        assert_eq!(event_run.run_id(), isolated.run_id());
+        assert_eq!(event_run.generation(), isolated.generation());
     }
 
     #[tokio::test]
@@ -5362,7 +5580,9 @@ memory:
             .send(PermissionResponse::Allow)
             .expect("tool runner should still be awaiting permission reply");
 
-        let (results, has_tools) = handle.await.expect("tool runner should not panic");
+        let ToolCallBatch {
+            results, has_tools, ..
+        } = handle.await.expect("tool runner should not panic");
         assert!(has_tools);
         assert_eq!(results.len(), 1);
         let content = results[0]["content"].as_str().unwrap_or_default();
@@ -5409,7 +5629,9 @@ memory:
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
         let run_context = test_run();
 
-        let (results, has_tools) = execute_tool_calls_for_tui(
+        let ToolCallBatch {
+            results, has_tools, ..
+        } = execute_tool_calls_for_tui(
             Arc::clone(&run_context),
             &[tool_call],
             None,
@@ -5489,7 +5711,9 @@ memory:
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
 
-        let (results, has_tools) = execute_tool_calls_for_tui(
+        let ToolCallBatch {
+            results, has_tools, ..
+        } = execute_tool_calls_for_tui(
             test_run(),
             &[tool_call],
             None,
@@ -5587,7 +5811,9 @@ memory:
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
 
-        let (results, has_tools) = execute_tool_calls_for_tui(
+        let ToolCallBatch {
+            results, has_tools, ..
+        } = execute_tool_calls_for_tui(
             test_run(),
             &[tool_call],
             None,
@@ -5655,7 +5881,9 @@ memory:
         let permission_mgr = Some(Arc::new(PermissionManager::unrestricted()));
         let run_context = test_run();
 
-        let (results, has_tools) = execute_tool_calls_for_tui(
+        let ToolCallBatch {
+            results, has_tools, ..
+        } = execute_tool_calls_for_tui(
             Arc::clone(&run_context),
             &[tool_call],
             None,
