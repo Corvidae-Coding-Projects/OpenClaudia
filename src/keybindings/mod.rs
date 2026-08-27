@@ -11,4 +11,4 @@ pub mod resolver;
 
 pub use actions::KeyAction;
 pub use parser::{parse_chord, ParsedKeystroke};
-pub use resolver::{ChordResolveResult, KeyContext, KeybindingResolver};
+pub use resolver::{ChordResolveResult, KeyContext, KeybindingResolver, DEFAULT_CHORD_TIMEOUT};

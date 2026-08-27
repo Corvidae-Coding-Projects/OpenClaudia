@@ -1092,6 +1092,12 @@ impl AcpServer {
         for error in manager.discover() {
             warn!(%error, "ACP plugin discovery rejected an entry");
         }
+        match manager.compose_hook_engine(&self.hook_engine) {
+            Ok(engine) => self.hook_engine = engine,
+            Err(error) => {
+                warn!(%error, "ACP plugin hooks failed canonical activation and remain unavailable");
+            }
+        }
         self.plugin_manager = Some(Arc::new(manager));
     }
 

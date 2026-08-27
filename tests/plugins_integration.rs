@@ -8,7 +8,8 @@
 
 use openclaudia::plugins::policy::PluginPolicy;
 use openclaudia::plugins::{
-    InstalledPlugins, MarketplaceSource, PluginError, PluginInstallEntry, PluginManager,
+    InstalledPlugins, MarketplaceSource, PluginComponentKind, PluginError, PluginInstallEntry,
+    PluginManager,
 };
 use openclaudia::skills::{
     load_skills_for_run, parse_skill_file, ResolvedSkill, SkillCapabilityPolicy, SkillRunAccess,
@@ -211,13 +212,165 @@ fn enabled_plugin_lsp_declarations_refresh_the_exact_run_service() {
     manager.configure_lsp_service_for_run(&run);
     let configured = run.lsp_service().plugin_servers();
     assert_eq!(configured.len(), 1);
-    assert_eq!(configured[0].owner, "lsp-plugin");
+    assert!(configured[0].owner.starts_with("plugin__"));
+    assert!(configured[0].owner.contains("__lsp__fixture__g"));
     assert_eq!(configured[0].language, "fixture");
     assert_eq!(configured[0].config.extensions, ["fixture"]);
 
     manager.disable("lsp-plugin").expect("disable plugin");
     manager.configure_lsp_service_for_run(&run);
     assert!(run.lsp_service().plugin_servers().is_empty());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One fixture proves the atomic six-component lifecycle end to end.
+fn canonical_plugin_generation_invokes_and_revokes_every_component_type() {
+    let root = TempDir::new().unwrap();
+    let plugin_dir = make_cc_plugin(root.path(), "complete-plugin");
+    let command_dir = plugin_dir.join("commands");
+    let hook_dir = plugin_dir.join("hooks");
+    let agent_dir = plugin_dir.join("agents");
+    let skill_dir = plugin_dir.join("skills/reviewer");
+    fs::create_dir_all(&command_dir).unwrap();
+    fs::create_dir_all(&hook_dir).unwrap();
+    fs::create_dir_all(&agent_dir).unwrap();
+    fs::create_dir_all(&skill_dir).unwrap();
+    fs::write(
+        command_dir.join("review.md"),
+        "---\nallowed-tools: [Read]\n---\nReview $ARGUMENTS",
+    )
+    .unwrap();
+    fs::write(
+        hook_dir.join("hooks.json"),
+        serde_json::json!({
+            "PreToolUse": [{"matcher": "read_file", "type": "command", "command": "echo plugin-hook", "timeout": 2}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        agent_dir.join("reviewer.md"),
+        "---\nname: reviewer\nallowed-tools: [Read]\nmodel: sonnet\n---\nInspect the assigned artifact and report concrete findings.",
+    )
+    .unwrap();
+    write_skill(
+        &skill_dir.join("SKILL.md"),
+        "plugin-review",
+        "Review with package context",
+        "Review the supplied arguments: $ARGUMENTS",
+    );
+    fs::write(
+        plugin_dir.join(".mcp.json"),
+        serde_json::json!({
+            "mcpServers": {
+                "fixture": {"transport": "stdio", "command": "node", "args": ["server.js"]}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        plugin_dir.join(".claude-plugin/plugin.json"),
+        serde_json::json!({
+            "name": "complete-plugin",
+            "version": "1.0.0",
+            "description": "Every supported component",
+            "lspServers": {
+                "fixture": {"command": "fixture-ls", "args": ["--stdio"], "extensions": ["fixture"]}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut manager =
+        PluginManager::with_paths_for_project(vec![root.path().to_path_buf()], root.path());
+    assert!(manager.discover().is_empty());
+    let registry = manager.capability_registry();
+    let kinds = registry
+        .all()
+        .map(|registration| registration.metadata().kind)
+        .collect::<Vec<_>>();
+    for kind in [
+        PluginComponentKind::Command,
+        PluginComponentKind::Hook,
+        PluginComponentKind::Skill,
+        PluginComponentKind::Agent,
+        PluginComponentKind::Mcp,
+        PluginComponentKind::Lsp,
+    ] {
+        assert!(
+            kinds.contains(&kind),
+            "missing canonical {kind} registration"
+        );
+    }
+
+    let command = manager
+        .invoke_command("complete-plugin", "review", "src/lib.rs")
+        .expect("command invocation");
+    assert_eq!(command.prompt, "Review src/lib.rs");
+    let skill = manager
+        .invoke_skill("complete-plugin", "plugin-review", "src/lib.rs")
+        .expect("skill invocation");
+    assert!(skill.prompt.contains("src/lib.rs"));
+    let agent = manager
+        .invoke_agent("complete-plugin", "reviewer", "inspect src/lib.rs")
+        .expect("agent invocation");
+    assert_eq!(agent.task, "inspect src/lib.rs");
+    assert!(manager
+        .capability_registry()
+        .all()
+        .all(|registration| registration
+            .metadata()
+            .canonical_name
+            .starts_with("plugin__")));
+    assert!(manager
+        .compose_hook_engine(&openclaudia::hooks::HookEngine::new(
+            openclaudia::config::HooksConfig::default(),
+        ))
+        .is_ok());
+
+    let run = ToolRunContext::builder(SessionId::new(), root.path())
+        .working_directory(root.path())
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(HashMap::new())
+        .mcp_environment_grants(HashMap::new())
+        .workspace_access(WorkspaceAccess::ReadWrite)
+        .process(true)
+        .network(false)
+        .secrets(false)
+        .provider("plugin-generation-test")
+        .build()
+        .expect("plugin generation run");
+    assert_eq!(manager.mcp_registrations_for_run(&run).len(), 1);
+    manager.configure_lsp_service_for_run(&run);
+    assert_eq!(run.lsp_service().plugin_servers().len(), 1);
+
+    manager.disable("complete-plugin").expect("disable plugin");
+    assert!(manager.capability_registry().all().next().is_none());
+    manager.configure_lsp_service_for_run(&run);
+    assert!(run.lsp_service().plugin_servers().is_empty());
+    let revocations = manager.take_pending_revocations();
+    assert_eq!(revocations.len(), 1);
+    let retired = &revocations[0];
+    assert_eq!(retired.retired_owners.len(), 1);
+    assert_eq!(retired.removed_registrations.len(), 6);
+    for kind in [
+        PluginComponentKind::Command,
+        PluginComponentKind::Hook,
+        PluginComponentKind::Skill,
+        PluginComponentKind::Agent,
+        PluginComponentKind::Mcp,
+        PluginComponentKind::Lsp,
+    ] {
+        assert!(retired.removed_kinds.contains(&kind));
+    }
+
+    let mut restarted =
+        PluginManager::with_paths_for_project(vec![root.path().to_path_buf()], root.path());
+    assert!(restarted.discover().is_empty());
+    assert!(restarted.capability_registry().all().next().is_none());
 }
 
 // ---------------------------------------------------------------------------

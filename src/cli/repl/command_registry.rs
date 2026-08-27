@@ -113,8 +113,11 @@ impl CommandHandler for HelpCommand {
     fn aliases(&self) -> &'static [&'static str] {
         &["?"]
     }
-    fn handle(&self, _ctx: &mut SlashCtx<'_>, _args: &str) -> SlashCommandResult {
+    fn handle(&self, ctx: &mut SlashCtx<'_>, _args: &str) -> SlashCommandResult {
         slash_help();
+        if let Some(config) = ctx.app_config {
+            super::keybindings::display_keybindings(&config.keybindings);
+        }
         SlashCommandResult::Handled
     }
 }

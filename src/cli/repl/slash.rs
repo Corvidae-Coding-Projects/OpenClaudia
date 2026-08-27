@@ -54,17 +54,14 @@ pub enum PluginActionOutcome {
     Handled,
     /// A plugin slash command resolved to a prompt that should be sent.
     Prompt(PluginCommandInvocation),
+    /// A namespaced plugin skill resolved through the same package registry.
+    Skill(plugins::PluginSkillInvocation),
+    /// A namespaced plugin agent resolved for canonical child execution.
+    Agent(plugins::PluginAgentInvocation),
 }
 
-/// Resolved prompt plus per-command metadata for a plugin slash command.
-pub struct PluginCommandInvocation {
-    /// Prompt content to send as the user message.
-    pub prompt: String,
-    /// Tools that should be pre-approved for this prompt.
-    pub allowed_tools: Option<Vec<String>>,
-    /// Optional model hint from command front matter.
-    pub model: Option<String>,
-}
+/// Generation-bound plugin invocation compiled by the canonical registry.
+pub type PluginCommandInvocation = plugins::PluginCommandInvocation;
 
 /// Resolved prompt plus per-skill metadata for a skill slash command.
 pub struct SkillInvocation {
@@ -2649,14 +2646,14 @@ impl PluginActionRunner for PluginAction {
             }
             Self::Enable { plugin } => {
                 match plugin_manager.enable(&plugin) {
-                    Ok(()) => println!("\nEnabled plugin '{plugin}'. Restart to apply changes.\n"),
+                    Ok(()) => println!("\nEnabled plugin '{plugin}'.\n"),
                     Err(e) => eprintln!("\nFailed to enable plugin: {e}\n"),
                 }
                 PluginActionOutcome::Handled
             }
             Self::Disable { plugin } => {
                 match plugin_manager.disable(&plugin) {
-                    Ok(()) => println!("\nDisabled plugin '{plugin}'. Restart to apply changes.\n"),
+                    Ok(()) => println!("\nDisabled plugin '{plugin}'.\n"),
                     Err(e) => eprintln!("\nFailed to disable plugin: {e}\n"),
                 }
                 PluginActionOutcome::Handled
@@ -3175,40 +3172,46 @@ fn plugin_run_command(
     arguments: &str,
     plugin_manager: &plugins::PluginManager,
 ) -> PluginActionOutcome {
-    if let Some(plugin) = plugin_manager.get(plugin_name) {
-        let commands = plugin.resolved_commands();
-        if let Some(cmd) = commands.iter().find(|c| c.name == command_name) {
+    match plugin_manager.invoke_command(plugin_name, command_name, arguments) {
+        Ok(invocation) => {
             println!("\nRunning plugin command /{plugin_name}:{command_name}\n");
-            return PluginActionOutcome::Prompt(PluginCommandInvocation {
-                prompt: render_plugin_command_prompt(cmd, arguments),
-                allowed_tools: cmd.allowed_tools.clone(),
-                model: cmd.model.clone(),
-            });
+            PluginActionOutcome::Prompt(invocation)
         }
-        let available: Vec<_> = commands.iter().map(|c| c.name.clone()).collect();
-        eprintln!("\nCommand '{command_name}' not found in plugin '{plugin_name}'.");
-        if available.is_empty() {
-            eprintln!("This plugin has no commands.\n");
-        } else {
-            eprintln!("Available: {}\n", available.join(", "));
+        Err(command_error) => {
+            if let Ok(invocation) =
+                plugin_manager.invoke_skill(plugin_name, command_name, arguments)
+            {
+                println!("\nRunning plugin skill /{plugin_name}:{command_name}\n");
+                return PluginActionOutcome::Skill(invocation);
+            }
+            if let Ok(invocation) =
+                plugin_manager.invoke_agent(plugin_name, command_name, arguments)
+            {
+                println!("\nRunning plugin agent /{plugin_name}:{command_name}\n");
+                return PluginActionOutcome::Agent(invocation);
+            }
+            let available = plugin_manager
+                .capability_registry()
+                .all()
+                .filter(|registration| registration.metadata().provenance.package == plugin_name)
+                .filter(|registration| {
+                    matches!(
+                        registration,
+                        plugins::PluginCapabilityRegistration::Command(_)
+                            | plugins::PluginCapabilityRegistration::Skill(_)
+                            | plugins::PluginCapabilityRegistration::Agent(_)
+                    )
+                })
+                .map(|registration| registration.metadata().component_name.clone())
+                .collect::<Vec<_>>();
+            eprintln!("\nPlugin command, skill, or agent '{plugin_name}:{command_name}' is unavailable: {command_error}");
+            if !available.is_empty() {
+                eprintln!("Available: {}", available.join(", "));
+            }
+            eprintln!();
+            PluginActionOutcome::Handled
         }
-    } else {
-        eprintln!("\nPlugin '{plugin_name}' not found. Use /plugin to see installed plugins.\n");
     }
-    PluginActionOutcome::Handled
-}
-
-fn render_plugin_command_prompt(cmd: &plugins::PluginCommand, arguments: &str) -> String {
-    let arguments = arguments.trim();
-    if arguments.is_empty() {
-        return cmd.content.clone();
-    }
-
-    if cmd.content.contains("$ARGUMENTS") {
-        return cmd.content.replace("$ARGUMENTS", arguments);
-    }
-
-    format!("{}\n\nArguments:\n{arguments}", cmd.content.trim_end())
 }
 
 /// Handle the `/mode` slash command.
@@ -3403,11 +3406,10 @@ mod tests {
         gh_bin, git_bin, handle_mode_command, handle_slash_command, handle_slash_command_for_run,
         hook_status_lines, parse_pinned_git_source, permission_status_lines,
         plugin_install_dir_for_name, project_mcp_server_count_from_str, render_agents_listing,
-        render_plugin_command_prompt, repl_doctor_report, slash_plugin, PinnedGitSource,
-        PinnedGitSourceError, PluginAction, SlashCommandResult,
+        repl_doctor_report, slash_plugin, PinnedGitSource, PinnedGitSourceError, PluginAction,
+        SlashCommandResult,
     };
     use openclaudia::config::{Hook, HookEntry, HookPolicy, HooksConfig, PermissionsConfig};
-    use openclaudia::plugins::PluginCommand;
     use std::collections::{HashMap, HashSet};
 
     /// Convenience: empty message vec, dummy provider + model.
@@ -4273,40 +4275,6 @@ mod tests {
             }
             _ => panic!("/plugin:command args must resolve to RunCommand with arguments"),
         }
-    }
-
-    #[test]
-    fn plugin_command_prompt_replaces_arguments_placeholder() {
-        let cmd = PluginCommand {
-            name: "fix".to_string(),
-            description: None,
-            content: "Review $ARGUMENTS carefully.".to_string(),
-            allowed_tools: None,
-            argument_hint: None,
-            model: None,
-        };
-
-        assert_eq!(
-            render_plugin_command_prompt(&cmd, "src/main.rs"),
-            "Review src/main.rs carefully."
-        );
-    }
-
-    #[test]
-    fn plugin_command_prompt_appends_arguments_when_no_placeholder_exists() {
-        let cmd = PluginCommand {
-            name: "fix".to_string(),
-            description: None,
-            content: "Review this request.\n".to_string(),
-            allowed_tools: None,
-            argument_hint: None,
-            model: None,
-        };
-
-        assert_eq!(
-            render_plugin_command_prompt(&cmd, "src/main.rs"),
-            "Review this request.\n\nArguments:\nsrc/main.rs"
-        );
     }
 
     // ── Rewind/checkpoint command parity ─────────────────────────────────────

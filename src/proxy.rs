@@ -3442,6 +3442,7 @@ async fn build_proxy_state(config: AppConfig) -> anyhow::Result<ProxyState> {
     build_proxy_state_with_loop_control(config, None).await
 }
 
+#[allow(clippy::too_many_lines)] // Proxy composition is one fail-closed startup transaction.
 async fn build_proxy_state_with_loop_control(
     config: AppConfig,
     loop_control: Option<Arc<LoopControl>>,
@@ -3451,7 +3452,7 @@ async fn build_proxy_state_with_loop_control(
 
     // Compose host hooks above exact, explicitly approved compatibility imports.
     let merged_hooks = load_effective_hooks(config.hooks.clone());
-    let hook_engine = HookEngine::new(merged_hooks);
+    let mut hook_engine = HookEngine::new(merged_hooks);
 
     // Compaction overrides default to "no overrides" — the per-request
     // model-specific compactor is built in `compact_request_context` using
@@ -3517,6 +3518,9 @@ async fn build_proxy_state_with_loop_control(
     }
     let plugin_manager = Arc::new(plugin_manager);
     plugin_manager.configure_lsp_service_for_run(&run_context);
+    hook_engine = plugin_manager
+        .compose_hook_engine(&hook_engine)
+        .map_err(anyhow::Error::new)?;
 
     // Initialize MCP manager and connect to configured servers
     let mcp_manager = Arc::new(RwLock::new(McpManager::new_with_permissions(
@@ -3621,18 +3625,25 @@ pub async fn connect_mcp_servers_with_trust<S: std::hash::BuildHasher + Sync>(
     plugin_manager: &Arc<PluginManager>,
     trusted: &std::collections::HashSet<String, S>,
 ) {
-    let discovered = plugin_manager.all_mcp_servers_for_run(mcp_manager.read().await.run_context());
+    let discovered =
+        plugin_manager.mcp_registrations_for_run(mcp_manager.read().await.run_context());
     let trusted_names = discovered
         .iter()
-        .filter(|(plugin, server)| trusted.contains(&format!("{}/{}", plugin.id, server.name)))
-        .map(|(_, server)| server.name.clone())
+        .filter(|(registration, _, server)| {
+            trusted.contains(&format!(
+                "{}/{}",
+                registration.metadata.provenance.plugin_id, server.name
+            ))
+        })
+        .map(|(_, _, server)| server.name.clone())
         .collect::<std::collections::HashSet<String>>();
     let collisions =
-        colliding_mcp_server_names(discovered.iter().filter_map(|(plugin, server)| {
-            let trust_id = format!("{}/{}", plugin.id, server.name);
+        colliding_mcp_server_names(discovered.iter().filter_map(|(registration, _, server)| {
+            let plugin_id = &registration.metadata.provenance.plugin_id;
+            let trust_id = format!("{plugin_id}/{}", server.name);
             trusted
                 .contains(&trust_id)
-                .then_some((server.name.as_str(), plugin.id.as_str()))
+                .then_some((server.name.as_str(), plugin_id.as_str()))
         }));
     let mcp = mcp_manager.write().await;
     for (server, plugins) in &collisions {
@@ -3645,8 +3656,12 @@ pub async fn connect_mcp_servers_with_trust<S: std::hash::BuildHasher + Sync>(
             "MCP server identity is declared by multiple trusted plugins and remains unavailable"
         );
     }
-    for (plugin, server) in discovered {
-        let trust_id = format!("{}/{}", plugin.id, server.name);
+    for (registration, plugin, server) in discovered {
+        let trust_id = format!(
+            "{}/{}",
+            registration.metadata.provenance.plugin_id, server.name
+        );
+        let lifecycle_id = registration.metadata.canonical_name.clone();
         if !trusted.contains(&trust_id) {
             if !trusted_names.contains(server.name.as_str()) {
                 if let Err(error) = mcp.disconnect(&server.name).await {
@@ -3673,6 +3688,7 @@ pub async fn connect_mcp_servers_with_trust<S: std::hash::BuildHasher + Sync>(
             plugin = %plugin.id,
             server = %server.name,
             trust_id,
+            lifecycle_id,
             transport = %server.transport,
             env_grants = server.env.len(),
             header_grants = server.headers.len(),
@@ -3715,7 +3731,7 @@ pub async fn connect_mcp_servers_with_trust<S: std::hash::BuildHasher + Sync>(
                             &args,
                             server.env.clone(),
                             tool_timeout,
-                            trust_id.clone(),
+                            lifecycle_id.clone(),
                         )
                         .await
                     {
@@ -3745,7 +3761,7 @@ pub async fn connect_mcp_servers_with_trust<S: std::hash::BuildHasher + Sync>(
                             server.headers_helper.as_deref(),
                             oauth,
                             tool_timeout,
-                            trust_id.clone(),
+                            lifecycle_id.clone(),
                         )
                         .await
                     } else {
@@ -3755,7 +3771,7 @@ pub async fn connect_mcp_servers_with_trust<S: std::hash::BuildHasher + Sync>(
                             server.headers.clone(),
                             server.headers_helper.as_deref(),
                             tool_timeout,
-                            trust_id.clone(),
+                            lifecycle_id.clone(),
                         )
                         .await
                     };

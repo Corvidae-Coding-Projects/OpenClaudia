@@ -1068,6 +1068,7 @@ fn rebuild_resumed_tui_endpoint(
     )?)
 }
 
+#[allow(clippy::too_many_lines)] // TUI composition is one fail-closed startup transaction.
 async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
     use openclaudia::hooks::{load_effective_hooks, HookEngine};
 
@@ -1154,6 +1155,13 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
     guardrails::configure(&run_context, &config.guardrails).map_err(anyhow::Error::msg)?;
     let plugin_manager = std::sync::Arc::new(init_plugin_manager(run_context.project_root()));
     plugin_manager.configure_lsp_service_for_run(&run_context);
+    if let Some(host) = app.hook_engine.as_ref() {
+        app.hook_engine = Some(std::sync::Arc::new(
+            plugin_manager
+                .compose_hook_engine(host.as_ref())
+                .map_err(anyhow::Error::new)?,
+        ));
+    }
     let mcp_manager = std::sync::Arc::new(tokio::sync::RwLock::new(
         openclaudia::mcp::McpManager::new_with_permissions(
             std::sync::Arc::clone(&run_context),

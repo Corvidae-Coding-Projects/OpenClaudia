@@ -7,7 +7,6 @@ pub mod plan_mode;
 pub mod review;
 pub mod session_io;
 pub mod slash;
-pub mod vim;
 
 use anyhow::Context;
 pub use openclaudia::state::Session;

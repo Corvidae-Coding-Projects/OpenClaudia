@@ -6,6 +6,7 @@
 //! of the YAML schema. See crosslink #357.
 
 use super::actions::KeyAction;
+use super::parser::parse_chord;
 use crate::config::KeybindingsConfig;
 
 impl KeybindingsConfig {
@@ -17,7 +18,12 @@ impl KeybindingsConfig {
     /// `"ctrl-x n"` correctly.
     #[must_use]
     pub fn get_action(&self, key: &str) -> Option<&KeyAction> {
-        self.bindings.get(&key.to_lowercase())
+        let canonical = canonical_chord(key)?;
+        let mut matches = self.bindings.iter().filter(|(candidate, _)| {
+            canonical_chord(candidate).as_deref() == Some(canonical.as_str())
+        });
+        let (_, action) = matches.next()?;
+        matches.next().is_none().then_some(action)
     }
 
     /// Check if a key is bound (returns `false` for disabled or unbound keys).
@@ -29,11 +35,14 @@ impl KeybindingsConfig {
     /// Get all bindings for a specific action.
     #[must_use]
     pub fn get_keys_for_action(&self, action: &KeyAction) -> Vec<&String> {
-        self.bindings
+        let mut keys = self
+            .bindings
             .iter()
             .filter(|(_, a)| *a == action)
             .map(|(k, _)| k)
-            .collect()
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
     }
 
     /// Get the action for a key, with `KeyAction::None` as default fallback.
@@ -41,6 +50,16 @@ impl KeybindingsConfig {
     pub fn get_action_or_default(&self, key: &str) -> KeyAction {
         self.get_action(key).cloned().unwrap_or(KeyAction::None)
     }
+}
+
+fn canonical_chord(raw: &str) -> Option<String> {
+    parse_chord(raw).map(|chord| {
+        chord
+            .iter()
+            .map(super::parser::ParsedKeystroke::display)
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
 }
 
 #[cfg(test)]

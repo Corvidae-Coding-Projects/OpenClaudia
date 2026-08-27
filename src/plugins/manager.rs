@@ -1,6 +1,6 @@
 //! Plugin manager for discovery, loading, and lifecycle management.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
@@ -24,7 +24,11 @@ use super::transaction::{
     ArtifactSourceProvenance, PluginInstallTransaction,
 };
 use super::zip_cache::ZipCache;
-use super::{Plugin, PluginCommand, PluginError, PluginHook, PluginMcpServer};
+use super::{
+    Plugin, PluginAgentInvocation, PluginCapabilityRegistry, PluginCapabilityRevocation,
+    PluginCommand, PluginCommandInvocation, PluginError, PluginHook, PluginMcpServer,
+    PluginSkillInvocation,
+};
 
 /// Outcome of [`PluginManager::fetch_plugin_archive`].
 ///
@@ -78,6 +82,13 @@ pub struct PluginManager {
     installed: InstalledPlugins,
     /// Exact project root for project-scoped discovery and install state.
     project_root: PathBuf,
+    /// Sole activation authority for every reviewed plugin component.
+    capabilities: PluginCapabilityRegistry,
+    /// Runtime teardown handoffs not yet acknowledged by the composition root.
+    pending_revocations: VecDeque<PluginCapabilityRevocation>,
+    /// Process-local disable decisions retained across discovery/reload. Durable
+    /// enablement remains owned by the host catalogue composition layer.
+    disabled_plugins: HashSet<String>,
 }
 
 impl PluginManager {
@@ -160,11 +171,15 @@ impl PluginManager {
             warn!(error = %error, "Plugin transaction recovery could not reconcile all staging state");
         }
 
+        let disabled_plugins = installed.disabled_plugins.clone();
         Self {
             plugins: HashMap::new(),
             search_paths,
             installed,
             project_root,
+            capabilities: PluginCapabilityRegistry::default(),
+            pending_revocations: VecDeque::new(),
+            disabled_plugins,
         }
     }
 
@@ -178,11 +193,20 @@ impl PluginManager {
     /// Create a manager with custom search paths and an explicit project root.
     #[must_use]
     pub fn with_paths_for_project(paths: Vec<PathBuf>, project_root: impl Into<PathBuf>) -> Self {
+        let project_root = project_root.into();
+        let installed = InstalledPlugins::load(&project_root);
+        if let Err(error) = recover_pending_transactions(&project_root, &installed) {
+            warn!(error = %error, "Plugin transaction recovery could not reconcile all staging state");
+        }
+        let disabled_plugins = installed.disabled_plugins.clone();
         Self {
             plugins: HashMap::new(),
             search_paths: paths,
-            installed: InstalledPlugins::default(),
-            project_root: project_root.into(),
+            installed,
+            project_root,
+            capabilities: PluginCapabilityRegistry::default(),
+            pending_revocations: VecDeque::new(),
+            disabled_plugins,
         }
     }
 
@@ -216,10 +240,13 @@ impl PluginManager {
                 }
                 if path.is_dir() {
                     match Plugin::load(&path) {
-                        Ok(plugin) => {
+                        Ok(mut plugin) => {
                             if reserved_names.contains(plugin.name()) {
                                 debug!(name = %plugin.name(), path = ?path, "Tracked plugin authority suppresses convention-directory shadow");
                                 continue;
+                            }
+                            if self.disabled_plugins.contains(plugin.name()) {
+                                plugin.enabled = false;
                             }
                             info!(
                                 name = %plugin.name(),
@@ -245,6 +272,7 @@ impl PluginManager {
             }
         }
 
+        errors.extend(self.rebuild_capability_registry());
         errors
     }
 
@@ -277,11 +305,14 @@ impl PluginManager {
                 debug!(plugin = %plugin_id, path = ?install_path, "Installed plugin path missing");
                 continue;
             }
-            if let Err(error) = verify_installed_generation(&install_path) {
-                warn!(plugin = %plugin_id, path = ?install_path, error = %error, "Rejected changed or incomplete plugin generation");
-                errors.push(error.into());
-                continue;
-            }
+            let generation_receipt = match verify_installed_generation(&install_path) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    warn!(plugin = %plugin_id, path = ?install_path, error = %error, "Rejected changed or incomplete plugin generation");
+                    errors.push(error.into());
+                    continue;
+                }
+            };
             let expected_name = plugin_id.split('@').next().unwrap_or(&plugin_id);
             if self.plugins.contains_key(expected_name) {
                 warn!(plugin = %plugin_id, "Duplicate tracked plugin identity ignored deterministically");
@@ -292,6 +323,12 @@ impl PluginManager {
                     plugin.id.clone_from(&plugin_id);
                     if let Some(marketplace) = plugin_id.split('@').nth(1) {
                         plugin.source = marketplace.to_string();
+                    }
+                    if let Some(receipt) = generation_receipt {
+                        plugin.bind_generation_receipt(receipt);
+                    }
+                    if self.disabled_plugins.contains(plugin.name()) {
+                        plugin.enabled = false;
                     }
                     info!(id = %plugin_id, name = %plugin.name(), scope = %entry.scope, "Loaded installed plugin generation");
                     self.plugins.insert(expected_name.to_string(), plugin);
@@ -334,14 +371,12 @@ impl PluginManager {
     /// Get all hooks from all enabled plugins
     #[must_use]
     pub fn all_hooks(&self) -> Vec<(&Plugin, PluginHook)> {
-        self.plugins
-            .values()
-            .filter(|p| p.enabled)
-            .flat_map(|plugin| {
-                plugin
-                    .resolved_hooks()
-                    .into_iter()
-                    .map(move |hook| (plugin, hook))
+        self.capabilities
+            .hooks()
+            .filter_map(|registration| {
+                self.plugins
+                    .get(&registration.metadata.provenance.package)
+                    .map(|plugin| (plugin, registration.hook.clone()))
             })
             .collect()
     }
@@ -358,14 +393,12 @@ impl PluginManager {
     /// Get all commands from all enabled plugins
     #[must_use]
     pub fn all_commands(&self) -> Vec<(&Plugin, PluginCommand)> {
-        self.plugins
-            .values()
-            .filter(|p| p.enabled)
-            .flat_map(|plugin| {
-                plugin
-                    .resolved_commands()
-                    .into_iter()
-                    .map(move |cmd| (plugin, cmd))
+        self.capabilities
+            .commands()
+            .filter_map(|registration| {
+                self.plugins
+                    .get(&registration.metadata.provenance.package)
+                    .map(|plugin| (plugin, registration.command.clone()))
             })
             .collect()
     }
@@ -373,14 +406,28 @@ impl PluginManager {
     /// Get all MCP servers from all enabled plugins
     #[must_use]
     pub fn all_mcp_servers(&self) -> Vec<(&Plugin, PluginMcpServer)> {
-        self.plugins
-            .values()
-            .filter(|p| p.enabled)
-            .flat_map(|plugin| {
-                plugin
-                    .resolved_mcp_servers()
-                    .into_iter()
-                    .map(move |server| (plugin, server))
+        self.capabilities
+            .mcp_servers()
+            .filter_map(|registration| {
+                let plugin = self
+                    .plugins
+                    .get(&registration.metadata.provenance.package)?;
+                match super::resolved_mcp_server_from_config_with(
+                    &registration.server_name,
+                    &registration.config,
+                    &|_| Ok(None),
+                ) {
+                    Ok(server) => Some((plugin, server)),
+                    Err(error) => {
+                        warn!(
+                            plugin = %registration.metadata.provenance.plugin_id,
+                            server = %registration.server_name,
+                            %error,
+                            "Plugin MCP registration is unavailable without run grants"
+                        );
+                        None
+                    }
+                }
             })
             .collect()
     }
@@ -391,14 +438,37 @@ impl PluginManager {
         &self,
         run: &crate::tools::ToolRunContext,
     ) -> Vec<(&Plugin, PluginMcpServer)> {
-        self.plugins
-            .values()
-            .filter(|plugin| plugin.enabled)
-            .flat_map(|plugin| {
-                plugin
-                    .resolved_mcp_servers_for_run(run)
-                    .into_iter()
-                    .map(move |server| (plugin, server))
+        self.mcp_registrations_for_run(run)
+            .into_iter()
+            .map(|(_, plugin, server)| (plugin, server))
+            .collect()
+    }
+
+    /// Resolve enabled MCP registrations without discarding their immutable
+    /// package generation and lifecycle identity.
+    #[must_use]
+    pub fn mcp_registrations_for_run(
+        &self,
+        run: &crate::tools::ToolRunContext,
+    ) -> Vec<(&super::PluginMcpRegistration, &Plugin, PluginMcpServer)> {
+        self.capabilities
+            .mcp_servers()
+            .filter_map(|registration| {
+                let plugin = self
+                    .plugins
+                    .get(&registration.metadata.provenance.package)?;
+                match registration.resolve_for_run(run) {
+                    Ok(server) => Some((registration, plugin, server)),
+                    Err(error) => {
+                        warn!(
+                            plugin = %registration.metadata.provenance.plugin_id,
+                            server = %registration.server_name,
+                            %error,
+                            "Plugin MCP registration is unavailable for this run"
+                        );
+                        None
+                    }
+                }
             })
             .collect()
     }
@@ -407,17 +477,12 @@ impl PluginManager {
     /// stateful language-server service.
     pub fn configure_lsp_service_for_run(&self, run: &crate::tools::ToolRunContext) {
         let mut servers = self
-            .plugins
-            .values()
-            .filter(|plugin| plugin.enabled)
-            .flat_map(|plugin| {
-                plugin.lsp_configs.iter().map(move |(language, config)| {
-                    crate::services::PluginLspServer {
-                        owner: plugin.id.clone(),
-                        language: language.clone(),
-                        config: config.clone(),
-                    }
-                })
+            .capabilities
+            .lsp_servers()
+            .map(|registration| crate::services::PluginLspServer {
+                owner: registration.metadata.canonical_name.clone(),
+                language: registration.language.clone(),
+                config: registration.config.clone(),
             })
             .collect::<Vec<_>>();
         servers.sort_by(|left, right| {
@@ -443,12 +508,37 @@ impl PluginManager {
     ///
     /// Returns `PluginError::NotFound` if no plugin with the given name is loaded.
     pub fn enable(&mut self, name: &str) -> Result<(), PluginError> {
-        if let Some(plugin) = self.plugins.get_mut(name) {
-            plugin.enabled = true;
-            Ok(())
-        } else {
-            Err(PluginError::NotFound(name.to_string()))
+        let activation_generation = self.capabilities.generation().saturating_add(1);
+        let compiled = self
+            .plugins
+            .get(name)
+            .ok_or_else(|| PluginError::NotFound(name.to_string()))
+            .and_then(|plugin| {
+                PluginCapabilityRegistry::compile_plugin(plugin, activation_generation)
+                    .map_err(PluginError::from)
+            })?;
+        self.installed.disabled_plugins.remove(name);
+        if let Err(error) = self.installed.save(&self.project_root) {
+            self.installed.disabled_plugins.insert(name.to_string());
+            return Err(error);
         }
+        let revocation = match self.capabilities.activate(compiled) {
+            Ok(revocation) => revocation,
+            Err(error) => {
+                self.installed.disabled_plugins.insert(name.to_string());
+                if let Err(rollback_error) = self.installed.save(&self.project_root) {
+                    warn!(plugin = name, %rollback_error, "failed to restore persisted disabled state after activation rejection");
+                }
+                return Err(error.into());
+            }
+        };
+        let Some(plugin) = self.plugins.get_mut(name) else {
+            return Err(PluginError::NotFound(name.to_string()));
+        };
+        plugin.enabled = true;
+        self.disabled_plugins.remove(name);
+        self.record_revocation(revocation);
+        Ok(())
     }
 
     /// Disable a plugin
@@ -457,19 +547,142 @@ impl PluginManager {
     ///
     /// Returns `PluginError::NotFound` if no plugin with the given name is loaded.
     pub fn disable(&mut self, name: &str) -> Result<(), PluginError> {
-        if let Some(plugin) = self.plugins.get_mut(name) {
-            plugin.enabled = false;
-            Ok(())
-        } else {
-            Err(PluginError::NotFound(name.to_string()))
+        if !self.plugins.contains_key(name) {
+            return Err(PluginError::NotFound(name.to_string()));
         }
+        self.installed.disabled_plugins.insert(name.to_string());
+        self.installed.save(&self.project_root)?;
+        let plugin = self
+            .plugins
+            .get_mut(name)
+            .ok_or_else(|| PluginError::NotFound(name.to_string()))?;
+        plugin.enabled = false;
+        self.disabled_plugins.insert(name.to_string());
+        let revocation = self.capabilities.revoke_plugin(name);
+        self.record_revocation(revocation);
+        Ok(())
     }
 
     /// Reload all plugins
     pub fn reload(&mut self) -> Vec<PluginError> {
         self.plugins.clear();
         self.installed = InstalledPlugins::load(&self.project_root);
+        self.disabled_plugins
+            .clone_from(&self.installed.disabled_plugins);
         self.discover()
+    }
+
+    /// Canonical capability snapshot used by command, hook, skill, agent, MCP,
+    /// and LSP consumers.
+    #[must_use]
+    pub const fn capability_registry(&self) -> &PluginCapabilityRegistry {
+        &self.capabilities
+    }
+
+    /// Compose active plugin hooks as a lower-authority layer under the host
+    /// engine while retaining the host's lifecycle resources and policy.
+    ///
+    /// # Errors
+    /// Returns an activation error if the published hook registration set no
+    /// longer satisfies the canonical hook runtime contract.
+    pub fn compose_hook_engine(
+        &self,
+        host: &crate::hooks::HookEngine,
+    ) -> Result<crate::hooks::HookEngine, PluginError> {
+        let hooks = self.capabilities.hooks_config()?;
+        Ok(host.with_scoped_hooks(hooks))
+    }
+
+    /// Drain lifecycle handoffs after the composition root has atomically
+    /// removed schemas/context and terminated resources owned by each receipt.
+    #[must_use]
+    pub fn take_pending_revocations(&mut self) -> Vec<PluginCapabilityRevocation> {
+        self.pending_revocations.drain(..).collect()
+    }
+
+    /// Render a generation-bound command invocation without rereading package
+    /// files.
+    ///
+    /// # Errors
+    /// Returns [`PluginError::NotFound`] when the command is not active.
+    pub fn invoke_command(
+        &self,
+        plugin_name: &str,
+        command_name: &str,
+        arguments: &str,
+    ) -> Result<PluginCommandInvocation, PluginError> {
+        self.capabilities
+            .invoke_command(plugin_name, command_name, arguments)
+    }
+
+    /// Render a generation-bound plugin skill invocation.
+    ///
+    /// # Errors
+    /// Returns [`PluginError::NotFound`] when the skill is not active.
+    pub fn invoke_skill(
+        &self,
+        plugin_name: &str,
+        skill_name: &str,
+        arguments: &str,
+    ) -> Result<PluginSkillInvocation, PluginError> {
+        self.capabilities
+            .invoke_skill(plugin_name, skill_name, arguments)
+    }
+
+    /// Resolve a generation-bound plugin agent invocation.
+    ///
+    /// # Errors
+    /// Returns an error when the agent is not active or the task is empty.
+    pub fn invoke_agent(
+        &self,
+        plugin_name: &str,
+        agent_name: &str,
+        task: &str,
+    ) -> Result<PluginAgentInvocation, PluginError> {
+        self.capabilities
+            .invoke_agent(plugin_name, agent_name, task)
+    }
+
+    fn rebuild_capability_registry(&mut self) -> Vec<PluginError> {
+        let activation_generation = self.capabilities.generation().saturating_add(1);
+        let mut compiled = Vec::new();
+        let mut rejected = Vec::new();
+        let mut errors = Vec::new();
+        let mut plugins = self.plugins.values().collect::<Vec<_>>();
+        plugins.sort_by_key(|plugin| plugin.name());
+        for plugin in plugins.into_iter().filter(|plugin| plugin.enabled) {
+            match PluginCapabilityRegistry::compile_plugin(plugin, activation_generation) {
+                Ok(generation) => compiled.push(generation),
+                Err(error) => {
+                    rejected.push(plugin.name().to_string());
+                    errors.push(error.into());
+                }
+            }
+        }
+        for name in rejected {
+            if let Some(plugin) = self.plugins.get_mut(&name) {
+                plugin.enabled = false;
+            }
+        }
+        match self.capabilities.replace_all(compiled) {
+            Ok(revocation) => self.record_revocation(revocation),
+            Err(error) => {
+                errors.push(error.into());
+                for plugin in self.plugins.values_mut() {
+                    plugin.enabled = false;
+                }
+                if let Ok(revocation) = self.capabilities.replace_all(Vec::new()) {
+                    self.record_revocation(revocation);
+                }
+            }
+        }
+        errors
+    }
+
+    fn record_revocation(&mut self, revocation: Option<PluginCapabilityRevocation>) {
+        if let Some(revocation) = revocation {
+            self.pending_revocations.push_back(revocation);
+        }
     }
 
     fn reload_after_committed_activation(

@@ -104,6 +104,8 @@ pub struct HelpOverlay {
     /// Most recent viewport height (rows). Set on each `render` so
     /// key handling can clamp scroll against the actual visible area.
     last_height: u16,
+    effective_bindings: Vec<(String, String)>,
+    binding_diagnostics: Vec<String>,
 }
 
 impl HelpOverlay {
@@ -112,7 +114,21 @@ impl HelpOverlay {
         Self {
             scroll: 0,
             last_height: 0,
+            effective_bindings: Vec::new(),
+            binding_diagnostics: Vec::new(),
         }
+    }
+
+    /// Attach the collision-checked map used by the live TUI resolver.
+    #[must_use]
+    pub fn with_keybindings(
+        mut self,
+        effective_bindings: Vec<(String, String)>,
+        diagnostics: Vec<String>,
+    ) -> Self {
+        self.effective_bindings = effective_bindings;
+        self.binding_diagnostics = diagnostics;
+        self
     }
 
     /// Flatten the section tree into one `Vec<Line>` for the paragraph
@@ -123,7 +139,7 @@ impl HelpOverlay {
     /// - Keybinding sections come from [`KEYBIND_SECTIONS`] (TUI-only).
     /// - Slash-command sections come from
     ///   [`crate::slash_commands::TUI_SLASH_SECTIONS`].
-    fn build_lines() -> Vec<Line<'static>> {
+    fn build_lines(&self) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
         lines.push(Line::from(Span::styled(
             "Keyboard shortcuts",
@@ -139,6 +155,32 @@ impl HelpOverlay {
             .fg(Color::Rgb(100, 180, 255))
             .add_modifier(Modifier::BOLD);
         let desc_style = Style::default().fg(Color::White);
+
+        if !self.effective_bindings.is_empty() {
+            lines.push(Line::from(Span::styled("Configured", section_title_style)));
+            for (keys, description) in &self.effective_bindings {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(keys.clone(), key_style),
+                    Span::raw("  "),
+                    Span::styled(description.clone(), desc_style),
+                ]));
+            }
+            lines.push(Line::from(""));
+        }
+        if !self.binding_diagnostics.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "Unavailable configured bindings",
+                section_title_style,
+            )));
+            for diagnostic in &self.binding_diagnostics {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(diagnostic.clone(), Style::default().fg(Color::Red)),
+                ]));
+            }
+            lines.push(Line::from(""));
+        }
 
         for (title, shortcuts) in KEYBIND_SECTIONS {
             lines.push(Line::from(Span::styled(*title, section_title_style)));
@@ -185,7 +227,7 @@ impl HelpOverlay {
 impl Overlay for HelpOverlay {
     fn render(&mut self, frame: &mut Frame, area: Rect) {
         self.last_height = area.height.saturating_sub(2); // borders
-        let lines = Self::build_lines();
+        let lines = self.build_lines();
         #[allow(clippy::cast_possible_truncation)] // list is tiny
         let total_lines = lines.len() as u16;
         // Clamp scroll to the current viewport so resize doesn't leave
@@ -332,7 +374,7 @@ mod tests {
     /// catches it before users see unsupported commands in `/help`.
     #[test]
     fn rendered_lines_include_tui_slash_commands_only() {
-        let lines = HelpOverlay::build_lines();
+        let lines = HelpOverlay::new().build_lines();
         let rendered: String = lines
             .into_iter()
             .flat_map(|l| l.spans.into_iter().map(|s| s.content.into_owned()))
@@ -366,5 +408,26 @@ mod tests {
             !rendered.contains("previous / next input in history"),
             "rendered overlay must describe Up/Down as transcript scrolling"
         );
+    }
+
+    #[test]
+    fn rendered_lines_include_effective_bindings_and_collision_diagnostics() {
+        let lines = HelpOverlay::new()
+            .with_keybindings(
+                vec![("f6".to_string(), "Show help".to_string())],
+                vec!["colliding keybinding chord 'ctrl-x'".to_string()],
+            )
+            .build_lines();
+        let rendered = lines
+            .into_iter()
+            .flat_map(|line| line.spans.into_iter().map(|span| span.content.into_owned()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Configured"));
+        assert!(rendered.contains("f6"));
+        assert!(rendered.contains("Show help"));
+        assert!(rendered.contains("Unavailable configured bindings"));
+        assert!(rendered.contains("colliding keybinding chord 'ctrl-x'"));
     }
 }

@@ -23,6 +23,7 @@
 //! - [`finding`], [`review`], [`parsing`], [`static_analysis`], [`confabulation`] —
 //!   domain types and pre-existing parsing/analysis support
 
+mod canonical;
 pub mod confabulation;
 mod engine;
 mod error;
@@ -37,6 +38,14 @@ mod transport;
 mod triage;
 
 // Re-exports for public API
+pub(crate) use canonical::validate_canonical_verifier_model_output;
+pub use canonical::{
+    CanonicalAcceptanceCriterion, CanonicalCriterionOutcome, CanonicalCriterionReport,
+    CanonicalDeterministicReceipt, CanonicalFindingSeverity, CanonicalModelVerdict,
+    CanonicalVddPreflightError, CanonicalVddReceipt, CanonicalVddRequest, CanonicalVddRequestParts,
+    CanonicalVddTerminalReason, CanonicalVddVerdict, CanonicalVerifierFinding,
+    CanonicalVerifierReport, DeterministicCheckOutcome, VddModelIdentity, VddPromotionAuthority,
+};
 pub use engine::{BuilderProvider, VddEngine};
 pub use error::{VddAdvisoryResult, VddBlockingResult, VddError, VddResult};
 pub use finding::{Finding, FindingStatus, Severity};

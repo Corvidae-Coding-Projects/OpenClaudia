@@ -136,6 +136,11 @@ pub enum AppEvent {
     ResponseDone,
     /// API error
     ApiError(crate::secrets::SafeDiagnostic),
+    /// A generation-bound plugin agent finished canonical child execution.
+    PluginAgentDone {
+        label: String,
+        result: crate::subagent::SubagentResult,
+    },
     /// The upstream API request will be retried after a transient failure.
     ApiRetry {
         kind: ApiRetryKind,

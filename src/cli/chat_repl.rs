@@ -36,7 +36,6 @@ use crate::cli::repl::slash::{
     PluginActionOutcome, PluginActionRunner, PluginCommandInvocation, SkillInvocation,
     SlashCommandResult,
 };
-use crate::cli::repl::vim::{self, VimState};
 use crate::cli::repl::{load_chat_session, save_chat_session, Session};
 use crate::{
     build_chat_endpoint_and_headers, build_hook_engine, chdir_to_git_root,
@@ -61,6 +60,44 @@ use openclaudia::{
     plugins, prompt, proxy, session, tools, tui, vdd,
 };
 use rustyline::error::ReadlineError;
+
+#[derive(Debug, Clone)]
+struct LegacyKeyInvocation {
+    action: openclaudia::keybindings::KeyAction,
+    draft: String,
+}
+
+struct LegacyKeyActionHandler {
+    action: openclaudia::keybindings::KeyAction,
+    pending: std::sync::Arc<std::sync::Mutex<Option<LegacyKeyInvocation>>>,
+}
+
+impl rustyline::ConditionalEventHandler for LegacyKeyActionHandler {
+    fn handle(
+        &self,
+        _event: &rustyline::Event,
+        _repeat: rustyline::RepeatCount,
+        _positive: bool,
+        context: &rustyline::EventContext<'_>,
+    ) -> Option<rustyline::Cmd> {
+        if context.mode() == rustyline::EditMode::Vi
+            && context.input_mode() == rustyline::InputMode::Command
+        {
+            return None;
+        }
+        if self.action == openclaudia::keybindings::KeyAction::None {
+            return Some(rustyline::Cmd::Noop);
+        }
+        let Ok(mut pending) = self.pending.lock() else {
+            return Some(rustyline::Cmd::Noop);
+        };
+        *pending = Some(LegacyKeyInvocation {
+            action: self.action.clone(),
+            draft: context.line().to_string(),
+        });
+        Some(rustyline::Cmd::AcceptLine)
+    }
+}
 
 struct CliToolExecution<'a> {
     run_context: &'a std::sync::Arc<tools::ToolRunContext>,
@@ -226,7 +263,8 @@ pub struct ChatRepl {
     current_task_obs: Option<openclaudia::ledger::ObsId>,
     active_theme: tui::Theme,
     vim_enabled: bool,
-    vim_state: VimState,
+    pending_key_invocation: std::sync::Arc<std::sync::Mutex<Option<LegacyKeyInvocation>>>,
+    pending_readline_initial: Option<String>,
     audit_logger: openclaudia::session::AuditLogger,
     memory_db: Option<memory::MemoryDb>,
     task_manager: std::sync::Mutex<session::TaskManager>,
@@ -260,6 +298,7 @@ enum SlashOutcome {
     EditorMessageAdded,
     FallThrough,
     RewrittenPrompt,
+    PluginAgent(Box<plugins::PluginAgentInvocation>),
 }
 
 /// Per-turn transport bundle — the URL + headers needed to POST to
@@ -708,8 +747,10 @@ impl ChatRepl {
         };
         let client = openclaudia::provider_transport::shared_client()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        let hook_engine = build_hook_engine(&config);
-        let (rl, history_path) = init_rustyline_with_history()?;
+        let mut hook_engine = build_hook_engine(&config);
+        let (mut rl, history_path) = init_rustyline_with_history()?;
+        let pending_key_invocation = std::sync::Arc::new(std::sync::Mutex::new(None));
+        install_rustyline_keybindings(&mut rl, &config.keybindings, &pending_key_invocation);
 
         render_welcome_or_fallback(&config.proxy.target, &model);
         let _ = tui::setup_pinned_bar();
@@ -836,6 +877,9 @@ impl ChatRepl {
             init_permission_manager(&config, args.dangerously_skip_permissions, &run_context);
         let plugin_manager = init_plugin_manager(run_context.project_root());
         plugin_manager.configure_lsp_service_for_run(&run_context);
+        hook_engine = plugin_manager
+            .compose_hook_engine(&hook_engine)
+            .map_err(anyhow::Error::new)?;
         let permissions = openclaudia::permissions::LocalApprovalCache::for_run(&run_context);
 
         Ok(Self {
@@ -859,7 +903,8 @@ impl ChatRepl {
             current_task_obs: None,
             active_theme: tui::Theme::load(),
             vim_enabled: false,
-            vim_state: VimState::new(),
+            pending_key_invocation,
+            pending_readline_initial: None,
             audit_logger,
             memory_db,
             task_manager,
@@ -898,9 +943,21 @@ impl ChatRepl {
         let outcome: anyhow::Result<()> = async {
             loop {
                 let prompt = self.build_prompt_string();
-                let readline = self.rl.readline(&prompt);
+                let readline = match self.pending_readline_initial.take() {
+                    Some(draft) => self.rl.readline_with_initial(&prompt, (&draft, "")),
+                    None => self.rl.readline(&prompt),
+                };
                 match readline {
-                    Ok(line) => {
+                    Ok(mut line) => {
+                        if let Some(invocation) = self.take_pending_key_invocation() {
+                            if !invocation.draft.is_empty() {
+                                self.pending_readline_initial = Some(invocation.draft);
+                            }
+                            let Some(command) = invocation.action.command_name() else {
+                                continue;
+                            };
+                            line = format!("/{command}");
+                        }
                         let should_break =
                             self.process_line(line, memory_db.as_ref()).await? == Some(true);
                         self.analytics_subscriber.drain_pending();
@@ -958,16 +1015,7 @@ impl ChatRepl {
         let _ = tui::render_bottom_bar(effort.as_str(), &mode_str);
 
         if self.vim_enabled {
-            let pending = self.vim_state.pending_display();
-            let status = vim::status_description(&self.vim_state);
-            let _ = self.vim_state.yank_buffer.len();
-            let _ = self.vim_state.last_find.is_some();
-            let _ = vim::describe_action(&vim::VimAction::None);
-            if self.vim_state.is_pending() {
-                format!("{status} {pending} \u{203A} ")
-            } else {
-                format!("{status} \u{203A} ")
-            }
+            "VI \u{203A} ".to_string()
         } else {
             "\u{203A} ".to_string()
         }
@@ -987,10 +1035,6 @@ impl ChatRepl {
         let mut skip_local_input_shortcuts = false;
         self.current_task_obs = None;
 
-        if self.vim_enabled {
-            let _ = self.vim_state.process_key("Escape");
-            let _ = self.vim_state.process_key("i");
-        }
         if input.is_empty() {
             return Ok(Some(false));
         }
@@ -1005,6 +1049,11 @@ impl ChatRepl {
             SlashOutcome::FallThrough => {}
             SlashOutcome::RewrittenPrompt => {
                 skip_local_input_shortcuts = true;
+            }
+            SlashOutcome::PluginAgent(invocation) => {
+                self.run_plugin_agent_invocation(*invocation, memory_db)
+                    .await;
+                return Ok(Some(false));
             }
         }
 
@@ -1379,12 +1428,43 @@ impl ChatRepl {
                 let outcome = action.apply(&mut self.plugin_manager, &self.run_context);
                 self.plugin_manager
                     .configure_lsp_service_for_run(&self.run_context);
+                let lifecycle_recomposed = match self
+                    .plugin_manager
+                    .compose_hook_engine(&build_hook_engine(&self.config))
+                {
+                    Ok(engine) => {
+                        self.hook_engine = engine;
+                        true
+                    }
+                    Err(error) => {
+                        eprintln!("Plugin hook activation failed closed: {error}");
+                        false
+                    }
+                };
+                if lifecycle_recomposed {
+                    let retired = self.plugin_manager.take_pending_revocations();
+                    if !retired.is_empty() {
+                        tracing::info!(
+                            revocation_count = retired.len(),
+                            "Acknowledged plugin lifecycle revocations after frontend recomposition"
+                        );
+                    }
+                }
                 match outcome {
                     PluginActionOutcome::Handled => SlashOutcome::Continue,
                     PluginActionOutcome::Prompt(invocation) => {
                         eprintln!("\x1b[36m⚡ Running plugin command...\x1b[0m");
                         self.apply_plugin_command_invocation(input, invocation);
                         SlashOutcome::RewrittenPrompt
+                    }
+                    PluginActionOutcome::Skill(invocation) => {
+                        eprintln!("\x1b[36m⚡ Running plugin skill...\x1b[0m");
+                        self.apply_plugin_skill_invocation(input, invocation);
+                        SlashOutcome::RewrittenPrompt
+                    }
+                    PluginActionOutcome::Agent(invocation) => {
+                        eprintln!("\x1b[36m⚡ Running plugin agent...\x1b[0m");
+                        SlashOutcome::PluginAgent(Box::new(invocation))
                     }
                 }
             }
@@ -1397,12 +1477,69 @@ impl ChatRepl {
         input: &mut String,
         invocation: PluginCommandInvocation,
     ) {
+        let metadata = &invocation.registration.metadata;
         self.apply_prompt_metadata(
-            invocation.allowed_tools.as_deref(),
-            invocation.model.as_deref(),
+            invocation.registration.command.allowed_tools.as_deref(),
+            invocation.registration.command.model.as_deref(),
             None,
         );
+        self.transient_skill_context = vec![openclaudia::context::ContextItem::reference(
+            format!("plugin.command.{}", metadata.component_digest),
+            openclaudia::context::ReferenceSource::Plugin,
+            metadata.canonical_name.clone(),
+            format!(
+                "Plugin command package={} plugin_id={} publisher={} artifact_digest={} source_revision={} requested_capabilities={:?}",
+                metadata.provenance.package,
+                metadata.provenance.plugin_id,
+                metadata.provenance.publisher,
+                metadata.provenance.artifact_digest,
+                metadata.provenance.source.resolved_revision,
+                metadata.requested_capabilities,
+            ),
+            openclaudia::context::ContextFreshness::Turn,
+            650,
+        )];
         *input = invocation.prompt;
+    }
+
+    async fn run_plugin_agent_invocation(
+        &mut self,
+        invocation: plugins::PluginAgentInvocation,
+        memory_db: Option<&memory::MemoryDb>,
+    ) {
+        let metadata = &invocation.registration.metadata;
+        let label = format!(
+            "/{}:{}",
+            metadata.provenance.package, metadata.component_name
+        );
+        let task = invocation.task.clone();
+        self.chat_session.push_message(serde_json::json!({
+            "role": "user",
+            "content": format!("Run plugin agent {label}.\n\nTask:\n{task}"),
+        }));
+        let result = openclaudia::subagent::run_plugin_agent(
+            &self.run_context,
+            &invocation,
+            &self.config,
+            &self.client,
+            memory_db,
+        )
+        .await;
+        if result.success {
+            println!("\n{}\n", result.output);
+            self.chat_session.push_message(serde_json::json!({
+                "role": "assistant",
+                "content": result.output,
+            }));
+        } else {
+            eprintln!("\nPlugin agent {label} failed: {}\n", result.output);
+            self.chat_session.push_message(serde_json::json!({
+                "role": "system",
+                "content": format!("Plugin agent {label} failed: {}", result.output),
+            }));
+        }
+        self.chat_session.touch();
+        persist_chat_session_update(&mut self.chat_session, "plugin agent result");
     }
 
     fn apply_skill_invocation(&mut self, input: &mut String, invocation: SkillInvocation) {
@@ -1429,6 +1566,43 @@ impl ChatRepl {
                 "Use the explicitly selected `/{name}` skill reference for this turn.\n\nUser arguments:\n{arguments}"
             )
         };
+    }
+
+    fn apply_plugin_skill_invocation(
+        &mut self,
+        input: &mut String,
+        invocation: plugins::PluginSkillInvocation,
+    ) {
+        let registration = &invocation.registration;
+        let definition = &registration.definition;
+        self.apply_prompt_metadata(
+            definition.allowed_tools.as_deref(),
+            definition.model.as_deref(),
+            definition.effort.as_deref(),
+        );
+        let metadata = &registration.metadata;
+        self.transient_skill_context = vec![openclaudia::context::ContextItem::reference(
+            format!("plugin.skill.{}", metadata.component_digest),
+            openclaudia::context::ReferenceSource::Plugin,
+            metadata.canonical_name.clone(),
+            format!(
+                "Explicit plugin skill package={} plugin_id={} publisher={} artifact_digest={} source_revision={} requested_capabilities={:?}",
+                metadata.provenance.package,
+                metadata.provenance.plugin_id,
+                metadata.provenance.publisher,
+                metadata.provenance.artifact_digest,
+                metadata.provenance.source.resolved_revision,
+                metadata.requested_capabilities,
+            ),
+            openclaudia::context::ContextFreshness::Turn,
+            650,
+        )];
+        self.transient_hook_engine = definition.hooks.as_ref().and_then(|hooks| {
+            serde_json::from_value::<openclaudia::config::HooksConfig>(hooks.clone())
+                .ok()
+                .map(|hooks| self.hook_engine.with_scoped_hooks(hooks))
+        });
+        *input = invocation.prompt;
     }
 
     fn apply_prompt_metadata(
@@ -1762,14 +1936,25 @@ impl ChatRepl {
         };
 
         let _ = next_editor.load_history(&self.history_path);
+        install_rustyline_keybindings(
+            &mut next_editor,
+            &self.config.keybindings,
+            &self.pending_key_invocation,
+        );
         self.rl = next_editor;
         self.vim_enabled = next_vim_enabled;
         if self.vim_enabled {
-            self.vim_state = VimState::new();
             eprintln!("Vim mode enabled (rustyline Vi mode)");
         } else {
             eprintln!("Vim mode disabled (Emacs mode)");
         }
+    }
+
+    fn take_pending_key_invocation(&self) -> Option<LegacyKeyInvocation> {
+        self.pending_key_invocation
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.take())
     }
 
     fn cycle_effort(&self) {
@@ -4622,6 +4807,93 @@ fn new_rustyline_editor(
     Editor::with_config(Config::builder().edit_mode(edit_mode).build())
 }
 
+fn install_rustyline_keybindings(
+    editor: &mut rustyline::DefaultEditor,
+    config: &openclaudia::config::KeybindingsConfig,
+    pending: &std::sync::Arc<std::sync::Mutex<Option<LegacyKeyInvocation>>>,
+) {
+    let resolver = openclaudia::keybindings::KeybindingResolver::from_config(config);
+    for diagnostic in resolver.diagnostics() {
+        eprintln!("Keybinding unavailable: {diagnostic}");
+    }
+    for (chord, action) in resolver.effective_bindings(openclaudia::keybindings::KeyContext::Chat) {
+        if action == openclaudia::keybindings::KeyAction::Cancel {
+            continue;
+        }
+        let Some(sequence) = openclaudia::keybindings::parse_chord(&chord)
+            .and_then(|strokes| strokes.iter().map(rustyline_key_event).collect())
+        else {
+            continue;
+        };
+        editor.bind_sequence(
+            rustyline::Event::KeySeq(sequence),
+            rustyline::EventHandler::Conditional(Box::new(LegacyKeyActionHandler {
+                action,
+                pending: std::sync::Arc::clone(pending),
+            })),
+        );
+    }
+}
+
+fn rustyline_key_event(
+    stroke: &openclaudia::keybindings::ParsedKeystroke,
+) -> Option<rustyline::KeyEvent> {
+    use rustyline::{KeyCode, KeyEvent, Modifiers};
+
+    let mut modifiers = Modifiers::NONE;
+    if stroke.ctrl {
+        modifiers.insert(Modifiers::CTRL);
+    }
+    if stroke.alt {
+        modifiers.insert(Modifiers::ALT);
+    }
+    if stroke.shift {
+        modifiers.insert(Modifiers::SHIFT);
+    }
+
+    let code = match stroke.key.as_str() {
+        "backspace" => KeyCode::Backspace,
+        "enter" => KeyCode::Enter,
+        "left" => KeyCode::Left,
+        "right" => KeyCode::Right,
+        "up" => KeyCode::Up,
+        "down" => KeyCode::Down,
+        "home" => KeyCode::Home,
+        "end" => KeyCode::End,
+        "pageup" => KeyCode::PageUp,
+        "pagedown" => KeyCode::PageDown,
+        "tab" if stroke.shift => {
+            modifiers.remove(Modifiers::SHIFT);
+            KeyCode::BackTab
+        }
+        "tab" => KeyCode::Tab,
+        "delete" => KeyCode::Delete,
+        "insert" => KeyCode::Insert,
+        "escape" => KeyCode::Esc,
+        key if key.starts_with('f') => KeyCode::F(key.get(1..)?.parse().ok()?),
+        key => {
+            let mut characters = key.chars();
+            let character = characters.next()?;
+            if characters.next().is_some() {
+                return None;
+            }
+            let character = if stroke.shift {
+                let mut uppercase = character.to_uppercase();
+                let uppercase_character = uppercase.next()?;
+                if uppercase.next().is_some() {
+                    return None;
+                }
+                modifiers.remove(Modifiers::SHIFT);
+                uppercase_character
+            } else {
+                character
+            };
+            KeyCode::Char(character)
+        }
+    };
+    Some(KeyEvent(code, modifiers))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5518,5 +5790,47 @@ memory:
     fn rustyline_editor_mode_construction_is_fallible_not_panicking() {
         let _ = new_rustyline_editor(rustyline::EditMode::Emacs);
         let _ = new_rustyline_editor(rustyline::EditMode::Vi);
+    }
+
+    #[test]
+    fn configured_chords_install_into_real_rustyline_editors() {
+        let config = openclaudia::config::KeybindingsConfig {
+            bindings: std::collections::HashMap::from([(
+                "ctrl-x n".to_string(),
+                openclaudia::keybindings::KeyAction::NewSession,
+            )]),
+        };
+        let pending = Arc::new(Mutex::new(None));
+        for mode in [rustyline::EditMode::Emacs, rustyline::EditMode::Vi] {
+            let mut editor = new_rustyline_editor(mode).expect("rustyline editor");
+            install_rustyline_keybindings(&mut editor, &config, &pending);
+        }
+    }
+
+    #[test]
+    fn normalized_keystrokes_map_losslessly_to_rustyline_events() {
+        let chord = openclaudia::keybindings::parse_chord("ctrl-x λ").expect("valid chord");
+        assert_eq!(
+            rustyline_key_event(&chord[0]),
+            Some(rustyline::KeyEvent(
+                rustyline::KeyCode::Char('x'),
+                rustyline::Modifiers::CTRL,
+            ))
+        );
+        assert_eq!(
+            rustyline_key_event(&chord[1]),
+            Some(rustyline::KeyEvent(
+                rustyline::KeyCode::Char('λ'),
+                rustyline::Modifiers::NONE,
+            ))
+        );
+        let back_tab = openclaudia::keybindings::ParsedKeystroke::parse("shift-tab").unwrap();
+        assert_eq!(
+            rustyline_key_event(&back_tab),
+            Some(rustyline::KeyEvent(
+                rustyline::KeyCode::BackTab,
+                rustyline::Modifiers::NONE,
+            ))
+        );
     }
 }

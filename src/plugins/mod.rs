@@ -17,6 +17,7 @@
 //! - `.openclaudia/plugins/` (project plugins)
 //! - Tracked in `~/.openclaudia/plugins/installed_plugins.json`
 
+pub mod activation;
 pub mod git;
 pub mod install;
 pub mod manager;
@@ -28,6 +29,15 @@ pub mod validate;
 pub mod zip_cache;
 
 // Re-export all public types for backward compatibility
+pub use activation::{
+    PluginActivationError, PluginAgentDefinition, PluginAgentInvocation, PluginAgentRegistration,
+    PluginCapabilityRegistration, PluginCapabilityRegistry, PluginCapabilityRequest,
+    PluginCapabilityRevocation, PluginCommandInvocation, PluginCommandRegistration,
+    PluginComponentKind, PluginEffectDeclaration, PluginHookRegistration, PluginLifecycleOwner,
+    PluginLspRegistration, PluginMcpRegistration, PluginPackageProvenance,
+    PluginRegistrationMetadata, PluginSkillInvocation, PluginSkillRegistration,
+    PLUGIN_CAPABILITY_SCHEMA,
+};
 pub use git::copy_dir_recursive;
 pub use install::{InstallScope, InstalledPlugins, PluginInstallEntry};
 pub use manager::PluginManager;
@@ -249,6 +259,11 @@ pub enum PluginError {
     /// Offline cache lookup, integrity, or extraction failed.
     #[error(transparent)]
     ZipCache(#[from] zip_cache::ZipCacheError),
+
+    /// A reviewed package could not be compiled into one atomic capability
+    /// generation. No component from that generation was published.
+    #[error(transparent)]
+    CapabilityActivation(#[from] activation::PluginActivationError),
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +271,7 @@ pub enum PluginError {
 // ---------------------------------------------------------------------------
 
 /// A resolved hook from a plugin, ready for the hook engine
+#[derive(Debug, Clone)]
 pub struct PluginHook {
     /// Hook event type (`PreToolUse`, `PostToolUse`, `SessionStart`, etc.)
     pub event: String,
@@ -272,6 +288,7 @@ pub struct PluginHook {
 }
 
 /// A resolved command from a plugin
+#[derive(Debug, Clone)]
 pub struct PluginCommand {
     /// Command name (used as /plugin-name:command)
     pub name: String,
@@ -394,6 +411,7 @@ fn parse_command_front_matter(content: &str) -> CommandFrontMatter {
 }
 
 /// A resolved MCP server from a plugin
+#[derive(Debug, Clone)]
 pub struct PluginMcpServer {
     /// Server name
     pub name: String,
@@ -644,6 +662,10 @@ pub struct Plugin {
     pub agent_paths: Vec<PathBuf>,
     /// Resolved skill paths
     pub skill_paths: Vec<PathBuf>,
+    /// Detached receipt for an immutable installed generation. Convention
+    /// plugins have no receipt and are bound to a host-observed tree digest
+    /// when their capability generation is compiled.
+    generation_receipt: Option<ArtifactGenerationReceipt>,
 }
 
 impl Plugin {
@@ -696,6 +718,7 @@ impl Plugin {
             lsp_configs: HashMap::new(),
             agent_paths: Vec::new(),
             skill_paths: Vec::new(),
+            generation_receipt: None,
         };
 
         // Resolve all components
@@ -1253,6 +1276,16 @@ impl Plugin {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.path
+    }
+
+    /// Immutable installation receipt attached by tracked discovery.
+    #[must_use]
+    pub const fn generation_receipt(&self) -> Option<&ArtifactGenerationReceipt> {
+        self.generation_receipt.as_ref()
+    }
+
+    pub(crate) fn bind_generation_receipt(&mut self, receipt: ArtifactGenerationReceipt) {
+        self.generation_receipt = Some(receipt);
     }
 
     /// Get environment variables to set when running plugin scripts

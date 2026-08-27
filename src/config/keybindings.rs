@@ -13,7 +13,7 @@ use std::collections::HashMap;
 /// Maps key-combination strings (case-insensitive, e.g. `"ctrl-x n"`) to
 /// [`KeyAction`] variants. Use `KeyAction::None` to disable a binding without
 /// removing it.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 pub struct KeybindingsConfig {
     /// Map of key combination strings to action names. The
     /// `#[serde(flatten)]` lets every YAML top-level key under `keybindings:`

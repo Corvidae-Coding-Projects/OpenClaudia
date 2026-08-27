@@ -7,34 +7,7 @@ pub fn key_event_to_string(
     event: &crossterm::event::KeyEvent,
     leader_active: bool,
 ) -> Option<String> {
-    use crossterm::event::{KeyCode, KeyModifiers};
-
-    let key_str = match event.code {
-        KeyCode::Esc => "escape".to_string(),
-        KeyCode::Tab => "tab".to_string(),
-        KeyCode::F(n) => format!("f{n}"),
-        KeyCode::Char(c) => {
-            if event.modifiers.contains(KeyModifiers::CONTROL) {
-                format!("ctrl-{}", c.to_lowercase())
-            } else if event.modifiers.contains(KeyModifiers::ALT) {
-                format!("alt-{}", c.to_lowercase())
-            } else {
-                c.to_lowercase().to_string()
-            }
-        }
-        KeyCode::Enter => "enter".to_string(),
-        KeyCode::Backspace => "backspace".to_string(),
-        KeyCode::Delete => "delete".to_string(),
-        KeyCode::Home => "home".to_string(),
-        KeyCode::End => "end".to_string(),
-        KeyCode::PageUp => "pageup".to_string(),
-        KeyCode::PageDown => "pagedown".to_string(),
-        KeyCode::Up => "up".to_string(),
-        KeyCode::Down => "down".to_string(),
-        KeyCode::Left => "left".to_string(),
-        KeyCode::Right => "right".to_string(),
-        _ => return None,
-    };
+    let key_str = config::ParsedKeystroke::from_key_event(event)?.display();
 
     if leader_active {
         Some(format!("ctrl-x {key_str}"))
@@ -87,6 +60,7 @@ pub fn display_keybindings(keybindings: &config::KeybindingsConfig) {
     println!("\nConfigured Keybindings:");
     println!("========================\n");
 
+    let resolver = config::KeybindingResolver::from_config(keybindings);
     let actions = [
         (KeyAction::NewSession, "New session"),
         (KeyAction::ListSessions, "List sessions"),
@@ -106,14 +80,19 @@ pub fn display_keybindings(keybindings: &config::KeybindingsConfig) {
     ];
 
     for (action, description) in actions {
-        let keys = keybindings.get_keys_for_action(&action);
+        let keys = resolver
+            .effective_bindings(config::KeyContext::Global)
+            .into_iter()
+            .filter_map(|(chord, effective)| (effective == action).then_some(chord))
+            .collect::<Vec<_>>();
         if !keys.is_empty() {
-            let key_str = keys
-                .iter()
-                .map(|k| k.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            println!("  {key_str:20} {description}");
+            println!("  {:20} {description}", keys.join(", "));
+        }
+    }
+    if !resolver.diagnostics().is_empty() {
+        println!("\nUnavailable bindings:");
+        for diagnostic in resolver.diagnostics() {
+            println!("  {diagnostic}");
         }
     }
 

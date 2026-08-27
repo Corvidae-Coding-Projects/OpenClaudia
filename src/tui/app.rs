@@ -13,7 +13,7 @@ use super::input::TextInput;
 use super::messages::{DisplayMessage, EffortLevel, MessageKind, MessageList, Mode};
 use super::{DIM, GOLD, PURPLE, SPINNER_FRAMES};
 use crossterm::{
-    event::{DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyModifiers},
+    event::{DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -396,7 +396,7 @@ struct PendingPlanApproval {
 /// handlers print to stdout, which corrupts the TUI's alternate-screen
 /// rendering. Mirroring the registry *pattern* here (table-driven
 /// dispatch over an if-chain) is the OCP win #232 brought to the CLI;
-/// this commit extends it to the TUI for the seven branches below.
+/// this commit extends it to the TUI for the exact branches below.
 ///
 /// Adding a new no-arg TUI command:
 ///   1. Add a `slash_<name>` method on [`App`] that takes `&mut self`.
@@ -419,20 +419,35 @@ const TUI_SLASH_TABLE: &[(&str, TuiSlashHandler)] = &[
     ("?", App::slash_help),
     ("/resume", App::slash_resume),
     ("/continue", App::slash_resume),
+    ("/new", App::slash_clear),
     ("/clear", App::slash_clear),
     ("/status", App::slash_status),
+    ("/copy", App::slash_copy),
+    ("/keybindings", App::slash_keybindings),
+    ("/keys", App::slash_keybindings),
+    ("/bindings", App::slash_keybindings),
     ("/mode", App::slash_mode),
+    ("/plan", App::slash_mode),
     ("/skill", App::slash_skill_list),
     ("/skills", App::slash_skill_list),
 ];
 
-/// O(n) lookup for the TUI slash table. The table is small (≤16 entries
+/// O(n) lookup for the TUI slash table. The table is small (fewer than 24 entries
 /// in practice) so linear scan beats a `HashMap` on cache locality and
 /// avoids the `OnceLock` build the CLI registry needs.
 fn lookup_tui_slash(text: &str) -> Option<TuiSlashHandler> {
     TUI_SLASH_TABLE
         .iter()
         .find_map(|(name, handler)| (*name == text).then_some(*handler))
+}
+
+const fn tui_supports_key_action(action: &crate::keybindings::KeyAction) -> bool {
+    !matches!(
+        action,
+        crate::keybindings::KeyAction::Editor
+            | crate::keybindings::KeyAction::Compact
+            | crate::keybindings::KeyAction::None
+    )
 }
 
 #[derive(Debug)]
@@ -869,10 +884,21 @@ struct TuiMcpRuntime {
     trusted_servers: std::collections::HashSet<String>,
 }
 
+enum PluginTurnInvocation {
+    Command(crate::plugins::PluginCommandInvocation),
+    Skill(crate::plugins::PluginSkillInvocation),
+    Agent(crate::plugins::PluginAgentInvocation),
+}
+
 /// Main TUI application state.
 pub struct App {
     pub messages: MessageList,
     pub input: TextInput,
+    /// Last configured key map compiled into the real terminal event path.
+    keybinding_config: crate::config::KeybindingsConfig,
+    keybinding_resolver: crate::keybindings::KeybindingResolver,
+    /// Original terminal events retained while a multi-key chord is pending.
+    pending_key_events: Vec<KeyEvent>,
     pub model: String,
     pub provider: String,
     /// Exact immutable host capabilities for this interactive session.
@@ -1041,9 +1067,15 @@ impl App {
             .ok()
             .and_then(|run| crate::session::TaskManager::for_run(run).ok())
             .unwrap_or_default();
+        let keybinding_config = crate::config::KeybindingsConfig::default();
+        let keybinding_resolver =
+            crate::keybindings::KeybindingResolver::from_config(&keybinding_config);
         Self {
             messages: MessageList::new(),
             input: TextInput::new(),
+            keybinding_config,
+            keybinding_resolver,
+            pending_key_events: Vec::new(),
             model: model.to_string(),
             provider: provider.to_string(),
             run_context,
@@ -1142,7 +1174,53 @@ impl App {
     /// Open the help-cheatsheet overlay. Subsequent keystrokes go to
     /// the overlay until it returns `OverlayAction::Close`.
     pub fn open_help_overlay(&mut self) {
-        self.overlay = Some(ActiveOverlay::Help(super::components::HelpOverlay::new()));
+        self.cancel_pending_keybinding();
+        self.sync_keybindings();
+        let bindings = self
+            .keybinding_resolver
+            .effective_bindings(crate::keybindings::KeyContext::Chat)
+            .into_iter()
+            .map(|(chord, action)| {
+                let availability = if tui_supports_key_action(&action) {
+                    action.description().to_string()
+                } else {
+                    format!("{} (unavailable in this TUI)", action.description())
+                };
+                (chord, availability)
+            })
+            .collect();
+        let diagnostics = self.keybinding_resolver.diagnostics().to_vec();
+        self.overlay = Some(ActiveOverlay::Help(
+            super::components::HelpOverlay::new().with_keybindings(bindings, diagnostics),
+        ));
+    }
+
+    fn sync_keybindings(&mut self) {
+        let configured = self
+            .app_config
+            .as_ref()
+            .map_or_else(crate::config::KeybindingsConfig::default, |config| {
+                config.keybindings.clone()
+            });
+        if configured == self.keybinding_config {
+            return;
+        }
+
+        self.keybinding_config = configured;
+        self.keybinding_resolver =
+            crate::keybindings::KeybindingResolver::from_config(&self.keybinding_config);
+        self.pending_key_events.clear();
+        if !self.keybinding_resolver.diagnostics().is_empty() {
+            self.messages.add(DisplayMessage::error(format!(
+                "Some keybindings are unavailable:\n{}",
+                self.keybinding_resolver.diagnostics().join("\n")
+            )));
+        }
+    }
+
+    fn cancel_pending_keybinding(&mut self) {
+        self.keybinding_resolver.cancel();
+        self.pending_key_events.clear();
     }
 
     fn apply_loaded_session(&mut self, loaded: &Session) -> bool {
@@ -1484,6 +1562,7 @@ impl App {
     /// overlay still opens with an empty-state message, matching
     /// Claude Code's `/resume` UX).
     pub fn open_log_selector(&mut self) {
+        self.cancel_pending_keybinding();
         let transcripts = crate::transcript::list_transcripts(&self.chat_session.transcript_cwd());
         let rows = transcripts
             .into_iter()
@@ -1877,6 +1956,7 @@ impl App {
             Ok(AppEvent::Paste(text)) => self.handle_paste(&text),
             Ok(AppEvent::Tick) => {
                 self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
+                self.handle_keybinding_timeout();
             }
             Ok(AppEvent::StreamText(text)) => {
                 self.messages.finish_thinking();
@@ -1921,12 +2001,37 @@ impl App {
             }
             Ok(AppEvent::ResponseDone) => self.handle_response_done(),
             Ok(AppEvent::ApiError(msg)) => {
+                self.cancel_pending_keybinding();
                 self.preserve_failed_stream_for_display();
                 self.messages
                     .add(DisplayMessage::error(format!("Error: {msg}")));
                 self.is_waiting = false;
                 self.fire_notification_hook(&format!("API error: {msg}"), "error");
                 self.active_turn_hook_engine = None;
+            }
+            Ok(AppEvent::PluginAgentDone { label, result }) => {
+                self.cancel_pending_keybinding();
+                self.is_waiting = false;
+                self.active_turn_hook_engine = None;
+                if result.success {
+                    self.messages
+                        .add(DisplayMessage::assistant(result.output.clone()));
+                    self.chat_session.push_message(serde_json::json!({
+                        "role": "assistant",
+                        "content": result.output,
+                    }));
+                } else {
+                    self.messages.add(DisplayMessage::error(format!(
+                        "Plugin agent {label} failed: {}",
+                        result.output
+                    )));
+                    self.chat_session.push_message(serde_json::json!({
+                        "role": "system",
+                        "content": format!("Plugin agent {label} failed: {}", result.output),
+                    }));
+                }
+                self.chat_session.touch();
+                self.persist_session();
             }
             Ok(AppEvent::ApiRetry {
                 kind,
@@ -1986,6 +2091,7 @@ impl App {
                 tool_args,
                 reply,
             }) => {
+                self.cancel_pending_keybinding();
                 self.pending_permission = Some(PendingPermission {
                     tool_name,
                     tool_args,
@@ -1993,6 +2099,7 @@ impl App {
                 });
             }
             Ok(AppEvent::UserQuestion { questions, reply }) => {
+                self.cancel_pending_keybinding();
                 // Surface the modal. The pipeline interceptor parks on
                 // the reply oneshot and resumes once the user walks
                 // every question; on Escape the modal drops `reply`
@@ -2008,6 +2115,7 @@ impl App {
                 });
             }
             Ok(AppEvent::PlanModeRequest { request, reply }) => {
+                self.cancel_pending_keybinding();
                 self.handle_plan_mode_request(request, reply);
             }
             Ok(AppEvent::ShellDone {
@@ -2089,6 +2197,7 @@ impl App {
     /// chat session, refreshing the token estimate, and firing the
     /// Stop hook so external orchestrators get the round-trip signal.
     fn handle_response_done(&mut self) {
+        self.cancel_pending_keybinding();
         self.messages.finish_thinking();
         self.prepare_streaming_final_for_display();
         self.messages.finish_streaming();
@@ -2300,9 +2409,132 @@ impl App {
         }
 
         match self.current_key_mode() {
-            KeyMode::Modal => self.handle_key_modal(key),
+            KeyMode::Modal => {
+                if let Some(replay) =
+                    self.resolve_configured_key(key, crate::keybindings::KeyContext::Help)
+                {
+                    for event in replay {
+                        self.handle_unbound_key(event);
+                    }
+                } else {
+                    self.handle_key_modal(key);
+                }
+            }
             KeyMode::Streaming => self.handle_key_streaming(key),
             KeyMode::Normal => self.handle_key_normal(key),
+        }
+    }
+
+    /// Feed a real terminal event into the configured resolver. `None` means
+    /// crossterm cannot represent the event in the configuration grammar;
+    /// `Some` contains ordinary events that must be replayed after resolution.
+    fn resolve_configured_key(
+        &mut self,
+        key: KeyEvent,
+        context: crate::keybindings::KeyContext,
+    ) -> Option<Vec<KeyEvent>> {
+        self.sync_keybindings();
+        let parsed = crate::keybindings::ParsedKeystroke::from_key_event(&key)?;
+        self.pending_key_events.push(key);
+        let result = self.keybinding_resolver.resolve_in_context(context, parsed);
+        let replay_count = self.keybinding_resolver.take_replay().len();
+        match result {
+            crate::keybindings::ChordResolveResult::Prefix => Some(Vec::new()),
+            crate::keybindings::ChordResolveResult::Match { action } => {
+                let replay = self.take_pending_key_replay(replay_count);
+                self.dispatch_keybinding_action(&action, context);
+                Some(replay)
+            }
+            crate::keybindings::ChordResolveResult::NoMatch => {
+                Some(self.take_pending_key_replay(replay_count))
+            }
+        }
+    }
+
+    fn take_pending_key_replay(&mut self, replay_count: usize) -> Vec<KeyEvent> {
+        let split_at = self
+            .pending_key_events
+            .len()
+            .saturating_sub(replay_count.min(self.pending_key_events.len()));
+        let replay = self.pending_key_events.split_off(split_at);
+        self.pending_key_events.clear();
+        replay
+    }
+
+    fn handle_keybinding_timeout(&mut self) {
+        let Some(result) = self.keybinding_resolver.resolve_timeout() else {
+            return;
+        };
+        let context = if self.overlay.is_some() {
+            crate::keybindings::KeyContext::Help
+        } else if self.pending_permission.is_some()
+            || self.pending_user_question.is_some()
+            || self.pending_plan_approval.is_some()
+        {
+            crate::keybindings::KeyContext::Confirmation
+        } else if self.is_waiting {
+            crate::keybindings::KeyContext::Streaming
+        } else {
+            crate::keybindings::KeyContext::Chat
+        };
+        let replay_count = self.keybinding_resolver.take_replay().len();
+        let replay = self.take_pending_key_replay(replay_count);
+        if let crate::keybindings::ChordResolveResult::Match { action } = result {
+            self.dispatch_keybinding_action(&action, context);
+        }
+        for event in replay {
+            self.handle_unbound_key(event);
+        }
+    }
+
+    fn dispatch_keybinding_action(
+        &mut self,
+        action: &crate::keybindings::KeyAction,
+        context: crate::keybindings::KeyContext,
+    ) {
+        if *action == crate::keybindings::KeyAction::None {
+            return;
+        }
+        if *action == crate::keybindings::KeyAction::Cancel {
+            match context {
+                crate::keybindings::KeyContext::Streaming => self.cancel_streaming_response(),
+                crate::keybindings::KeyContext::Confirmation => {
+                    self.cancel_pending_confirmation();
+                }
+                crate::keybindings::KeyContext::Help => self.overlay = None,
+                _ => {}
+            }
+            return;
+        }
+        if !tui_supports_key_action(action) {
+            self.messages.add(DisplayMessage::error(format!(
+                "{} is not available in the full-screen TUI",
+                action.description()
+            )));
+            return;
+        }
+        if let Some(command) = action.command_name() {
+            self.handle_input(format!("/{command}"));
+        }
+    }
+
+    /// Replay a key without passing through the chord resolver again. The
+    /// current modal state is re-read because an exact-prefix fallback may
+    /// have opened an overlay before the mismatching event is replayed.
+    fn handle_unbound_key(&mut self, key: KeyEvent) {
+        match self.current_key_mode() {
+            KeyMode::Modal => self.handle_key_modal(key),
+            KeyMode::Streaming => self.handle_streaming_key_unbound(key),
+            KeyMode::Normal if self.pending_permission.is_some() => {
+                self.handle_permission_key(key);
+            }
+            KeyMode::Normal if self.pending_user_question.is_some() => {
+                self.handle_user_question_key(key);
+            }
+            KeyMode::Normal if self.pending_plan_approval.is_some() => {
+                self.handle_plan_approval_key(key);
+            }
+            KeyMode::Normal => self.handle_editing_key(key),
         }
     }
 
@@ -2316,6 +2548,14 @@ impl App {
             return;
         }
 
+        self.keybinding_resolver.cancel();
+        let pending = std::mem::take(&mut self.pending_key_events);
+        for event in pending {
+            self.handle_unbound_key(event);
+        }
+        if self.overlay.is_some() || self.is_waiting {
+            return;
+        }
         self.input.insert_str(text);
     }
 
@@ -2327,6 +2567,7 @@ impl App {
     /// [`handle_key_normal`] each handle one shape without re-asserting
     /// the global escape hatch.
     fn handle_global_ctrl_c(&mut self) {
+        self.cancel_pending_keybinding();
         // If permission prompt is active, deny and dismiss without quitting.
         if let Some(perm) = self.pending_permission.take() {
             let _ = perm.reply.send(super::events::PermissionResponse::Deny);
@@ -2394,14 +2635,31 @@ impl App {
     /// type into the input line while a response is being rendered. The
     /// global Ctrl+C handler in [`handle_global_ctrl_c`] still applies.
     fn handle_key_streaming(&mut self, key: crossterm::event::KeyEvent) {
-        if key.code == KeyCode::Esc {
-            self.is_waiting = false;
-            self.messages.finish_streaming();
-            self.streaming_raw_text.clear();
-            self.active_turn_hook_engine = None;
-            self.messages
-                .add(DisplayMessage::system("[Response interrupted]"));
+        if let Some(replay) =
+            self.resolve_configured_key(key, crate::keybindings::KeyContext::Streaming)
+        {
+            for event in replay {
+                self.handle_unbound_key(event);
+            }
+            return;
         }
+        self.handle_streaming_key_unbound(key);
+    }
+
+    fn handle_streaming_key_unbound(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Esc {
+            self.cancel_streaming_response();
+        }
+    }
+
+    fn cancel_streaming_response(&mut self) {
+        self.cancel_pending_keybinding();
+        self.is_waiting = false;
+        self.messages.finish_streaming();
+        self.streaming_raw_text.clear();
+        self.active_turn_hook_engine = None;
+        self.messages
+            .add(DisplayMessage::system("[Response interrupted]"));
     }
 
     /// Normal-mode keystrokes: interactive editing. Permission, question,
@@ -2409,19 +2667,39 @@ impl App {
     /// prompt / modal overlays the input line without taking the App
     /// into modal-overlay state.
     fn handle_key_normal(&mut self, key: crossterm::event::KeyEvent) {
-        if self.pending_permission.is_some() {
-            self.handle_permission_key(key);
+        if self.pending_permission.is_some()
+            || self.pending_user_question.is_some()
+            || self.pending_plan_approval.is_some()
+        {
+            if let Some(replay) =
+                self.resolve_configured_key(key, crate::keybindings::KeyContext::Confirmation)
+            {
+                for event in replay {
+                    self.handle_unbound_key(event);
+                }
+                return;
+            }
+            self.handle_unbound_key(key);
             return;
         }
-        if self.pending_user_question.is_some() {
-            self.handle_user_question_key(key);
-            return;
-        }
-        if self.pending_plan_approval.is_some() {
-            self.handle_plan_approval_key(key);
+        if let Some(replay) = self.resolve_configured_key(key, crate::keybindings::KeyContext::Chat)
+        {
+            for event in replay {
+                self.handle_unbound_key(event);
+            }
             return;
         }
         self.handle_editing_key(key);
+    }
+
+    fn cancel_pending_confirmation(&mut self) {
+        if self.pending_permission.is_some() {
+            self.handle_permission_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        } else if self.pending_user_question.is_some() {
+            self.handle_user_question_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        } else if self.pending_plan_approval.is_some() {
+            self.handle_plan_approval_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        }
     }
 
     /// Dispatch keystrokes when a permission prompt is active.
@@ -2778,7 +3056,13 @@ impl App {
                 self.input.insert_newline();
             }
             KeyCode::Char('\n' | '\r') => self.input.insert_newline(),
-            KeyCode::Char(c) => self.input.insert(c),
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.input.insert(c);
+            }
             KeyCode::Backspace => self.input.backspace(),
             KeyCode::Delete => self.input.delete(),
             KeyCode::Left => self.input.move_left(),
@@ -2995,7 +3279,8 @@ impl App {
     /// Handle slash commands. Returns true if the command was recognized.
     ///
     /// No-argument branches (`/quit`, `/exit`, `/help`, `?`, `/resume`,
-    /// `/continue`, `/clear`, `/status`, `/mode`, `/skill`, `/skills`) are
+    /// `/continue`, `/new`, `/clear`, `/status`, `/copy`, `/keybindings`,
+    /// `/mode`, `/plan`, `/skill`, `/skills`) are
     /// dispatched via the [`TUI_SLASH_TABLE`] lookup — the same OCP-clean
     /// dispatch pattern the CLI's [`command_registry::registry`] uses
     /// (crosslink #232 / #259). Branches that take arguments (`/load <id>`,
@@ -3079,6 +3364,81 @@ impl App {
             self.chat_session.effort_level(),
             self.chat_session.message_count(),
             self.chat_session.estimated_tokens(),
+        )));
+    }
+
+    /// Copy the latest committed assistant message through the same command
+    /// path used by `/copy` and a configured `copy_response` binding.
+    fn slash_copy(&mut self) {
+        let response = self
+            .chat_session
+            .messages_snapshot()
+            .into_iter()
+            .rev()
+            .find(|message| {
+                message.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+            })
+            .and_then(|message| {
+                message
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+        let Some(response) = response else {
+            self.messages
+                .add(DisplayMessage::system("No assistant response to copy."));
+            return;
+        };
+        match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(response)) {
+            Ok(()) => self
+                .messages
+                .add(DisplayMessage::system("Copied last response.")),
+            Err(error) => self.messages.add(DisplayMessage::error(format!(
+                "Could not copy the last response: {error}"
+            ))),
+        }
+    }
+
+    /// Render the collision-checked map actually reachable in normal TUI
+    /// editing, rather than a second static shortcut table.
+    fn slash_keybindings(&mut self) {
+        self.sync_keybindings();
+        let effective = self
+            .keybinding_resolver
+            .effective_bindings(crate::keybindings::KeyContext::Chat)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut lines = effective
+            .iter()
+            .filter(|(_, action)| tui_supports_key_action(action))
+            .map(|(chord, action)| format!("  {chord:20} {}", action.description()))
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            lines.push("  (no reachable bindings)".to_string());
+        }
+        let unavailable = effective
+            .iter()
+            .filter(|(_, action)| !tui_supports_key_action(action))
+            .map(|(chord, action)| format!("  {chord:20} {}", action.description()))
+            .collect::<Vec<_>>();
+        if !unavailable.is_empty() {
+            lines.push(String::new());
+            lines.push("Not available in the full-screen TUI:".to_string());
+            lines.extend(unavailable);
+        }
+        if !self.keybinding_resolver.diagnostics().is_empty() {
+            lines.push(String::new());
+            lines.push("Unavailable bindings:".to_string());
+            lines.extend(
+                self.keybinding_resolver
+                    .diagnostics()
+                    .iter()
+                    .map(|diagnostic| format!("  {diagnostic}")),
+            );
+        }
+        self.messages.add(DisplayMessage::system(format!(
+            "Effective keybindings:\n{}",
+            lines.join("\n")
         )));
     }
 
@@ -3253,6 +3613,10 @@ impl App {
             .unwrap_or(skill_request.len());
         let skill_name = &skill_request[..split_at];
         let arguments = skill_request[split_at..].trim();
+        if let Some(invocation) = self.resolve_plugin_turn(skill_name, arguments) {
+            self.apply_plugin_turn(invocation);
+            return;
+        }
         let activation = self.run_context.as_ref().ok().and_then(|run| {
             crate::skills::activate_user_invocable_skill_for_run(run, skill_name).ok()
         });
@@ -3295,6 +3659,157 @@ impl App {
         self.messages.add(DisplayMessage::system(format!(
             "Unknown command: {text}. Type /help for commands."
         )));
+    }
+
+    fn resolve_plugin_turn(
+        &self,
+        namespaced_name: &str,
+        arguments: &str,
+    ) -> Option<PluginTurnInvocation> {
+        let (plugin, component) = namespaced_name.split_once(':')?;
+        let manager = self.mcp_runtime.as_ref()?.plugin_manager.as_ref();
+        manager
+            .invoke_command(plugin, component, arguments)
+            .map(PluginTurnInvocation::Command)
+            .or_else(|_| {
+                manager
+                    .invoke_skill(plugin, component, arguments)
+                    .map(PluginTurnInvocation::Skill)
+            })
+            .or_else(|_| {
+                manager
+                    .invoke_agent(plugin, component, arguments)
+                    .map(PluginTurnInvocation::Agent)
+            })
+            .ok()
+    }
+
+    fn apply_plugin_turn(&mut self, invocation: PluginTurnInvocation) {
+        if let PluginTurnInvocation::Agent(invocation) = invocation {
+            self.spawn_plugin_agent(invocation);
+            return;
+        }
+        let (prompt, allowed_tools, model, effort, hooks, metadata, kind) = match invocation {
+            PluginTurnInvocation::Command(invocation) => {
+                let registration = invocation.registration;
+                (
+                    invocation.prompt,
+                    registration.command.allowed_tools,
+                    registration.command.model,
+                    None,
+                    None,
+                    registration.metadata,
+                    "command",
+                )
+            }
+            PluginTurnInvocation::Skill(invocation) => {
+                let registration = invocation.registration;
+                (
+                    invocation.prompt,
+                    registration.definition.allowed_tools,
+                    registration.definition.model,
+                    registration.definition.effort,
+                    registration.definition.hooks,
+                    registration.metadata,
+                    "skill",
+                )
+            }
+            PluginTurnInvocation::Agent(_) => unreachable!("plugin agent handled above"),
+        };
+        self.next_turn_allowed_tool_rules =
+            crate::permissions::allowed_tool_specs_to_permission_rules(allowed_tools.as_deref());
+        if let Some(model) = model.filter(|model| self.can_use_prompt_model(model)) {
+            self.next_turn_model = Some(model);
+        }
+        self.next_turn_effort_level = effort.as_deref().and_then(parse_prompt_effort_level);
+        self.next_turn_skill_context = vec![crate::context::ContextItem::reference(
+            format!("plugin.{kind}.{}", metadata.component_digest),
+            crate::context::ReferenceSource::Plugin,
+            metadata.canonical_name.clone(),
+            format!(
+                "Explicit plugin {kind} package={} plugin_id={} publisher={} artifact_digest={} source_revision={} requested_capabilities={:?}",
+                metadata.provenance.package,
+                metadata.provenance.plugin_id,
+                metadata.provenance.publisher,
+                metadata.provenance.artifact_digest,
+                metadata.provenance.source.resolved_revision,
+                metadata.requested_capabilities,
+            ),
+            crate::context::ContextFreshness::Turn,
+            650,
+        )];
+        self.next_turn_hook_engine = hooks.and_then(|hooks| {
+            serde_json::from_value::<crate::config::HooksConfig>(hooks)
+                .ok()
+                .map(|hooks| {
+                    let engine = match self.hook_engine.as_ref() {
+                        Some(engine) => engine.with_scoped_hooks(hooks),
+                        None => crate::hooks::HookEngine::new(hooks),
+                    };
+                    std::sync::Arc::new(engine)
+                })
+        });
+        self.messages.add(DisplayMessage::system(format!(
+            "Running plugin {kind}: /{}:{}",
+            metadata.provenance.package, metadata.component_name
+        )));
+        self.chat_session
+            .push_message(serde_json::json!({ "role": "user", "content": prompt }));
+        self.is_waiting = true;
+        self.spawn_api_turn();
+    }
+
+    fn spawn_plugin_agent(&mut self, invocation: crate::plugins::PluginAgentInvocation) {
+        let Some(handle) = self.runtime_handle.as_ref() else {
+            self.messages.add(DisplayMessage::error(
+                "Plugin agents require the async runtime.",
+            ));
+            return;
+        };
+        let Some(tx) = self.event_sender() else {
+            self.messages.add(DisplayMessage::error(
+                "Plugin agent event delivery is unavailable.",
+            ));
+            return;
+        };
+        let Ok(run_context) = self.run_context.as_ref().map(std::sync::Arc::clone) else {
+            self.messages.add(DisplayMessage::error(
+                "Plugin agents require an active run context.",
+            ));
+            return;
+        };
+        let Some(app_config) = self.app_config.clone() else {
+            self.messages.add(DisplayMessage::error(
+                "Plugin agents require active application configuration.",
+            ));
+            return;
+        };
+        let metadata = &invocation.registration.metadata;
+        let label = format!(
+            "/{}:{}",
+            metadata.provenance.package, metadata.component_name
+        );
+        self.messages.add(DisplayMessage::system(format!(
+            "Running plugin agent: {label}"
+        )));
+        self.chat_session.push_message(serde_json::json!({
+            "role": "user",
+            "content": format!("Run plugin agent {label}.\n\nTask:\n{}", invocation.task),
+        }));
+        self.is_waiting = true;
+        let client = self.api_client.client.clone();
+        let memory_db = self.memory_db.clone();
+        handle.spawn(async move {
+            let result = crate::subagent::run_plugin_agent(
+                &run_context,
+                &invocation,
+                app_config.as_ref(),
+                &client,
+                memory_db.as_deref(),
+            )
+            .await;
+            let _ = tx.send(AppEvent::PluginAgentDone { label, result });
+        });
     }
 
     fn apply_skill_turn_metadata(&mut self, activation: &crate::skills::SkillActivation) {
@@ -4267,7 +4782,11 @@ impl App {
         }
 
         // ── Status bar ──
-        let left_text = "? for shortcuts";
+        let left_text = if self.keybinding_resolver.is_pending() {
+            format!("keys: {} …", self.keybinding_resolver.pending_display())
+        } else {
+            "? for shortcuts".to_string()
+        };
         let effort = self.chat_session.effort_level();
         let effort_symbol = effort.symbol();
         let right_text = format!("{effort_symbol} {effort} \u{00B7} /effort");
@@ -5044,6 +5563,9 @@ fn describe_event(event: &super::events::AppEvent) -> String {
         super::events::AppEvent::ApiError(e) => {
             let snippet: String = e.as_str().chars().take(80).collect();
             format!("ApiError({snippet:?})")
+        }
+        super::events::AppEvent::PluginAgentDone { label, result } => {
+            format!("PluginAgentDone({label}, ok={})", result.success)
         }
         super::events::AppEvent::ApiRetry {
             kind,
@@ -6121,7 +6643,7 @@ mod tests {
     use super::{compile_file_ref_regex, expand_file_refs};
     use crate::slash_commands::all_tui_commands;
     use crate::state::Session;
-    use crate::tui::events::{ApiRetryKind, PlanModeReply, PlanModeRequest};
+    use crate::tui::events::{ApiRetryKind, PermissionResponse, PlanModeReply, PlanModeRequest};
     use crossterm::event::{KeyCode, KeyModifiers};
     use std::io::Write as _;
     use std::path::PathBuf;
@@ -7503,6 +8025,99 @@ mod tests {
     }
 
     // ── handle_key mode split (crosslink #364) ─────────────────────────
+
+    fn app_config_with_keybindings(
+        bindings: impl IntoIterator<Item = (&'static str, crate::keybindings::KeyAction)>,
+    ) -> Arc<crate::config::AppConfig> {
+        let mut config: crate::config::AppConfig = serde_yaml::from_str(
+            "proxy:\n  port: 8080\n  host: 127.0.0.1\n  target: local\nproviders:\n  local:\n    base_url: http://localhost:1234/v1\n",
+        )
+        .expect("minimal TUI keybinding config");
+        config.keybindings.bindings = bindings
+            .into_iter()
+            .map(|(chord, action)| (chord.to_string(), action))
+            .collect();
+        Arc::new(config)
+    }
+
+    #[test]
+    fn configured_chat_key_dispatches_the_typed_help_command() {
+        let mut app = App::new("test", "local");
+        app.app_config = Some(app_config_with_keybindings([(
+            "f6",
+            crate::keybindings::KeyAction::Help,
+        )]));
+
+        app.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::F(6),
+            KeyModifiers::NONE,
+        ));
+
+        assert!(app.overlay.is_some(), "configured F6 must open real help");
+    }
+
+    #[test]
+    fn unmatched_unicode_chord_is_replayed_into_the_editor() {
+        let mut app = App::new("test", "local");
+        app.app_config = Some(app_config_with_keybindings([(
+            "λ x",
+            crate::keybindings::KeyAction::Help,
+        )]));
+
+        app.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('λ'),
+            KeyModifiers::NONE,
+        ));
+        assert!(app.input.is_empty(), "prefix must wait for its next key");
+        app.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('β'),
+            KeyModifiers::NONE,
+        ));
+
+        assert_eq!(app.input.content, "λβ");
+    }
+
+    #[test]
+    fn non_cancel_configured_action_cannot_escape_streaming_context() {
+        let mut app = App::new("test", "local");
+        app.app_config = Some(app_config_with_keybindings([(
+            "f6",
+            crate::keybindings::KeyAction::Help,
+        )]));
+        app.is_waiting = true;
+
+        app.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::F(6),
+            KeyModifiers::NONE,
+        ));
+
+        assert!(app.is_waiting);
+        assert!(app.overlay.is_none());
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn configured_cancel_binding_denies_a_permission_dialog() {
+        let mut app = App::new("test", "local");
+        app.app_config = Some(app_config_with_keybindings([(
+            "f6",
+            crate::keybindings::KeyAction::Cancel,
+        )]));
+        let (reply, mut response) = tokio::sync::oneshot::channel();
+        app.handle_app_event(Ok(AppEvent::PermissionRequest {
+            tool_name: "bash".to_string(),
+            tool_args: "{}".to_string(),
+            reply,
+        }));
+
+        app.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::F(6),
+            KeyModifiers::NONE,
+        ));
+
+        assert!(app.pending_permission.is_none());
+        assert_eq!(response.try_recv(), Ok(PermissionResponse::Deny));
+    }
 
     /// `current_key_mode` reports `Normal` for a fresh app — no overlay,
     /// not streaming.

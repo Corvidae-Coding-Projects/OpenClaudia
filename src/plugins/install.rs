@@ -8,7 +8,7 @@
 //! that owns its scope.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, warn};
 
@@ -112,6 +112,15 @@ pub struct InstalledPlugins {
     pub version: u32,
     /// Map of plugin IDs (plugin@marketplace) to installation entries
     pub plugins: HashMap<String, Vec<PluginInstallEntry>>,
+    /// Project-scoped operator enablement decisions. Keeping this alongside
+    /// the install catalogue makes disable survive process restart for both
+    /// tracked and convention-discovered plugins.
+    #[serde(
+        default,
+        rename = "disabledPlugins",
+        skip_serializing_if = "HashSet::is_empty"
+    )]
+    pub disabled_plugins: HashSet<String>,
 }
 
 impl Default for InstalledPlugins {
@@ -119,6 +128,7 @@ impl Default for InstalledPlugins {
         Self {
             version: 2,
             plugins: HashMap::new(),
+            disabled_plugins: HashSet::new(),
         }
     }
 }
@@ -172,6 +182,7 @@ impl InstalledPlugins {
         match std::fs::read_to_string(path) {
             Ok(content) => match serde_json::from_str::<Self>(&content) {
                 Ok(data) => {
+                    target.disabled_plugins.extend(data.disabled_plugins);
                     for (plugin_id, entries) in data.plugins {
                         let bucket = target.plugins.entry(plugin_id).or_default();
                         for entry in entries {
@@ -304,7 +315,10 @@ impl InstalledPlugins {
         // consistent with the in-memory view; the dedicated branches are
         // retained for explicit "create on demand only when needed" intent.
         let project_path = Self::project_file_path(project_root);
-        if !project_view.plugins.is_empty() || project_path.exists() {
+        if !project_view.plugins.is_empty()
+            || !project_view.disabled_plugins.is_empty()
+            || project_path.exists()
+        {
             atomic_save_to(&project_view, &project_path)?;
         }
 
@@ -318,6 +332,7 @@ impl InstalledPlugins {
     fn split_by_scope(&self) -> (Self, Self) {
         let mut global = Self::default();
         let mut project = Self::default();
+        project.disabled_plugins.clone_from(&self.disabled_plugins);
         for (plugin_id, entries) in &self.plugins {
             for entry in entries {
                 let bucket = if entry.scope.is_global() {

@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- S-088: Run VDD as the canonical alternate-model verifier (#1157)
+- S-081: Use one real keybinding engine (#1179)
+- S-063: Activate plugin capabilities through canonical registries (#1178)
 - Coordinate incomplete-feature repair wave two (#1166)
 - S-094: Route every proxy API through the canonical lifecycle (#1169)
 - S-091: Make ACP modes and advertised tools effective (#1168)

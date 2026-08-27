@@ -192,6 +192,17 @@ fabricated citation receipts, false source generations, missing receipt
 coverage, forged reviews, relabelled artifacts, privacy leakage, and forbidden
 final states rather than counting failures or a lack of panics as success.
 
+S-063 later changed the still-cited `src/main.rs` while preserving the
+migration-doctor behavior exercised by this corpus. The citation is rebound to
+`worktree:s063` at source digest
+`7ed2070fb0832e8966c560340d76303e0a5537d05691eeea4c34648b8515f9b4`.
+The regenerated held-out digest is
+`36124d1a238de8cd0f2e1b1f3bcebd8062bb7ba62e2bc8105da367ef5e372ee3`
+and the evaluation digest is
+`2d12d081479108834b8a58056b3aab2eb0297fcb3cb992facea16b60554a51da`.
+The corresponding review remains explicitly rejected; regeneration is not an
+independent review or a VDD promotion.
+
 ## Residual boundaries
 
 - S-088 owns the independent artifact-bound VDD review, including the required

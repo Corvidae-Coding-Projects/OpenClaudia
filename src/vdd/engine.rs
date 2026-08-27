@@ -112,6 +112,27 @@ impl VddEngine {
         }
     }
 
+    /// Verify one exact supervised-worker artifact through a fresh canonical
+    /// verifier run with an alternate provider, endpoint, and model family.
+    ///
+    /// This returns only a proposed verification receipt. It cannot approve,
+    /// publish, commit, close, complete, or mutate the reviewed artifact.
+    pub async fn verify_worker_artifact(
+        &self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
+        request: &crate::vdd::CanonicalVddRequest,
+    ) -> crate::vdd::CanonicalVddReceipt {
+        crate::vdd::canonical::run_canonical_verification(
+            run,
+            &self.client,
+            &self.app_config,
+            &self.config,
+            self.adversary_auth.as_ref(),
+            request,
+        )
+        .await
+    }
+
     /// Simplified entry point for chat loop integration.
     /// Takes the builder text and user task, plus builder auth for the
     /// AI verification agent (which uses the builder's provider, not the
