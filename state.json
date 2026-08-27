@@ -1,6 +1,6 @@
 {
   "next_display_id": 1183,
-  "next_comment_id": 1848,
+  "next_comment_id": 1849,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -14581,7 +14581,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T22:07:58.866963627Z",
-      "updated_at": "2026-08-27T22:15:19.403984283Z",
+      "updated_at": "2026-08-27T22:15:24.076274624Z",
       "labels": [
         "review"
       ],
@@ -14594,6 +14594,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAGN/9qNkNDH8emypSPD+YVVwh0aTNnzRJz2zvAjQpK3p1dggGnjhmtn+2gLIMOJOqJkQQNfwTjkUWeW0FLyj0BQ=="
+        },
+        "37f0ffac-a8bb-44e1-b30f-99acdad5f335": {
+          "display_id": 1848,
+          "author": "6Vw9",
+          "content": "Confirmed HIGH blocker: canonical verifier tool evidence is split across ledger keys. ToolExecutor installs the active ledger under agent_id (src/services/tool_executor.rs:280-282), but read_file and bash record authoritative FileRead/CommandRun observations using run.session_id() (src/tools/file/mod.rs:1355-1385; src/tools/bash/mod.rs:1277-1328). The verifier grounding and final citation gate open the agent_id ledger (src/subagent.rs:3550-3555; src/vdd/canonical.rs:749-768). Therefore normal verifier reads/checks do not produce citable authoritative observations in the ledger being validated; only the generic ToolResult envelope lands there and it is UntrustedContent, which validate_citations rejects. The test at canonical.rs:1538-1575 masks this by manually inserting a FileRead into the agent_id ledger instead of executing read_file through ToolExecutor. This prevents an ordinary evidence-backed pass/fail and requires changes.",
+          "created_at": "2026-08-27T22:15:24.073833246Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAfQ8pCMZYa5oOfIfzz3cZAnggpjTxgJW2vZiksvNXh+JnhXHtg6onYKQFGvUmObfZqZhaLuzfxghOFg9foZohAA=="
         },
         "7b90bc62-a8bd-4883-9aec-e4210992f58c": {
           "display_id": 1846,
@@ -46507,11 +46516,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2130,
       "timestamp": "2026-08-27T22:15:19.403984283Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2131,
+      "timestamp": "2026-08-27T22:15:24.076274624Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T22:15:19.403984283Z",
+    "timestamp": "2026-08-27T22:15:24.076274624Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2130
+    "agent_seq": 2131
   }
 }
