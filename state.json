@@ -5102,12 +5102,13 @@
       "display_id": 1186,
       "title": "Exercise canonical VDD through the real child harness end to end",
       "description": "Current S-088 tests validate request/report helpers and manually seed Reality evidence, but never call VddEngine::verify_worker_artifact/run_canonical_verification or execute verifier tools through the production child harness. Add deterministic provider fixtures and a real preserved-worktree fixture covering alternate identity, read-only artifact and writable scratch, no network/secrets/delegation, authoritative citations, strict report terminal paths, artifact mutation, timeout/cancellation/budget/truncation, and receipt snapshots. This gate must fail for the ledger-key, identity, or unjoined-process defects rather than reproducing their implementation assumptions.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T22:18:28.703438669Z",
-      "updated_at": "2026-08-27T22:51:05.958457118Z",
+      "updated_at": "2026-08-27T22:51:12.835804885Z",
+      "closed_at": "2026-08-27T22:51:12.835803383Z",
       "labels": [
         "test",
         "vdd"
@@ -46933,11 +46934,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2172,
       "timestamp": "2026-08-27T22:51:05.958457118Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2173,
+      "timestamp": "2026-08-27T22:51:12.835804885Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T22:51:05.958457118Z",
+    "timestamp": "2026-08-27T22:51:12.835804885Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2172
+    "agent_seq": 2173
   }
 }
