@@ -1,6 +1,6 @@
 {
   "next_display_id": 1170,
-  "next_comment_id": 1793,
+  "next_comment_id": 1794,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -10855,11 +10855,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T11:25:20.668792623Z",
-      "updated_at": "2026-08-27T11:27:55.720392965Z",
+      "updated_at": "2026-08-27T12:03:46.805202612Z",
       "labels": [
         "feature"
       ],
       "comments": {
+        "5973b6b5-d742-4a43-a9c5-554cc3769004": {
+          "display_id": 1793,
+          "author": "NeZq",
+          "content": "Implemented canonical proxy lifecycle routing in src/proxy.rs: supported chat completions, legacy completions, Anthropic messages, and OpenAI Responses now normalize through explicit route capabilities and the shared context/hooks, compaction, model/token policy, provider budget, evidence, usage, terminal finalization, and delivery stages. Unsupported catch-all routes and wrong methods fail before body parsing or credential resolution; supported native routes retain opaque provider fields and Responses preserves bounded body/query forwarding. Added focused normalization, lifecycle parity, fail-closed routing, opaque-field, typed-error, and exact forwarding tests. No Cargo, test, formatting, build, Clippy, Rust compiler, CI, or Git verification commands were run under the worker boundary. Remaining adjacent integration: S-093 owns per-caller session isolation, S-095 owns true streaming translation/finalization parity, and the artifact-bound VDD receipt awaits S-088.",
+          "created_at": "2026-08-27T12:03:46.802362906Z",
+          "kind": "result",
+          "signed_by": "SHA256:Pno18rb2Fit9+ChYzlK2hqGGHc8a9w0gWTDSYqtFPF8",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgf6zX/OSipECNC3b+xW4BqMVIVwAW8f+opORGgO7Tn+sAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA/YkZR2Slb3vcErmD07CLR01wTfwnCVpRSyC3QeV7iTcoDtjr6Yn7CyvkcGLPs+OjXUP/v644RKBXdFVdA5sBBA=="
+        },
         "83fab281-c996-44f2-84f7-cbe26d59f566": {
           "display_id": 1788,
           "author": "6Vw9",
@@ -45103,11 +45112,16 @@
       "agent_id": "Xnwv",
       "agent_seq": 4,
       "timestamp": "2026-08-27T12:01:24.183414190Z"
+    },
+    {
+      "agent_id": "NeZq",
+      "agent_seq": 2,
+      "timestamp": "2026-08-27T12:03:46.805202612Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T12:01:24.183414190Z",
-    "agent_id": "Xnwv",
-    "agent_seq": 4
+    "timestamp": "2026-08-27T12:03:46.805202612Z",
+    "agent_id": "NeZq",
+    "agent_seq": 2
   }
 }
