@@ -1,6 +1,6 @@
 {
   "next_display_id": 1182,
-  "next_comment_id": 1842,
+  "next_comment_id": 1843,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -26846,10 +26846,21 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T20:47:39.842404779Z",
-      "updated_at": "2026-08-27T20:47:45.421768491Z",
+      "updated_at": "2026-08-27T20:48:06.610141135Z",
       "labels": [
         "maintenance"
-      ]
+      ],
+      "comments": {
+        "b9a52bf3-c02b-4431-bc7f-c7c4adc3ba63": {
+          "display_id": 1842,
+          "author": "6Vw9",
+          "content": "Exact-head CI run 33114642866 failed repository-policy because a fresh crates.io index reports locked chacha20 0.10.1 yanked through rand 0.10.2. Both local cargo-deny commands initially passed against a stale local index; CI log is the authoritative reproduction. Repair category: root-cause dependency lock update, without weakening deny policy.",
+          "created_at": "2026-08-27T20:48:06.607605568Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAEAKVyrHK9qWygI72/PcQq6JkSfc8c0wO4fI/KMYVAileH9FC4qmxgFiMAw8m7cKriko9MFhfJPhR/jZBirf/Dw=="
+        }
+      }
     },
     "bb0a33ca-c8fd-4773-949a-ac6b30c20346": {
       "uuid": "bb0a33ca-c8fd-4773-949a-ac6b30c20346",
@@ -46357,11 +46368,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2115,
       "timestamp": "2026-08-27T20:47:52.676770188Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2116,
+      "timestamp": "2026-08-27T20:48:06.610141135Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T20:47:52.676770188Z",
+    "timestamp": "2026-08-27T20:48:06.610141135Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2115
+    "agent_seq": 2116
   }
 }
