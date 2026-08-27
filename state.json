@@ -1,6 +1,6 @@
 {
   "next_display_id": 1170,
-  "next_comment_id": 1796,
+  "next_comment_id": 1797,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -17100,11 +17100,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T11:24:50.435019544Z",
-      "updated_at": "2026-08-27T11:31:49.473557092Z",
+      "updated_at": "2026-08-27T12:12:54.093898395Z",
       "labels": [
         "feature"
       ],
       "comments": {
+        "02d6657a-793d-41f4-9ebc-404c653bebbc": {
+          "display_id": 1796,
+          "author": "xdNo",
+          "content": "Implemented S-087 as a thin coordinator-owned worker lifecycle authority. Replaced the rejected parallel framework with immutable semantic assignment/model-generation records and durable PlannerState assignment/result maps persisted by the existing PlannerCheckpointStore. Coordinator task slices now bind exact objective/source/dependency/acceptance digests, existing evidence-freshness model generation, fresh RunDescriptor attempts, canonical budget/capability/workspace generations, cancellation receipts, and terminal output/evidence digests. Background resume creates a fresh runtime record and coordinator provider context only after prior semantic results are checkpoint-acknowledged; coordinator retries create fresh canonical delegation tasks, while ordinary non-coordinator resume behavior remains legacy-compatible. Added explicit clean/untracked/unstaged/staged/committed/conflicted/partial/failed/cancelled/orphaned/inspection-failed artifact handoffs with durable locators and pending review disposition. Reused S-074 worktree inspection for exact byte/index/branch classification; cleanup is non-force, fails closed, preserves ignored/untracked/staged/conflicted/committed or inspection-failed work, and registry GC/removal cannot discard an uncheckpointed semantic result. Added focused lifecycle, fresh-resume, and cleanup-predicate unit coverage. Changed: src/coordinator/worker_lifecycle.rs, src/coordinator/planner.rs, src/coordinator/mod.rs, src/subagent.rs, src/tools/worktree.rs. No known integration blocker. Per worker boundary, no Cargo, rustc, tests, builds, Clippy, rustfmt, CI, Git status/diff, or other verification command was run; parent integration must compile, format, and test.",
+          "created_at": "2026-08-27T12:12:54.091330905Z",
+          "kind": "result",
+          "signed_by": "SHA256:xseubu1kl2y6dLtm7eVZIcmgDi3p1ZeIGL/ravonWEk",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgWPmvE/5+aog3nFgkY2HchTlQRBhWVRFPxRK9UU43OW4AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAsE4b4iIZa7oigOU/VQKl7slq5WQD3sEFhOtqPfyTKUgQrcSQwPbqnWC08ct65S4KfqNnGCV5/Z3H1FtW0C01Aw=="
+        },
         "90589b41-250b-488f-9b3c-10b1eefbceb4": {
           "display_id": 1790,
           "author": "xdNo",
@@ -45146,11 +45155,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2005,
       "timestamp": "2026-08-27T12:06:21.376984703Z"
+    },
+    {
+      "agent_id": "xdNo",
+      "agent_seq": 3,
+      "timestamp": "2026-08-27T12:12:54.093898395Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T12:06:21.376984703Z",
-    "agent_id": "6Vw9",
-    "agent_seq": 2005
+    "timestamp": "2026-08-27T12:12:54.093898395Z",
+    "agent_id": "xdNo",
+    "agent_seq": 3
   }
 }
