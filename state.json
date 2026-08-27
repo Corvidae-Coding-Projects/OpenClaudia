@@ -26838,12 +26838,11 @@
       "uuid": "bacab20b-9a90-4b22-a7ab-395b1f2ce5df",
       "display_id": 1181,
       "title": "Replace yanked chacha20 dependency blocking repository policy",
-      "status": "closed",
+      "status": "open",
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T20:47:39.842404779Z",
-      "updated_at": "2026-08-27T20:58:14.384005160Z",
-      "closed_at": "2026-08-27T20:58:14.383999513Z",
+      "updated_at": "2026-08-27T20:58:26.729606828Z",
       "labels": [
         "maintenance"
       ],
@@ -46394,11 +46393,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2119,
       "timestamp": "2026-08-27T20:58:18.904316926Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2120,
+      "timestamp": "2026-08-27T20:58:26.729606828Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T20:58:18.904316926Z",
+    "timestamp": "2026-08-27T20:58:26.729606828Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2119
+    "agent_seq": 2120
   }
 }
