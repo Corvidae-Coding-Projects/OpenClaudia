@@ -1,6 +1,6 @@
 {
   "next_display_id": 1181,
-  "next_comment_id": 1837,
+  "next_comment_id": 1838,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -19563,10 +19563,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T19:00:25.427833535Z",
-      "updated_at": "2026-08-27T19:00:33.196404004Z",
+      "updated_at": "2026-08-27T20:39:43.044124419Z",
       "labels": [
         "feature"
-      ]
+      ],
+      "comments": {
+        "5e7e0cce-4f87-4bf1-bb6f-e3d2aa9a975c": {
+          "display_id": 1837,
+          "author": "6Vw9",
+          "content": "Implemented the canonical generation-bound plugin capability registry and wired commands, hooks, skills, agents, MCP, LSP, durable disable state, and revocation through production CLI/TUI/proxy/ACP paths. Parent review repaired composition boundaries and verified 31/31 plugin integration tests. Rust 1.98 formatting, strict all-target/all-feature Clippy, and the complete serialized all-target/all-feature test suite pass. S-105 cited evidence was regenerated against the final src/main.rs generation; its independent review remains rejected. No VDD self-approval is claimed.",
+          "created_at": "2026-08-27T20:39:43.038343888Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAAgQ7vH48dpxNqqg2PMhLJHIH7Y3NnK6E91QzgjNZdXiaK43Wzow5yup5CYWiJLkUE1nRdb/yifDOaxebY0YiBQ=="
+        }
+      }
     },
     "877278c1-4bf8-44d7-921f-6cc3fcbcd6f1": {
       "uuid": "877278c1-4bf8-44d7-921f-6cc3fcbcd6f1",
@@ -46200,11 +46211,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2097,
       "timestamp": "2026-08-27T19:09:47.887111328Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2098,
+      "timestamp": "2026-08-27T20:39:43.044124419Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T19:09:47.887111328Z",
+    "timestamp": "2026-08-27T20:39:43.044124419Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2097
+    "agent_seq": 2098
   }
 }
