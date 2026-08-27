@@ -8507,12 +8507,13 @@
       "display_id": 1164,
       "title": "S-086: Implement rotating planner checkpoints",
       "description": "Implement docs/remediation-slices/086-rotating-planner-checkpoints.md as production wiring. Code-only worker; parent owns integration and verification.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T08:44:43.997640377Z",
-      "updated_at": "2026-08-27T10:35:51.162166260Z",
+      "updated_at": "2026-08-27T10:35:55.537960822Z",
+      "closed_at": "2026-08-27T10:35:55.537954439Z",
       "labels": [
         "feature"
       ],
@@ -44594,11 +44595,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1965,
       "timestamp": "2026-08-27T10:35:51.162166260Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1966,
+      "timestamp": "2026-08-27T10:35:55.537960822Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T10:35:51.162166260Z",
+    "timestamp": "2026-08-27T10:35:55.537960822Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1965
+    "agent_seq": 1966
   }
 }
