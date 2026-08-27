@@ -8020,12 +8020,13 @@
       "display_id": 1187,
       "title": "Deliver the selected source snapshot to canonical VDD",
       "description": "S-088 promises the verifier the exact selected source snapshot, but CanonicalVddRequest carries only PlannerEvidenceSourceRecord metadata (id, kind, digest, reference, observing run, timestamp) and the verifier prompt serializes only those records. The fresh verifier has no worker transcript, network, memory, MCP, or parent ledger access, so a criterion depending on user/tool/external evidence outside the reviewed worktree cannot be checked and must remain inconclusive. Add a bounded immutable source-evidence projection or read capability, validate every supplied byte/locator against the source receipt digest and run generation, keep the content subordinate as evidence, and test source-dependent pass plus missing/stale/tampered rejection.",
-      "status": "open",
+      "status": "closed",
       "priority": "medium",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T22:19:23.856453007Z",
-      "updated_at": "2026-08-27T22:42:37.904319907Z",
+      "updated_at": "2026-08-27T22:42:44.712582376Z",
+      "closed_at": "2026-08-27T22:42:44.712580889Z",
       "labels": [
         "bug",
         "vdd"
@@ -46901,11 +46902,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2168,
       "timestamp": "2026-08-27T22:42:37.904319907Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2169,
+      "timestamp": "2026-08-27T22:42:44.712582376Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T22:42:37.904319907Z",
+    "timestamp": "2026-08-27T22:42:44.712582376Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2168
+    "agent_seq": 2169
   }
 }
