@@ -1,6 +1,6 @@
 {
   "next_display_id": 1158,
-  "next_comment_id": 1730,
+  "next_comment_id": 1731,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -13527,7 +13527,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T23:02:08.777248190Z",
-      "updated_at": "2026-08-27T00:38:38.577052437Z",
+      "updated_at": "2026-08-27T00:39:12.488038353Z",
       "labels": [
         "feature"
       ],
@@ -13576,6 +13576,15 @@
           "kind": "result",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAWusK4yY/bCStg8PczDO8trGsv4z1uFK2+hs6P9bIfGfCDBIb3b2nrTeeiXUkUz08EcixRQ9M6K0evXoIPf2NBA=="
+        },
+        "ebe231c2-f22a-4b67-9596-5e36f6600624": {
+          "display_id": 1730,
+          "author": "6Vw9",
+          "content": "Approach: preserve the existing worktree product while replacing its composite exit behavior with explicit preview, stage, commit, merge, discard, and remove effects. Bind every mutation to a complete canonical generation; retain immutable recovery refs/cleanup receipts; verify postconditions and retries; test realistic Git failures and fresh-run boundaries; exclude S-074/S-075/S-077.",
+          "created_at": "2026-08-27T00:39:12.485237481Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAaPA4xaqsLLkiAwhpB+KdR4iZnjUe0f47RL2x7/yaPRNWRk+msVMIza6tz40rtTap5PFDI2C+QY6TBj2WTeheCA=="
         }
       }
     },
@@ -43546,11 +43555,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1886,
       "timestamp": "2026-08-27T00:38:43.706075104Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1887,
+      "timestamp": "2026-08-27T00:39:12.488038353Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T00:38:43.706075104Z",
+    "timestamp": "2026-08-27T00:39:12.488038353Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1886
+    "agent_seq": 1887
   }
 }
