@@ -7042,11 +7042,12 @@
       "display_id": 1174,
       "title": "Treat successful hook stdin EPIPE as an early close",
       "description": "Linux CI run 33083812957 failed hooks_permissions_e2e::command_hook_runs_and_returns_allowed_by_default because a successful command hook exited without reading its JSON stdin, and the shared process supervisor converted BrokenPipe into CommandFailed. Preserve strict stdin-delivery errors by default, allow hook invocations to opt into truthful early-close handling, keep timeouts/cancellation/output bounds intact, add deterministic regression coverage, and restore all five exact-head runners.",
-      "status": "open",
+      "status": "closed",
       "priority": "medium",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T15:04:57.438590597Z",
-      "updated_at": "2026-08-27T15:42:46.926669993Z",
+      "updated_at": "2026-08-27T15:42:58.382628575Z",
+      "closed_at": "2026-08-27T15:42:58.382627247Z",
       "labels": [
         "defect"
       ],
@@ -45791,11 +45792,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2062,
       "timestamp": "2026-08-27T15:42:46.926669993Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2063,
+      "timestamp": "2026-08-27T15:42:58.382628575Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T15:42:46.926669993Z",
+    "timestamp": "2026-08-27T15:42:58.382628575Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2062
+    "agent_seq": 2063
   }
 }
