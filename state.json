@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1183,
+  "next_display_id": 1184,
   "next_comment_id": 1850,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -290,6 +290,7 @@
     "458cbc83-74ca-41de-85a8-877dbc6d6530": 608,
     "45bb659e-5d03-41a1-866a-63f7209e607c": 403,
     "45f3bb9f-e9b5-4936-a055-38e0107a505f": 156,
+    "460c1743-20d3-4a46-aced-9e405dfbe3dd": 1183,
     "461c9e6d-ca13-496b-abc6-e797fc51764e": 144,
     "4682bf6f-9850-4f51-8fd6-9de2c36c8813": 116,
     "4690884c-2ff5-4dcb-b1eb-73d5f335780f": 330,
@@ -9031,6 +9032,18 @@
       "labels": [
         "qa"
       ]
+    },
+    "460c1743-20d3-4a46-aced-9e405dfbe3dd": {
+      "uuid": "460c1743-20d3-4a46-aced-9e405dfbe3dd",
+      "display_id": 1183,
+      "title": "Make canonical verifier evidence use one artifact-bound ledger",
+      "description": "S-088 production verifier tools do not publish authoritative FileRead/CommandRun observations into the ledger that its grounding and final citation gate read: ToolExecutor scopes the active ledger by agent_id, while file/bash observers use ToolRunContext.session_id. Align the evidence key without mixing concurrent child runs, then require cited artifact evidence to bind to the reviewed locator/current generation rather than any run-local file or command (including scratch or an irrelevant command). Add a production-path test that executes read_file and a bounded command through ToolExecutor, obtains model-visible ObsIds, accepts current artifact evidence, and rejects cross-run, scratch, irrelevant, stale, and mutated evidence.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-27T22:17:56.756101588Z",
+      "updated_at": "2026-08-27T22:17:56.756101588Z"
     },
     "461c9e6d-ca13-496b-abc6-e797fc51764e": {
       "uuid": "461c9e6d-ca13-496b-abc6-e797fc51764e",
@@ -46535,11 +46548,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2132,
       "timestamp": "2026-08-27T22:15:44.644453613Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2133,
+      "timestamp": "2026-08-27T22:17:56.756101588Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T22:15:44.644453613Z",
+    "timestamp": "2026-08-27T22:17:56.756101588Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2132
+    "agent_seq": 2133
   }
 }
