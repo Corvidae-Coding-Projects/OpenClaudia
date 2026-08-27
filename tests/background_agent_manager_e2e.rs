@@ -70,7 +70,7 @@ fn register_returns_distinct_run_visible_agents() {
 }
 
 #[test]
-fn register_with_id_reattaches_only_within_same_run() {
+fn register_with_id_reattaches_matching_semantics_only_within_same_run() {
     let manager = BackgroundAgentManager::new();
     let owner = test_run("resume-owner");
     let foreign = test_run("resume-foreign");
@@ -79,8 +79,15 @@ fn register_with_id_reattaches_only_within_same_run() {
         .register_with_id(&owner, AgentType::Explore, "first", "shared-id")
         .expect("fresh registration"));
     assert!(!manager
-        .register_with_id(&owner, AgentType::Plan, "replacement", "shared-id")
-        .expect("same-run reattach"));
+        .register_with_id(&owner, AgentType::Explore, "first", "shared-id")
+        .expect("same-run matching reattach"));
+    assert_eq!(
+        manager.register_with_id(&owner, AgentType::Plan, "replacement", "shared-id"),
+        Err(
+            "Agent 'shared-id' cannot be resumed with a different role or semantic task"
+                .to_string()
+        )
+    );
     assert_eq!(
         manager.register_with_id(&foreign, AgentType::Plan, "steal", "shared-id"),
         Err("Agent 'shared-id' not found".to_string())

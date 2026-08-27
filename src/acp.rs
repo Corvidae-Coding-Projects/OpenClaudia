@@ -23,6 +23,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -119,6 +120,12 @@ pub struct AcpServer {
     session_map: HashMap<String, String>,
     /// ACP session ID -> exact immutable host capability generation.
     run_contexts: HashMap<String, Arc<crate::tools::ToolRunContext>>,
+    /// ACP session ID -> dynamic MCP registry bound to the same exact run.
+    mcp_managers: HashMap<String, Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
+    /// Host-discovered plugin registry used only to compose reviewed MCP/LSP
+    /// integrations. Plugin tool schemas remain unavailable until the
+    /// canonical plugin catalog publishes classified handlers.
+    plugin_manager: Option<Arc<crate::plugins::PluginManager>>,
     /// Durable canonical task graph handles, keyed by ACP session id and
     /// rebound whenever that key maps to a different `OpenClaudia` run.
     task_managers: SharedAcpTaskManagers,
@@ -634,6 +641,89 @@ const MAX_ACP_SESSIONS: usize = 64;
 const ACP_CONFIG_MODE_ID: &str = "mode";
 const ACP_CONFIG_MODEL_ID: &str = "model";
 
+#[derive(Debug, Clone)]
+struct AcpModeProfile {
+    id: &'static str,
+    name: &'static str,
+    description: &'static str,
+    session_mode: SessionMode,
+    runtime_mode: crate::modes::RuntimeMode,
+}
+
+#[derive(Debug, Error)]
+enum AcpCapabilityError {
+    #[error("Unknown ACP sessionId: {0}")]
+    UnknownSession(String),
+    #[error("Invalid ACP mode '{0}'. Supported values are generated in configOptions.mode")]
+    UnknownMode(String),
+    #[error("ACP capability transition was rejected: {0}")]
+    Transition(String),
+    #[error("ACP run capability construction failed: {0}")]
+    Construction(String),
+    #[error("ACP dynamic integration binding failed: {0}")]
+    Integration(String),
+    #[error("ACP effective tool catalog failed: {0}")]
+    Catalog(String),
+}
+
+fn readonly_runtime_mode() -> crate::modes::RuntimeMode {
+    let mut behavior = crate::modes::BehaviorMode::default();
+    behavior.add_modifier(crate::modes::Modifier::Readonly);
+    crate::modes::RuntimeMode::Behavioral(behavior)
+}
+
+fn acp_mode_profiles() -> [AcpModeProfile; 4] {
+    [
+        AcpModeProfile {
+            id: "initializer",
+            name: "Initializer",
+            description: "Gather context with the canonical read-only Initializer policy",
+            session_mode: SessionMode::Initializer,
+            runtime_mode: crate::modes::RuntimeMode::Initializer,
+        },
+        AcpModeProfile {
+            id: "coding",
+            name: "Coding",
+            description: "Implement and verify changes through the canonical Coding policy",
+            session_mode: SessionMode::Coding,
+            runtime_mode: crate::modes::RuntimeMode::Behavioral(
+                crate::modes::BehaviorMode::default(),
+            ),
+        },
+        AcpModeProfile {
+            id: "plan",
+            name: "Plan",
+            description: "Inspect the workspace and write only the run-bound plan resource",
+            session_mode: SessionMode::Coding,
+            runtime_mode: crate::modes::RuntimeMode::Plan,
+        },
+        AcpModeProfile {
+            id: "readonly",
+            name: "Read Only",
+            description:
+                "Inspect local resources without workspace, process, network, or external mutation",
+            session_mode: SessionMode::Coding,
+            runtime_mode: readonly_runtime_mode(),
+        },
+    ]
+}
+
+fn acp_mode_profile(mode: &str) -> Result<AcpModeProfile, AcpCapabilityError> {
+    acp_mode_profiles()
+        .into_iter()
+        .find(|profile| profile.id == mode)
+        .ok_or_else(|| AcpCapabilityError::UnknownMode(mode.to_string()))
+}
+
+const fn acp_runtime_mode_label(snapshot: &crate::modes::RuntimeModeSnapshot) -> &'static str {
+    match (&snapshot.mode, snapshot.class) {
+        (crate::modes::RuntimeMode::Initializer, _) => "initializer",
+        (crate::modes::RuntimeMode::Plan, _) => "plan",
+        (_, crate::modes::RuntimeModeClass::ReadOnly) => "readonly",
+        _ => "coding",
+    }
+}
+
 /// Insert an ACP→openclaudia session-id mapping into `map`, evicting
 /// the oldest entry first if `order` is already at `cap`. Idempotent
 /// on re-insert: a session that is already present is bumped to the
@@ -666,13 +756,6 @@ fn upsert_session_mapping_into(
     }
     map.insert(acp_session_id.clone(), oc_session_id);
     order.push_back(acp_session_id);
-}
-
-const fn acp_mode_label(mode: SessionMode) -> &'static str {
-    match mode {
-        SessionMode::Initializer => "initializer",
-        SessionMode::Coding => "coding",
-    }
 }
 
 fn acp_model_option_ids(target: &str, current_model: &str) -> Vec<String> {
@@ -716,28 +799,32 @@ fn acp_config_value_options(ids: impl IntoIterator<Item = String>) -> Vec<Value>
 fn acp_session_config_options(
     target: &str,
     current_model: &str,
-    current_mode: SessionMode,
+    run: &crate::tools::ToolRunContext,
 ) -> Vec<Value> {
+    let runtime_mode = run.runtime_mode();
+    let mode_options = acp_mode_profiles()
+        .into_iter()
+        .filter(|profile| {
+            run.validate_runtime_mode_transition(&profile.runtime_mode)
+                .is_ok()
+        })
+        .map(|profile| {
+            json!({
+                "value": profile.id,
+                "name": profile.name,
+                "description": profile.description,
+            })
+        })
+        .collect::<Vec<_>>();
     vec![
         json!({
             "id": ACP_CONFIG_MODE_ID,
             "name": "Session Mode",
-            "description": "Controls whether the session is gathering context or editing code",
+            "description": "Selects a canonical runtime policy for the next capability generation",
             "category": "mode",
             "type": "select",
-            "currentValue": acp_mode_label(current_mode),
-            "options": [
-                {
-                    "value": "initializer",
-                    "name": "Initializer",
-                    "description": "Gather context and prepare the task"
-                },
-                {
-                    "value": "coding",
-                    "name": "Coding",
-                    "description": "Implement and verify code changes"
-                }
-            ],
+            "currentValue": acp_runtime_mode_label(&runtime_mode),
+            "options": mode_options,
         }),
         json!({
             "id": ACP_CONFIG_MODEL_ID,
@@ -806,9 +893,10 @@ impl AcpServer {
         self.session_map.get(acp_session_id).map(String::as_str)
     }
 
-    fn build_run_context(
+    fn build_run_context_for_mode(
         &self,
         openclaudia_session_id: &str,
+        runtime_mode: crate::modes::RuntimeMode,
     ) -> Result<Arc<crate::tools::ToolRunContext>, String> {
         let session_id = crate::state::SessionId::from_raw(openclaudia_session_id)
             .map_err(|error| format!("Invalid OpenClaudia session id: {error}"))?;
@@ -818,16 +906,23 @@ impl AcpServer {
             &self.launch_root,
             &self.config.proxy.target,
         )?;
+        run.transition_runtime_mode(runtime_mode)?;
+        crate::guardrails::configure(&run, &self.config.guardrails)
+            .map_err(|error| format!("Cannot configure ACP guardrails: {error}"))?;
+        Ok(run)
+    }
+
+    fn build_run_context(
+        &self,
+        openclaudia_session_id: &str,
+    ) -> Result<Arc<crate::tools::ToolRunContext>, String> {
         let runtime_mode = match self.current_session_mode() {
             SessionMode::Initializer => crate::modes::RuntimeMode::Initializer,
             SessionMode::Coding => {
                 crate::modes::RuntimeMode::Behavioral(crate::modes::BehaviorMode::default())
             }
         };
-        run.transition_runtime_mode(runtime_mode)?;
-        crate::guardrails::configure(&run, &self.config.guardrails)
-            .map_err(|error| format!("Cannot configure ACP guardrails: {error}"))?;
-        Ok(run)
+        self.build_run_context_for_mode(openclaudia_session_id, runtime_mode)
     }
 
     fn run_context_for_acp(
@@ -864,36 +959,106 @@ impl AcpServer {
         )
     }
 
-    fn acp_config_options(&self) -> Vec<Value> {
-        acp_session_config_options(
+    fn acp_config_options(&self, acp_session_id: &str) -> Result<Vec<Value>, AcpCapabilityError> {
+        let run = self
+            .run_context_for_acp(acp_session_id)
+            .ok_or_else(|| AcpCapabilityError::UnknownSession(acp_session_id.to_string()))?;
+        Ok(acp_session_config_options(
             &self.config.proxy.target,
             &self.model,
-            self.current_session_mode(),
-        )
+            run,
+        ))
     }
 
-    fn apply_acp_mode_value(&mut self, mode: &str) -> Result<SessionMode, String> {
-        let (session_mode, runtime_mode) = match mode {
-            "initializer" => (
-                SessionMode::Initializer,
-                crate::modes::RuntimeMode::Initializer,
-            ),
-            "coding" => (
-                SessionMode::Coding,
-                crate::modes::RuntimeMode::Behavioral(crate::modes::BehaviorMode::default()),
-            ),
-            _ => Err(format!(
-                "Invalid value for mode: {mode}. Supported values: initializer, coding"
-            ))?,
-        };
-        if let Some(run) = self
-            .active_conversation_acp_session_id
-            .as_deref()
-            .and_then(|session_id| self.run_contexts.get(session_id))
-        {
-            run.transition_runtime_mode(runtime_mode)?;
+    fn existing_requested_acp_session_id(
+        &self,
+        params: &Value,
+    ) -> Result<Option<String>, AcpCapabilityError> {
+        let session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| self.active_conversation_acp_session_id.clone());
+        if let Some(session_id) = session_id {
+            if !self.session_map.contains_key(&session_id) {
+                return Err(AcpCapabilityError::UnknownSession(session_id));
+            }
+            return Ok(Some(session_id));
         }
-        Ok(self.session_manager.set_current_mode(session_mode).mode)
+        Ok(None)
+    }
+
+    async fn ensure_requested_acp_session_id(
+        &mut self,
+        params: &Value,
+    ) -> Result<String, AcpCapabilityError> {
+        if let Some(session_id) = self.existing_requested_acp_session_id(params)? {
+            return Ok(session_id);
+        }
+        let (acp_session_id, openclaudia_session_id, run) = self
+            .prepare_new_session()
+            .map_err(AcpCapabilityError::Construction)?;
+        self.admit_session_start(&run, &openclaudia_session_id)
+            .await
+            .map_err(AcpCapabilityError::Transition)?;
+        self.install_new_session(&acp_session_id, openclaudia_session_id, Arc::clone(&run));
+        self.install_run_integrations(&acp_session_id, &run).await?;
+        Ok(acp_session_id)
+    }
+
+    async fn apply_acp_mode_value(
+        &mut self,
+        acp_session_id: &str,
+        mode: &str,
+    ) -> Result<Arc<crate::tools::ToolRunContext>, AcpCapabilityError> {
+        let profile = acp_mode_profile(mode)?;
+        let openclaudia_session_id = self
+            .oc_session_id_for_acp(acp_session_id)
+            .ok_or_else(|| AcpCapabilityError::UnknownSession(acp_session_id.to_string()))?
+            .to_string();
+        let current = Arc::clone(
+            self.run_context_for_acp(acp_session_id)
+                .ok_or_else(|| AcpCapabilityError::UnknownSession(acp_session_id.to_string()))?,
+        );
+        if acp_runtime_mode_label(&current.runtime_mode()) == profile.id {
+            return Ok(current);
+        }
+
+        // Validate the requested policy against the live generation without
+        // mutating it. The replacement run is not published until its mode,
+        // workspace, guardrails, and dynamic integrations are ready, so a
+        // failed construction cannot leave the current ACP session in a mode
+        // it never successfully negotiated.
+        current
+            .validate_runtime_mode_transition(&profile.runtime_mode)
+            .map_err(AcpCapabilityError::Transition)?;
+        let persisted_workspace = current.isolated_workspace().cloned();
+        let base = self
+            .build_run_context_for_mode(&openclaudia_session_id, profile.runtime_mode)
+            .map_err(AcpCapabilityError::Construction)?;
+        let next = if let Some(workspace) = persisted_workspace.as_ref() {
+            crate::tools::worktree::release_workspace_descriptor_owner(&current)
+                .map_err(AcpCapabilityError::Transition)?;
+            match crate::tools::ToolRunContext::resume_isolated_workspace(&base, workspace) {
+                Ok(next) => {
+                    crate::tools::retire_run(&base);
+                    next
+                }
+                Err(error) => {
+                    crate::tools::retire_run(&base);
+                    return Err(AcpCapabilityError::Construction(error.to_string()));
+                }
+            }
+        } else {
+            base
+        };
+
+        self.install_run_integrations(acp_session_id, &next).await?;
+        self.replace_run_context(acp_session_id.to_string(), Arc::clone(&next));
+        if self.active_conversation_acp_session_id.as_deref() == Some(acp_session_id) {
+            self.session_manager.set_current_mode(profile.session_mode);
+        }
+        Ok(next)
     }
 
     fn apply_acp_model_value(&mut self, model: &str) -> Result<(), String> {
@@ -910,6 +1075,157 @@ impl AcpServer {
         }
         self.model = model.to_string();
         Ok(())
+    }
+
+    fn discover_runtime_plugins(&mut self) {
+        let mut manager =
+            match crate::plugins::PluginManager::try_new_for_project(&self.launch_root) {
+                Ok(manager) => manager,
+                Err(error) => {
+                    warn!(
+                        %error,
+                        "ACP plugin discovery is limited to project-local search paths"
+                    );
+                    crate::plugins::PluginManager::new_for_project(&self.launch_root)
+                }
+            };
+        for error in manager.discover() {
+            warn!(%error, "ACP plugin discovery rejected an entry");
+        }
+        self.plugin_manager = Some(Arc::new(manager));
+    }
+
+    async fn build_mcp_manager(
+        &self,
+        run: &Arc<crate::tools::ToolRunContext>,
+    ) -> Result<Arc<tokio::sync::RwLock<crate::mcp::McpManager>>, AcpCapabilityError> {
+        let manager = Arc::new(tokio::sync::RwLock::new(
+            crate::mcp::McpManager::new_with_permissions(
+                Arc::clone(run),
+                self.config.permissions.clone(),
+            ),
+        ));
+        if let Some(plugin_manager) = self.plugin_manager.as_ref() {
+            plugin_manager.configure_lsp_service_for_run(run);
+            crate::proxy::connect_mcp_servers(&manager, plugin_manager).await;
+        }
+        if !crate::mcp::install_manager(run, &manager) {
+            return Err(AcpCapabilityError::Integration(format!(
+                "an MCP manager is already installed for run {} generation {}",
+                run.run_id(),
+                run.generation()
+            )));
+        }
+        Ok(manager)
+    }
+
+    async fn install_run_integrations(
+        &mut self,
+        acp_session_id: &str,
+        run: &Arc<crate::tools::ToolRunContext>,
+    ) -> Result<(), AcpCapabilityError> {
+        let next_manager = self.build_mcp_manager(run).await?;
+        let previous = self
+            .mcp_managers
+            .insert(acp_session_id.to_string(), next_manager);
+        if let Some(previous) = previous {
+            if let Err(error) = previous.read().await.disconnect_all().await {
+                warn!(%error, acp_session_id, "Retired ACP MCP manager did not disconnect cleanly");
+            }
+        }
+        self.mcp_managers
+            .retain(|session_id, _| self.session_map.contains_key(session_id));
+        Ok(())
+    }
+
+    async fn effective_tool_catalog(
+        &self,
+        acp_session_id: &str,
+        run: &Arc<crate::tools::ToolRunContext>,
+        messages: &[Value],
+    ) -> Result<crate::tools::catalog::ToolCatalogSnapshot, AcpCapabilityError> {
+        let manager = self
+            .mcp_managers
+            .get(acp_session_id)
+            .ok_or_else(|| {
+                AcpCapabilityError::Integration(format!(
+                    "no dynamic integration manager is bound to ACP session {acp_session_id}"
+                ))
+            })?
+            .read()
+            .await;
+        if !manager.matches_run(run) {
+            return Err(AcpCapabilityError::Integration(format!(
+                "dynamic integration manager does not match run {} generation {}",
+                run.run_id(),
+                run.generation()
+            )));
+        }
+        let dynamic = manager.tool_catalog_snapshot().await;
+        drop(manager);
+        for unavailable in &dynamic.unavailable {
+            warn!(
+                server = %unavailable.server,
+                tool = %unavailable.tool,
+                reason = %unavailable.reason,
+                "ACP dynamic tool is unavailable in this capability generation"
+            );
+        }
+        crate::tools::get_progressive_tool_definitions_with_additional(
+            run,
+            messages,
+            false,
+            &dynamic.definitions,
+        )
+        .map_err(AcpCapabilityError::Catalog)
+    }
+
+    async fn session_capability_payload(
+        &self,
+        acp_session_id: &str,
+    ) -> Result<Value, AcpCapabilityError> {
+        let run = Arc::clone(
+            self.run_context_for_acp(acp_session_id)
+                .ok_or_else(|| AcpCapabilityError::UnknownSession(acp_session_id.to_string()))?,
+        );
+        let catalog = self
+            .effective_tool_catalog(acp_session_id, &run, &[])
+            .await?;
+        let has_tool = |name: &str| catalog.active_names.iter().any(|active| active == name);
+        let mode = run.runtime_mode();
+        if catalog.capability_generation != run.generation()
+            || catalog.runtime_mode_generation != mode.generation
+        {
+            return Err(AcpCapabilityError::Catalog(format!(
+                "capability or runtime mode changed while preparing session {acp_session_id}; retry negotiation"
+            )));
+        }
+        let unrestricted_workspace_write = mode.class == crate::modes::RuntimeModeClass::Standard
+            && (has_tool("edit_file") || has_tool("write_file"));
+        let restricted_write_targets =
+            if mode.class == crate::modes::RuntimeModeClass::Plan && has_tool("write_file") {
+                vec![run.agent_plan_file().display().to_string()]
+            } else {
+                Vec::new()
+            };
+        Ok(json!({
+            "mode": acp_runtime_mode_label(&mode),
+            "capabilityGeneration": catalog.capability_generation.get(),
+            "runtimeModeGeneration": catalog.runtime_mode_generation,
+            "toolCatalogGeneration": catalog.generation.to_string(),
+            "capabilities": {
+                "prompts": true,
+                "tools": !catalog.active_names.is_empty(),
+                "fs": {
+                    "read": has_tool("read_file") || has_tool("grep") || has_tool("glob"),
+                    "write": unrestricted_workspace_write,
+                    "restrictedWriteTargets": restricted_write_targets,
+                },
+                "terminal": has_tool("bash"),
+            },
+            "availableTools": catalog.active_names,
+            "toolSchemas": catalog.definitions,
+        }))
     }
 
     /// Create a new ACP server from the loaded config.
@@ -1012,6 +1328,8 @@ impl AcpServer {
             hook_engine,
             session_map: HashMap::new(),
             run_contexts: HashMap::new(),
+            mcp_managers: HashMap::new(),
+            plugin_manager: None,
             task_managers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             memory_db,
             session_order: VecDeque::new(),
@@ -1180,8 +1498,10 @@ impl AcpServer {
             "session/load" => self.handle_session_load(msg.id, &params).await,
             "session/prompt" => self.handle_session_prompt(msg.id, params).await,
             "session/cancel" => self.handle_session_cancel(msg.id, params),
-            "session/set_mode" => self.handle_session_set_mode(msg.id, &params),
-            "session/set_config_option" => self.handle_session_set_config_option(msg.id, &params),
+            "session/set_mode" => self.handle_session_set_mode(msg.id, &params).await,
+            "session/set_config_option" => {
+                self.handle_session_set_config_option(msg.id, &params).await;
+            }
             // ─── IDE bridge notifications (crosslink #517) ───
             // Editor plugins push file-open / selection / diagnostic
             // events here. They're fire-and-forget (no response) —
@@ -1204,6 +1524,11 @@ impl AcpServer {
 
     fn handle_initialize(&self, id: Option<Value>, _params: Value) {
         let Some(id) = id else { return };
+        let launch = &self.launch_capabilities;
+        let mode_options = acp_mode_profiles()
+            .into_iter()
+            .map(|profile| profile.id)
+            .collect::<Vec<_>>();
 
         self.send_response(
             id,
@@ -1215,13 +1540,15 @@ impl AcpServer {
                 },
                 "capabilities": {
                     "prompts": true,
-                    "tools": true,
+                    "tools": launch.grants_resource(crate::tools::ToolResource::WorkspaceRead),
                     "fs": {
-                        "read": true,
-                        "write": true,
+                        "read": launch.grants_resource(crate::tools::ToolResource::WorkspaceRead),
+                        "write": launch.grants_resource(crate::tools::ToolResource::WorkspaceWrite),
                     },
-                    "terminal": true,
+                    "terminal": launch.grants_resource(crate::tools::ToolResource::Process),
                 },
+                "sessionModes": mode_options,
+                "effectiveSessionCapabilities": true,
             })),
             None,
         );
@@ -1263,8 +1590,15 @@ impl AcpServer {
             return;
         }
 
-        self.install_new_session(&acp_session_id, oc_session_id, run_context);
-        self.send_new_session_response(id, &acp_session_id);
+        self.install_new_session(&acp_session_id, oc_session_id, Arc::clone(&run_context));
+        if let Err(error) = self
+            .install_run_integrations(&acp_session_id, &run_context)
+            .await
+        {
+            self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+            return;
+        }
+        self.send_new_session_response(id, &acp_session_id).await;
     }
 
     async fn admit_session_start(
@@ -1306,12 +1640,27 @@ impl AcpServer {
         }
     }
 
-    fn send_new_session_response(&self, id: Value, acp_session_id: &str) {
+    async fn send_new_session_response(&self, id: Value, acp_session_id: &str) {
+        let config_options = match self.acp_config_options(acp_session_id) {
+            Ok(options) => options,
+            Err(error) => {
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                return;
+            }
+        };
+        let effective = match self.session_capability_payload(acp_session_id).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                return;
+            }
+        };
         self.send_response(
             id,
             Some(json!({
                 "sessionId": acp_session_id,
-                "configOptions": self.acp_config_options(),
+                "configOptions": config_options,
+                "effectiveCapabilities": effective,
             })),
             None,
         );
@@ -1319,6 +1668,7 @@ impl AcpServer {
         info!(acp_session_id = %acp_session_id, "Created new ACP session");
     }
 
+    #[allow(clippy::too_many_lines)] // One ACP load transaction with explicit rollback boundaries.
     async fn handle_session_load(&mut self, id: Option<Value>, params: &Value) {
         let Some(id) = id else { return };
 
@@ -1358,17 +1708,39 @@ impl AcpServer {
                 }
                 // Restore it as active only after canonical admission.
                 self.session_manager.start_coding(&session.id);
-                self.replace_run_context(acp_session_id.clone(), run_context);
+                self.replace_run_context(acp_session_id.clone(), Arc::clone(&run_context));
+                if let Err(error) = self
+                    .install_run_integrations(&acp_session_id, &run_context)
+                    .await
+                {
+                    self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                    return;
+                }
                 self.reset_state_for_session(&oc_id);
                 self.messages.clear();
                 self.provider_native_state = None;
                 self.active_conversation_acp_session_id = Some(acp_session_id.clone());
+                let config_options = match self.acp_config_options(&acp_session_id) {
+                    Ok(options) => options,
+                    Err(error) => {
+                        self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                        return;
+                    }
+                };
+                let effective = match self.session_capability_payload(&acp_session_id).await {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                        return;
+                    }
+                };
                 self.send_response(
                     id,
                     Some(json!({
                         "sessionId": acp_session_id,
                         "loaded": true,
-                        "configOptions": self.acp_config_options(),
+                        "configOptions": config_options,
+                        "effectiveCapabilities": effective,
                     })),
                     None,
                 );
@@ -1396,7 +1768,18 @@ impl AcpServer {
             );
             return;
         }
-        self.upsert_session_mapping(acp_session_id.clone(), oc_session_id, run_context);
+        self.upsert_session_mapping(
+            acp_session_id.clone(),
+            oc_session_id,
+            Arc::clone(&run_context),
+        );
+        if let Err(error) = self
+            .install_run_integrations(&acp_session_id, &run_context)
+            .await
+        {
+            self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+            return;
+        }
         self.messages.clear();
         self.provider_native_state = None;
         self.active_conversation_acp_session_id = Some(acp_session_id.clone());
@@ -1404,12 +1787,27 @@ impl AcpServer {
             self.reset_state_for_session(oc_session_id);
         }
 
+        let config_options = match self.acp_config_options(&acp_session_id) {
+            Ok(options) => options,
+            Err(error) => {
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                return;
+            }
+        };
+        let effective = match self.session_capability_payload(&acp_session_id).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                return;
+            }
+        };
         self.send_response(
             id,
             Some(json!({
                 "sessionId": acp_session_id,
                 "loaded": false,
-                "configOptions": self.acp_config_options(),
+                "configOptions": config_options,
+                "effectiveCapabilities": effective,
             })),
             None,
         );
@@ -1433,7 +1831,7 @@ impl AcpServer {
         info!("Prompt cancellation requested");
     }
 
-    fn handle_session_set_mode(&mut self, id: Option<Value>, params: &Value) {
+    async fn handle_session_set_mode(&mut self, id: Option<Value>, params: &Value) {
         let Some(id) = id else { return };
 
         let mode = match Self::required_alias_string_param(params, "mode", "modeId", "Missing mode")
@@ -1444,40 +1842,76 @@ impl AcpServer {
                 return;
             }
         };
+        if mode != "auto" && acp_mode_profile(mode).is_err() {
+            self.send_error(
+                id,
+                INVALID_PARAMS,
+                &AcpCapabilityError::UnknownMode(mode.to_string()).to_string(),
+            );
+            return;
+        }
+        let acp_session_id = match self.ensure_requested_acp_session_id(params).await {
+            Ok(session_id) => session_id,
+            Err(error) => {
+                self.send_error(id, INVALID_PARAMS, &error.to_string());
+                return;
+            }
+        };
 
         let active_mode = match mode {
-            "initializer" | "coding" => match self.apply_acp_mode_value(mode) {
-                Ok(mode) => mode,
-                Err(reason) => {
-                    self.send_error(id, INVALID_PARAMS, &reason);
-                    return;
+            "initializer" | "coding" | "plan" | "readonly" => {
+                match self.apply_acp_mode_value(&acp_session_id, mode).await {
+                    Ok(run) => acp_runtime_mode_label(&run.runtime_mode()),
+                    Err(reason) => {
+                        self.send_error(id, INVALID_PARAMS, &reason.to_string());
+                        return;
+                    }
                 }
-            },
-            "auto" => self.session_manager.get_or_create_session().mode,
+            }
+            "auto" => self
+                .run_context_for_acp(&acp_session_id)
+                .map_or("initializer", |run| {
+                    acp_runtime_mode_label(&run.runtime_mode())
+                }),
             _ => {
                 self.send_error(
                     id,
                     INVALID_PARAMS,
-                    &format!("Invalid mode: {mode}. Supported: initializer, coding, auto"),
+                    &AcpCapabilityError::UnknownMode(mode.to_string()).to_string(),
                 );
                 return;
             }
         };
-        let active_mode = acp_mode_label(active_mode);
+        let config_options = match self.acp_config_options(&acp_session_id) {
+            Ok(options) => options,
+            Err(error) => {
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                return;
+            }
+        };
+        let effective = match self.session_capability_payload(&acp_session_id).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                return;
+            }
+        };
 
         self.send_response(
             id,
             Some(json!({
+                "sessionId": acp_session_id,
                 "mode": mode,
                 "activeMode": active_mode,
-                "configOptions": self.acp_config_options(),
+                "configOptions": config_options,
+                "effectiveCapabilities": effective,
             })),
             None,
         );
         info!(requested_mode = %mode, active_mode, "Session mode set");
     }
 
-    fn handle_session_set_config_option(&mut self, id: Option<Value>, params: &Value) {
+    async fn handle_session_set_config_option(&mut self, id: Option<Value>, params: &Value) {
         let Some(id) = id else { return };
 
         let uses_v1_shape = params.get("configId").is_some();
@@ -1503,7 +1937,6 @@ impl AcpServer {
                 }
             }
         }
-
         let value = match Self::required_string_param(params, "value", "Missing string value") {
             Ok(value) => value.to_string(),
             Err(message) => {
@@ -1511,9 +1944,36 @@ impl AcpServer {
                 return;
             }
         };
+        if !matches!(config_id.as_str(), ACP_CONFIG_MODE_ID | ACP_CONFIG_MODEL_ID) {
+            self.send_error(
+                id,
+                INVALID_PARAMS,
+                &format!("Unknown configId: {config_id}. Supported values: mode, model"),
+            );
+            return;
+        }
+        if config_id == ACP_CONFIG_MODE_ID && acp_mode_profile(&value).is_err() {
+            self.send_error(
+                id,
+                INVALID_PARAMS,
+                &AcpCapabilityError::UnknownMode(value.clone()).to_string(),
+            );
+            return;
+        }
+        let acp_session_id = match self.ensure_requested_acp_session_id(params).await {
+            Ok(session_id) => session_id,
+            Err(error) => {
+                self.send_error(id, INVALID_PARAMS, &error.to_string());
+                return;
+            }
+        };
 
         let apply_result = match config_id.as_str() {
-            ACP_CONFIG_MODE_ID => self.apply_acp_mode_value(&value).map(|_| ()),
+            ACP_CONFIG_MODE_ID => self
+                .apply_acp_mode_value(&acp_session_id, &value)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
             ACP_CONFIG_MODEL_ID => self.apply_acp_model_value(&value),
             _ => Err(format!(
                 "Unknown configId: {config_id}. Supported values: mode, model"
@@ -1527,10 +1987,26 @@ impl AcpServer {
 
         self.config_options
             .insert(config_id.clone(), Value::String(value.clone()));
+        let config_options = match self.acp_config_options(&acp_session_id) {
+            Ok(options) => options,
+            Err(error) => {
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                return;
+            }
+        };
+        let effective = match self.session_capability_payload(&acp_session_id).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                return;
+            }
+        };
         self.send_response(
             id,
             Some(json!({
-                "configOptions": self.acp_config_options(),
+                "sessionId": acp_session_id,
+                "configOptions": config_options,
+                "effectiveCapabilities": effective,
             })),
             None,
         );
@@ -1635,11 +2111,20 @@ impl AcpServer {
         Ok((session_id.to_string(), prompt.to_string()))
     }
 
-    fn prepare_prompt_run_context(
+    async fn prepare_prompt_run_context(
         &mut self,
         acp_session_id: &str,
         oc_session_id: &str,
     ) -> Result<Arc<crate::tools::ToolRunContext>, String> {
+        let runtime_mode = self.run_contexts.get(acp_session_id).map_or_else(
+            || match self.current_session_mode() {
+                SessionMode::Initializer => crate::modes::RuntimeMode::Initializer,
+                SessionMode::Coding => {
+                    crate::modes::RuntimeMode::Behavioral(crate::modes::BehaviorMode::default())
+                }
+            },
+            |run| run.runtime_mode().mode,
+        );
         let persisted_workspace = self
             .run_contexts
             .get(acp_session_id)
@@ -1650,7 +2135,7 @@ impl AcpServer {
                 crate::tools::retire_run(&retired);
             }
         }
-        let base_run = self.build_run_context(oc_session_id)?;
+        let base_run = self.build_run_context_for_mode(oc_session_id, runtime_mode)?;
         let run_context = if let Some(workspace) = persisted_workspace.as_ref() {
             match crate::tools::ToolRunContext::resume_isolated_workspace(&base_run, workspace) {
                 Ok(run) => {
@@ -1666,9 +2151,13 @@ impl AcpServer {
             base_run
         };
         self.replace_run_context(acp_session_id.to_string(), Arc::clone(&run_context));
+        self.install_run_integrations(acp_session_id, &run_context)
+            .await
+            .map_err(|error| error.to_string())?;
         Ok(run_context)
     }
 
+    #[allow(clippy::too_many_lines)] // Keep prompt admission and published capability response together.
     async fn handle_session_prompt(&mut self, id: Option<Value>, params: Value) {
         let Some(id) = id else { return };
         let (acp_session_id, prompt) = match Self::parse_prompt_params(&params) {
@@ -1692,7 +2181,10 @@ impl AcpServer {
         // A prompt is one cancellable run generation. Rotate the capability
         // rather than clearing a process-global cancellation bit so a prior
         // cancelled turn can never poison or revive another turn.
-        let run_context = match self.prepare_prompt_run_context(&acp_session_id, &oc_session_id) {
+        let run_context = match self
+            .prepare_prompt_run_context(&acp_session_id, &oc_session_id)
+            .await
+        {
             Ok(run) => run,
             Err(error) => {
                 self.send_error(id, _INTERNAL_ERROR, &error);
@@ -1774,11 +2266,19 @@ impl AcpServer {
             session.request_count += 1;
             session.updated_at = chrono::Utc::now();
         }
+        let effective = match self.session_capability_payload(&acp_session_id).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                return;
+            }
+        };
 
         self.send_response(
             id,
             Some(json!({
                 "stopReason": stop_reason,
+                "effectiveCapabilities": effective,
             })),
             None,
         );
@@ -1843,17 +2343,19 @@ impl AcpServer {
             }
 
             // Build the request
-            let tools =
-                match crate::tools::get_progressive_tool_definitions(&run, &self.messages, false)
-                    .and_then(|snapshot| {
-                        acp_tool_definitions_for_chat_request(snapshot.definitions_value())
-                    }) {
-                    Ok(tools) => tools,
-                    Err(e) => {
-                        let text = format!("Internal ACP tool registry error: {e}");
-                        return self.fail_prompt_with_update(acp_session_id, &text);
-                    }
-                };
+            let tools = match self
+                .effective_tool_catalog(acp_session_id, &run, &self.messages)
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|snapshot| {
+                    acp_tool_definitions_for_chat_request(snapshot.definitions_value())
+                }) {
+                Ok(tools) => tools,
+                Err(e) => {
+                    let text = format!("Internal ACP tool registry error: {e}");
+                    return self.fail_prompt_with_update(acp_session_id, &text);
+                }
+            };
             // The exact generation-bound run supplies both the model-visible
             // working directory and the bounded project skill layer.
             let ide_state = self.ide_state();
@@ -2416,6 +2918,62 @@ impl AcpServer {
                                 &tc.arguments,
                             )
                             .await;
+                        match result.follow_up().clone() {
+                            crate::tools::ToolFollowUp::EnterPlanMode { .. } => {
+                                match self.apply_acp_mode_value(acp_session_id, "plan").await {
+                                    Ok(next_run) => {
+                                        let mode = next_run.runtime_mode();
+                                        result = result
+                                            .resolve_follow_up(
+                                                format!(
+                                                    "Entered Plan mode generation {}. Workspace and external effects are now denied.",
+                                                    mode.generation
+                                                ),
+                                                json!({
+                                                    "mode": "plan",
+                                                    "capabilityGeneration": next_run.generation().get(),
+                                                    "runtimeModeGeneration": mode.generation,
+                                                }),
+                                            )
+                                            .unwrap_or(result);
+                                        run = next_run;
+                                        task_obs = self.messages.iter().rev().find_map(|message| {
+                                            (message.get("role").and_then(Value::as_str)
+                                                == Some("user"))
+                                            .then(|| message.get("content").and_then(Value::as_str))
+                                            .flatten()
+                                            .and_then(|content| {
+                                                crate::grounded_loop::observe_session_user_task(
+                                                    &run,
+                                                    oc_session_id,
+                                                    content,
+                                                    &self.model,
+                                                )
+                                            })
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let reason = error.to_string();
+                                        result = result
+                                            .cancel_follow_up(
+                                                format!(
+                                                    "Plan mode transition was rejected: {reason}"
+                                                ),
+                                                reason,
+                                            )
+                                            .unwrap_or(result);
+                                    }
+                                }
+                            }
+                            crate::tools::ToolFollowUp::ExitPlanMode { .. } => {
+                                let reason = "Plan mode remains active until the ACP client explicitly negotiates session/set_mode for this sessionId".to_string();
+                                result = result
+                                    .cancel_follow_up(reason.clone(), reason)
+                                    .unwrap_or(result);
+                            }
+                            crate::tools::ToolFollowUp::None
+                            | crate::tools::ToolFollowUp::UserQuestion { .. } => {}
+                        }
                         record_acp_tool_result_observation(&run, oc_session_id, &result);
                         if let Some(transition) = result.workspace_transition() {
                             match crate::tools::ToolRunContext::apply_workspace_transition(
@@ -2436,12 +2994,28 @@ impl AcpServer {
                                             ),
                                         );
                                     }
+                                    if let Err(error) = self
+                                        .install_run_integrations(acp_session_id, &next_run)
+                                        .await
+                                    {
+                                        result = result.with_postcondition_failure(
+                                            ToolFailure::new(
+                                                ToolFailureCode::Internal,
+                                                format!(
+                                                    "Workspace changed, but ACP integration rebinding failed: {error}"
+                                                ),
+                                                ToolRetryability::Never,
+                                            ),
+                                        );
+                                    }
                                     self.task_managers
                                         .lock()
                                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                                         .remove(oc_session_id);
-                                    self.run_contexts
-                                        .insert(acp_session_id.to_string(), Arc::clone(&next_run));
+                                    self.replace_run_context(
+                                        acp_session_id.to_string(),
+                                        Arc::clone(&next_run),
+                                    );
                                     task_obs = self.messages.iter().rev().find_map(|message| {
                                         (message.get("role").and_then(Value::as_str)
                                             == Some("user"))
@@ -2772,7 +3346,7 @@ impl AcpServer {
         arguments_json: &str,
     ) -> ToolResult {
         let tool_call = acp_tool_call(tool_call_id, tool_name, arguments_json);
-        if let Err(reason) = run.tool_catalog().admit_tool_call(tool_name) {
+        if let Err(reason) = run.tool_catalog().admit_tool_call(run, tool_name) {
             return ToolResult::failure(
                 &tool_call,
                 ToolFailureCode::Unavailable,
@@ -3274,6 +3848,11 @@ impl AcpServer {
 
 impl Drop for AcpServer {
     fn drop(&mut self) {
+        // Drop integration owners before retiring their exact capability
+        // generations. Connection actors cannot then retain authority beyond
+        // the ACP server lifecycle.
+        self.mcp_managers.clear();
+        self.plugin_manager = None;
         let launch_run_id = self.launch_capabilities.run_id();
         for (_, run) in self.run_contexts.drain() {
             if run.run_id() != launch_run_id {
@@ -3930,6 +4509,7 @@ pub async fn run_acp_server(
         host_home,
     )
     .map_err(anyhow::Error::msg)?;
+    server.discover_runtime_plugins();
 
     // Spawn stdin reader on a blocking thread — stdin.lock() is not Send.
     // Cancellation is raised here, before the sequential dispatcher receives
@@ -4979,8 +5559,8 @@ mod tool_argument_tests {
 #[cfg(test)]
 mod session_mode_tests {
     use super::{
-        acp_mode_label, build_acp_prompt_context, AcpServer, ACP_CONFIG_MODEL_ID,
-        ACP_CONFIG_MODE_ID, INVALID_PARAMS,
+        build_acp_prompt_context, AcpServer, ACP_CONFIG_MODEL_ID, ACP_CONFIG_MODE_ID,
+        INVALID_PARAMS,
     };
     use crate::config::{AppConfig, Hook, HookEntry, HookPolicy, HooksConfig};
     use crate::hooks::HookEngine;
@@ -5065,6 +5645,8 @@ memory:
             hook_engine: HookEngine::new(HooksConfig::default()),
             session_map: HashMap::new(),
             run_contexts,
+            mcp_managers: HashMap::new(),
+            plugin_manager: None,
             task_managers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             memory_db,
             session_order: VecDeque::new(),
@@ -6792,12 +7374,6 @@ blast_radius:
             .expect("expected config option")
     }
 
-    #[test]
-    fn acp_mode_label_matches_protocol_tokens() {
-        assert_eq!(acp_mode_label(SessionMode::Initializer), "initializer");
-        assert_eq!(acp_mode_label(SessionMode::Coding), "coding");
-    }
-
     #[tokio::test]
     async fn session_set_mode_updates_active_session_without_replacing_id() {
         let (mut server, mut rx, _tmp) = test_server();
@@ -6825,7 +7401,9 @@ blast_radius:
             crate::modes::RuntimeModeClass::ReadOnly
         );
 
-        server.handle_session_set_mode(Some(json!(2)), &json!({"mode": "coding"}));
+        server
+            .handle_session_set_mode(Some(json!(2)), &json!({"mode": "coding"}))
+            .await;
         let response = next_response(&mut rx);
 
         assert_eq!(response["result"]["mode"], "coding");
@@ -6845,7 +7423,9 @@ blast_radius:
             crate::modes::RuntimeModeClass::Standard
         );
 
-        server.handle_session_set_mode(Some(json!(3)), &json!({"mode": "initializer"}));
+        server
+            .handle_session_set_mode(Some(json!(3)), &json!({"mode": "initializer"}))
+            .await;
         let response = next_response(&mut rx);
 
         assert_eq!(response["result"]["mode"], "initializer");
@@ -6867,11 +7447,13 @@ blast_radius:
         );
     }
 
-    #[test]
-    fn session_set_mode_auto_creates_and_reports_selected_mode() {
+    #[tokio::test]
+    async fn session_set_mode_auto_creates_and_reports_selected_mode() {
         let (mut server, mut rx, _tmp) = test_server();
 
-        server.handle_session_set_mode(Some(json!(1)), &json!({"mode": "auto"}));
+        server
+            .handle_session_set_mode(Some(json!(1)), &json!({"mode": "auto"}))
+            .await;
         let response = next_response(&mut rx);
 
         assert_eq!(response["result"]["mode"], "auto");
@@ -6917,8 +7499,8 @@ blast_radius:
         }
     }
 
-    #[test]
-    fn session_set_mode_rejects_wrong_type_mode_without_mutation() {
+    #[tokio::test]
+    async fn session_set_mode_rejects_wrong_type_mode_without_mutation() {
         let (mut server, mut rx, _tmp) = test_server();
 
         for (id, params, expected) in [
@@ -6933,7 +7515,7 @@ blast_radius:
                 "Invalid 'modeId' parameter: expected string",
             ),
         ] {
-            server.handle_session_set_mode(Some(id), &params);
+            server.handle_session_set_mode(Some(id), &params).await;
             let response = next_response(&mut rx);
 
             assert_invalid_params(&response, expected);
@@ -6958,7 +7540,9 @@ blast_radius:
             .id
             .clone();
 
-        server.handle_session_set_mode(Some(json!(2)), &json!({"mode": "plan"}));
+        server
+            .handle_session_set_mode(Some(json!(2)), &json!({"mode": "unsupported"}))
+            .await;
         let response = next_response(&mut rx);
 
         assert_eq!(response["error"]["code"], INVALID_PARAMS);
@@ -7001,6 +7585,158 @@ blast_radius:
             assert!(state.ide.active_file.is_none());
             assert_eq!(state.identity.session_id.as_str(), mapped_session_id);
         });
+        let mode_values = config_option(&response, ACP_CONFIG_MODE_ID)["options"]
+            .as_array()
+            .expect("mode options")
+            .iter()
+            .filter_map(|option| option["value"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mode_values,
+            vec!["initializer", "coding", "plan", "readonly"]
+        );
+        assert_eq!(
+            response["result"]["effectiveCapabilities"]["mode"],
+            "initializer"
+        );
+        assert_eq!(
+            response["result"]["effectiveCapabilities"]["capabilities"]["fs"]["write"],
+            false
+        );
+        assert_eq!(
+            response["result"]["effectiveCapabilities"]["capabilities"]["terminal"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn negotiated_mode_rotates_capability_and_denies_unadvertised_effects() {
+        let (mut server, mut rx, _tmp) = test_server();
+        server
+            .handle_session_new_canonical(Some(json!(1)), Value::Null)
+            .await;
+        let created = next_response(&mut rx);
+        let acp_session_id = created["result"]["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        let initializer_generation = created["result"]["effectiveCapabilities"]
+            ["capabilityGeneration"]
+            .as_u64()
+            .expect("initializer capability generation");
+
+        server
+            .handle_session_set_mode(
+                Some(json!(2)),
+                &json!({"sessionId": acp_session_id, "mode": "coding"}),
+            )
+            .await;
+        let coding = next_response(&mut rx);
+        let coding_generation = coding["result"]["effectiveCapabilities"]["capabilityGeneration"]
+            .as_u64()
+            .expect("coding capability generation");
+        assert_ne!(initializer_generation, coding_generation);
+        assert_eq!(coding["result"]["activeMode"], "coding");
+        assert_eq!(
+            coding["result"]["effectiveCapabilities"]["capabilities"]["fs"]["write"],
+            true
+        );
+
+        server
+            .handle_session_set_mode(
+                Some(json!(3)),
+                &json!({"sessionId": acp_session_id, "mode": "readonly"}),
+            )
+            .await;
+        let readonly = next_response(&mut rx);
+        assert_eq!(readonly["result"]["activeMode"], "readonly");
+        assert_eq!(
+            readonly["result"]["effectiveCapabilities"]["capabilities"]["fs"]["write"],
+            false
+        );
+        let run = Arc::clone(
+            server
+                .run_context_for_acp(&acp_session_id)
+                .expect("read-only run"),
+        );
+        let result = server
+            .execute_tool_via_acp(
+                &run,
+                "acp-readonly",
+                "call-write-denied",
+                "write_file",
+                r#"{"path":"forbidden.txt","content":"forbidden"}"#,
+            )
+            .await;
+        let ToolOutcome::Error { failure } = result.outcome() else {
+            panic!("unadvertised write must be rejected: {result:#?}");
+        };
+        assert_eq!(failure.code, ToolFailureCode::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn plan_mode_is_advertised_from_the_canonical_policy() {
+        let (mut server, mut rx, _tmp) = test_server();
+        server
+            .handle_session_new_canonical(Some(json!(1)), Value::Null)
+            .await;
+        let created = next_response(&mut rx);
+        let acp_session_id = created["result"]["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+
+        server
+            .handle_session_set_mode(
+                Some(json!(2)),
+                &json!({"sessionId": acp_session_id, "mode": "plan"}),
+            )
+            .await;
+        let response = next_response(&mut rx);
+        assert_eq!(response["result"]["activeMode"], "plan");
+        assert_eq!(response["result"]["effectiveCapabilities"]["mode"], "plan");
+        let available = response["result"]["effectiveCapabilities"]["availableTools"]
+            .as_array()
+            .expect("available tools");
+        for forbidden in ["bash", "edit_file"] {
+            assert!(!available
+                .iter()
+                .any(|name| name.as_str() == Some(forbidden)));
+        }
+        assert!(available
+            .iter()
+            .any(|name| name.as_str() == Some("write_file")));
+        assert_eq!(
+            response["result"]["effectiveCapabilities"]["capabilities"]["fs"]["write"],
+            false
+        );
+        assert_eq!(
+            response["result"]["effectiveCapabilities"]["capabilities"]["fs"]
+                ["restrictedWriteTargets"]
+                .as_array()
+                .expect("plan write targets")
+                .len(),
+            1
+        );
+
+        let run = Arc::clone(
+            server
+                .run_context_for_acp(&acp_session_id)
+                .expect("plan run"),
+        );
+        let result = server
+            .execute_tool_via_acp(
+                &run,
+                "acp-plan",
+                "call-plan-write-denied",
+                "write_file",
+                r#"{"path":"outside-plan.md","content":"forbidden"}"#,
+            )
+            .await;
+        let ToolOutcome::Error { failure } = result.outcome() else {
+            panic!("write outside the advertised plan target must fail: {result:#?}");
+        };
+        assert_eq!(failure.code, ToolFailureCode::PolicyDenied);
     }
 
     #[tokio::test]
@@ -7015,14 +7751,16 @@ blast_radius:
             .expect("session id")
             .to_string();
 
-        server.handle_session_set_config_option(
-            Some(json!(2)),
-            &json!({
-                "sessionId": acp_session_id,
-                "configId": "mode",
-                "value": "coding",
-            }),
-        );
+        server
+            .handle_session_set_config_option(
+                Some(json!(2)),
+                &json!({
+                    "sessionId": acp_session_id,
+                    "configId": "mode",
+                    "value": "coding",
+                }),
+            )
+            .await;
         let response = next_response(&mut rx);
 
         assert_eq!(
@@ -7053,14 +7791,16 @@ blast_radius:
             .expect("session id")
             .to_string();
 
-        server.handle_session_set_config_option(
-            Some(json!(2)),
-            &json!({
-                "sessionId": acp_session_id,
-                "configId": "model",
-                "value": "claude-opus-4-7",
-            }),
-        );
+        server
+            .handle_session_set_config_option(
+                Some(json!(2)),
+                &json!({
+                    "sessionId": acp_session_id,
+                    "configId": "model",
+                    "value": "claude-opus-4-7",
+                }),
+            )
+            .await;
         let response = next_response(&mut rx);
 
         assert_eq!(server.model, "claude-opus-4-7");
@@ -7084,14 +7824,16 @@ blast_radius:
             .expect("session id")
             .to_string();
 
-        server.handle_session_set_config_option(
-            Some(json!(2)),
-            &json!({
-                "sessionId": acp_session_id,
-                "configId": "model",
-                "value": "not-advertised",
-            }),
-        );
+        server
+            .handle_session_set_config_option(
+                Some(json!(2)),
+                &json!({
+                    "sessionId": acp_session_id,
+                    "configId": "model",
+                    "value": "not-advertised",
+                }),
+            )
+            .await;
         let response = next_response(&mut rx);
 
         assert_eq!(server.model, "not-advertised");
@@ -7120,14 +7862,16 @@ blast_radius:
             .expect("session id")
             .to_string();
 
-        server.handle_session_set_config_option(
-            Some(json!(2)),
-            &json!({
-                "sessionId": acp_session_id,
-                "configId": "model",
-                "value": "not-allowed",
-            }),
-        );
+        server
+            .handle_session_set_config_option(
+                Some(json!(2)),
+                &json!({
+                    "sessionId": acp_session_id,
+                    "configId": "model",
+                    "value": "not-allowed",
+                }),
+            )
+            .await;
         let response = next_response(&mut rx);
 
         assert_invalid_params(&response, "Blocked by policy");
@@ -7138,8 +7882,8 @@ blast_radius:
         assert_eq!(server.model, "allowed-model");
     }
 
-    #[test]
-    fn session_set_config_option_rejects_wrong_type_fields_without_mutation() {
+    #[tokio::test]
+    async fn session_set_config_option_rejects_wrong_type_fields_without_mutation() {
         let (mut server, mut rx, _tmp) = test_server();
 
         for (id, params, expected) in [
@@ -7164,7 +7908,9 @@ blast_radius:
                 "Invalid 'key' parameter: expected string",
             ),
         ] {
-            server.handle_session_set_config_option(Some(id), &params);
+            server
+                .handle_session_set_config_option(Some(id), &params)
+                .await;
             let response = next_response(&mut rx);
 
             assert_invalid_params(&response, expected);
@@ -7180,17 +7926,19 @@ blast_radius:
         }
     }
 
-    #[test]
-    fn session_set_config_option_accepts_legacy_key_alias_for_mode() {
+    #[tokio::test]
+    async fn session_set_config_option_accepts_legacy_key_alias_for_mode() {
         let (mut server, mut rx, _tmp) = test_server();
 
-        server.handle_session_set_config_option(
-            Some(json!(1)),
-            &json!({
-                "key": "mode",
-                "value": "coding",
-            }),
-        );
+        server
+            .handle_session_set_config_option(
+                Some(json!(1)),
+                &json!({
+                    "key": "mode",
+                    "value": "coding",
+                }),
+            )
+            .await;
         let response = next_response(&mut rx);
 
         assert_eq!(

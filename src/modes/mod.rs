@@ -954,10 +954,12 @@ impl RuntimeModeAuthority {
 
     /// Validate a transition against the current target generation without
     /// mutating authority.
-    pub(crate) fn validate_transition(&self, mode: &RuntimeMode) -> Result<(), String> {
+    pub(crate) fn validate_transition(
+        &self,
+        mode: &RuntimeMode,
+    ) -> Result<RuntimeModeClass, String> {
         let scope_targets = self.snapshot().scope_targets;
         self.validate_scoped_transition(mode, &scope_targets)
-            .map(|_| ())
     }
 
     /// Validate and bind a prospective complete profile without publishing it.

@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::runtime::{CapabilityKind, ContentDigest};
+use crate::runtime::{CapabilityGeneration, CapabilityKind, ContentDigest};
 
 use super::effect::{self, ToolEffectSpec, ToolSurface};
 use super::registry::registry;
@@ -55,6 +55,10 @@ const BOOTSTRAP_NAMES: &[&str] = &[
 /// Exact host-published catalog view used for one provider request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCatalogSnapshot {
+    /// Immutable run capability generation that produced this publication.
+    pub capability_generation: CapabilityGeneration,
+    /// Exact behavioral-policy generation used to filter the definitions.
+    pub runtime_mode_generation: u64,
     /// Deterministic digest of definitions, capabilities, and source metadata.
     pub generation: ContentDigest,
     /// OpenAI-format definitions in deterministic priority order.
@@ -163,6 +167,8 @@ impl CatalogEntry {
 #[derive(Debug, Clone)]
 struct PublishedCatalog {
     generation: ContentDigest,
+    capability_generation: CapabilityGeneration,
+    runtime_mode_generation: u64,
     active_names: BTreeSet<String>,
 }
 
@@ -228,9 +234,18 @@ impl RunToolCatalog {
             state.unavailable = unavailable;
         }
 
-        let snapshot = build_snapshot(&state, messages)?;
+        let snapshot = build_snapshot(&state, messages, run.generation(), runtime_mode.generation)?;
+        let current_mode = run.runtime_mode();
+        if current_mode.generation != runtime_mode.generation {
+            return Err(format!(
+                "runtime mode changed from generation {} to {} while preparing the tool catalog; retry publication",
+                runtime_mode.generation, current_mode.generation
+            ));
+        }
         state.published = Some(PublishedCatalog {
             generation: snapshot.generation,
+            capability_generation: snapshot.capability_generation,
+            runtime_mode_generation: snapshot.runtime_mode_generation,
             active_names: snapshot.active_names.iter().cloned().collect(),
         });
         drop(state);
@@ -329,25 +344,25 @@ impl RunToolCatalog {
     ///
     /// Returns an error when the last published view is stale or did not
     /// advertise the requested canonical tool name.
-    pub fn admit_tool_call(&self, tool_name: &str) -> Result<(), String> {
+    pub fn admit_tool_call(&self, run: &ToolRunContext, tool_name: &str) -> Result<(), String> {
         let state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.published.as_ref().map_or(Ok(()), |published| {
-            if published.generation != state.generation {
-                Err(format!(
-                    "Tool catalog generation {} is stale; current generation is {}",
-                    published.generation, state.generation
-                ))
-            } else if published.active_names.contains(tool_name) {
-                Ok(())
-            } else {
-                Err(format!(
-                    "Tool '{tool_name}' was not active in catalog generation {}; call tool_search and retry on the next provider request",
-                    state.generation
-                ))
-            }
+            stale_publication_reason(run, &state, published).map_or_else(
+                || {
+                    if published.active_names.contains(tool_name) {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "Tool '{tool_name}' was not active in catalog generation {}; call tool_search and retry on the next provider request",
+                            state.generation
+                        ))
+                    }
+                },
+                Err,
+            )
         })
     }
 
@@ -359,6 +374,7 @@ impl RunToolCatalog {
     /// Returns the same stale/unadvertised errors as [`Self::admit_tool_call`].
     pub(crate) fn admit_tool_call_with_receipt(
         &self,
+        run: &ToolRunContext,
         tool_name: &str,
     ) -> Result<ToolCallAdmission, String> {
         let state = self
@@ -378,11 +394,8 @@ impl RunToolCatalog {
                 )
             },
             |published| {
-                if published.generation != state.generation {
-                    Err(format!(
-                        "Tool catalog generation {} is stale; current generation is {}",
-                        published.generation, state.generation
-                    ))
+                if let Some(reason) = stale_publication_reason(run, &state, published) {
+                    Err(reason)
                 } else if published.active_names.contains(tool_name) {
                     let entry = state.entries.get(tool_name).ok_or_else(|| {
                         format!(
@@ -412,6 +425,34 @@ impl RunToolCatalog {
             .as_ref()
             .map(|published| published.generation)
     }
+}
+
+fn stale_publication_reason(
+    run: &ToolRunContext,
+    state: &CatalogState,
+    published: &PublishedCatalog,
+) -> Option<String> {
+    if published.generation != state.generation {
+        return Some(format!(
+            "Tool catalog generation {} is stale; current generation is {}",
+            published.generation, state.generation
+        ));
+    }
+    if published.capability_generation != run.generation() {
+        return Some(format!(
+            "Tool catalog belongs to capability generation {}; current generation is {}",
+            published.capability_generation,
+            run.generation()
+        ));
+    }
+    let current_mode_generation = run.runtime_mode().generation;
+    if published.runtime_mode_generation != current_mode_generation {
+        return Some(format!(
+            "Tool catalog belongs to runtime mode generation {}; current generation is {}",
+            published.runtime_mode_generation, current_mode_generation
+        ));
+    }
+    None
 }
 
 struct ActivationRequest<'query> {
@@ -908,7 +949,12 @@ fn prioritized_names(
     prioritized
 }
 
-fn build_snapshot(state: &CatalogState, messages: &[Value]) -> Result<ToolCatalogSnapshot, String> {
+fn build_snapshot(
+    state: &CatalogState,
+    messages: &[Value],
+    capability_generation: CapabilityGeneration,
+    runtime_mode_generation: u64,
+) -> Result<ToolCatalogSnapshot, String> {
     let full_catalog_fallback = full_catalog_fits(state)?;
     let prioritized = prioritized_names(state, messages, full_catalog_fallback);
 
@@ -966,6 +1012,8 @@ fn build_snapshot(state: &CatalogState, messages: &[Value]) -> Result<ToolCatalo
         }
     }
     Ok(ToolCatalogSnapshot {
+        capability_generation,
+        runtime_mode_generation,
         generation: state.generation,
         definitions,
         active_names,
@@ -1413,11 +1461,47 @@ mod tests {
         let root = tempfile::tempdir().expect("catalog root");
         let run = crate::tools::security::test_run_context_for(root.path());
 
-        assert!(run.tool_catalog().admit_tool_call("write_file").is_ok());
         assert!(run
             .tool_catalog()
-            .admit_tool_call_with_receipt("mcp__remote__write")
+            .admit_tool_call(&run, "write_file")
+            .is_ok());
+        assert!(run
+            .tool_catalog()
+            .admit_tool_call_with_receipt(&run, "mcp__remote__write")
             .is_err());
+    }
+
+    #[test]
+    fn published_calls_are_rejected_after_runtime_mode_generation_changes() {
+        let root = tempfile::tempdir().expect("catalog root");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        let definitions = full_definitions();
+        let coding = run
+            .tool_catalog()
+            .snapshot(&run, &[], &definitions)
+            .expect("coding catalog");
+        assert!(coding.active_names.iter().any(|name| name == "write_file"));
+
+        run.transition_runtime_mode(crate::modes::RuntimeMode::Initializer)
+            .expect("initializer transition");
+        let error = run
+            .tool_catalog()
+            .admit_tool_call(&run, "write_file")
+            .expect_err("the coding publication must not outlive its runtime mode generation");
+        assert!(error.contains("runtime mode generation"));
+
+        let initializer = run
+            .tool_catalog()
+            .snapshot(&run, &[], &definitions)
+            .expect("initializer catalog");
+        assert_ne!(
+            coding.runtime_mode_generation,
+            initializer.runtime_mode_generation
+        );
+        assert!(!initializer
+            .active_names
+            .iter()
+            .any(|name| name == "write_file"));
     }
 
     #[test]
@@ -1531,7 +1615,7 @@ mod tests {
             ),
         ]);
         run.tool_catalog().activate(&run, &args).expect("activate");
-        assert!(run.tool_catalog().admit_tool_call(&deferred).is_err());
+        assert!(run.tool_catalog().admit_tool_call(&run, &deferred).is_err());
 
         let second = run
             .tool_catalog()
@@ -1542,7 +1626,7 @@ mod tests {
             )
             .expect("second snapshot");
         assert!(second.active_names.contains(&deferred));
-        assert!(run.tool_catalog().admit_tool_call(&deferred).is_ok());
+        assert!(run.tool_catalog().admit_tool_call(&run, &deferred).is_ok());
     }
 
     #[test]
@@ -1656,7 +1740,7 @@ mod tests {
         );
         assert!(
             run.tool_catalog()
-                .admit_tool_call("mcp__alpha__lookup")
+                .admit_tool_call(&run, "mcp__alpha__lookup")
                 .is_err(),
             "a cleared lease must not remain callable in the newly published generation"
         );

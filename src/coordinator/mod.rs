@@ -20,6 +20,7 @@ pub mod planner;
 pub mod task_queue;
 pub mod tasks;
 pub mod teammate;
+pub mod worker_lifecycle;
 
 pub use permission::{LeaderPermissionBridge, QueuedPermission};
 pub use planner::{
@@ -34,6 +35,11 @@ pub use planner::{
 };
 pub use task_queue::{Task, TaskId, TaskQueue, TaskQueueError, TaskState};
 pub use teammate::{AgentColor, Teammate, TeammateId, TeammateState, TransitionError};
+pub use worker_lifecycle::{
+    WorkerArtifactDisposition, WorkerArtifactHandoff, WorkerArtifactState, WorkerLifecycleError,
+    WorkerModelBinding, WorkerProfile, WorkerSliceAssignment, WorkerSliceResult,
+    WorkerTerminalState,
+};
 
 use std::collections::HashMap;
 

@@ -1009,6 +1009,63 @@ struct WorktreeSnapshot {
     worktree_root_id: crate::persistence::StorageRootId,
 }
 
+/// Narrow read-only projection used by supervised-worker handoff.
+///
+/// S-087 consumes the same byte-bound observation as the transactional
+/// worktree tool instead of reimplementing Git status parsing in subagent
+/// cleanup. The projection deliberately exposes no mutation capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // Direct projection of independent porcelain-v2 state categories.
+pub(crate) struct WorkerArtifactObservation {
+    pub generation: String,
+    pub staged: bool,
+    pub unstaged: bool,
+    pub untracked: bool,
+    pub ignored: bool,
+    pub conflicted: bool,
+    pub committed: bool,
+}
+
+impl WorkerArtifactObservation {
+    /// Removal is safe only when neither the worktree bytes/index nor its
+    /// branch contain state that has not reached the target branch.
+    #[must_use]
+    pub const fn cleanup_allowed(&self) -> bool {
+        !self.staged && !self.unstaged && !self.untracked && !self.conflicted && !self.committed
+    }
+}
+
+/// Inspect one linked worktree using the canonical S-074 observation path.
+///
+/// # Errors
+/// Returns the same fail-closed errors as transactional preview. Callers must
+/// preserve the linked worktree when inspection fails.
+pub(crate) fn inspect_worker_artifacts(
+    run: &crate::tools::security::ToolRunContext,
+    path: &Path,
+) -> Result<WorkerArtifactObservation, String> {
+    let snapshot = inspect_worktree(run, path)?;
+    let committed = if snapshot.view.worktree_head == snapshot.view.target_head {
+        false
+    } else {
+        !is_ancestor(
+            run,
+            &snapshot.worktree_path,
+            &snapshot.view.worktree_head,
+            &snapshot.view.target_head,
+        )?
+    };
+    Ok(WorkerArtifactObservation {
+        generation: snapshot.view.generation,
+        staged: !snapshot.view.changes.staged.is_empty(),
+        unstaged: !snapshot.view.changes.unstaged.is_empty(),
+        untracked: !snapshot.view.changes.untracked.is_empty(),
+        ignored: !snapshot.view.changes.ignored.is_empty(),
+        conflicted: !snapshot.view.changes.conflicted.is_empty(),
+        committed,
+    })
+}
+
 #[derive(Serialize)]
 struct SnapshotGeneration<'a> {
     schema_version: u16,
@@ -2945,6 +3002,31 @@ mod tests {
     use super::*;
     use crate::tools::testutil::process_cwd_lock;
     use std::sync::MutexGuard;
+
+    #[test]
+    fn worker_cleanup_requires_clean_bytes_index_and_branch() {
+        let clean = WorkerArtifactObservation {
+            generation: "sha256:clean".to_string(),
+            staged: false,
+            unstaged: false,
+            untracked: false,
+            ignored: false,
+            conflicted: false,
+            committed: false,
+        };
+        assert!(clean.cleanup_allowed());
+
+        let ignored_cache_only = WorkerArtifactObservation {
+            ignored: true,
+            ..clean.clone()
+        };
+        let committed = WorkerArtifactObservation {
+            committed: true,
+            ..clean
+        };
+        assert!(ignored_cache_only.cleanup_allowed());
+        assert!(!committed.cleanup_allowed());
+    }
 
     fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
         crate::tools::security::test_run_context()

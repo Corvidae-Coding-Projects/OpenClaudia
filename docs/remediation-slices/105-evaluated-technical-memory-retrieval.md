@@ -142,6 +142,18 @@ the checked-in generator rebuilt the evaluation and the deliberately rejected
 review remains rejected while binding the new exact corpus and evaluation
 digests above.
 
+S-091 subsequently changed the still-cited `src/main.rs` while preserving the
+tested migration-doctor behavior. That citation is rebound to `worktree:s091`
+and digest
+`sha256:cbfd7d33778b03af36dc0fa0e295f11f0e6612f35f511d1447b591710175aeab`.
+The checked-in generator rebuilt the evaluation, and the deliberately rejected
+review remains rejected. The current tuning, held-out, evaluation, and review
+artifact digests are respectively
+`a97e53b6b0c63638ad1daf41d1c912669f8590781d8b3feeb29bf729b869c768`,
+`c7bcfe253411ff1b4f22c639bc00327fff57c637261f276d610b3d150162f256`,
+`34f94c71e6759af48bca9f3462e7a1149a401f74c6e21dbae73175da3547e6e9`,
+and `632939ab2c00a762500ed9dccbcb5ccd91fee3b9cf02eda1a6032634ed175e91`.
+
 The SHA-256 digest of the sorted `sha256sum` manifest for the 24 changed
 non-slice artifacts is
 `8adc4a735d9b0fa38b2ce327a8ab35f02dc5bbb2c74117694eac1548201e5e9d`.

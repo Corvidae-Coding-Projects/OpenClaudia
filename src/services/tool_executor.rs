@@ -234,7 +234,7 @@ impl ToolExecutor {
 
         if let Err(reason) = run_context
             .tool_catalog()
-            .admit_tool_call(&tool_call.function.name)
+            .admit_tool_call(run_context, &tool_call.function.name)
         {
             return ToolResult::failure(
                 tool_call,
@@ -656,7 +656,7 @@ fn prepare_mcp_dispatch(
     let admission = match request
         .run_context
         .tool_catalog()
-        .admit_tool_call_with_receipt(&request.tool_call.function.name)
+        .admit_tool_call_with_receipt(request.run_context, &request.tool_call.function.name)
     {
         Ok(admission) if admission.is_mcp() => admission,
         Ok(_) => {

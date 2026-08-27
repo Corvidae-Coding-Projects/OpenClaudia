@@ -1185,7 +1185,27 @@ impl ToolRunContext {
         &self,
         mode: &crate::modes::RuntimeMode,
     ) -> Result<(), String> {
-        self.runtime_mode.validate_transition(mode)
+        let _lifecycle = self
+            .background_effect_lifecycle
+            .lock()
+            .map_err(|error| format!("background-effect lifecycle is unavailable: {error}"))?;
+        let class = self.runtime_mode.validate_transition(mode)?;
+        if matches!(
+            class,
+            crate::modes::RuntimeModeClass::Plan | crate::modes::RuntimeModeClass::ReadOnly
+        ) {
+            let shell_ids = crate::tools::BACKGROUND_SHELLS.active_ids_for_run(self);
+            let agent_ids = crate::subagent::BACKGROUND_AGENTS.active_ids_for_run(self)?;
+            if !shell_ids.is_empty() || !agent_ids.is_empty() {
+                return Err(format!(
+                    "cannot enter {} mode while this run owns {} background shell(s) and {} background agent(s)",
+                    runtime_mode_name(mode),
+                    shell_ids.len(),
+                    agent_ids.len()
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Enforce the active mode against a concrete classified tool call.

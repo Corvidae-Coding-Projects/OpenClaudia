@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Coordinate incomplete-feature repair wave two (#1166)
+- S-094: Route every proxy API through the canonical lifecycle (#1169)
+- S-091: Make ACP modes and advertised tools effective (#1168)
+- S-087: Create fresh workers for semantic task slices (#1167)
 - S-086: Implement rotating planner checkpoints (#1164)
 - S-062: Make plugin install and update verifiable transactions (#1162)
 - S-059: Unify the hook lifecycle across frontends (#1163)
@@ -188,6 +192,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- Allow trusted Codex Git mutations in repository hooks (#1170)
 - Monitor and repair wave-one CI (#1165)
 - S-066: Own and bound MCP transports (#1141)
 - Make MCP resource capability requirements transport-specific (#1026)

@@ -558,7 +558,13 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Acp {
             target,
             model: acp_model,
-        }) => cli::commands::acp::cmd_acp(target.or(cli.target), acp_model.or(cli.model)).await,
+        }) => {
+            Box::pin(cli::commands::acp::cmd_acp(
+                target.or(cli.target),
+                acp_model.or(cli.model),
+            ))
+            .await
+        }
         Some(Commands::Start { port, host, target }) => {
             cli::commands::start::cmd_start(port, host, target.or(cli.target)).await
         }

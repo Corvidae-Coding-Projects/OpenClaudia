@@ -1,6 +1,6 @@
 # S-087: Create fresh workers for semantic task slices
 
-Status: Planned
+Status: Complete
 Effort: Medium
 Primary findings: F-122
 Workstreams: W8, W10, W12, W24
@@ -27,3 +27,28 @@ Run each coherent task slice in a fresh supervised worker with enforced isolatio
 ## Handoff
 
 Record changed artifact generations, commands/tests run, typed evidence receipts, unresolved risks, and any newly proposed slice. Completion of this slice does not imply completion of its parent workstream.
+
+## Completed implementation — 2026-08-27
+
+Coordinator-mode delegation now creates immutable, generation-bound worker
+assignments containing the task revision, objective digest, accepted source
+records, dependency and acceptance digests, model generation, and optional
+isolated-worktree locator. Each semantic attempt receives a fresh provider
+transcript and child run. General-purpose workers receive worktree isolation
+automatically; one semantic slice admits at most one live worker while unrelated
+slices remain parallel.
+
+Terminal worker artifacts are retained as typed succeeded, partial, failed,
+cancelled, or orphaned handoffs until a durable planner checkpoint acknowledges
+them. Cancellation waits for the worker future to drop, reaps owned shells, and
+then snapshots artifacts. Cleanup reuses the S-074 porcelain-v2 observation and
+refuses removal when tracked, untracked, staged, conflicted, or committed work
+remains; ignored build caches do not masquerade as deliverable work.
+
+Rust 1.98 formatting, locked all-target/all-feature checking, strict Clippy, and
+the serialized all-target/all-feature suite passed. The full local suite excluded
+only four independently reproduced worktree-fixture cases tracked by #1055;
+all other worktree tests passed. Focused coverage includes fresh terminal
+resume, active semantic-conflict rejection, clean-artifact cleanup authority,
+and planner checkpoint handoff. An alternate-model VDD receipt remains owned by
+S-088; deeper isolated-workspace replacement remains tracked by #1160.

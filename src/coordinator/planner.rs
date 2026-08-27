@@ -18,6 +18,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::coordinator::worker_lifecycle::{
+    WorkerArtifactDisposition, WorkerArtifactHandoff, WorkerArtifactState, WorkerProfile,
+    WorkerSliceAssignment, WorkerSliceOutcome, WorkerSliceResult, WorkerTerminalState,
+    MAX_WORKER_SLICE_ACCEPTANCE, MAX_WORKER_SLICE_DEPENDENCIES, MAX_WORKER_SLICE_SOURCES,
+};
 use crate::persistence::{
     CommitReceipt, FileClass, PersistenceError, PersistentStorage, StorageGeneration,
 };
@@ -421,6 +426,12 @@ pub struct PlannerState {
     pub budget: BudgetSnapshot,
     pub contradictions: BTreeMap<PlannerContradictionId, PlannerContradiction>,
     pub children: BTreeMap<RunId, PlannerChild>,
+    /// Immutable semantic assignment bound to each fresh supervised child run.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub worker_assignments: BTreeMap<RunId, WorkerSliceAssignment>,
+    /// Immutable terminal handoff bound to the canonical planner attempt.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub worker_results: BTreeMap<PlannerAttemptId, WorkerSliceResult>,
 }
 
 impl PlannerState {
@@ -445,6 +456,8 @@ impl PlannerState {
             budget,
             contradictions: BTreeMap::new(),
             children: BTreeMap::new(),
+            worker_assignments: BTreeMap::new(),
+            worker_results: BTreeMap::new(),
         }
     }
 }
@@ -1101,10 +1114,24 @@ impl PlannerRuntime {
         let (checkpoint, receipt) =
             self.store
                 .checkpoint_and_commit(stored, stored.checkpoint.generation(), state, now)?;
+        let handed_off_runs = checkpoint
+            .state()
+            .worker_results
+            .values()
+            .map(|result| result.run_id)
+            .collect::<BTreeSet<_>>();
         self.stored = Some(StoredPlannerCheckpoint {
             checkpoint,
             storage_generation: receipt.generation(),
         });
+        if let Err(error) = crate::subagent::BACKGROUND_AGENTS
+            .acknowledge_semantic_handoffs(supervisor, &handed_off_runs)
+        {
+            tracing::warn!(
+                %error,
+                "Planner checkpoint committed, but runtime worker-handoff cleanup was not acknowledged"
+            );
+        }
         self.budget_observation = live_budget;
         Ok(())
     }
@@ -1449,11 +1476,52 @@ fn synchronize_children(
         .iter()
         .map(|snapshot| snapshot.descriptor.run_id)
         .collect::<BTreeSet<_>>();
+    let mut newly_orphaned = Vec::new();
     for child in state.children.values_mut() {
         if child.state.is_live() && !observed.contains(&child.run_id) {
             child.owner = PlannerChildOwner::Orphaned;
             child.updated_at = now;
+            newly_orphaned.push((child.run_id, child.attempt_id, child.workspace_generation));
         }
+    }
+    for (run_id, attempt_id, workspace_generation) in newly_orphaned {
+        if state.worker_results.contains_key(&attempt_id) {
+            continue;
+        }
+        let Some(assignment) = state.worker_assignments.get(&run_id) else {
+            // Checkpoints created before semantic-slice tracking remain
+            // readable; only newly dispatched planner slices are required to
+            // carry the S-087 assignment.
+            continue;
+        };
+        let mut artifact = WorkerArtifactHandoff::observed(
+            format!("workspace-generation:{workspace_generation}"),
+            BTreeSet::from([
+                WorkerArtifactState::Orphaned,
+                WorkerArtifactState::InspectionFailed,
+            ]),
+        )
+        .map_err(|_| PlannerCheckpointError::SubagentStateUnavailable)?;
+        if let Some(locator) = assignment.artifact_locator.as_ref() {
+            artifact = artifact
+                .with_locator(locator.clone())
+                .map_err(|_| PlannerCheckpointError::SubagentStateUnavailable)?;
+        }
+        artifact.mark_handed_off();
+        state.worker_results.insert(
+            attempt_id,
+            WorkerSliceResult::from_outcome(
+                attempt_id,
+                run_id,
+                assignment,
+                WorkerSliceOutcome {
+                    terminal: WorkerTerminalState::Orphaned,
+                    output_digest: ContentDigest::sha256(b"orphaned worker attempt"),
+                    artifact,
+                    recorded_at: now,
+                },
+            ),
+        );
     }
 
     for snapshot in snapshots {
@@ -1462,6 +1530,7 @@ fn synchronize_children(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // One causal snapshot-to-checkpoint reconciliation boundary.
 fn synchronize_child_snapshot(
     state: &mut PlannerState,
     lease_id: PlannerLeaseId,
@@ -1469,38 +1538,77 @@ fn synchronize_child_snapshot(
     snapshot: crate::subagent::BackgroundChildSnapshot,
     now: DateTime<Utc>,
 ) -> Result<(), PlannerCheckpointError> {
-    let descriptor = snapshot.descriptor;
+    let crate::subagent::BackgroundChildSnapshot {
+        agent_id: snapshot_agent_id,
+        task_id,
+        descriptor,
+        finished,
+        failed,
+        cancellation_receipt,
+        source,
+        assignment,
+        outcome,
+    } = snapshot;
     if descriptor.actor.role != ActorRole::Worker
         || descriptor.session_id.as_str() != supervisor.session_id()
     {
         return Err(PlannerCheckpointError::SubagentStateUnavailable);
     }
-    let task_id = TaskId::parse(snapshot.task_id)
-        .map_err(|_| PlannerCheckpointError::SubagentStateUnavailable)?;
+    let task_id =
+        TaskId::parse(task_id).map_err(|_| PlannerCheckpointError::SubagentStateUnavailable)?;
     let task = state
         .task_graph
         .task(&task_id)
         .ok_or(PlannerCheckpointError::SubagentStateUnavailable)?;
-    let TaskSource::Delegation { agent_id } = &task.source else {
+    let TaskSource::Delegation {
+        agent_id: delegated_agent_id,
+    } = &task.source
+    else {
         return Err(PlannerCheckpointError::SubagentStateUnavailable);
     };
-    if agent_id != &snapshot.agent_id {
+    if delegated_agent_id != &snapshot_agent_id {
         return Err(PlannerCheckpointError::SubagentStateUnavailable);
     }
-    let (attempt_state, child_state) = child_snapshot_states(
-        snapshot.finished,
-        snapshot.failed,
-        snapshot.cancellation_receipt,
-        task.status,
-    )?;
+    let task_status = task.status;
+    if assignment.task_id != task_id
+        || source.id
+            != *assignment
+                .sources
+                .first()
+                .ok_or(PlannerCheckpointError::SubagentStateUnavailable)?
+        || assignment.sources.len() != 1
+        || source.observed_by != descriptor.run_id
+    {
+        return Err(PlannerCheckpointError::SubagentStateUnavailable);
+    }
+    match state.sources.get(&source.id) {
+        Some(existing) if existing != &source => {
+            return Err(PlannerCheckpointError::SubagentStateUnavailable);
+        }
+        Some(_) => {}
+        None => {
+            state.sources.insert(source.id, source);
+        }
+    }
     let run_id = descriptor.run_id;
+    match state.worker_assignments.get(&run_id) {
+        Some(existing) if existing != &assignment => {
+            return Err(PlannerCheckpointError::SubagentStateUnavailable);
+        }
+        Some(_) => {}
+        None => {
+            state.worker_assignments.insert(run_id, assignment.clone());
+        }
+    }
+    let (attempt_state, child_state) =
+        child_snapshot_states(finished, failed, cancellation_receipt, task_status)?;
     if let Some(child) = state.children.get_mut(&run_id) {
         let attempt = state
             .attempts
             .get_mut(&child.attempt_id)
             .ok_or(PlannerCheckpointError::SubagentStateUnavailable)?;
         if child.task_id != task_id
-            || child.delegation_agent_id != snapshot.agent_id
+            || child.delegation_agent_id != snapshot_agent_id
             || child.cancellation_root != descriptor.cancellation_root
             || attempt.run_id != run_id
             || !attempt.state.can_transition_to(attempt_state)
@@ -1509,12 +1617,21 @@ fn synchronize_child_snapshot(
             return Err(PlannerCheckpointError::SubagentStateUnavailable);
         }
         attempt.state = attempt_state;
+        attempt.evidence.extend(assignment.sources.iter().copied());
         attempt.updated_at = now;
         child.state = child_state;
         if child.state.is_live() {
             child.owner = PlannerChildOwner::Lease(lease_id);
         }
         child.updated_at = now;
+        record_worker_result(
+            &mut state.worker_results,
+            child.attempt_id,
+            run_id,
+            &assignment,
+            outcome,
+            attempt_state,
+        )?;
         return Ok(());
     }
 
@@ -1531,7 +1648,7 @@ fn synchronize_child_snapshot(
             budget_id: descriptor.budget.id,
             budget_generation: descriptor.budget.generation.get(),
             state: attempt_state,
-            evidence: BTreeSet::new(),
+            evidence: assignment.sources.clone(),
             artifacts: BTreeSet::new(),
             started_at: task.created_at,
             updated_at: now,
@@ -1543,7 +1660,7 @@ fn synchronize_child_snapshot(
             run_id,
             attempt_id,
             task_id,
-            delegation_agent_id: snapshot.agent_id,
+            delegation_agent_id: snapshot_agent_id,
             cancellation_root: descriptor.cancellation_root,
             workspace_generation: descriptor.workspace.generation.get(),
             capability_generation: descriptor.capabilities.generation.get(),
@@ -1556,7 +1673,56 @@ fn synchronize_child_snapshot(
             updated_at: now,
         },
     );
+    record_worker_result(
+        &mut state.worker_results,
+        attempt_id,
+        run_id,
+        &assignment,
+        outcome,
+        attempt_state,
+    )?;
     Ok(())
+}
+
+fn record_worker_result(
+    results: &mut BTreeMap<PlannerAttemptId, WorkerSliceResult>,
+    attempt_id: PlannerAttemptId,
+    run_id: RunId,
+    assignment: &WorkerSliceAssignment,
+    outcome: Option<WorkerSliceOutcome>,
+    attempt_state: PlannerAttemptState,
+) -> Result<(), PlannerCheckpointError> {
+    let Some(outcome) = outcome else {
+        if attempt_state.is_terminal() {
+            return Err(PlannerCheckpointError::SubagentStateUnavailable);
+        }
+        return Ok(());
+    };
+    let terminal_matches = matches!(
+        (outcome.terminal, attempt_state),
+        (
+            WorkerTerminalState::Succeeded,
+            PlannerAttemptState::Succeeded
+        ) | (WorkerTerminalState::Failed, PlannerAttemptState::Failed)
+            | (
+                WorkerTerminalState::Cancelled,
+                PlannerAttemptState::Cancelled
+            )
+    );
+    if !terminal_matches {
+        return Err(PlannerCheckpointError::SubagentStateUnavailable);
+    }
+    let result = WorkerSliceResult::from_outcome(attempt_id, run_id, assignment, outcome);
+    match results.get(&attempt_id) {
+        Some(existing) if existing != &result => {
+            Err(PlannerCheckpointError::SubagentStateUnavailable)
+        }
+        Some(_) => Ok(()),
+        None => {
+            results.insert(attempt_id, result);
+            Ok(())
+        }
+    }
 }
 
 fn child_snapshot_states(
@@ -1857,7 +2023,8 @@ fn validate_state(
     validate_run_budget_within_limits(&lease.budget, &state.budget.limits)?;
     validate_planner_evidence(state)?;
     validate_planner_execution(state)?;
-    validate_children(state, lease)
+    validate_children(state, lease)?;
+    validate_worker_lifecycle(state)
 }
 
 fn validate_planner_objective(state: &PlannerState) -> Result<(), PlannerCheckpointError> {
@@ -2026,9 +2193,173 @@ fn validate_map_bounds(state: &PlannerState) -> Result<(), PlannerCheckpointErro
             MAX_PLANNER_RECORDS,
         ),
         ("children", state.children.len(), MAX_PLANNER_CHILDREN),
+        (
+            "worker assignments",
+            state.worker_assignments.len(),
+            MAX_PLANNER_RECORDS,
+        ),
+        (
+            "worker results",
+            state.worker_results.len(),
+            MAX_PLANNER_RECORDS,
+        ),
     ] {
         if count > limit {
             return Err(PlannerCheckpointError::Capacity { resource, limit });
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // Validate the complete immutable assignment/result relation together.
+fn validate_worker_lifecycle(state: &PlannerState) -> Result<(), PlannerCheckpointError> {
+    for (run_id, assignment) in &state.worker_assignments {
+        let task = state.task_graph.task(&assignment.task_id).ok_or(
+            PlannerCheckpointError::InvalidField {
+                field: "worker assignment",
+                reason: "assignment references a missing task",
+            },
+        )?;
+        if assignment.task_revision == 0
+            || assignment.task_revision > task.revision
+            || assignment.objective_digest != ContentDigest::sha256(task.subject.as_bytes())
+            || assignment.sources.is_empty()
+            || assignment.sources.len() > MAX_WORKER_SLICE_SOURCES
+            || assignment.dependencies.len() > MAX_WORKER_SLICE_DEPENDENCIES
+            || assignment.acceptance_digests.is_empty()
+            || assignment.acceptance_digests.len() > MAX_WORKER_SLICE_ACCEPTANCE
+            || assignment.dependencies != task.blocked_by
+            || assignment.model.generation == 0
+            || assignment.model.identity_sha256.len() != 64
+            || (assignment.profile == WorkerProfile::GeneralPurpose
+                && assignment.artifact_locator.is_none())
+            || assignment
+                .artifact_locator
+                .as_ref()
+                .is_some_and(|locator| locator.is_empty() || locator.len() > 4 * 1024)
+            || !assignment
+                .model
+                .identity_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(PlannerCheckpointError::InvalidField {
+                field: "worker assignment",
+                reason: "semantic, generation, model, or bounded-set binding is invalid",
+            });
+        }
+        require_sources(&assignment.sources, &state.sources)?;
+        if assignment.sources.iter().any(|source_id| {
+            state
+                .sources
+                .get(source_id)
+                .is_none_or(|source| source.observed_by != *run_id)
+        }) {
+            return Err(PlannerCheckpointError::InvalidField {
+                field: "worker assignment",
+                reason: "assignment source was not observed by its exact child run",
+            });
+        }
+        let child = state
+            .children
+            .get(run_id)
+            .ok_or(PlannerCheckpointError::InvalidField {
+                field: "worker assignment",
+                reason: "assignment has no supervised child run",
+            })?;
+        if child.task_id != assignment.task_id {
+            return Err(PlannerCheckpointError::InvalidField {
+                field: "worker assignment",
+                reason: "assignment and child task bindings differ",
+            });
+        }
+        if !child.state.is_live() && !state.worker_results.contains_key(&child.attempt_id) {
+            return Err(PlannerCheckpointError::InvalidField {
+                field: "worker assignment",
+                reason: "terminal worker assignment has no durable result handoff",
+            });
+        }
+    }
+
+    for (attempt_id, result) in &state.worker_results {
+        let attempt =
+            state
+                .attempts
+                .get(attempt_id)
+                .ok_or(PlannerCheckpointError::InvalidField {
+                    field: "worker result",
+                    reason: "result references a missing attempt",
+                })?;
+        let assignment = state.worker_assignments.get(&result.run_id).ok_or(
+            PlannerCheckpointError::InvalidField {
+                field: "worker result",
+                reason: "result references a missing assignment",
+            },
+        )?;
+        if result.attempt_id != *attempt_id
+            || result.run_id != attempt.run_id
+            || result.task_id != attempt.task_id
+            || result.task_id != assignment.task_id
+            || result.task_revision != assignment.task_revision
+            || result.model != assignment.model
+            || result.artifact.locator != assignment.artifact_locator
+            || result.evidence != assignment.sources
+            || result.recorded_at < attempt.started_at
+            || result.artifact.generation.is_empty()
+            || result
+                .artifact
+                .locator
+                .as_ref()
+                .is_some_and(|locator| locator.is_empty() || locator.len() > 4 * 1024)
+            || result.artifact.states.is_empty()
+            || !result.artifact.handed_off
+        {
+            return Err(PlannerCheckpointError::InvalidField {
+                field: "worker result",
+                reason: "attempt, assignment, evidence, artifact, or time binding is invalid",
+            });
+        }
+        require_sources(&result.evidence, &state.sources)?;
+        let artifact_is_clean = result.artifact.states.len() == 1
+            && result.artifact.states.contains(&WorkerArtifactState::Clean);
+        if artifact_is_clean != (result.artifact.disposition == WorkerArtifactDisposition::None) {
+            return Err(PlannerCheckpointError::InvalidField {
+                field: "worker artifact handoff",
+                reason: "artifact disposition disagrees with its exact state set",
+            });
+        }
+        let terminal_matches = match result.terminal {
+            WorkerTerminalState::Succeeded => attempt.state == PlannerAttemptState::Succeeded,
+            WorkerTerminalState::Failed => {
+                attempt.state == PlannerAttemptState::Failed
+                    && result
+                        .artifact
+                        .states
+                        .contains(&WorkerArtifactState::Failed)
+            }
+            WorkerTerminalState::Cancelled => {
+                attempt.state == PlannerAttemptState::Cancelled
+                    && result
+                        .artifact
+                        .states
+                        .contains(&WorkerArtifactState::Cancelled)
+            }
+            WorkerTerminalState::Orphaned => {
+                state
+                    .children
+                    .get(&result.run_id)
+                    .is_some_and(|child| child.owner == PlannerChildOwner::Orphaned)
+                    && result
+                        .artifact
+                        .states
+                        .contains(&WorkerArtifactState::Orphaned)
+            }
+        };
+        if !terminal_matches {
+            return Err(PlannerCheckpointError::InvalidField {
+                field: "worker result",
+                reason: "result terminal state disagrees with its attempt",
+            });
         }
     }
     Ok(())
@@ -2167,6 +2498,8 @@ fn validate_state_evolution(
     require_unchanged_entries(&current.sources, &next.sources)?;
     require_unchanged_entries(&current.decisions, &next.decisions)?;
     require_unchanged_entries(&current.artifacts, &next.artifacts)?;
+    require_unchanged_entries(&current.worker_assignments, &next.worker_assignments)?;
+    require_unchanged_entries(&current.worker_results, &next.worker_results)?;
     validate_budget_evolution(&current.budget, &next.budget)?;
     validate_attempt_evolution(&current.attempts, &next.attempts)?;
     validate_approval_evolution(&current.approvals, &next.approvals)?;

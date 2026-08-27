@@ -28,6 +28,10 @@ const MAX_SUBAGENT_TURNS: usize = 50;
 /// Maximum tokens for subagent responses
 const SUBAGENT_MAX_TOKENS: u32 = 8192;
 
+/// One coherent coordinator slice has one live owner. Retry count remains
+/// bounded by the existing canonical parent `child_runs` budget.
+const MAX_CONCURRENT_SEMANTIC_WORKERS: usize = 1;
+
 /// Resolve `git` through the immutable executable search path captured for the
 /// exact parent or child run that owns the worktree operation.
 fn git_bin(run: &crate::tools::ToolRunContext) -> Result<PathBuf, String> {
@@ -175,6 +179,16 @@ impl AgentType {
             Self::Explore => Some("explore"),
             Self::Plan => Some("plan"),
             Self::Guide => Some("guide"),
+            Self::Coordinator => None,
+        }
+    }
+
+    const fn worker_profile(self) -> Option<crate::coordinator::WorkerProfile> {
+        match self {
+            Self::GeneralPurpose => Some(crate::coordinator::WorkerProfile::GeneralPurpose),
+            Self::Explore => Some(crate::coordinator::WorkerProfile::Explore),
+            Self::Plan => Some(crate::coordinator::WorkerProfile::Plan),
+            Self::Guide => Some(crate::coordinator::WorkerProfile::Guide),
             Self::Coordinator => None,
         }
     }
@@ -454,6 +468,17 @@ pub struct BackgroundAgent {
     /// Live cancellation capability retained so a stopped child yields an
     /// exact receipt instead of an inferred terminal flag.
     child_cancellation: Mutex<Option<crate::runtime::CancellationHandle>>,
+    /// Coordinator-only immutable semantic slice and terminal handoff.
+    semantic_slice: Mutex<Option<SemanticWorkerSlice>>,
+}
+
+#[derive(Debug, Clone)]
+struct SemanticWorkerSlice {
+    source: crate::coordinator::PlannerEvidenceSourceRecord,
+    assignment: crate::coordinator::WorkerSliceAssignment,
+    worktree_path: Option<PathBuf>,
+    outcome: Option<crate::coordinator::worker_lifecycle::WorkerSliceOutcome>,
+    checkpointed: bool,
 }
 
 /// Canonical child-run snapshot consumed by the rotating planner ledger.
@@ -464,6 +489,9 @@ pub(crate) struct BackgroundChildSnapshot {
     pub finished: bool,
     pub failed: bool,
     pub cancellation_receipt: Option<crate::runtime::CancellationReceipt>,
+    pub source: crate::coordinator::PlannerEvidenceSourceRecord,
+    pub assignment: crate::coordinator::WorkerSliceAssignment,
+    pub outcome: Option<crate::coordinator::worker_lifecycle::WorkerSliceOutcome>,
 }
 
 /// Manager for background agents
@@ -528,10 +556,12 @@ impl BackgroundAgentManager {
     ///
     /// * If no entry exists for `id`, a fresh tracking entry is inserted
     ///   (mirrors [`Self::register`] but with a known id).
-    /// * If an entry already exists, this is a no-op — we deliberately
-    ///   do **not** reset `finished` / `turns` / `result` / `error`,
-    ///   because the caller is reattaching to (not replacing) the
-    ///   prior agent.
+    /// * If an active entry already exists with the same role/task, this is a
+    ///   no-op used by the pre-registration path.
+    /// * If a terminal entry exists, it is replaced by a fresh supervised
+    ///   runtime record only after any coordinator semantic result has been
+    ///   acknowledged by a durable planner checkpoint. The separately
+    ///   bounded transcript remains available to the resume path.
     ///
     /// Returns `true` iff a new entry was inserted (i.e. the id was
     /// fresh). Callers can ignore the return value when they only need
@@ -557,16 +587,30 @@ impl BackgroundAgentManager {
         };
         if let Some(existing) = agents.get(id) {
             if existing.owner_run == owner.run_id() {
-                return Ok(false);
+                if existing.agent_type != agent_type || existing.task != task {
+                    return Err(format!(
+                        "Agent '{id}' cannot be resumed with a different role or semantic task"
+                    ));
+                }
+                if !existing.finished.load(Ordering::SeqCst) {
+                    return Ok(false);
+                }
+                if !semantic_record_can_be_removed(existing) {
+                    return Err(format!(
+                        "Agent '{id}' has preserved artifacts awaiting planner handoff"
+                    ));
+                }
+            } else {
+                tracing::warn!(
+                    target: "openclaudia::subagent",
+                    event = "cross_run_agent_resume_denied",
+                    caller_run = %owner.run_id(),
+                    agent_id = id,
+                    "Denied background-agent id reuse outside the owning run"
+                );
+                return Err(format!("Agent '{id}' not found"));
             }
-            tracing::warn!(
-                target: "openclaudia::subagent",
-                event = "cross_run_agent_resume_denied",
-                caller_run = %owner.run_id(),
-                agent_id = id,
-                "Denied background-agent id reuse outside the owning run"
-            );
-            return Err(format!("Agent '{id}' not found"));
+            agents.remove(id);
         }
         let agent = Arc::new(BackgroundAgent {
             id: id.to_string(),
@@ -583,6 +627,7 @@ impl BackgroundAgentManager {
             canonical_task_id: Mutex::new(None),
             child_descriptor: Mutex::new(None),
             child_cancellation: Mutex::new(None),
+            semantic_slice: Mutex::new(None),
         });
         agents.insert(id.to_string(), agent);
         Ok(true)
@@ -687,6 +732,92 @@ impl BackgroundAgentManager {
         Ok(())
     }
 
+    fn bind_semantic_slice(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+        id: &str,
+        source: crate::coordinator::PlannerEvidenceSourceRecord,
+        assignment: crate::coordinator::WorkerSliceAssignment,
+        worktree_path: Option<PathBuf>,
+    ) -> Result<(), String> {
+        let observed_locator = worktree_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        if assignment.artifact_locator != observed_locator {
+            return Err(format!(
+                "Agent '{id}' semantic assignment does not match its worktree locator"
+            ));
+        }
+        let agents = self
+            .agents_guard("bind_semantic_slice")
+            .ok_or_else(|| "Background agent registry is unavailable".to_string())?;
+        let agent = agents
+            .get(id)
+            .filter(|agent| agent.owner_run == owner.run_id())
+            .cloned()
+            .ok_or_else(|| format!("Agent '{id}' not found"))?;
+        let mut live_same_slice = 0;
+        for peer in agents.values().filter(|peer| {
+            peer.owner_run == owner.run_id()
+                && peer.id != id
+                && !peer.finished.load(Ordering::SeqCst)
+        }) {
+            let Some(peer_slice) = agent_field_guard(
+                &peer.semantic_slice,
+                "bind_semantic_slice",
+                &peer.id,
+                "semantic_slice",
+            ) else {
+                return Err(format!("Agent '{}' semantic-slice lock poisoned", peer.id));
+            };
+            if peer_slice.as_ref().is_some_and(|peer_slice| {
+                peer_slice.assignment.objective_digest == assignment.objective_digest
+                    && peer_slice.assignment.profile == assignment.profile
+                    && peer_slice.assignment.dependencies == assignment.dependencies
+                    && peer_slice.assignment.acceptance_digests == assignment.acceptance_digests
+            }) {
+                live_same_slice += 1;
+            }
+        }
+        drop(agents);
+        if live_same_slice >= MAX_CONCURRENT_SEMANTIC_WORKERS {
+            return Err(format!(
+                "Semantic slice already has the maximum {MAX_CONCURRENT_SEMANTIC_WORKERS} live worker"
+            ));
+        }
+        let Some(mut slot) = agent_field_guard(
+            &agent.semantic_slice,
+            "bind_semantic_slice",
+            id,
+            "semantic_slice",
+        ) else {
+            return Err(format!("Agent '{id}' semantic-slice lock poisoned"));
+        };
+        let next = SemanticWorkerSlice {
+            source,
+            assignment,
+            worktree_path,
+            outcome: None,
+            checkpointed: false,
+        };
+        match slot.as_ref() {
+            Some(existing)
+                if existing.source == next.source
+                    && existing.assignment == next.assignment
+                    && existing.worktree_path == next.worktree_path =>
+            {
+                Ok(())
+            }
+            Some(_) => Err(format!(
+                "Agent '{id}' is already bound to a different semantic slice"
+            )),
+            None => {
+                *slot = Some(next);
+                Ok(())
+            }
+        }
+    }
+
     /// Snapshot every child with a concrete run binding owned by this exact
     /// supervisor. An active registration without its run binding fails
     /// closed so planner rotation cannot silently omit a starting child.
@@ -746,6 +877,20 @@ impl BackgroundAgentManager {
             .ok_or_else(|| format!("Agent '{}' cancellation lock poisoned", agent.id))?
             .as_ref()
             .and_then(crate::runtime::CancellationHandle::receipt);
+            let semantic_slice = agent_field_guard(
+                &agent.semantic_slice,
+                "child_snapshots_for_run",
+                &agent.id,
+                "semantic_slice",
+            )
+            .ok_or_else(|| format!("Agent '{}' semantic-slice lock poisoned", agent.id))?
+            .clone()
+            .ok_or_else(|| {
+                format!(
+                    "Agent '{}' has no immutable coordinator semantic assignment",
+                    agent.id
+                )
+            })?;
             snapshots.push(BackgroundChildSnapshot {
                 agent_id: agent.id.clone(),
                 task_id,
@@ -753,10 +898,57 @@ impl BackgroundAgentManager {
                 finished,
                 failed,
                 cancellation_receipt,
+                source: semantic_slice.source,
+                assignment: semantic_slice.assignment,
+                outcome: semantic_slice.outcome,
             });
         }
         snapshots.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
         Ok(snapshots)
+    }
+
+    /// Acknowledge only handoffs present in a successfully committed planner
+    /// checkpoint. This lets normal bounded registry cleanup proceed without
+    /// erasing the last runtime record for preserved work.
+    pub(crate) fn acknowledge_semantic_handoffs(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+        run_ids: &BTreeSet<crate::runtime::RunId>,
+    ) -> Result<(), String> {
+        let agents = {
+            let Some(agents) = self.agents_guard("acknowledge_semantic_handoffs") else {
+                return Err("Background agent registry is unavailable".to_string());
+            };
+            agents
+                .values()
+                .filter(|agent| agent.owner_run == owner.run_id())
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for agent in agents {
+            let run_id = agent_field_guard(
+                &agent.child_descriptor,
+                "acknowledge_semantic_handoffs",
+                &agent.id,
+                "child_descriptor",
+            )
+            .and_then(|descriptor| descriptor.as_ref().map(|descriptor| descriptor.run_id));
+            if !run_id.is_some_and(|run_id| run_ids.contains(&run_id)) {
+                continue;
+            }
+            let Some(mut semantic) = agent_field_guard(
+                &agent.semantic_slice,
+                "acknowledge_semantic_handoffs",
+                &agent.id,
+                "semantic_slice",
+            ) else {
+                return Err(format!("Agent '{}' semantic-slice lock poisoned", agent.id));
+            };
+            if let Some(semantic) = semantic.as_mut() {
+                semantic.checkpointed = true;
+            }
+        }
+        Ok(())
     }
 
     /// Mark an agent as finished with a result
@@ -767,6 +959,75 @@ impl BackgroundAgentManager {
     /// Mark an agent as failed with an error
     pub fn fail(&self, owner: &crate::tools::ToolRunContext, id: &str, error: String) {
         self.mark_terminal(owner, id, None, Some(error), "fail");
+    }
+
+    fn record_semantic_outcome(
+        owner: &crate::tools::ToolRunContext,
+        agent: &BackgroundAgent,
+        terminal: crate::coordinator::WorkerTerminalState,
+        output: &str,
+    ) {
+        let semantic = agent_field_guard(
+            &agent.semantic_slice,
+            "record_semantic_outcome",
+            &agent.id,
+            "semantic_slice",
+        )
+        .and_then(|slice| slice.clone());
+        let Some(semantic) = semantic else {
+            return;
+        };
+        if semantic.outcome.is_some() {
+            return;
+        }
+        let workspace_generation = agent_field_guard(
+            &agent.child_descriptor,
+            "record_semantic_outcome",
+            &agent.id,
+            "child_descriptor",
+        )
+        .and_then(|descriptor| {
+            descriptor
+                .as_ref()
+                .map(|descriptor| descriptor.workspace.generation.get())
+        })
+        .unwrap_or(1);
+        let artifact = worker_artifact_handoff(
+            owner,
+            semantic.worktree_path.as_deref(),
+            workspace_generation,
+            terminal,
+        );
+        let outcome = crate::coordinator::worker_lifecycle::WorkerSliceOutcome {
+            terminal,
+            output_digest: crate::runtime::ContentDigest::sha256(output.as_bytes()),
+            artifact,
+            recorded_at: chrono::Utc::now(),
+        };
+        if let Some(mut slot) = agent_field_guard(
+            &agent.semantic_slice,
+            "record_semantic_outcome",
+            &agent.id,
+            "semantic_slice",
+        ) {
+            if let Some(slice) = slot.as_mut() {
+                if slice.outcome.is_none() {
+                    slice.outcome = Some(outcome);
+                }
+            }
+        }
+    }
+
+    fn prepare_semantic_outcome(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+        id: &str,
+        terminal: crate::coordinator::WorkerTerminalState,
+        output: &str,
+    ) {
+        if let Some(agent) = self.get_for_run(owner, id) {
+            Self::record_semantic_outcome(owner, &agent, terminal, output);
+        }
     }
 
     fn mark_terminal(
@@ -789,6 +1050,13 @@ impl BackgroundAgentManager {
             if agent.finished.load(Ordering::SeqCst) {
                 return false;
             }
+            let terminal = if error.is_some() {
+                crate::coordinator::WorkerTerminalState::Failed
+            } else {
+                crate::coordinator::WorkerTerminalState::Succeeded
+            };
+            let output = result.as_deref().or(error.as_deref()).unwrap_or_default();
+            Self::record_semantic_outcome(owner, &agent, terminal, output);
             if let Some(result) = result {
                 if let Some(mut r) = agent_field_guard(&agent.result, operation, id, "result") {
                     *r = Some(result);
@@ -868,7 +1136,7 @@ impl BackgroundAgentManager {
             reason.trim()
         };
 
-        let abort_handle = {
+        let shell_cleanup = {
             let Ok(_terminal) = agent.terminal_lock.lock() else {
                 return Err(format!("Agent '{id}' terminal-state lock poisoned"));
             };
@@ -891,15 +1159,14 @@ impl BackgroundAgentManager {
                 let _ = cancellation.cancel(crate::runtime::CancellationReason::User);
             }
             let abort_handle = agent_field_guard(&agent.abort_handle, "stop", id, "abort_handle")
-                .and_then(|mut h| h.take());
+                .and_then(|mut handle| handle.take());
+            if let Some(handle) = abort_handle {
+                handle.abort();
+            }
+            let shell_cleanup = crate::tools::BACKGROUND_SHELLS.kill_for_process_owner(owner, id);
             agent.finished.store(true, Ordering::SeqCst);
-            abort_handle
+            shell_cleanup
         };
-
-        if let Some(handle) = abort_handle {
-            handle.abort();
-        }
-        let shell_cleanup = crate::tools::BACKGROUND_SHELLS.kill_for_process_owner(owner, id);
         Ok(format!(
             "Agent '{id}' stopped after {turns} turns.\nTask: {task}\nReason: {reason}\n{shell_cleanup}"
         ))
@@ -964,21 +1231,20 @@ impl BackgroundAgentManager {
         id: &str,
     ) -> Option<Arc<BackgroundAgent>> {
         let mut agents = self.agents_guard("remove_for_run")?;
-        if agents
-            .get(id)
-            .is_some_and(|agent| agent.owner_run == owner.run_id())
-        {
+        if agents.get(id).is_some_and(|agent| {
+            agent.owner_run == owner.run_id() && semantic_record_can_be_removed(agent)
+        }) {
             agents.remove(id)
         } else {
             None
         }
     }
 
-    /// Garbage-collect finished agents older than [`FINISHED_AGENT_TTL_SECS`].
+    /// Garbage-collect handed-off finished agents older than
+    /// [`FINISHED_AGENT_TTL_SECS`].
     ///
-    /// Running agents (`finished == false`) are never removed regardless of
-    /// how long they have been registered — only completion age triggers
-    /// eviction. Returns the number of removed entries.
+    /// Running agents and semantic results not yet acknowledged by a durable
+    /// planner checkpoint are never removed. Returns the number removed.
     ///
     /// Fix for crosslink #422 — replaces unbounded growth with a bounded
     /// retention window. Safe to call from any context (poisoned lock is
@@ -991,6 +1257,9 @@ impl BackgroundAgentManager {
         let before = agents.len();
         agents.retain(|_, agent| {
             if !agent.finished.load(Ordering::SeqCst) {
+                return true;
+            }
+            if !semantic_record_can_be_removed(agent) {
                 return true;
             }
             // Finished: keep only if not yet past TTL. Missing/poisoned
@@ -1006,8 +1275,9 @@ impl BackgroundAgentManager {
         before.saturating_sub(agents.len())
     }
 
-    /// Drop finished agents owned by one exact run generation rather than
-    /// allowing one frontend to clean up another run's lifecycle state.
+    /// Drop handed-off finished agents owned by one exact run generation
+    /// rather than allowing one frontend to clean up another run's lifecycle
+    /// state or erase the last record of preserved work.
     /// Returns the number of agents removed.
     pub fn cleanup_finished_for_run(&self, owner: &crate::tools::ToolRunContext) -> usize {
         let Some(mut agents) = self.agents_guard("cleanup_finished_for_run") else {
@@ -1015,7 +1285,9 @@ impl BackgroundAgentManager {
         };
         let before = agents.len();
         agents.retain(|_, agent| {
-            agent.owner_run != owner.run_id() || !agent.finished.load(Ordering::SeqCst)
+            agent.owner_run != owner.run_id()
+                || !agent.finished.load(Ordering::SeqCst)
+                || !semantic_record_can_be_removed(agent)
         });
         before.saturating_sub(agents.len())
     }
@@ -1060,6 +1332,116 @@ impl BackgroundAgentManager {
 impl Default for BackgroundAgentManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn semantic_record_can_be_removed(agent: &BackgroundAgent) -> bool {
+    let Ok(semantic) = agent.semantic_slice.lock() else {
+        return false;
+    };
+    let Some(semantic) = semantic.as_ref() else {
+        return true;
+    };
+    if semantic.outcome.is_none() {
+        return false;
+    }
+    semantic.checkpointed
+}
+
+fn worker_artifact_handoff(
+    owner: &crate::tools::ToolRunContext,
+    worktree_path: Option<&Path>,
+    workspace_generation: u64,
+    terminal: crate::coordinator::WorkerTerminalState,
+) -> crate::coordinator::WorkerArtifactHandoff {
+    use crate::coordinator::{
+        WorkerArtifactDisposition, WorkerArtifactHandoff, WorkerArtifactState, WorkerTerminalState,
+    };
+
+    let mut states = BTreeSet::new();
+    let generation = if let Some(path) = worktree_path {
+        match crate::tools::worktree::inspect_worker_artifacts(owner, path) {
+            Ok(observation) => {
+                if observation.staged {
+                    states.insert(WorkerArtifactState::Staged);
+                }
+                if observation.unstaged {
+                    states.insert(WorkerArtifactState::Unstaged);
+                }
+                if observation.untracked {
+                    states.insert(WorkerArtifactState::Untracked);
+                }
+                if observation.conflicted {
+                    states.insert(WorkerArtifactState::Conflicted);
+                }
+                if observation.committed {
+                    states.insert(WorkerArtifactState::Committed);
+                }
+                if observation.cleanup_allowed() {
+                    states.insert(WorkerArtifactState::Clean);
+                }
+                observation.generation
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "Could not inspect supervised-worker artifacts; preserving the worktree"
+                );
+                states.insert(WorkerArtifactState::InspectionFailed);
+                format!("workspace-generation:{workspace_generation}")
+            }
+        }
+    } else {
+        states.insert(WorkerArtifactState::Clean);
+        format!("workspace-generation:{workspace_generation}")
+    };
+
+    let has_material_artifact = states.iter().any(|state| {
+        matches!(
+            state,
+            WorkerArtifactState::Untracked
+                | WorkerArtifactState::Unstaged
+                | WorkerArtifactState::Staged
+                | WorkerArtifactState::Committed
+                | WorkerArtifactState::Conflicted
+        )
+    });
+    match terminal {
+        WorkerTerminalState::Succeeded => {}
+        WorkerTerminalState::Failed => {
+            states.remove(&WorkerArtifactState::Clean);
+            states.insert(WorkerArtifactState::Failed);
+            if has_material_artifact {
+                states.insert(WorkerArtifactState::Partial);
+            }
+        }
+        WorkerTerminalState::Cancelled => {
+            states.remove(&WorkerArtifactState::Clean);
+            states.insert(WorkerArtifactState::Cancelled);
+            if has_material_artifact {
+                states.insert(WorkerArtifactState::Partial);
+            }
+        }
+        WorkerTerminalState::Orphaned => {
+            states.remove(&WorkerArtifactState::Clean);
+            states.insert(WorkerArtifactState::Orphaned);
+            if has_material_artifact {
+                states.insert(WorkerArtifactState::Partial);
+            }
+        }
+    }
+    let clean = states.len() == 1 && states.contains(&WorkerArtifactState::Clean);
+    WorkerArtifactHandoff {
+        generation,
+        locator: worktree_path.map(|path| path.to_string_lossy().into_owned()),
+        states,
+        disposition: if clean {
+            WorkerArtifactDisposition::None
+        } else {
+            WorkerArtifactDisposition::ReviewRequired
+        },
+        handed_off: clean,
     }
 }
 
@@ -1479,37 +1861,26 @@ impl WorktreeIsolation {
         })
     }
 
-    /// Check if the worktree has uncommitted changes
+    /// Check if the worktree has any unhanded-off bytes, index state, or
+    /// commits. Inspection failure is treated as changed.
     #[must_use]
     pub fn has_changes(&self, run: &crate::tools::ToolRunContext) -> bool {
-        let result = self
-            .worktree_path
-            .to_str()
-            .ok_or_else(|| "worktree path must be valid UTF-8".to_string())
-            .and_then(|worktree| {
-                sandboxed_git(
-                    run,
-                    run.working_directory(),
-                    &["-C", worktree, "diff", "--stat"],
-                )
-            });
-
-        match result {
-            Ok(output) => !output.stdout.is_empty(),
-            Err(_) => false,
-        }
+        crate::tools::worktree::inspect_worker_artifacts(run, &self.worktree_path)
+            .map_or(true, |observation| !observation.cleanup_allowed())
     }
 
-    /// Remove the worktree (only if no changes).
+    /// Remove the worktree only after an exact clean observation.
     ///
     /// # Errors
     ///
-    /// Returns `Err` if the worktree has uncommitted changes or if the
-    /// git worktree remove command fails.
+    /// Returns `Err` if the worktree has any artifact state, inspection
+    /// fails, or the non-force Git cleanup fails.
     pub fn cleanup(&self, run: &crate::tools::ToolRunContext) -> Result<(), String> {
-        if self.has_changes(run) {
+        let observation =
+            crate::tools::worktree::inspect_worker_artifacts(run, &self.worktree_path)?;
+        if !observation.cleanup_allowed() {
             return Err(format!(
-                "Worktree has changes \u{2014} keeping at {} on branch {}",
+                "Worktree has unhanded-off artifacts \u{2014} keeping at {} on branch {}",
                 self.worktree_path.display(),
                 self.branch_name
             ));
@@ -1522,7 +1893,7 @@ impl WorktreeIsolation {
         let result = sandboxed_git(
             run,
             run.working_directory(),
-            &["worktree", "remove", worktree, "--force"],
+            &["worktree", "remove", worktree],
         )
         .map_err(|e| format!("Failed to remove worktree: {e}"))?;
 
@@ -1531,12 +1902,19 @@ impl WorktreeIsolation {
             return Err(format!("git worktree remove failed: {stderr}"));
         }
 
-        // Also delete the branch
-        let _ = sandboxed_git(
+        // A clean, uncommitted branch can be deleted without force.
+        let branch_result = sandboxed_git(
             run,
             run.working_directory(),
-            &["branch", "-D", &self.branch_name],
-        );
+            &["branch", "-d", &self.branch_name],
+        )?;
+        if !branch_result.status.success() {
+            return Err(format!(
+                "Clean worktree was removed, but branch '{}' could not be deleted: {}",
+                self.branch_name,
+                String::from_utf8_lossy(&branch_result.stderr).trim()
+            ));
+        }
 
         Ok(())
     }
@@ -1737,17 +2115,23 @@ impl DelegationTaskGuard {
             max_child_runs: None,
             max_concurrent_calls: None,
         };
-        let existing = manager
-            .list_tasks()
-            .iter()
-            .find(|task| {
-                matches!(
-                    &task.source,
-                    crate::task_graph::TaskSource::Delegation { agent_id: existing }
-                        if existing == agent_id
-                )
-            })
-            .map(|task| task.id.clone());
+        let reuse_legacy_task =
+            parent_run.runtime_mode().class != crate::modes::RuntimeModeClass::Coordinator;
+        let existing = if reuse_legacy_task {
+            manager
+                .list_tasks()
+                .iter()
+                .find(|task| {
+                    matches!(
+                        &task.source,
+                        crate::task_graph::TaskSource::Delegation { agent_id: existing }
+                            if existing == agent_id
+                    )
+                })
+                .map(|task| task.id.clone())
+        } else {
+            None
+        };
         let (task_id, task_revision) = if let Some(task_id) = existing {
             let revision = manager
                 .update_delegation_task(
@@ -1841,6 +2225,71 @@ impl Drop for DelegationTaskGuard {
                 task_id = %self.task_id,
                 %error,
                 "Could not close canonical delegation task after child termination"
+            );
+        }
+    }
+}
+
+/// Ensures every admitted child run reaches the existing background-manager
+/// terminal path even when a later setup/provider/tool branch returns early.
+struct BackgroundAttemptGuard {
+    owner: Arc<crate::tools::ToolRunContext>,
+    agent_id: String,
+    armed: bool,
+}
+
+impl BackgroundAttemptGuard {
+    fn new(owner: &Arc<crate::tools::ToolRunContext>, agent_id: &str) -> Self {
+        Self {
+            owner: Arc::clone(owner),
+            agent_id: agent_id.to_string(),
+            armed: true,
+        }
+    }
+
+    const fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BackgroundAttemptGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let cancelled = BACKGROUND_AGENTS
+                .get_for_run(&self.owner, &self.agent_id)
+                .and_then(|agent| {
+                    agent_field_guard(
+                        &agent.child_cancellation,
+                        "background_attempt_drop",
+                        &self.agent_id,
+                        "child_cancellation",
+                    )
+                    .and_then(|cancellation| {
+                        cancellation
+                            .as_ref()
+                            .and_then(crate::runtime::CancellationHandle::receipt)
+                    })
+                })
+                .is_some();
+            if cancelled {
+                // The future is now being dropped, so it cannot begin another
+                // tool operation. Reap any already-started shell before the
+                // artifact snapshot; task_stop may race this drop and the
+                // process cleanup is intentionally idempotent.
+                let _ = crate::tools::BACKGROUND_SHELLS
+                    .kill_for_process_owner(&self.owner, &self.agent_id);
+                BACKGROUND_AGENTS.prepare_semantic_outcome(
+                    &self.owner,
+                    &self.agent_id,
+                    crate::coordinator::WorkerTerminalState::Cancelled,
+                    "Subagent attempt was cancelled",
+                );
+                return;
+            }
+            BACKGROUND_AGENTS.fail(
+                &self.owner,
+                &self.agent_id,
+                "Subagent attempt ended before publishing an explicit terminal result".to_string(),
             );
         }
     }
@@ -2027,6 +2476,8 @@ async fn run_subagent_core(
     hook_engine: &crate::hooks::HookEngine,
     hook_context: Vec<crate::context::ContextItem>,
 ) -> SubagentResult {
+    let parent_mode = parent_run.runtime_mode();
+    let coordinator_slice = parent_mode.class == crate::modes::RuntimeModeClass::Coordinator;
     let child_registration = match parent_run.begin_child_run_registration() {
         Ok(registration) => registration,
         Err(error) => {
@@ -2054,9 +2505,9 @@ async fn run_subagent_core(
     //   2. Prompt cache continuity: provider-side prompt caches that
     //      key off the conversation id never hit on resume.
     // The fix: route through `register_with_id` so the original id is
-    // reattached to the tracker. If the id was already registered
-    // (e.g. a previous turn of the same resume chain), `register_with_id`
-    // is a no-op and preserves the existing turn counter / state.
+    // reattached to the tracker. Ordinary subagents retain transcript/cache
+    // continuity. Coordinator semantic retries deliberately start a fresh
+    // provider context after the prior result is durably checkpointed.
     let (agent_id, mut messages, mut provider_native_state) = if let Some(preallocated_id) =
         preallocated_agent_id
     {
@@ -2098,13 +2549,24 @@ async fn run_subagent_core(
                         worktree: None,
                     };
                 }
-                let mut msgs = prev_messages;
-                // Append the new prompt as a continuation
-                msgs.push(json!({
+                if coordinator_slice {
+                    let msgs = vec![json!({
+                        "role": "user",
+                        "content": format!(
+                            "Fresh supervised attempt. Task: {}\n\n{}",
+                            config.task, config.prompt
+                        )
+                    })];
+                    (resume_id.clone(), msgs, None)
+                } else {
+                    let mut msgs = prev_messages;
+                    // Append the new prompt as a continuation
+                    msgs.push(json!({
                     "role": "user",
                     "content": format!("Continuing from where you left off.\n\n{}", config.prompt)
                 }));
-                (resume_id.clone(), msgs, native_state)
+                    (resume_id.clone(), msgs, native_state)
+                }
             }
             None => {
                 return SubagentResult {
@@ -2158,7 +2620,9 @@ async fn run_subagent_core(
     };
 
     // Set up worktree isolation if requested
-    let worktree = if config.isolation.as_deref() == Some("worktree") {
+    let isolate_worker = config.isolation.as_deref() == Some("worktree")
+        || (coordinator_slice && config.agent_type == AgentType::GeneralPurpose);
+    let worktree = if isolate_worker {
         match WorktreeIsolation::create(parent_run, &agent_id) {
             Ok(wt) => Some(wt),
             Err(e) => {
@@ -2230,7 +2694,6 @@ async fn run_subagent_core(
                 .cloned(),
         );
     }
-    let parent_mode = parent_run.runtime_mode();
     let child_runtime_mode = if parent_mode.class == crate::modes::RuntimeModeClass::Coordinator {
         crate::modes::RuntimeMode::Behavioral(crate::modes::BehaviorMode::default())
     } else {
@@ -2272,17 +2735,6 @@ async fn run_subagent_core(
             };
         }
     };
-    if let Err(error) = BACKGROUND_AGENTS.bind_child_run(parent_run, &agent_id, &subagent_run) {
-        BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
-        return SubagentResult {
-            agent_id,
-            success: false,
-            output: format!("Cannot bind subagent runtime ownership: {error}"),
-            turns_used: 0,
-            is_background: config.run_in_background,
-            worktree,
-        };
-    }
     let model = config
         .model_override
         .clone()
@@ -2294,6 +2746,98 @@ async fn run_subagent_core(
                 .and_then(|p| p.model.clone())
                 .unwrap_or_else(|| "claude-sonnet-4-6".to_string())
         });
+    if coordinator_slice {
+        let semantic_binding = (|| -> Result<_, String> {
+            crate::evidence_freshness::sync_model(&subagent_run, &model)?;
+            let freshness = crate::evidence_freshness::current_stamp(&subagent_run)?;
+            let model_sha256 = freshness.model_sha256.ok_or_else(|| {
+                "subagent model freshness did not retain its identity digest".to_string()
+            })?;
+            let model_binding = crate::coordinator::WorkerModelBinding::new(
+                freshness.model_generation,
+                model_sha256,
+            )
+            .map_err(|error| error.to_string())?;
+            let task_id = crate::task_graph::TaskId::parse(delegation.task_id.clone())
+                .map_err(|error| error.to_string())?;
+            let source_id = crate::coordinator::PlannerSourceId::new();
+            let source = crate::coordinator::PlannerEvidenceSourceRecord {
+                id: source_id,
+                source: crate::coordinator::PlannerEvidenceSource::Runtime,
+                content_digest: crate::runtime::ContentDigest::sha256(task_content.as_bytes()),
+                reference: format!("delegation:{task_id}:prompt"),
+                observed_by: subagent_run.run_id(),
+                recorded_at: chrono::Utc::now(),
+            };
+            let profile = config.agent_type.worker_profile().ok_or_else(|| {
+                "coordinator profiles cannot execute as semantic workers".to_string()
+            })?;
+            let mut assignment = crate::coordinator::WorkerSliceAssignment::new(
+                task_id,
+                delegation.task_revision,
+                profile,
+                crate::runtime::ContentDigest::sha256(config.task.as_bytes()),
+                BTreeSet::from([source_id]),
+                BTreeSet::new(),
+                BTreeSet::from([crate::runtime::ContentDigest::sha256(
+                    config.prompt.as_bytes(),
+                )]),
+                model_binding,
+            )
+            .map_err(|error| error.to_string())?;
+            if let Some(worktree) = worktree.as_ref() {
+                assignment = assignment
+                    .with_artifact_locator(worktree.worktree_path.to_string_lossy().into_owned())
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok((source, assignment))
+        })();
+        let (source, assignment) = match semantic_binding {
+            Ok(binding) => binding,
+            Err(error) => {
+                BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
+                return SubagentResult {
+                    agent_id,
+                    success: false,
+                    output: format!("Cannot bind coordinator semantic slice: {error}"),
+                    turns_used: 0,
+                    is_background: config.run_in_background,
+                    worktree,
+                };
+            }
+        };
+        if let Err(error) = BACKGROUND_AGENTS.bind_semantic_slice(
+            parent_run,
+            &agent_id,
+            source,
+            assignment,
+            worktree
+                .as_ref()
+                .map(|isolation| isolation.worktree_path.clone()),
+        ) {
+            BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
+            return SubagentResult {
+                agent_id,
+                success: false,
+                output: format!("Cannot retain coordinator semantic slice: {error}"),
+                turns_used: 0,
+                is_background: config.run_in_background,
+                worktree,
+            };
+        }
+    }
+    if let Err(error) = BACKGROUND_AGENTS.bind_child_run(parent_run, &agent_id, &subagent_run) {
+        BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
+        return SubagentResult {
+            agent_id,
+            success: false,
+            output: format!("Cannot bind subagent runtime ownership: {error}"),
+            turns_used: 0,
+            is_background: config.run_in_background,
+            worktree,
+        };
+    }
+    let mut attempt_guard = BackgroundAttemptGuard::new(parent_run, &agent_id);
     if let Err(error) = crate::guardrails::configure(&subagent_run, &app_config.guardrails) {
         return SubagentResult {
             agent_id,
@@ -3131,16 +3675,6 @@ async fn run_subagent_core(
         config.agent_type,
     );
 
-    // Handle worktree cleanup: remove if no changes, keep if changes exist
-    let final_worktree = worktree.and_then(|wt| {
-        if wt.has_changes(parent_run) {
-            Some(wt) // Keep -- return path and branch to caller
-        } else {
-            let _ = wt.cleanup(parent_run); // No changes, clean up silently
-            None
-        }
-    });
-
     if let Err(error) = delegation.finish(crate::session::TaskUpdateStatus::Completed) {
         let message = format!(
             "Subagent returned a result, but canonical delegation completion could not be committed: {error}"
@@ -3152,10 +3686,37 @@ async fn run_subagent_core(
             output: message,
             turns_used: turns,
             is_background: config.run_in_background,
-            worktree: final_worktree,
+            worktree,
         };
     }
+    BACKGROUND_AGENTS.prepare_semantic_outcome(
+        parent_run,
+        &agent_id,
+        crate::coordinator::WorkerTerminalState::Succeeded,
+        &final_output,
+    );
     BACKGROUND_AGENTS.finish(parent_run, &agent_id, final_output.clone());
+    attempt_guard.disarm();
+
+    // Inspect through the S-074 authority before cleanup. Any observation or
+    // non-force removal failure preserves the worktree and returns its exact
+    // location to the supervisor.
+    let final_worktree = worktree.and_then(|worktree| {
+        if worktree.has_changes(parent_run) {
+            return Some(worktree);
+        }
+        match worktree.cleanup(parent_run) {
+            Ok(()) => None,
+            Err(error) => {
+                tracing::warn!(
+                    path = %worktree.worktree_path.display(),
+                    %error,
+                    "Could not safely clean a supervised-worker worktree; preserving it"
+                );
+                Some(worktree)
+            }
+        }
+    });
 
     SubagentResult {
         agent_id,
@@ -6543,11 +7104,10 @@ memory:
             .is_some());
     }
 
-    /// #582 — `register_with_id` is idempotent: a second call with the
-    /// same id leaves the existing tracking entry intact (no reset of
-    /// `finished` / `turns` / `result`).
+    /// #582 — active `register_with_id` reattachment is idempotent when the
+    /// immutable role and semantic task still match.
     #[test]
-    fn fix582_register_with_id_is_idempotent() {
+    fn fix582_active_register_with_id_is_idempotent() {
         let mgr = TestBackgroundAgentManager::new();
         let id = format!("582-idem-{}", Uuid::new_v4());
 
@@ -6557,9 +7117,7 @@ memory:
         // Mutate state on the first registration so we can detect a reset.
         let _ = mgr.increment_turns(&id);
         let _ = mgr.increment_turns(&id);
-        mgr.finish(&id, "result from turn 2".to_string());
-
-        let inserted_second = mgr.register_with_id(AgentType::Explore, "task v2", &id);
+        let inserted_second = mgr.register_with_id(AgentType::Plan, "task v1", &id);
         assert!(
             !inserted_second,
             "second call with the same id must be a no-op"
@@ -6572,19 +7130,57 @@ memory:
         );
         assert_eq!(agent.agent_type, AgentType::Plan, "agent_type preserved");
         assert!(
-            agent.finished.load(Ordering::SeqCst),
-            "finished flag preserved across reattach"
+            !agent.finished.load(Ordering::SeqCst),
+            "active flag preserved across reattach"
         );
         assert_eq!(
             agent.turns.load(Ordering::SeqCst),
             2,
             "turn counter must not be reset"
         );
-        assert_eq!(
-            agent.result.lock().unwrap().as_deref(),
-            Some("result from turn 2"),
-            "result preserved across reattach"
+        assert!(agent.result.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn issue1167_active_registration_rejects_changed_semantics() {
+        let mgr = TestBackgroundAgentManager::new();
+        let id = format!("1167-conflict-{}", Uuid::new_v4());
+        assert!(mgr.register_with_id(AgentType::Plan, "task v1", &id));
+
+        let error = mgr
+            .inner
+            .register_with_id(&mgr.owner, AgentType::Explore, "task v2", &id)
+            .expect_err("active identifier cannot change role or semantic task");
+        assert!(error.contains("different role or semantic task"));
+
+        let agent = mgr.get(&id).expect("conflict must preserve original entry");
+        assert_eq!(agent.task, "task v1");
+        assert_eq!(agent.agent_type, AgentType::Plan);
+    }
+
+    #[test]
+    fn issue1167_terminal_resume_gets_a_fresh_runtime_record() {
+        let id = format!("1167-resume-{}", Uuid::new_v4());
+        BACKGROUND_AGENTS
+            .register_with_id(test_run(), AgentType::Plan, "stable semantic slice", &id)
+            .expect("initial registration");
+        let _ = BACKGROUND_AGENTS.increment_turns(test_run(), &id);
+        BACKGROUND_AGENTS.finish(test_run(), &id, "first attempt".to_string());
+
+        let replaced = BACKGROUND_AGENTS
+            .register_with_id(test_run(), AgentType::Plan, "stable semantic slice", &id)
+            .expect("terminal resume registration");
+        assert!(
+            replaced,
+            "a terminal attempt must be replaced, not reattached"
         );
+        let resumed = BACKGROUND_AGENTS
+            .get_for_run(test_run(), &id)
+            .expect("fresh resumed record");
+        assert!(!resumed.finished.load(Ordering::SeqCst));
+        assert_eq!(resumed.turns.load(Ordering::SeqCst), 0);
+        assert!(resumed.result.lock().expect("result lock").is_none());
+        let _ = BACKGROUND_AGENTS.remove_for_run(test_run(), &id);
     }
 
     // ── Spec #527 behavior 5: task_stop ─────────────────────────────────────

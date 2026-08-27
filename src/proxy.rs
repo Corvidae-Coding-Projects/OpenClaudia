@@ -6,7 +6,7 @@
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{any, get, post},
     Json, Router,
@@ -142,6 +142,15 @@ pub enum ProxyError {
 
     #[error("Policy denied request: {0}")]
     PolicyDenied(String),
+
+    #[error("Unsupported proxy route: {method} {path}")]
+    UnsupportedRoute { method: String, path: String },
+
+    #[error("Proxy route does not accept this method: {method} {path}")]
+    MethodNotAllowed { method: String, path: String },
+
+    #[error("Canonical proxy finalization failed: {0}")]
+    FinalizationFailed(String),
 }
 
 impl IntoResponse for ProxyError {
@@ -156,6 +165,9 @@ impl IntoResponse for ProxyError {
             Self::HookBlocked(_) | Self::PolicyDenied(_) => {
                 (StatusCode::FORBIDDEN, self.to_string())
             }
+            Self::UnsupportedRoute { .. } => (StatusCode::NOT_FOUND, self.to_string()),
+            Self::MethodNotAllowed { .. } => (StatusCode::METHOD_NOT_ALLOWED, self.to_string()),
+            Self::FinalizationFailed(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
             Self::ProviderNotConfigured(_) | Self::InvalidBody(_) | Self::JsonError(_) => {
                 (StatusCode::BAD_REQUEST, self.to_string())
             }
@@ -227,6 +239,616 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<Value>,
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyRouteKind {
+    ChatCompletions,
+    LegacyCompletions,
+    AnthropicMessages,
+    OpenAiResponses,
+}
+
+impl ProxyRouteKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat_completions",
+            Self::LegacyCompletions => "legacy_completions",
+            Self::AnthropicMessages => "anthropic_messages",
+            Self::OpenAiResponses => "openai_responses",
+        }
+    }
+
+    const fn preserves_opaque_state(self) -> bool {
+        matches!(self, Self::AnthropicMessages | Self::OpenAiResponses)
+    }
+
+    const fn supports_structured_tools(self) -> bool {
+        !matches!(self, Self::LegacyCompletions)
+    }
+
+    fn provider_name(self, state: &ProxyState, model: &str) -> String {
+        match self {
+            Self::ChatCompletions | Self::LegacyCompletions => {
+                determine_provider(model, &state.config)
+            }
+            Self::AnthropicMessages => "anthropic".to_string(),
+            Self::OpenAiResponses => state.config.proxy.target.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyLifecycleStage {
+    Normalized,
+    ProviderStateValidated,
+    ToolsValidated,
+    PolicyAdmitted,
+    SessionAttached,
+    Compacted,
+    ContextAndHooksApplied,
+    TokenBudgetAdmitted,
+    ProviderBudgetReserved,
+    ProviderDispatched,
+    EvidencePolicyApplied,
+    Finalized,
+    DeliveryReady,
+}
+
+const CANONICAL_PROXY_LIFECYCLE: &[ProxyLifecycleStage] = &[
+    ProxyLifecycleStage::Normalized,
+    ProxyLifecycleStage::ProviderStateValidated,
+    ProxyLifecycleStage::ToolsValidated,
+    ProxyLifecycleStage::PolicyAdmitted,
+    ProxyLifecycleStage::SessionAttached,
+    ProxyLifecycleStage::Compacted,
+    ProxyLifecycleStage::ContextAndHooksApplied,
+    ProxyLifecycleStage::TokenBudgetAdmitted,
+    ProxyLifecycleStage::ProviderBudgetReserved,
+    ProxyLifecycleStage::ProviderDispatched,
+    ProxyLifecycleStage::EvidencePolicyApplied,
+    ProxyLifecycleStage::Finalized,
+    ProxyLifecycleStage::DeliveryReady,
+];
+
+#[derive(Debug)]
+struct ProxyLifecycleTrace {
+    route: ProxyRouteKind,
+    stages: Vec<ProxyLifecycleStage>,
+}
+
+impl ProxyLifecycleTrace {
+    fn new(route: ProxyRouteKind) -> Self {
+        Self {
+            route,
+            stages: Vec::with_capacity(CANONICAL_PROXY_LIFECYCLE.len()),
+        }
+    }
+
+    fn record(&mut self, stage: ProxyLifecycleStage) -> Result<(), ProxyError> {
+        let expected = CANONICAL_PROXY_LIFECYCLE.get(self.stages.len()).copied();
+        if expected != Some(stage) {
+            return Err(ProxyError::FinalizationFailed(format!(
+                "route {} attempted lifecycle stage {stage:?}, expected {expected:?}",
+                self.route.as_str()
+            )));
+        }
+        self.stages.push(stage);
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(), ProxyError> {
+        if self.stages.as_slice() != CANONICAL_PROXY_LIFECYCLE {
+            return Err(ProxyError::FinalizationFailed(format!(
+                "route {} ended with incomplete lifecycle trace {:?}",
+                self.route.as_str(),
+                self.stages
+            )));
+        }
+        debug!(
+            route = self.route.as_str(),
+            stages = ?self.stages,
+            "Canonical proxy lifecycle completed"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct NormalizedProxyRequest {
+    route: ProxyRouteKind,
+    canonical: ChatCompletionRequest,
+    wire: Value,
+    opaque_history: bool,
+}
+
+fn classify_proxy_route(method: &Method, path: &str) -> Result<ProxyRouteKind, ProxyError> {
+    let route = match path {
+        "/v1/chat/completions" => ProxyRouteKind::ChatCompletions,
+        "/v1/completions" => ProxyRouteKind::LegacyCompletions,
+        "/v1/messages" => ProxyRouteKind::AnthropicMessages,
+        "/v1/responses" => ProxyRouteKind::OpenAiResponses,
+        _ => {
+            return Err(ProxyError::UnsupportedRoute {
+                method: method.to_string(),
+                path: path.to_string(),
+            });
+        }
+    };
+    if method != Method::POST {
+        return Err(ProxyError::MethodNotAllowed {
+            method: method.to_string(),
+            path: path.to_string(),
+        });
+    }
+    Ok(route)
+}
+
+fn content_text(content: &MessageContent) -> String {
+    match content {
+        MessageContent::Text(text) => text.clone(),
+        MessageContent::Parts(parts) => parts
+            .iter()
+            .filter_map(|part| part.text.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+fn native_content_text(content: &Value) -> Result<String, ProxyError> {
+    match content {
+        Value::String(text) => Ok(text.clone()),
+        Value::Array(blocks) => Ok(blocks
+            .iter()
+            .filter_map(|block| {
+                block
+                    .get("text")
+                    .or_else(|| block.get("output"))
+                    .and_then(Value::as_str)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")),
+        _ => Err(ProxyError::InvalidBody(
+            "message content must be a string or an array of native content blocks".to_string(),
+        )),
+    }
+}
+
+fn optional_field<T: serde::de::DeserializeOwned>(
+    body: &Value,
+    field: &str,
+) -> Result<Option<T>, ProxyError> {
+    body.get(field)
+        .cloned()
+        .map(|value| {
+            serde_json::from_value(value)
+                .map_err(|error| ProxyError::InvalidBody(format!("invalid {field}: {error}")))
+        })
+        .transpose()
+}
+
+fn required_model(body: &Value) -> Result<String, ProxyError> {
+    body.get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| ProxyError::InvalidBody("model must be a non-empty string".to_string()))
+}
+
+fn chat_message(role: &str, content: String) -> ChatMessage {
+    ChatMessage {
+        role: role.to_string(),
+        content: MessageContent::Text(content),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+        extra: std::collections::HashMap::new(),
+    }
+}
+
+fn native_tools(body: &Value) -> Result<Option<Vec<Value>>, ProxyError> {
+    body.get("tools")
+        .map(|tools| {
+            tools
+                .as_array()
+                .cloned()
+                .ok_or_else(|| ProxyError::InvalidBody("tools must be a JSON array".to_string()))
+        })
+        .transpose()
+}
+
+fn anthropic_messages(wire: &Value) -> Result<Vec<ChatMessage>, ProxyError> {
+    let native_messages = wire
+        .get("messages")
+        .and_then(Value::as_array)
+        .filter(|messages| !messages.is_empty())
+        .ok_or_else(|| {
+            ProxyError::InvalidBody("Anthropic messages must contain at least one item".to_string())
+        })?;
+    let mut messages = Vec::with_capacity(native_messages.len().saturating_add(1));
+    if let Some(system) = wire.get("system") {
+        messages.push(chat_message("system", native_content_text(system)?));
+    }
+    for message in native_messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .filter(|role| matches!(*role, "user" | "assistant"))
+            .ok_or_else(|| {
+                ProxyError::InvalidBody(
+                    "Anthropic message role must be user or assistant".to_string(),
+                )
+            })?;
+        let content = message.get("content").ok_or_else(|| {
+            ProxyError::InvalidBody("Anthropic message content is required".to_string())
+        })?;
+        messages.push(chat_message(role, native_content_text(content)?));
+    }
+    Ok(messages)
+}
+
+fn responses_input_messages(input: &Value) -> Result<Vec<ChatMessage>, ProxyError> {
+    match input {
+        Value::String(text) => Ok(vec![chat_message("user", text.clone())]),
+        Value::Array(items) => {
+            let mut messages = Vec::new();
+            for item in items {
+                let Some(role) = item.get("role").and_then(Value::as_str) else {
+                    continue;
+                };
+                let content = item.get("content").ok_or_else(|| {
+                    ProxyError::InvalidBody("Responses message content is required".to_string())
+                })?;
+                messages.push(chat_message(role, native_content_text(content)?));
+            }
+            Ok(messages)
+        }
+        _ => Err(ProxyError::InvalidBody(
+            "Responses input must be a string or an array".to_string(),
+        )),
+    }
+}
+
+fn responses_messages(wire: &Value) -> Result<Vec<ChatMessage>, ProxyError> {
+    let input = wire
+        .get("input")
+        .ok_or_else(|| ProxyError::InvalidBody("Responses input is required".to_string()))?;
+    let mut messages = Vec::new();
+    if let Some(instructions) = wire.get("instructions") {
+        messages.push(chat_message("system", native_content_text(instructions)?));
+    }
+    messages.extend(responses_input_messages(input)?);
+    Ok(messages)
+}
+
+fn legacy_messages(wire: &Value) -> Result<(Vec<ChatMessage>, bool), ProxyError> {
+    if wire.get("tools").is_some() || wire.get("functions").is_some() {
+        return Err(ProxyError::InvalidBody(
+            "legacy completions do not support structured tools".to_string(),
+        ));
+    }
+    let prompt = wire.get("prompt").ok_or_else(|| {
+        ProxyError::InvalidBody("legacy completion prompt is required".to_string())
+    })?;
+    match prompt {
+        Value::String(text) => Ok((vec![chat_message("user", text.clone())], false)),
+        Value::Array(prompts) if !prompts.is_empty() => Ok((
+            prompts
+                .iter()
+                .map(|prompt| {
+                    prompt
+                        .as_str()
+                        .map(|text| chat_message("user", text.to_string()))
+                        .ok_or_else(|| {
+                            ProxyError::InvalidBody(
+                                "legacy prompt arrays may contain only strings".to_string(),
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            true,
+        )),
+        _ => Err(ProxyError::InvalidBody(
+            "legacy prompt must be a string or non-empty string array".to_string(),
+        )),
+    }
+}
+
+fn normalize_proxy_request(
+    route: ProxyRouteKind,
+    mut wire: Value,
+) -> Result<NormalizedProxyRequest, ProxyError> {
+    if !wire.is_object() {
+        return Err(ProxyError::InvalidBody(
+            "proxy request body must be a JSON object".to_string(),
+        ));
+    }
+    if route == ProxyRouteKind::ChatCompletions {
+        let canonical: ChatCompletionRequest = serde_json::from_value(wire.clone())
+            .map_err(|error| ProxyError::InvalidBody(error.to_string()))?;
+        if canonical.model.is_empty() || canonical.messages.is_empty() {
+            return Err(ProxyError::InvalidBody(
+                "chat requests require a model and at least one message".to_string(),
+            ));
+        }
+        return Ok(NormalizedProxyRequest {
+            route,
+            canonical,
+            wire,
+            opaque_history: false,
+        });
+    }
+
+    let model = if route == ProxyRouteKind::LegacyCompletions {
+        let model = wire
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|model| !model.is_empty())
+            .unwrap_or("gpt-3.5-turbo-instruct")
+            .to_string();
+        wire["model"] = Value::String(model.clone());
+        model
+    } else {
+        required_model(&wire)?
+    };
+    let (messages, opaque_history, tools, max_tokens) = match route {
+        ProxyRouteKind::LegacyCompletions => {
+            let (messages, opaque) = legacy_messages(&wire)?;
+            (messages, opaque, None, optional_field(&wire, "max_tokens")?)
+        }
+        ProxyRouteKind::AnthropicMessages => (
+            anthropic_messages(&wire)?,
+            true,
+            native_tools(&wire)?,
+            optional_field(&wire, "max_tokens")?,
+        ),
+        ProxyRouteKind::OpenAiResponses => (
+            responses_messages(&wire)?,
+            true,
+            native_tools(&wire)?,
+            optional_field(&wire, "max_output_tokens")?,
+        ),
+        ProxyRouteKind::ChatCompletions => {
+            return Err(ProxyError::FinalizationFailed(
+                "chat normalization entered the native-route branch".to_string(),
+            ));
+        }
+    };
+    Ok(NormalizedProxyRequest {
+        route,
+        canonical: ChatCompletionRequest {
+            model,
+            messages,
+            temperature: optional_field(&wire, "temperature")?,
+            max_tokens,
+            stream: wire.get("stream").and_then(Value::as_bool),
+            tools,
+            tool_choice: wire.get("tool_choice").cloned(),
+            extra: std::collections::HashMap::new(),
+        },
+        wire,
+        opaque_history,
+    })
+}
+
+fn canonical_system_text(request: &ChatCompletionRequest) -> String {
+    request
+        .messages
+        .iter()
+        .filter(|message| message.role == "system")
+        .map(|message| content_text(&message.content))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn prefix_context(context: &str, prompt: &str) -> String {
+    if context.is_empty() {
+        prompt.to_string()
+    } else if prompt.is_empty() {
+        context.to_string()
+    } else {
+        format!("{context}\n\n{prompt}")
+    }
+}
+
+fn render_legacy_prompt(request: &ChatCompletionRequest) -> String {
+    let messages = request
+        .messages
+        .iter()
+        .filter(|message| message.role != "system")
+        .collect::<Vec<_>>();
+    if let [message] = messages.as_slice() {
+        if message.role == "user" {
+            return content_text(&message.content);
+        }
+    }
+    messages
+        .into_iter()
+        .map(|message| format!("{}:\n{}", message.role, content_text(&message.content)))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn append_native_reference(
+    content: &mut Value,
+    reference: &str,
+    block_type: &str,
+) -> Result<(), ProxyError> {
+    match content {
+        Value::String(text) => {
+            text.push_str("\n\n");
+            text.push_str(reference);
+        }
+        Value::Array(parts) => parts.push(serde_json::json!({
+            "type": block_type,
+            "text": reference,
+        })),
+        _ => {
+            return Err(ProxyError::InvalidBody(
+                "native user content cannot receive projected context".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn append_anthropic_reference(wire: &mut Value, reference: &str) -> Result<(), ProxyError> {
+    if reference.is_empty() {
+        return Ok(());
+    }
+    let messages = wire
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            ProxyError::InvalidBody("Anthropic messages must be an array".to_string())
+        })?;
+    if let Some(message) = messages
+        .last_mut()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+    {
+        let content = message.get_mut("content").ok_or_else(|| {
+            ProxyError::InvalidBody("Anthropic message content is required".to_string())
+        })?;
+        return append_native_reference(content, reference, "text");
+    }
+    messages.push(serde_json::json!({
+        "role": "user",
+        "content": [{"type": "text", "text": reference}],
+    }));
+    Ok(())
+}
+
+fn append_responses_reference(wire: &mut Value, reference: &str) -> Result<(), ProxyError> {
+    if reference.is_empty() {
+        return Ok(());
+    }
+    let input = wire
+        .get_mut("input")
+        .ok_or_else(|| ProxyError::InvalidBody("Responses input is required".to_string()))?;
+    match input {
+        Value::String(text) => {
+            text.push_str("\n\n");
+            text.push_str(reference);
+        }
+        Value::Array(items) => {
+            if let Some(message) = items
+                .last_mut()
+                .filter(|item| item.get("role").and_then(Value::as_str) == Some("user"))
+            {
+                let content = message.get_mut("content").ok_or_else(|| {
+                    ProxyError::InvalidBody("Responses message content is required".to_string())
+                })?;
+                append_native_reference(content, reference, "input_text")?;
+            } else {
+                items.push(serde_json::json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": reference}],
+                }));
+            }
+        }
+        _ => {
+            return Err(ProxyError::InvalidBody(
+                "Responses input must be a string or an array".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn apply_wire_projection(
+    request: &mut NormalizedProxyRequest,
+    reference: &str,
+) -> Result<(), ProxyError> {
+    let system = canonical_system_text(&request.canonical);
+    match request.route {
+        ProxyRouteKind::ChatCompletions => {
+            request.wire = serde_json::to_value(&request.canonical)
+                .map_err(|error| ProxyError::InvalidBody(error.to_string()))?;
+        }
+        ProxyRouteKind::LegacyCompletions => {
+            let prompt = request.wire.get_mut("prompt").ok_or_else(|| {
+                ProxyError::InvalidBody("legacy completion prompt is required".to_string())
+            })?;
+            match prompt {
+                Value::String(value) => {
+                    *value = prefix_context(&system, &render_legacy_prompt(&request.canonical));
+                }
+                Value::Array(values) => {
+                    let projected_prompts = request
+                        .canonical
+                        .messages
+                        .iter()
+                        .filter(|message| message.role == "user")
+                        .map(|message| content_text(&message.content))
+                        .collect::<Vec<_>>();
+                    if projected_prompts.len() != values.len() {
+                        return Err(ProxyError::InvalidBody(
+                            "legacy prompt projection changed the prompt count".to_string(),
+                        ));
+                    }
+                    for (value, projected) in values.iter_mut().zip(projected_prompts) {
+                        value.as_str().ok_or_else(|| {
+                            ProxyError::InvalidBody(
+                                "legacy prompt arrays may contain only strings".to_string(),
+                            )
+                        })?;
+                        *value = Value::String(prefix_context(&system, &projected));
+                    }
+                }
+                _ => {
+                    return Err(ProxyError::InvalidBody(
+                        "legacy completion prompt has an unsupported shape".to_string(),
+                    ));
+                }
+            }
+        }
+        ProxyRouteKind::AnthropicMessages => {
+            if !system.is_empty() {
+                request.wire["system"] = serde_json::json!([{
+                    "type": "text",
+                    "text": system
+                }]);
+            }
+            append_anthropic_reference(&mut request.wire, reference)?;
+        }
+        ProxyRouteKind::OpenAiResponses => {
+            if !system.is_empty() {
+                request.wire["instructions"] = Value::String(system);
+            }
+            append_responses_reference(&mut request.wire, reference)?;
+        }
+    }
+    Ok(())
+}
+
+async fn read_normalized_proxy_request(
+    request: Request,
+    expected_route: ProxyRouteKind,
+    max_bytes: usize,
+) -> Result<(HeaderMap, String, NormalizedProxyRequest), ProxyError> {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let route = classify_proxy_route(&method, &path)?;
+    if route != expected_route {
+        return Err(ProxyError::UnsupportedRoute {
+            method: method.to_string(),
+            path,
+        });
+    }
+    let path_and_query = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_string(), ToString::to_string);
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(body, max_bytes)
+        .await
+        .map_err(|error| ProxyError::InvalidBody(format!("request body rejected: {error}")))?;
+    let wire = serde_json::from_slice::<Value>(&bytes)
+        .map_err(|error| ProxyError::InvalidBody(error.to_string()))?;
+    let normalized = normalize_proxy_request(route, wire)?;
+    Ok((parts.headers, path_and_query, normalized))
 }
 
 /// Create the proxy router
@@ -710,7 +1332,7 @@ async fn run_pre_tool_use_hooks(
 async fn prepare_request_context(
     request: &mut ChatCompletionRequest,
     state: &ProxyState,
-) -> Result<(), ProxyError> {
+) -> Result<String, ProxyError> {
     // Convert client-authored and compaction-compatibility system records at
     // the boundary. Client instructions retain explicit user authority;
     // compaction summaries and grounding records remain reference data.
@@ -857,7 +1479,92 @@ async fn prepare_request_context(
         }
     }
 
-    Ok(())
+    Ok(projection.reference)
+}
+
+fn non_system_message_snapshot(request: &ChatCompletionRequest) -> Result<Value, ProxyError> {
+    let messages = request
+        .messages
+        .iter()
+        .filter(|message| message.role != "system")
+        .collect::<Vec<_>>();
+    serde_json::to_value(messages).map_err(ProxyError::JsonError)
+}
+
+async fn prepare_canonical_proxy_request(
+    state: &ProxyState,
+    mut normalized: NormalizedProxyRequest,
+) -> Result<(NormalizedProxyRequest, String, ProxyLifecycleTrace), ProxyError> {
+    let mut trace = ProxyLifecycleTrace::new(normalized.route);
+    trace.record(ProxyLifecycleStage::Normalized)?;
+    if normalized.route.preserves_opaque_state() && !normalized.wire.is_object() {
+        return Err(ProxyError::InvalidBody(
+            "provider-native request state must be a JSON object".to_string(),
+        ));
+    }
+    let provider_name = normalized
+        .route
+        .provider_name(state, &normalized.canonical.model);
+    state
+        .config
+        .get_provider(&provider_name)
+        .ok_or_else(|| ProxyError::ProviderNotConfigured(provider_name.clone()))?;
+    get_adapter(&provider_name).map_err(|error| ProxyError::InvalidBody(error.to_string()))?;
+    trace.record(ProxyLifecycleStage::ProviderStateValidated)?;
+
+    if !normalized.route.supports_structured_tools() && normalized.canonical.tools.is_some() {
+        return Err(ProxyError::InvalidBody(format!(
+            "route {} does not support structured tools",
+            normalized.route.as_str()
+        )));
+    }
+    trace.record(ProxyLifecycleStage::ToolsValidated)?;
+
+    enforce_model_policy(state, &normalized.canonical)?;
+    enforce_model_catalog_contract(&provider_name, &normalized.canonical)?;
+    trace.record(ProxyLifecycleStage::PolicyAdmitted)?;
+
+    bump_session_request_count(state).await;
+    trace.record(ProxyLifecycleStage::SessionAttached)?;
+
+    let before_compaction = normalized
+        .opaque_history
+        .then(|| non_system_message_snapshot(&normalized.canonical))
+        .transpose()?;
+    compact_request_context(&mut normalized.canonical, state).await?;
+    if let Some(before) = before_compaction {
+        let after = non_system_message_snapshot(&normalized.canonical)?;
+        if before != after {
+            return Err(ProxyError::InvalidBody(format!(
+                "route {} requires compaction, but its opaque provider-native history cannot be rewritten losslessly",
+                normalized.route.as_str()
+            )));
+        }
+    }
+    trace.record(ProxyLifecycleStage::Compacted)?;
+
+    let projected_reference = prepare_request_context(&mut normalized.canonical, state).await?;
+    apply_wire_projection(&mut normalized, &projected_reference)?;
+    trace.record(ProxyLifecycleStage::ContextAndHooksApplied)?;
+
+    let canonical_estimate = crate::compaction::estimate_request_tokens(&normalized.canonical);
+    let wire_estimate = crate::compaction::estimate_tokens(&normalized.wire.to_string());
+    if normalized.opaque_history
+        && wire_estimate > crate::compaction::get_context_window(&normalized.canonical.model)
+    {
+        return Err(ProxyError::InvalidBody(format!(
+            "route {} provider-native state exceeds the model context window and cannot be compacted losslessly",
+            normalized.route.as_str()
+        )));
+    }
+    let estimated_input = canonical_estimate.max(wire_estimate);
+    enforce_token_policy(state, &normalized.canonical, estimated_input).await?;
+    if state.config.session.token_tracking.enabled {
+        record_turn_estimate(state, &normalized.canonical, estimated_input).await;
+    }
+    trace.record(ProxyLifecycleStage::TokenBudgetAdmitted)?;
+
+    Ok((normalized, provider_name, trace))
 }
 
 fn take_system_context_items(request: &mut ChatCompletionRequest) -> Vec<ContextItem> {
@@ -1014,9 +1721,8 @@ async fn record_turn_estimate(
 /// pattern-matched helper. See crosslink #247 point 5.
 ///
 /// Bounded read closes crosslink #352: `max_response_bytes` (default
-/// 50 MiB) caps the buffered body; over-limit and other read errors
-/// log at `warn!` and return an empty passthrough rather than feeding
-/// an empty buffer to the VDD engine.
+/// 50 MiB) caps the buffered body; over-limit and other read errors are typed
+/// finalization failures and can never become an empty successful response.
 #[allow(clippy::too_many_lines)] // Keep one auditable response-body/VDD/reassembly transaction.
 async fn apply_vdd_review(
     response_value: Response,
@@ -1034,13 +1740,9 @@ async fn apply_vdd_review(
     let response_bytes = match axum::body::to_bytes(body, max_bytes).await {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!(
-                error = %e,
-                max_bytes = max_bytes,
-                "Failed to read upstream response body for VDD review; \
-                 returning empty passthrough to the client (crosslink #352)."
-            );
-            return Ok(Response::from_parts(parts, Body::empty()));
+            return Err(ProxyError::FinalizationFailed(format!(
+                "failed to read candidate response for evidence review within {max_bytes} bytes: {e}"
+            )));
         }
     };
 
@@ -1125,7 +1827,11 @@ async fn apply_vdd_review(
                 crosslink_issues = blocking.crosslink_issues.len(),
                 "VDD blocking loop complete"
             );
-            serde_json::to_vec(&blocking.final_response).unwrap_or_else(|_| response_bytes.to_vec())
+            serde_json::to_vec(&blocking.final_response).map_err(|error| {
+                ProxyError::FinalizationFailed(format!(
+                    "failed to serialize blocking VDD response: {error}"
+                ))
+            })?
         }
         Ok(VddResult::Skipped(reason)) => {
             debug!(reason = %reason, "VDD skipped");
@@ -1380,12 +2086,7 @@ async fn complete_loop_iteration(state: &ProxyState) {
     }
 }
 
-/// Resolve the target provider, its configuration, and the API key for a
-/// chat-completion request.
-///
-/// Returns `(provider_name, provider_config, api_key)`. The provider config is
-/// borrowed from `state.config`; callers must hold `state` across the
-/// returned reference's lifetime.
+/// Resolve one already-admitted provider configuration and API key.
 ///
 /// # Errors
 ///
@@ -1393,21 +2094,20 @@ async fn complete_loop_iteration(state: &ProxyState) {
 ///   no entry in `state.config.providers`.
 /// - [`ProxyError::NoApiKey`] if neither the request headers nor the provider
 ///   config supply an API key for a non-local provider.
-fn resolve_provider<'a>(
+fn resolve_provider_credentials<'a>(
     state: &'a ProxyState,
     headers: &HeaderMap,
-    model: &str,
-) -> Result<(String, &'a ProviderConfig, Option<ApiKey>), ProxyError> {
-    let provider_name = determine_provider(model, &state.config);
+    provider_name: &str,
+) -> Result<(&'a ProviderConfig, Option<ApiKey>), ProxyError> {
     let provider = state
         .config
-        .get_provider(&provider_name)
-        .ok_or_else(|| ProxyError::ProviderNotConfigured(provider_name.clone()))?;
+        .get_provider(provider_name)
+        .ok_or_else(|| ProxyError::ProviderNotConfigured(provider_name.to_string()))?;
     let api_key = extract_api_key(headers)?.or_else(|| provider.api_key.clone());
-    if api_key.is_none() && !crate::config::is_local_provider_name(&provider_name) {
-        return Err(ProxyError::NoApiKey(provider_name));
+    if api_key.is_none() && !crate::config::is_local_provider_name(provider_name) {
+        return Err(ProxyError::NoApiKey(provider_name.to_string()));
     }
-    Ok((provider_name, provider, api_key))
+    Ok((provider, api_key))
 }
 
 fn adapter_headers(
@@ -1473,6 +2173,7 @@ async fn transform_and_forward(
     api_key: Option<&ApiKey>,
     request: &ChatCompletionRequest,
     is_stream: bool,
+    trace: &mut ProxyLifecycleTrace,
 ) -> Result<
     (
         UpstreamResponse,
@@ -1503,6 +2204,7 @@ async fn transform_and_forward(
     .map_err(|error| {
         ProxyError::PolicyDenied(format!("Run budget denied provider call: {error}"))
     })?;
+    trace.record(ProxyLifecycleStage::ProviderBudgetReserved)?;
 
     let upstream = forward_to_provider_raw_reqwest(
         &state.client,
@@ -1514,6 +2216,7 @@ async fn transform_and_forward(
         adapter_headers(adapter, api_key),
     )
     .await?;
+    trace.record(ProxyLifecycleStage::ProviderDispatched)?;
     Ok((upstream, provider_budget))
 }
 
@@ -1549,6 +2252,50 @@ async fn record_actual_usage_for_session(state: &ProxyState, usage: TokenUsage) 
             "Actual token usage from provider"
         );
     }
+}
+
+async fn finalize_canonical_proxy_response(
+    state: &ProxyState,
+    normalized: &NormalizedProxyRequest,
+    provider_name: &str,
+    api_key: Option<&ApiKey>,
+    converted: (Response, Option<TokenUsage>),
+    provider_budget: crate::provider_budget::ProviderBudgetReservation,
+    mut trace: ProxyLifecycleTrace,
+) -> Result<Response, ProxyError> {
+    let (response, usage) = converted;
+    match usage.as_ref() {
+        Some(usage) => provider_budget.reconcile(usage),
+        None => provider_budget.finish_unknown(),
+    }
+    .map_err(|error| {
+        ProxyError::FinalizationFailed(format!("provider budget reconciliation failed: {error}"))
+    })?;
+    if state.config.session.token_tracking.enabled {
+        if let Some(usage) = usage {
+            record_actual_usage_for_session(state, usage).await;
+        }
+    }
+
+    let response = if normalized.canonical.stream == Some(true) || !response.status().is_success() {
+        response
+    } else {
+        apply_vdd_review(
+            response,
+            state,
+            &normalized.canonical,
+            provider_name,
+            api_key,
+        )
+        .await?
+    };
+    trace.record(ProxyLifecycleStage::EvidencePolicyApplied)?;
+
+    complete_loop_iteration(state).await;
+    trace.record(ProxyLifecycleStage::Finalized)?;
+    trace.record(ProxyLifecycleStage::DeliveryReady)?;
+    trace.finish()?;
+    Ok(response)
 }
 
 fn proxy_policy_error(error: &crate::services::policy::PolicyError) -> ProxyError {
@@ -1652,97 +2399,56 @@ async fn enforce_token_policy(
 
 async fn proxy_chat_completions(
     State(state): State<ProxyState>,
-    headers: HeaderMap,
-    body: String,
+    request: Request,
 ) -> Result<Response, ProxyError> {
-    let mut request: ChatCompletionRequest =
-        serde_json::from_str(&body).map_err(|e| ProxyError::InvalidBody(e.to_string()))?;
+    let (headers, _, normalized) = read_normalized_proxy_request(
+        request,
+        ProxyRouteKind::ChatCompletions,
+        state.config.proxy.max_response_bytes,
+    )
+    .await?;
+    let (normalized, provider_name, mut trace) =
+        prepare_canonical_proxy_request(&state, normalized).await?;
 
     info!(
-        model = %request.model,
-        messages = request.messages.len(),
+        model = %normalized.canonical.model,
+        messages = normalized.canonical.messages.len(),
         "Proxying chat completion request"
     );
 
-    enforce_model_policy(&state, &request)?;
-
-    let (provider_name, provider, api_key) = resolve_provider(&state, &headers, &request.model)?;
-    enforce_model_catalog_contract(&provider_name, &request)?;
-
-    bump_session_request_count(&state).await;
-
-    // Compact first into one cited, non-authoritative assistant checkpoint.
-    // The client retains the exact transcript archive; only this provider
-    // projection is replaced.
-    compact_request_context(&mut request, &state).await?;
-    // Prepare request: run hooks, project typed context, plugins, VDD, and
-    // every system-role value left by the client or compactor. This
-    // transparent proxy does not own a local tool-result/model-follow-up loop,
-    // so it must not advertise host MCP schemas as callable.
-    prepare_request_context(&mut request, &state).await?;
-    let estimated_input = crate::compaction::estimate_request_tokens(&request);
-    enforce_token_policy(&state, &request, estimated_input).await?;
-
-    // Pre-request token estimation and tracking
-    let token_tracking_enabled = state.config.session.token_tracking.enabled;
-    if token_tracking_enabled {
-        record_turn_estimate(&state, &request, estimated_input).await;
-    }
-
-    let is_stream = request.stream.unwrap_or(false);
+    let (provider, api_key) = resolve_provider_credentials(&state, &headers, &provider_name)?;
+    let is_stream = normalized.canonical.stream.unwrap_or(false);
     let (raw_response, provider_budget) = transform_and_forward(
         &state,
         provider,
         &provider_name,
         api_key.as_ref(),
-        &request,
+        &normalized.canonical,
         is_stream,
+        &mut trace,
     )
     .await?;
 
     // Post-response: non-streaming chat completions must be normalized back
     // into OpenAI shape after the provider-native request/response roundtrip.
     let max_bytes = state.config.proxy.max_response_bytes;
-    if is_stream {
-        let response = convert_response(raw_response, max_bytes).await?;
-        provider_budget.finish_unknown().map_err(|error| {
-            ProxyError::InvalidBody(format!("Provider budget reconciliation failed: {error}"))
-        })?;
-        complete_loop_iteration(&state).await;
-        Ok(response)
+    let (response, usage) = if is_stream {
+        (convert_response(raw_response, max_bytes).await?, None)
     } else {
         let (response_value, usage) =
             convert_response_with_usage(raw_response, max_bytes, &provider_name).await?;
-        if let Some(usage) = usage.as_ref() {
-            provider_budget.reconcile(usage).map_err(|error| {
-                ProxyError::InvalidBody(format!("Provider budget reconciliation failed: {error}"))
-            })?;
-        } else {
-            provider_budget.finish_unknown().map_err(|error| {
-                ProxyError::InvalidBody(format!("Provider budget reconciliation failed: {error}"))
-            })?;
-        }
-        if let Some(usage) = usage {
-            if token_tracking_enabled {
-                record_actual_usage_for_session(&state, usage).await;
-            }
-        }
-        if token_tracking_enabled {
-            let response = apply_vdd_review(
-                response_value,
-                &state,
-                &request,
-                &provider_name,
-                api_key.as_ref(),
-            )
-            .await?;
-            complete_loop_iteration(&state).await;
-            Ok(response)
-        } else {
-            complete_loop_iteration(&state).await;
-            Ok(response_value)
-        }
-    }
+        (response_value, usage)
+    };
+    finalize_canonical_proxy_response(
+        &state,
+        &normalized,
+        &provider_name,
+        api_key.as_ref(),
+        (response, usage),
+        provider_budget,
+        trace,
+    )
+    .await
 }
 
 /// Handle an explicitly host-initiated MCP call for compatibility callers.
@@ -1884,56 +2590,57 @@ pub async fn shutdown_mcp(mcp_manager: &Arc<RwLock<McpManager>>) {
 /// Proxy completions (legacy `OpenAI` format)
 async fn proxy_completions(
     State(state): State<ProxyState>,
-    headers: HeaderMap,
-    body: String,
+    request: Request,
 ) -> Result<Response, ProxyError> {
-    let mut request: Value =
-        serde_json::from_str(&body).map_err(|e| ProxyError::InvalidBody(e.to_string()))?;
-
-    let model = request["model"]
-        .as_str()
-        .unwrap_or("gpt-3.5-turbo-instruct")
-        .to_string();
-    let provider_name = determine_provider(&model, &state.config);
-    let provider = state
-        .config
-        .get_provider(&provider_name)
-        .ok_or_else(|| ProxyError::ProviderNotConfigured(provider_name.clone()))?;
-
-    let api_key = extract_api_key(&headers)?.or_else(|| provider.api_key.clone());
-    if api_key.is_none() && !crate::config::is_local_provider_name(&provider_name) {
-        return Err(ProxyError::NoApiKey(provider_name));
-    }
-
-    let is_stream = request["stream"].as_bool().unwrap_or(false);
+    let (headers, _, normalized) = read_normalized_proxy_request(
+        request,
+        ProxyRouteKind::LegacyCompletions,
+        state.config.proxy.max_response_bytes,
+    )
+    .await?;
+    let (mut normalized, provider_name, mut trace) =
+        prepare_canonical_proxy_request(&state, normalized).await?;
+    let (provider, api_key) = resolve_provider_credentials(&state, &headers, &provider_name)?;
+    let is_stream = normalized.canonical.stream.unwrap_or(false);
     let max_bytes = state.config.proxy.max_response_bytes;
     let provider_budget = crate::provider_budget::reserve_provider_call(
         &state.run_context,
         &provider_name,
-        &model,
-        &mut request,
+        &normalized.canonical.model,
+        &mut normalized.wire,
         u64::from(state.config.session.token_tracking.max_output_tokens),
     )
     .map_err(|error| {
         ProxyError::PolicyDenied(format!("Run budget denied provider call: {error}"))
     })?;
+    trace.record(ProxyLifecycleStage::ProviderBudgetReserved)?;
     let raw = forward_to_provider(
         &state.client,
         provider,
         &provider_name,
         api_key.as_ref(),
         "/v1/completions",
-        &request,
+        &normalized.wire,
         is_stream,
     )
     .await?;
+    trace.record(ProxyLifecycleStage::ProviderDispatched)?;
 
-    let response = convert_response(raw, max_bytes).await?;
-    provider_budget.finish_unknown().map_err(|error| {
-        ProxyError::InvalidBody(format!("Provider budget reconciliation failed: {error}"))
-    })?;
-    complete_loop_iteration(&state).await;
-    Ok(response)
+    let (response, usage) = if is_stream {
+        (convert_response(raw, max_bytes).await?, None)
+    } else {
+        convert_native_response_with_usage(raw, max_bytes, Some(&provider_name)).await?
+    };
+    finalize_canonical_proxy_response(
+        &state,
+        &normalized,
+        &provider_name,
+        api_key.as_ref(),
+        (response, usage),
+        provider_budget,
+        trace,
+    )
+    .await
 }
 
 /// Resolved authentication for a `/v1/messages` request.
@@ -2030,8 +2737,7 @@ async fn send_oauth_anthropic_messages(
     provider: &ProviderConfig,
     session: &crate::oauth::OAuthSession,
     request: &Value,
-    max_bytes: usize,
-) -> Result<Response, ProxyError> {
+) -> Result<UpstreamResponse, ProxyError> {
     info!("[/v1/messages] Using browser-bound OAuth session");
 
     let url = format!("{}/v1/messages", normalize_base_url(&provider.base_url));
@@ -2045,14 +2751,10 @@ async fn send_oauth_anthropic_messages(
         .apply(client.post(&url).json(request))
         .map_err(|error| ProxyError::InvalidBody(error.to_string()))?;
     let response = crate::provider_transport::send(builder).await?;
-    convert_response(
-        UpstreamResponse {
-            response,
-            request_headers: merged,
-        },
-        max_bytes,
-    )
-    .await
+    Ok(UpstreamResponse {
+        response,
+        request_headers: merged,
+    })
 }
 
 /// Send an Anthropic `/v1/messages` request authenticated by an API
@@ -2066,10 +2768,9 @@ async fn send_api_key_anthropic_messages(
     provider: &ProviderConfig,
     api_key: &ApiKey,
     request: &Value,
-    max_bytes: usize,
-) -> Result<Response, ProxyError> {
+) -> Result<UpstreamResponse, ProxyError> {
     let is_stream = request["stream"].as_bool().unwrap_or(false);
-    let raw = forward_to_provider(
+    forward_to_provider(
         client,
         provider,
         "anthropic",
@@ -2078,8 +2779,7 @@ async fn send_api_key_anthropic_messages(
         request,
         is_stream,
     )
-    .await?;
-    convert_response(raw, max_bytes).await
+    .await
 }
 
 /// Proxy Anthropic messages endpoint.
@@ -2092,60 +2792,79 @@ async fn send_api_key_anthropic_messages(
 /// [`send_api_key_anthropic_messages`]. See crosslink #386.
 async fn proxy_anthropic_messages(
     State(state): State<ProxyState>,
-    headers: HeaderMap,
-    body: String,
+    request: Request,
 ) -> Result<Response, ProxyError> {
-    let mut request: Value =
-        serde_json::from_str(&body).map_err(|e| ProxyError::InvalidBody(e.to_string()))?;
-
+    let (headers, _, normalized) = read_normalized_proxy_request(
+        request,
+        ProxyRouteKind::AnthropicMessages,
+        state.config.proxy.max_response_bytes,
+    )
+    .await?;
+    let (mut normalized, provider_name, mut trace) =
+        prepare_canonical_proxy_request(&state, normalized).await?;
     let provider = state
         .config
-        .get_provider("anthropic")
-        .ok_or_else(|| ProxyError::ProviderNotConfigured("anthropic".to_string()))?;
+        .get_provider(&provider_name)
+        .ok_or_else(|| ProxyError::ProviderNotConfigured(provider_name.clone()))?;
 
     let max_bytes = state.config.proxy.max_response_bytes;
     let auth = resolve_anthropic_auth(&headers, &state.oauth_store, provider).await?;
     if matches!(auth, AnthropicAuth::Oauth(_)) {
-        crate::claude_credentials::inject_oauth_prefix_only(&mut request)
+        crate::claude_credentials::inject_oauth_prefix_only(&mut normalized.wire)
             .map_err(|error| ProxyError::InvalidBody(error.to_string()))?;
-        crate::claude_credentials::strip_cache_control_ttl(&mut request);
+        crate::claude_credentials::strip_cache_control_ttl(&mut normalized.wire);
     }
-    let model = request
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("anthropic-messages")
-        .to_string();
     let provider_budget = crate::provider_budget::reserve_provider_call(
         &state.run_context,
-        "anthropic",
-        &model,
-        &mut request,
+        &provider_name,
+        &normalized.canonical.model,
+        &mut normalized.wire,
         u64::from(state.config.session.token_tracking.max_output_tokens),
     )
     .map_err(|error| {
         ProxyError::PolicyDenied(format!("Run budget denied provider call: {error}"))
     })?;
-    let response = match auth {
+    trace.record(ProxyLifecycleStage::ProviderBudgetReserved)?;
+    let raw = match &auth {
         AnthropicAuth::Oauth(session) => {
-            send_oauth_anthropic_messages(&state.client, provider, &session, &request, max_bytes)
-                .await
+            send_oauth_anthropic_messages(&state.client, provider, session, &normalized.wire).await
         }
         AnthropicAuth::ApiKey(api_key) => {
-            send_api_key_anthropic_messages(&state.client, provider, &api_key, &request, max_bytes)
+            send_api_key_anthropic_messages(&state.client, provider, api_key, &normalized.wire)
                 .await
         }
     }?;
-    provider_budget.finish_unknown().map_err(|error| {
-        ProxyError::InvalidBody(format!("Provider budget reconciliation failed: {error}"))
-    })?;
-    complete_loop_iteration(&state).await;
-    Ok(response)
+    trace.record(ProxyLifecycleStage::ProviderDispatched)?;
+    let is_stream = normalized.canonical.stream.unwrap_or(false);
+    let (response, usage) = if is_stream {
+        (convert_response(raw, max_bytes).await?, None)
+    } else {
+        convert_native_response_with_usage(raw, max_bytes, Some(&provider_name)).await?
+    };
+    let api_key = match &auth {
+        AnthropicAuth::ApiKey(api_key) => Some(api_key),
+        AnthropicAuth::Oauth(_) => None,
+    };
+    finalize_canonical_proxy_response(
+        &state,
+        &normalized,
+        &provider_name,
+        api_key,
+        (response, usage),
+        provider_budget,
+        trace,
+    )
+    .await
 }
 
-/// Passthrough for unhandled routes
+/// Canonical `OpenAI` Responses passthrough.
+///
+/// The catch-all router reaches this handler for every otherwise-unhandled
+/// `/v1/*` path. Classification happens before provider configuration or
+/// credentials are inspected, so an unknown shape cannot become an ambient
+/// operator-funded raw proxy.
 async fn proxy_passthrough(
     State(state): State<ProxyState>,
-    headers: HeaderMap,
     request: Request,
 ) -> Result<Response, ProxyError> {
     // Whitelist safe headers to forward — prevents credential leaks from
@@ -2157,62 +2876,38 @@ async fn proxy_passthrough(
         "user-agent",
         "content-type",
     ];
-    let path_and_query = request
-        .uri()
-        .path_and_query()
-        .map_or_else(|| request.uri().path().to_string(), ToString::to_string);
-    let request_path = request.uri().path().to_string();
-    let method = request.method().clone();
-    let provider = state
-        .config
-        .active_provider()
-        .ok_or_else(|| ProxyError::ProviderNotConfigured(state.config.proxy.target.clone()))?;
-
-    let api_key = extract_api_key(&headers)?.or_else(|| provider.api_key.clone());
-    if api_key.is_none() && !crate::config::is_local_provider_name(&state.config.proxy.target) {
-        return Err(ProxyError::NoApiKey(state.config.proxy.target.clone()));
-    }
+    let (headers, path_and_query, normalized) = read_normalized_proxy_request(
+        request,
+        ProxyRouteKind::OpenAiResponses,
+        state.config.proxy.max_response_bytes,
+    )
+    .await?;
+    let (mut normalized, provider_name, mut trace) =
+        prepare_canonical_proxy_request(&state, normalized).await?;
+    let (provider, api_key) = resolve_provider_credentials(&state, &headers, &provider_name)?;
 
     let url = format!(
         "{}{}",
         normalize_base_url(&provider.base_url),
         path_and_query
     );
-    crate::provider_transport::validate_endpoint(&state.config.proxy.target, &url)?;
-    debug!("Passthrough request");
-
-    let mut body = axum::body::to_bytes(request.into_body(), state.config.proxy.max_response_bytes)
-        .await
-        .map_err(|error| ProxyError::InvalidBody(format!("passthrough body rejected: {error}")))?;
-    // Responses is intentionally routed through passthrough so its opaque
-    // continuation items survive unchanged. It is still model work, so bind
-    // it to the same run budget and mutate only its output cap.
-    let provider_budget = if method == reqwest::Method::POST && request_path == "/v1/responses" {
-        let mut request_json = serde_json::from_slice::<Value>(&body)
-            .map_err(|error| ProxyError::InvalidBody(error.to_string()))?;
-        let model = request_json
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or("openai-responses")
-            .to_string();
-        let reservation = crate::provider_budget::reserve_provider_call(
-            &state.run_context,
-            &state.config.proxy.target,
-            &model,
-            &mut request_json,
-            u64::from(state.config.session.token_tracking.max_output_tokens),
-        )
-        .map_err(|error| {
-            ProxyError::PolicyDenied(format!("Run budget denied provider call: {error}"))
-        })?;
-        body = serde_json::to_vec(&request_json)
-            .map_err(|error| ProxyError::InvalidBody(error.to_string()))?
-            .into();
-        Some(reservation)
-    } else {
-        None
-    };
-    let mut req_builder = state.client.request(method, &url).body(body);
+    crate::provider_transport::validate_endpoint(&provider_name, &url)?;
+    debug!(
+        route = normalized.route.as_str(),
+        "Canonical passthrough request"
+    );
+    let provider_budget = crate::provider_budget::reserve_provider_call(
+        &state.run_context,
+        &provider_name,
+        &normalized.canonical.model,
+        &mut normalized.wire,
+        u64::from(state.config.session.token_tracking.max_output_tokens),
+    )
+    .map_err(|error| {
+        ProxyError::PolicyDenied(format!("Run budget denied provider call: {error}"))
+    })?;
+    trace.record(ProxyLifecycleStage::ProviderBudgetReserved)?;
+    let mut req_builder = state.client.post(&url).json(&normalized.wire);
 
     for (key, value) in &headers {
         let key_lower = key.as_str().to_lowercase();
@@ -2232,7 +2927,7 @@ async fn proxy_passthrough(
     // Crosslink #433: get_adapter now propagates an explicit error if
     // `state.config.proxy.target` is a typo'd name. This used to silently
     // fall back to OpenAIAdapter; the failure was invisible.
-    let adapter = crate::providers::get_adapter(&state.config.proxy.target)
+    let adapter = crate::providers::get_adapter(&provider_name)
         .map_err(|e| ProxyError::InvalidBody(e.to_string()))?;
     let mut provider_headers = adapter_headers(adapter, api_key.as_ref());
     provider_headers.extend(&provider.headers);
@@ -2241,20 +2936,35 @@ async fn proxy_passthrough(
         .map_err(|error| ProxyError::InvalidBody(error.to_string()))?;
 
     let response = crate::provider_transport::send(req_builder).await?;
-    let response = convert_response(
-        UpstreamResponse {
-            response,
-            request_headers: provider_headers,
-        },
-        state.config.proxy.max_response_bytes,
+    trace.record(ProxyLifecycleStage::ProviderDispatched)?;
+    let raw = UpstreamResponse {
+        response,
+        request_headers: provider_headers,
+    };
+    let is_stream = normalized.canonical.stream.unwrap_or(false);
+    let (response, usage) = if is_stream {
+        (
+            convert_response(raw, state.config.proxy.max_response_bytes).await?,
+            None,
+        )
+    } else {
+        convert_native_response_with_usage(
+            raw,
+            state.config.proxy.max_response_bytes,
+            Some(&provider_name),
+        )
+        .await?
+    };
+    finalize_canonical_proxy_response(
+        &state,
+        &normalized,
+        &provider_name,
+        api_key.as_ref(),
+        (response, usage),
+        provider_budget,
+        trace,
     )
-    .await?;
-    if let Some(provider_budget) = provider_budget {
-        provider_budget.finish_unknown().map_err(|error| {
-            ProxyError::InvalidBody(format!("Provider budget reconciliation failed: {error}"))
-        })?;
-    }
-    Ok(response)
+    .await
 }
 
 /// Determine which provider to use based on model name.
@@ -2650,6 +3360,16 @@ async fn convert_response(
     upstream: UpstreamResponse,
     max_bytes: usize,
 ) -> Result<Response, ProxyError> {
+    convert_native_response_with_usage(upstream, max_bytes, None)
+        .await
+        .map(|(response, _)| response)
+}
+
+async fn convert_native_response_with_usage(
+    upstream: UpstreamResponse,
+    max_bytes: usize,
+    provider_name: Option<&str>,
+) -> Result<(Response, Option<TokenUsage>), ProxyError> {
     let UpstreamResponse {
         response,
         request_headers,
@@ -2685,21 +3405,36 @@ async fn convert_response(
                 }
             });
             let json_body = serde_json::to_string(&clean_error).unwrap_or_default();
-            return builder
+            let response = builder
                 .header("content-type", "application/json")
                 .body(Body::from(json_body))
-                .map_err(|e| ProxyError::InvalidBody(format!("Failed to build error body: {e}")));
+                .map_err(|e| ProxyError::InvalidBody(format!("Failed to build error body: {e}")))?;
+            return Ok((response, None));
         }
 
         let diagnostic = request_headers.sanitize_diagnostic(&body_str);
-        return builder
+        let response = builder
             .body(Body::from(diagnostic.to_string()))
-            .map_err(|e| ProxyError::InvalidBody(format!("Failed to build error body: {e}")));
+            .map_err(|e| ProxyError::InvalidBody(format!("Failed to build error body: {e}")))?;
+        return Ok((response, None));
     }
 
-    builder
+    let usage = provider_name
+        .and_then(|name| get_adapter(name).ok())
+        .and_then(|adapter| {
+            serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|json| {
+                    adapter.extract_token_usage(&json).or_else(|| {
+                        let usage = extract_usage_from_response(&json);
+                        (usage.total() > 0).then_some(usage)
+                    })
+                })
+        });
+    let response = builder
         .body(Body::from(body))
-        .map_err(|e| ProxyError::InvalidBody(format!("Failed to build response body: {e}")))
+        .map_err(|e| ProxyError::InvalidBody(format!("Failed to build response body: {e}")))?;
+    Ok((response, usage))
 }
 
 /// Build a `ProxyState` from the given config, initializing all subsystems.
@@ -3425,6 +4160,210 @@ mod tests {
     }
 
     #[test]
+    fn supported_routes_normalize_to_equivalent_canonical_requests() {
+        let cases = [
+            (
+                ProxyRouteKind::ChatCompletions,
+                serde_json::json!({
+                    "model": "operator-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "max_tokens": 64
+                }),
+            ),
+            (
+                ProxyRouteKind::LegacyCompletions,
+                serde_json::json!({
+                    "model": "operator-model",
+                    "prompt": "hello",
+                    "max_tokens": 64
+                }),
+            ),
+            (
+                ProxyRouteKind::AnthropicMessages,
+                serde_json::json!({
+                    "model": "operator-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "max_tokens": 64
+                }),
+            ),
+            (
+                ProxyRouteKind::OpenAiResponses,
+                serde_json::json!({
+                    "model": "operator-model",
+                    "input": "hello",
+                    "max_output_tokens": 64
+                }),
+            ),
+        ];
+
+        for (route, wire) in cases {
+            let normalized = normalize_proxy_request(route, wire).expect("normalize route");
+            assert_eq!(normalized.route, route);
+            assert_eq!(normalized.canonical.model, "operator-model");
+            assert_eq!(normalized.canonical.max_tokens, Some(64));
+            let user = normalized
+                .canonical
+                .messages
+                .iter()
+                .find(|message| message.role == "user")
+                .expect("canonical user message");
+            assert_eq!(content_text(&user.content), "hello");
+        }
+    }
+
+    #[tokio::test]
+    async fn supported_routes_share_one_ordered_lifecycle_trace() {
+        let mut config = minimal_config("local");
+        config.providers.insert(
+            "local".to_string(),
+            test_provider_config("http://127.0.0.1:1".to_string()),
+        );
+        config.providers.insert(
+            "anthropic".to_string(),
+            test_provider_config("http://127.0.0.1:1".to_string()),
+        );
+        let state = test_proxy_state(config);
+        let cases = [
+            (
+                ProxyRouteKind::ChatCompletions,
+                serde_json::json!({"model": "operator-model", "messages": [{"role": "user", "content": "hello"}]}),
+            ),
+            (
+                ProxyRouteKind::LegacyCompletions,
+                serde_json::json!({"model": "operator-model", "prompt": "hello"}),
+            ),
+            (
+                ProxyRouteKind::AnthropicMessages,
+                serde_json::json!({"model": "operator-model", "messages": [{"role": "user", "content": "hello"}]}),
+            ),
+            (
+                ProxyRouteKind::OpenAiResponses,
+                serde_json::json!({"model": "operator-model", "input": "hello"}),
+            ),
+        ];
+        for (route, wire) in cases {
+            let normalized = normalize_proxy_request(route, wire).expect("normalize route");
+            let (_, _, mut trace) = prepare_canonical_proxy_request(&state, normalized)
+                .await
+                .expect("shared pre-dispatch lifecycle");
+            assert_eq!(trace.stages.as_slice(), &CANONICAL_PROXY_LIFECYCLE[..8]);
+            for stage in &CANONICAL_PROXY_LIFECYCLE[8..] {
+                trace.record(*stage).expect("canonical terminal stage");
+            }
+            trace.finish().expect("complete lifecycle");
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_passthrough_is_rejected_before_credentials_or_body() {
+        let state = test_proxy_state(minimal_config("anthropic"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header(header::AUTHORIZATION, "not-a-bearer")
+            .body(Body::from("not-json"))
+            .expect("request");
+
+        let error = proxy_passthrough(State(state), request)
+            .await
+            .expect_err("unknown route must fail closed");
+        assert!(matches!(error, ProxyError::UnsupportedRoute { .. }));
+
+        let state = test_proxy_state(minimal_config("anthropic"));
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/responses")
+            .header(header::AUTHORIZATION, "not-a-bearer")
+            .body(Body::from("not-json"))
+            .expect("request");
+        let error = proxy_passthrough(State(state), request)
+            .await
+            .expect_err("unsupported method must fail closed");
+        assert!(matches!(error, ProxyError::MethodNotAllowed { .. }));
+    }
+
+    #[test]
+    fn native_route_projection_preserves_opaque_provider_fields() {
+        let anthropic_messages = serde_json::json!([{
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "opaque", "signature": "sig_1"},
+                {"type": "text", "text": "hello"}
+            ]
+        }]);
+        let anthropic_tools = serde_json::json!([{
+            "name": "lookup",
+            "input_schema": {"type": "object"}
+        }]);
+        let mut anthropic = normalize_proxy_request(
+            ProxyRouteKind::AnthropicMessages,
+            serde_json::json!({
+                "model": "claude-test",
+                "messages": anthropic_messages,
+                "max_tokens": 64,
+                "tools": anthropic_tools,
+                "metadata": {"tenant_id": "tenant-1"}
+            }),
+        )
+        .expect("normalize Anthropic");
+        anthropic
+            .canonical
+            .messages
+            .insert(0, chat_message("system", "host context".to_string()));
+        apply_wire_projection(&mut anthropic, "host reference").expect("project Anthropic context");
+        assert_eq!(anthropic.wire["messages"][0], anthropic_messages[0]);
+        assert_eq!(anthropic.wire["messages"][1]["role"], "user");
+        assert_eq!(
+            anthropic.wire["messages"][1]["content"][0]["text"],
+            "host reference"
+        );
+        assert_eq!(anthropic.wire["tools"], anthropic_tools);
+        assert_eq!(anthropic.canonical.tools.as_ref().map(Vec::len), Some(1));
+        assert_eq!(anthropic.wire["metadata"]["tenant_id"], "tenant-1");
+        assert_eq!(anthropic.wire["system"][0]["text"], "host context");
+
+        let responses_input = serde_json::json!([
+            {"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque-state"},
+            {"role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+        ]);
+        let responses_tools = serde_json::json!([{
+            "type": "function",
+            "name": "lookup",
+            "parameters": {"type": "object"}
+        }]);
+        let mut responses = normalize_proxy_request(
+            ProxyRouteKind::OpenAiResponses,
+            serde_json::json!({
+                "model": "gpt-test",
+                "input": responses_input,
+                "store": false,
+                "tools": responses_tools,
+                "metadata": {"request_id": "request-1"}
+            }),
+        )
+        .expect("normalize Responses");
+        responses
+            .canonical
+            .messages
+            .insert(0, chat_message("system", "host context".to_string()));
+        apply_wire_projection(&mut responses, "host reference").expect("project Responses context");
+        assert_eq!(responses.wire["input"][0], responses_input[0]);
+        assert_eq!(
+            responses.wire["input"][1]["content"][0],
+            responses_input[1]["content"][0]
+        );
+        assert_eq!(
+            responses.wire["input"][1]["content"][1]["text"],
+            "host reference"
+        );
+        assert_eq!(responses.wire["tools"], responses_tools);
+        assert_eq!(responses.canonical.tools.as_ref().map(Vec::len), Some(1));
+        assert_eq!(responses.wire["store"], false);
+        assert_eq!(responses.wire["metadata"]["request_id"], "request-1");
+        assert_eq!(responses.wire["instructions"], "host context");
+    }
+
+    #[test]
     fn client_system_messages_cross_typed_user_authority_boundary() {
         let mut request = test_chat_request("test-model", None);
         request.messages.insert(
@@ -3678,15 +4617,6 @@ mod tests {
             .providers
             .insert("local".to_string(), test_provider_config(server.uri()));
         let state = test_proxy_state(config);
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer sk-proxy-test"),
-        );
-        headers.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
         let request = Request::builder()
             .method("POST")
             .uri("/v1/responses?include=reasoning.encrypted_content")
@@ -3694,7 +4624,7 @@ mod tests {
             .body(Body::from(request_body.to_string()))
             .expect("request");
 
-        let response = proxy_passthrough(State(state), headers, request)
+        let response = proxy_passthrough(State(state), request)
             .await
             .expect("Responses passthrough");
         assert_eq!(response.status(), StatusCode::OK);
@@ -4298,6 +5228,28 @@ mod tests {
         let err = ProxyError::PolicyDenied("model denied".to_string());
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn route_and_finalization_failures_have_typed_http_statuses() {
+        let unsupported = ProxyError::UnsupportedRoute {
+            method: "POST".to_string(),
+            path: "/v1/unknown".to_string(),
+        };
+        assert_eq!(unsupported.into_response().status(), StatusCode::NOT_FOUND);
+        let wrong_method = ProxyError::MethodNotAllowed {
+            method: "GET".to_string(),
+            path: "/v1/responses".to_string(),
+        };
+        assert_eq!(
+            wrong_method.into_response().status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        let finalization = ProxyError::FinalizationFailed("candidate lost".to_string());
+        assert_eq!(
+            finalization.into_response().status(),
+            StatusCode::BAD_GATEWAY
+        );
     }
 
     #[test]
