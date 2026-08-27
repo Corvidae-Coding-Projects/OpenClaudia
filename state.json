@@ -1,6 +1,6 @@
 {
   "next_display_id": 1173,
-  "next_comment_id": 1813,
+  "next_comment_id": 1814,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8403,7 +8403,7 @@
       "priority": "medium",
       "created_by": "s004-wave",
       "created_at": "2026-08-20T22:59:13.451175121Z",
-      "updated_at": "2026-08-27T12:41:33.018147570Z",
+      "updated_at": "2026-08-27T14:16:22.606898676Z",
       "labels": [
         "defect"
       ],
@@ -8416,6 +8416,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAdEzlG6II4xOK2MiIppALrNRNjnoSSb1LXIZAjKbTDU/VXgrx+TYUurz2V9lIb5HtSDjBxOIZd0mkj6fivozIBA=="
+        },
+        "bc4607ca-c5b2-4b6b-b5b0-edb36b446447": {
+          "display_id": 1813,
+          "author": "6Vw9",
+          "content": "Root-cause classification: test-harness isolation defect. The four currently failing #623/#624 lifecycle tests call test_run(), which roots sandboxed Git in the live OpenClaudia checkout and snapshots the shared .worktrees top-level containing unrelated persistent worktrees. The neighboring transaction fixtures use disposable repositories and pass. Repair will move these mutating tests onto isolated_git_fixture run capabilities, retain all production sandbox authority and cleanup semantics, and add .worktrees to the disposable repository's committed ignore policy.",
+          "created_at": "2026-08-27T14:16:22.604178459Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAlkGaWcXmi2XtJNjWdbkqncO5egBCIYU45+kKkq2O76fJR4PZSkbZC+FP4HpH8zWVgMWkQowoy1ooAh4y0fMgDw=="
         }
       }
     },
@@ -45551,11 +45560,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2041,
       "timestamp": "2026-08-27T14:14:17.587952437Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2042,
+      "timestamp": "2026-08-27T14:16:22.606898676Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T14:14:17.587952437Z",
+    "timestamp": "2026-08-27T14:16:22.606898676Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2041
+    "agent_seq": 2042
   }
 }
