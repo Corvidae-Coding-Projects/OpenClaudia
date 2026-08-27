@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- S-074: Bind isolated workspaces to run capabilities (#1159)
 - S-073: Make worktree apply and cleanup transactional (#1156)
 - S-072: Supervise browser and web work (#1154)
 - S-071: Enforce web policy at the connection boundary (#1153)
