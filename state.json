@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1168,
+  "next_display_id": 1169,
   "next_comment_id": 1786,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -842,6 +842,7 @@
     "c45ab2d3-40b1-43cd-8dae-ce6520fda40a": 1125,
     "c465e740-cba5-41e8-a8c9-1cd700e496c0": 954,
     "c4abcad5-e0ae-48fe-a67d-0c5ab275ac4b": 92,
+    "c4b54ee9-f54f-43a3-8653-2fae5ea5c884": 1168,
     "c4c5ecf5-1e7c-4bbd-9d37-8f6cbe6ea53d": 1137,
     "c519c063-640b-4bd6-96e4-6025b6ff1aac": 545,
     "c524245e-62ff-4a25-9c4a-22a018b8a249": 1038,
@@ -27278,6 +27279,18 @@
         "qa"
       ]
     },
+    "c4b54ee9-f54f-43a3-8653-2fae5ea5c884": {
+      "uuid": "c4b54ee9-f54f-43a3-8653-2fae5ea5c884",
+      "display_id": 1168,
+      "title": "S-091: Make ACP modes and advertised tools effective",
+      "description": "Implement docs/remediation-slices/091-acp-effective-capabilities.md on the active refactor branch. Generate ACP modes/tool schemas from effective registries, bind negotiated changes to validated run capability generations, and enforce the same canonical policy as other frontends so nothing forbidden is advertised or callable. Preserve working ACP behavior and capabilities; do not remove features. Worker phase writes code and focused tests only; parent coordinator performs all builds, tests, QA, integration fixes, commits, and runner monitoring. Prioritize realistic application paths over hypothetical perfection.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-27T11:25:05.507985757Z",
+      "updated_at": "2026-08-27T11:25:05.507985757Z"
+    },
     "c4c5ecf5-1e7c-4bbd-9d37-8f6cbe6ea53d": {
       "uuid": "c4c5ecf5-1e7c-4bbd-9d37-8f6cbe6ea53d",
       "display_id": 1137,
@@ -44897,11 +44910,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1992,
       "timestamp": "2026-08-27T11:24:54.995285419Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1993,
+      "timestamp": "2026-08-27T11:25:05.507985757Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T11:24:54.995285419Z",
+    "timestamp": "2026-08-27T11:25:05.507985757Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1992
+    "agent_seq": 1993
   }
 }
