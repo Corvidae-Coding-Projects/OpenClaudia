@@ -20664,12 +20664,13 @@
       "display_id": 1157,
       "title": "S-088: Run VDD as the canonical alternate-model verifier",
       "description": "Implement docs/remediation-slices/088-canonical-vdd-verifier-role.md as the canonical independent verifier run. VDD must use the same harness, guardrails, reality grounding, typed tools/evidence, provider adapters, budgets, cancellation, traces, and terminal states as other agents, but with separate context, enforced alternate-model/model-family identity, and stricter read-only authority. It must never self-approve, mutate the reviewed artifact, publish, commit, or close work; collision, staleness, unavailability, timeout, truncation, parse/transport error, and inconclusive results never become pass. Bootstrap with independent external/manual review. Retrospective queue includes S073-G1 sorted-manifest SHA-256 4857652caf8a1c802977be00cee7f5a8c12b022d030db2c4a3c7c72ec646380c and the other exact generations recorded in completed slice documents; any artifact mutation invalidates its queued generation.",
-      "status": "open",
+      "status": "closed",
       "priority": "medium",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T00:36:32.320359690Z",
-      "updated_at": "2026-08-27T20:39:52.701222306Z",
+      "updated_at": "2026-08-27T20:40:10.389259590Z",
+      "closed_at": "2026-08-27T20:40:10.389254285Z",
       "labels": [
         "feature"
       ],
@@ -46258,11 +46259,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2102,
       "timestamp": "2026-08-27T20:40:05.554861257Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2103,
+      "timestamp": "2026-08-27T20:40:10.389259590Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T20:40:05.554861257Z",
+    "timestamp": "2026-08-27T20:40:10.389259590Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2102
+    "agent_seq": 2103
   }
 }
