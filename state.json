@@ -1110,6 +1110,10 @@
       "agent_id": "6Vw9",
       "claimed_at": "2026-08-27T08:43:32.203825937Z"
     },
+    "1162": {
+      "agent_id": "wave1-s062-sol",
+      "claimed_at": "2026-08-27T08:46:42.468971919Z"
+    },
     "1163": {
       "agent_id": "wave1-s059-sol",
       "claimed_at": "2026-08-27T08:46:36.371990660Z"
@@ -44333,11 +44337,16 @@
       "agent_id": "wave1-s059-sol",
       "agent_seq": 1,
       "timestamp": "2026-08-27T08:46:36.371990660Z"
+    },
+    {
+      "agent_id": "wave1-s062-sol",
+      "agent_seq": 1,
+      "timestamp": "2026-08-27T08:46:42.468971919Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T08:46:36.371990660Z",
-    "agent_id": "wave1-s059-sol",
+    "timestamp": "2026-08-27T08:46:42.468971919Z",
+    "agent_id": "wave1-s062-sol",
     "agent_seq": 1
   }
 }
