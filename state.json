@@ -1,6 +1,6 @@
 {
   "next_display_id": 1173,
-  "next_comment_id": 1815,
+  "next_comment_id": 1816,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8403,11 +8403,20 @@
       "priority": "medium",
       "created_by": "s004-wave",
       "created_at": "2026-08-20T22:59:13.451175121Z",
-      "updated_at": "2026-08-27T14:29:03.336761771Z",
+      "updated_at": "2026-08-27T14:37:21.005802377Z",
       "labels": [
         "defect"
       ],
       "comments": {
+        "8a88b103-fdc5-433a-a0ad-92d8d901aff9": {
+          "display_id": 1815,
+          "author": "6Vw9",
+          "content": "Repair the local harness at its test-fixture boundary: make all six worktree discovery/lifecycle tests use disposable Git repositories with a committed .worktrees ignore rule, preserve production GitWorktree sandbox authority and dirty-worktree safety semantics, and verify both focused and complete Rust 1.98 gates.",
+          "created_at": "2026-08-27T14:37:21.003267756Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA8tTdIIaELEdfYK3znuqfE7840yIzWznahkaHq+N4yyuyxyIMQHE1MIUjmr8FjeLQGgdVL0yEQQlWX/l0tUu6Dg=="
+        },
         "ae5da985-5175-4110-a2b4-7ba2fb6d6a9a": {
           "display_id": 1800,
           "author": "6Vw9",
@@ -45579,11 +45588,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2043,
       "timestamp": "2026-08-27T14:29:03.336761771Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2044,
+      "timestamp": "2026-08-27T14:37:21.005802377Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T14:29:03.336761771Z",
+    "timestamp": "2026-08-27T14:37:21.005802377Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2043
+    "agent_seq": 2044
   }
 }
