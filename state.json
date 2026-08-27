@@ -10858,12 +10858,13 @@
       "display_id": 1169,
       "title": "S-094: Route every proxy API through the canonical lifecycle",
       "description": "Implement docs/remediation-slices/094-proxy-canonical-lifecycle-routing.md on the active refactor branch. Normalize supported chat, legacy completion, Anthropic-compatible, and passthrough routes into canonical requests with explicit capability profiles; apply context/provider state/tools/policy/hooks/budgets/compaction/evidence/finalization/delivery uniformly; reject unsupported forwarding before credential use. Preserve working proxy behavior and capabilities; do not remove features. Worker phase writes code and focused tests only; parent coordinator performs all builds, tests, QA, integration fixes, commits, and runner monitoring. Prioritize realistic application paths over hypothetical perfection.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T11:25:20.668792623Z",
-      "updated_at": "2026-08-27T12:59:26.008630166Z",
+      "updated_at": "2026-08-27T12:59:49.071750747Z",
+      "closed_at": "2026-08-27T12:59:49.071749096Z",
       "labels": [
         "feature"
       ],
@@ -45381,11 +45382,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2021,
       "timestamp": "2026-08-27T12:59:44.485885763Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2022,
+      "timestamp": "2026-08-27T12:59:49.071750747Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T12:59:44.485885763Z",
+    "timestamp": "2026-08-27T12:59:49.071750747Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2021
+    "agent_seq": 2022
   }
 }
