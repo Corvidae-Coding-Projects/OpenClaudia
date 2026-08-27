@@ -11355,11 +11355,12 @@
       "uuid": "51ec0a95-c9da-4bb1-b084-edbac07276ac",
       "display_id": 1158,
       "title": "Monitor S-073 exact-head PR #66 runners",
-      "status": "open",
+      "status": "closed",
       "priority": "medium",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T00:41:06.296173668Z",
-      "updated_at": "2026-08-27T04:33:09.848723378Z",
+      "updated_at": "2026-08-27T04:33:14.447374888Z",
+      "closed_at": "2026-08-27T04:33:14.447368641Z",
       "labels": [
         "maintenance"
       ],
@@ -43768,11 +43769,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1903,
       "timestamp": "2026-08-27T04:33:09.848723378Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1904,
+      "timestamp": "2026-08-27T04:33:14.447374888Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T04:33:09.848723378Z",
+    "timestamp": "2026-08-27T04:33:14.447374888Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1903
+    "agent_seq": 1904
   }
 }
