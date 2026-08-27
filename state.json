@@ -1,6 +1,6 @@
 {
   "next_display_id": 1171,
-  "next_comment_id": 1807,
+  "next_comment_id": 1808,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -10863,7 +10863,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T11:25:20.668792623Z",
-      "updated_at": "2026-08-27T12:04:02.542795650Z",
+      "updated_at": "2026-08-27T12:59:26.008630166Z",
       "labels": [
         "feature"
       ],
@@ -10885,6 +10885,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAVe44AT86uwQVtDYYzw1I12k31oju2HoHGkGRHOuLsf80iqrDcE7bEve/uc0S7JQaI1juRL3fwJ48PDm0sJetBg=="
+        },
+        "bddc87a4-24fc-4999-83e7-ac27d63f8259": {
+          "display_id": 1807,
+          "author": "6Vw9",
+          "content": "Parent verification integrated and line-reviewed S-094. Fixed native reference projection so canonical context reaches Anthropic and Responses wire bodies while opaque thinking/reasoning/tool fields remain intact. Supported-route admission, rejection before credentials/body, reference projection, full check, strict Clippy, and serialized suite coverage passed on Rust 1.98. Streaming/VDD delivery remains S-095.",
+          "created_at": "2026-08-27T12:59:25.988591681Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAmbh/tBzH5pTVXpXsIWPH32qnh6rLXiRStJrvXyh0cUhAAzcTRLZykbGVxPcXZwvTis4orDlzhxe5sOwzEfNUCw=="
         },
         "f92e9364-c089-486f-a9f6-6c6f0ded955c": {
           "display_id": 1794,
@@ -45341,11 +45350,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2017,
       "timestamp": "2026-08-27T12:59:21.200748057Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2018,
+      "timestamp": "2026-08-27T12:59:26.008630166Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T12:59:21.200748057Z",
+    "timestamp": "2026-08-27T12:59:26.008630166Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2017
+    "agent_seq": 2018
   }
 }
