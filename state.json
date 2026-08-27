@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1157,
+  "next_display_id": 1158,
   "next_comment_id": 1728,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -586,6 +586,7 @@
     "8d435fbf-0e17-4724-89ef-1ade747108d6": 1135,
     "8de5caaf-be57-4083-bc07-c9f33e5e7759": 580,
     "8e03afe6-d146-43e7-84bc-4084c696a4dc": 1115,
+    "8e058e60-5ec5-4756-9c54-0d1e156de3a6": 1157,
     "8e4a5961-7f8d-4650-81ff-7ea7d29be200": 384,
     "8ea62b4d-468c-4d61-bf8f-b69d261b2756": 26,
     "8ecebe13-cf84-408b-b5c1-f803b0b77dc4": 291,
@@ -19617,6 +19618,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAdbBhmqUWk/R1ZnZNGGQu0+utwWHY4ZkwR8FkSmIgPsDVkg9kgr8s5A3SzN/ArT6puwCxEBjahS4VrmYYT2cwAQ=="
         }
       }
+    },
+    "8e058e60-5ec5-4756-9c54-0d1e156de3a6": {
+      "uuid": "8e058e60-5ec5-4756-9c54-0d1e156de3a6",
+      "display_id": 1157,
+      "title": "S-088: Run VDD as the canonical alternate-model verifier",
+      "description": "Implement docs/remediation-slices/088-canonical-vdd-verifier-role.md as the canonical independent verifier run. VDD must use the same harness, guardrails, reality grounding, typed tools/evidence, provider adapters, budgets, cancellation, traces, and terminal states as other agents, but with separate context, enforced alternate-model/model-family identity, and stricter read-only authority. It must never self-approve, mutate the reviewed artifact, publish, commit, or close work; collision, staleness, unavailability, timeout, truncation, parse/transport error, and inconclusive results never become pass. Bootstrap with independent external/manual review. Retrospective queue includes S073-G1 sorted-manifest SHA-256 4857652caf8a1c802977be00cee7f5a8c12b022d030db2c4a3c7c72ec646380c and the other exact generations recorded in completed slice documents; any artifact mutation invalidates its queued generation.",
+      "status": "open",
+      "priority": "medium",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-27T00:36:32.320359690Z",
+      "updated_at": "2026-08-27T00:36:32.320359690Z"
     },
     "8e4a5961-7f8d-4650-81ff-7ea7d29be200": {
       "uuid": "8e4a5961-7f8d-4650-81ff-7ea7d29be200",
@@ -43472,11 +43485,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1878,
       "timestamp": "2026-08-27T00:30:37.470619440Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1879,
+      "timestamp": "2026-08-27T00:36:32.320359690Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T00:30:37.470619440Z",
+    "timestamp": "2026-08-27T00:36:32.320359690Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1878
+    "agent_seq": 1879
   }
 }
