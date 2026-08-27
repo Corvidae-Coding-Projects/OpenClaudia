@@ -1,6 +1,6 @@
 {
   "next_display_id": 1165,
-  "next_comment_id": 1777,
+  "next_comment_id": 1778,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8860,7 +8860,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-27T10:38:03.643526052Z",
+      "updated_at": "2026-08-27T10:43:17.048568739Z",
       "labels": [
         "remediation"
       ],
@@ -9577,6 +9577,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAUWFBcF6LrWtNaYrVGN+vPLd8M5fcFAK5+gRIGUriFyhT0SFsMW3s7wLnzQP4rtNJnF2P45tLdIm2OhhBq88PDA=="
+        },
+        "8dc2421c-bd4d-466b-9b7b-f419a772879d": {
+          "display_id": 1777,
+          "author": "6Vw9",
+          "content": "Runner repair committed as 1ff7bbcf. Cause: fuzz/Cargo.lock had not absorbed the new root zip dependency, so the repository-policy fuzz cargo-deny invocation failed under --locked. Exact local verification passed: root cargo deny, fuzz cargo deny, and Rust 1.98 cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets.",
+          "created_at": "2026-08-27T10:43:17.045910831Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAxsZRSVHioRIn9cRyYCBgeV7jbB6AH1VpXk+GRIdYtVoU587oXO1TFUAXgRy6Q9hYvxH4CQgajWIFEMxwk1okBQ=="
         },
         "91bd7ee4-b017-46c0-901a-02c2c2fbaeaa": {
           "display_id": 1480,
@@ -44642,11 +44651,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1969,
       "timestamp": "2026-08-27T10:38:03.643526052Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1970,
+      "timestamp": "2026-08-27T10:43:17.048568739Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T10:38:03.643526052Z",
+    "timestamp": "2026-08-27T10:43:17.048568739Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1969
+    "agent_seq": 1970
   }
 }
