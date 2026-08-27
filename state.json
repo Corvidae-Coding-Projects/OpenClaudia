@@ -19569,12 +19569,13 @@
       "display_id": 1178,
       "title": "S-063: Activate plugin capabilities through canonical registries",
       "description": "Implement docs/remediation-slices/063-plugin-capability-activation.md. Make reviewed plugin commands, hooks, skills, agents, MCP, and LSP components operational as namespaced generation-bound canonical registrations with exact provenance, effects, schemas, capabilities, activation/revocation ownership, and no private bypass paths. Preserve intended capabilities; do not remove features or broaden into adjacent cleanup.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T19:00:25.427833535Z",
-      "updated_at": "2026-08-27T20:39:43.044124419Z",
+      "updated_at": "2026-08-27T20:40:00.411622534Z",
+      "closed_at": "2026-08-27T20:40:00.411620871Z",
       "labels": [
         "feature"
       ],
@@ -46246,11 +46247,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2100,
       "timestamp": "2026-08-27T20:39:52.701222306Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2101,
+      "timestamp": "2026-08-27T20:40:00.411622534Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T20:39:52.701222306Z",
+    "timestamp": "2026-08-27T20:40:00.411622534Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2100
+    "agent_seq": 2101
   }
 }
