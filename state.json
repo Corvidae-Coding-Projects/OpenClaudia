@@ -13522,12 +13522,13 @@
       "display_id": 1156,
       "title": "S-073: Make worktree apply and cleanup transactional",
       "description": "Implement docs/remediation-slices/073-transactional-worktree-apply.md under parent #1071. Preserve working worktree behavior while separating preview, stage, commit, merge, discard, and removal into generation-bound transactional effects. Failed, timed-out, ambiguous, partially successful, conflicted, or inspection-failed Git operations must retain recoverable state with exact next actions; cleanup must never destroy unproven work, and retries must be idempotent. Keep S-074 workspace capability binding, S-075 command registry, S-077 general Git review/commit, and unrelated perfection work out of scope. Use Rust 1.98 with CARGO_BUILD_JOBS=2, skeptical deterministic tests, complete resource-aware gates, exact generated changelog, artifact-bound S-088 handoff, signed dollspace-gay commit on agent/refactor-agent-system-remediation, no push, final cargo clean, and exact-head PR #66 runner monitoring after user push.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-26T23:02:08.777248190Z",
-      "updated_at": "2026-08-27T00:38:03.546602193Z",
+      "updated_at": "2026-08-27T00:38:14.372807779Z",
+      "closed_at": "2026-08-27T00:38:14.372801450Z",
       "labels": [
         "feature"
       ],
@@ -43512,11 +43513,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1881,
       "timestamp": "2026-08-27T00:38:03.546602193Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1882,
+      "timestamp": "2026-08-27T00:38:14.372807779Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T00:38:03.546602193Z",
+    "timestamp": "2026-08-27T00:38:14.372807779Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1881
+    "agent_seq": 1882
   }
 }
