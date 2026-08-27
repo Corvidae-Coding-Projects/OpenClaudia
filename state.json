@@ -1,6 +1,6 @@
 {
   "next_display_id": 1173,
-  "next_comment_id": 1818,
+  "next_comment_id": 1819,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8403,7 +8403,7 @@
       "priority": "medium",
       "created_by": "s004-wave",
       "created_at": "2026-08-20T22:59:13.451175121Z",
-      "updated_at": "2026-08-27T14:42:58.547027843Z",
+      "updated_at": "2026-08-27T15:02:56.447062864Z",
       "labels": [
         "defect"
       ],
@@ -8443,6 +8443,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAlkGaWcXmi2XtJNjWdbkqncO5egBCIYU45+kKkq2O76fJR4PZSkbZC+FP4HpH8zWVgMWkQowoy1ooAh4y0fMgDw=="
+        },
+        "ec3e4968-1277-4bc6-8068-7ad13bb2f5ea": {
+          "display_id": 1818,
+          "author": "6Vw9",
+          "content": "Exact-head CI run 33083812957 validated repository-policy, Rust 1.98/MSRV, macOS, and Windows as green. Linux completed the repaired worktree coverage but later failed in unrelated hooks_permissions_e2e::command_hook_runs_and_returns_allowed_by_default because a successful hook's early stdin close was treated as CommandFailed(EPIPE). That runner defect is being tracked and fixed separately; it does not reopen the verified linked-worktree harness result.",
+          "created_at": "2026-08-27T15:02:56.444302487Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABANhCLp8NMxUuaubI7uTkB3WYvox/JAuWCLbPnhVZyBi5zz33PYGIMQDhqlE91JhfCYZ6n3IidXzG6oyWH2aUCBg=="
         },
         "f05d9c00-3d8d-4d15-9075-7af28161dd02": {
           "display_id": 1817,
@@ -45621,11 +45630,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2046,
       "timestamp": "2026-08-27T14:42:58.547027843Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2047,
+      "timestamp": "2026-08-27T15:02:56.447062864Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T14:42:58.547027843Z",
+    "timestamp": "2026-08-27T15:02:56.447062864Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2046
+    "agent_seq": 2047
   }
 }
