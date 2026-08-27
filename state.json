@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1186,
+  "next_display_id": 1187,
   "next_comment_id": 1850,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -145,6 +145,7 @@
     "229161ac-804a-46d0-bd0f-7db135965396": 457,
     "229c6659-0de7-4d63-b0f5-04fde1b686a0": 676,
     "22a3dc41-b354-4a3c-9e22-ed0355024460": 278,
+    "23035018-e570-4193-b7b1-4c313ed21c8b": 1186,
     "230a9c10-fd14-4736-88fa-506c98551924": 500,
     "23236431-8d2f-42b0-b8ff-64c86a2b1619": 965,
     "23299649-8a87-4b89-86b4-1bf7e9f4bb42": 752,
@@ -5094,6 +5095,18 @@
         "qa-seam-memory",
         "refactor"
       ]
+    },
+    "23035018-e570-4193-b7b1-4c313ed21c8b": {
+      "uuid": "23035018-e570-4193-b7b1-4c313ed21c8b",
+      "display_id": 1186,
+      "title": "Exercise canonical VDD through the real child harness end to end",
+      "description": "Current S-088 tests validate request/report helpers and manually seed Reality evidence, but never call VddEngine::verify_worker_artifact/run_canonical_verification or execute verifier tools through the production child harness. Add deterministic provider fixtures and a real preserved-worktree fixture covering alternate identity, read-only artifact and writable scratch, no network/secrets/delegation, authoritative citations, strict report terminal paths, artifact mutation, timeout/cancellation/budget/truncation, and receipt snapshots. This gate must fail for the ledger-key, identity, or unjoined-process defects rather than reproducing their implementation assumptions.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-27T22:18:28.703438669Z",
+      "updated_at": "2026-08-27T22:18:28.703438669Z"
     },
     "230a9c10-fd14-4736-88fa-506c98551924": {
       "uuid": "230a9c10-fd14-4736-88fa-506c98551924",
@@ -46619,11 +46632,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2139,
       "timestamp": "2026-08-27T22:18:24.512173232Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2140,
+      "timestamp": "2026-08-27T22:18:28.703438669Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T22:18:24.512173232Z",
+    "timestamp": "2026-08-27T22:18:28.703438669Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2139
+    "agent_seq": 2140
   }
 }
