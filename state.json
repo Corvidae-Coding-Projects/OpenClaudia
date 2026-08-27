@@ -1,6 +1,6 @@
 {
   "next_display_id": 1175,
-  "next_comment_id": 1822,
+  "next_comment_id": 1823,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -7046,7 +7046,7 @@
       "priority": "medium",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T15:04:57.438590597Z",
-      "updated_at": "2026-08-27T15:05:38.514535913Z",
+      "updated_at": "2026-08-27T15:16:26.700745524Z",
       "labels": [
         "defect"
       ],
@@ -7059,6 +7059,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABATK8MDIZxMTPdB8uO1MawbNc9iMQ82nrnlQfRopAdsKWgBsX3S0vLPcLj1j33qNs+PgP1vg+bbxiWHAcFlsSdAg=="
+        },
+        "e0ddcf61-ebdf-4684-838b-c20c5fde49c8": {
+          "display_id": 1822,
+          "author": "6Vw9",
+          "content": "Implemented in e2bb4980 fix(hooks): accept advisory stdin early close. ProcessLimits remains strict by default; hooks explicitly allow early stdin closure, StdinDelivery records ClosedEarly, and exit status remains authoritative. Verification on Rust 1.98: process supervisor unit tests 10/10; hook unit surface 82/82; hooks_permissions_e2e 22/22; full cargo test --locked --all-targets --all-features -- --test-threads=1 exit 0 (main library 2967 passed/0 failed/1 ignored); cargo check and Clippy --all-targets --all-features with -D warnings; fmt and diff checks.",
+          "created_at": "2026-08-27T15:16:26.698093049Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAKeo2OUdCGIqHAsUJrDCCKG9JjGCgAVcpA+d4eqmbAviDHXYJoIO5Ysc3W2qXzDzXWAfPqeiwmNlx9hwrpqKsCg=="
         }
       }
     },
@@ -45763,11 +45772,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2060,
       "timestamp": "2026-08-27T15:05:38.514535913Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2061,
+      "timestamp": "2026-08-27T15:16:26.700745524Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T15:05:38.514535913Z",
+    "timestamp": "2026-08-27T15:16:26.700745524Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2060
+    "agent_seq": 2061
   }
 }
