@@ -1114,10 +1114,6 @@
     "1166": {
       "agent_id": "6Vw9",
       "claimed_at": "2026-08-27T11:21:30.895513799Z"
-    },
-    "1167": {
-      "agent_id": "xdNo",
-      "claimed_at": "2026-08-27T11:31:44.035157477Z"
     }
   },
   "issues": {
@@ -45160,11 +45156,16 @@
       "agent_id": "xdNo",
       "agent_seq": 3,
       "timestamp": "2026-08-27T12:12:54.093898395Z"
+    },
+    {
+      "agent_id": "xdNo",
+      "agent_seq": 4,
+      "timestamp": "2026-08-27T12:13:05.041543983Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T12:12:54.093898395Z",
+    "timestamp": "2026-08-27T12:13:05.041543983Z",
     "agent_id": "xdNo",
-    "agent_seq": 3
+    "agent_seq": 4
   }
 }
