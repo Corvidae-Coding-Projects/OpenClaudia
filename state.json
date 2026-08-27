@@ -1,6 +1,6 @@
 {
   "next_display_id": 1170,
-  "next_comment_id": 1790,
+  "next_comment_id": 1791,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -17073,11 +17073,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T11:24:50.435019544Z",
-      "updated_at": "2026-08-27T11:27:00.214644794Z",
+      "updated_at": "2026-08-27T11:31:49.473557092Z",
       "labels": [
         "feature"
       ],
       "comments": {
+        "90589b41-250b-488f-9b3c-10b1eefbceb4": {
+          "display_id": 1790,
+          "author": "xdNo",
+          "content": "Plan resumed in isolated worktree wave2-s087: re-read repository instructions and current coordinator/subagent lifecycle code in this checkout, then implement the S-087 durable fresh-worker lifecycle and focused tests only. No Cargo, rustc, formatting, test, Git inspection, or verification commands will be run by this worker.",
+          "created_at": "2026-08-27T11:31:49.470662873Z",
+          "kind": "plan",
+          "signed_by": "SHA256:xseubu1kl2y6dLtm7eVZIcmgDi3p1ZeIGL/ravonWEk",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgWPmvE/5+aog3nFgkY2HchTlQRBhWVRFPxRK9UU43OW4AAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA+cDg0u+10F9BX8pSjtZPZDYpzjJCqL1X8/+4MCDcvoGj+J0gj33qBZBd03VkY39icX+qtPEdrZvxs0hwDtQuAA=="
+        },
         "c09ba8c4-c7bd-48ea-bdf3-e8e98bd8ac90": {
           "display_id": 1787,
           "author": "6Vw9",
@@ -45042,11 +45051,16 @@
       "agent_id": "xdNo",
       "agent_seq": 1,
       "timestamp": "2026-08-27T11:31:44.035157477Z"
+    },
+    {
+      "agent_id": "xdNo",
+      "agent_seq": 2,
+      "timestamp": "2026-08-27T11:31:49.473557092Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T11:31:44.035157477Z",
+    "timestamp": "2026-08-27T11:31:49.473557092Z",
     "agent_id": "xdNo",
-    "agent_seq": 1
+    "agent_seq": 2
   }
 }
