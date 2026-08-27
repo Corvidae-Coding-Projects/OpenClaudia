@@ -1,6 +1,6 @@
 {
   "next_display_id": 1193,
-  "next_comment_id": 1862,
+  "next_comment_id": 1863,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -13992,7 +13992,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T23:53:50.698988492Z",
-      "updated_at": "2026-08-27T23:55:32.663649941Z",
+      "updated_at": "2026-08-27T23:59:55.159279043Z",
       "labels": [
         "remediation"
       ],
@@ -14005,6 +14005,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAKllDzVehdbsQWVW3aJDsFIUrbB6JF8SAAwQR+H0KweFhLsFmw4EVH8ZZB782AdXSCC3elu/jY8TOaXh+3lGYDg=="
+        },
+        "f933b041-d0ca-4f01-a253-2cc7847f7a1a": {
+          "display_id": 1862,
+          "author": "6Vw9",
+          "content": "Architecture decision: S-084 must replace the competing metadata-only and unavailable synchronous scheduler shapes with one run-owned durable scheduler lifecycle; external metadata-only retention is rejected because it leaves the feature dormant. S-085 must use a run/generation-bound coordinator and a stricter deterministic snapshot-read allowlist; a global predictor or after-the-fact cache is rejected. S-095 must preserve true pull-based streaming when review policy permits it and use an explicit honest delayed/non-live delivery contract when exact-candidate review must precede success; replaying buffered bytes as fake live upstream streaming is rejected. Existing capabilities and auth routes remain operational.",
+          "created_at": "2026-08-27T23:59:55.156742111Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABARUN1eygBRko2MAF9NM/MsFI7Ad/EPfZ2G/pR4q5w8dXIyF6iGffRPZ9OCFxk8bTghvaZsGqnAHQJ0uJWNJLHCA=="
         }
       }
     },
@@ -47145,11 +47154,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2189,
       "timestamp": "2026-08-27T23:55:41.982393572Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2190,
+      "timestamp": "2026-08-27T23:59:55.159279043Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T23:55:41.982393572Z",
+    "timestamp": "2026-08-27T23:59:55.159279043Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2189
+    "agent_seq": 2190
   }
 }
