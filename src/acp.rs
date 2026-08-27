@@ -1176,8 +1176,8 @@ impl AcpServer {
         match method.as_str() {
             "initialize" => self.handle_initialize(msg.id, params),
             "authenticate" => self.handle_authenticate(msg.id, params),
-            "session/new" => self.handle_session_new(msg.id, params),
-            "session/load" => self.handle_session_load(msg.id, &params),
+            "session/new" => self.handle_session_new_canonical(msg.id, params).await,
+            "session/load" => self.handle_session_load(msg.id, &params).await,
             "session/prompt" => self.handle_session_prompt(msg.id, params).await,
             "session/cancel" => self.handle_session_cancel(msg.id, params),
             "session/set_mode" => self.handle_session_set_mode(msg.id, &params),
@@ -1243,29 +1243,70 @@ impl AcpServer {
         );
     }
 
-    fn handle_session_new(&mut self, id: Option<Value>, _params: Value) {
+    async fn handle_session_new_canonical(&mut self, id: Option<Value>, _params: Value) {
         let Some(id) = id else { return };
 
-        let session = self.session_manager.get_or_create_session();
-        let oc_session_id = session.id.clone();
-        let run_context = match self.build_run_context(&oc_session_id) {
-            Ok(run) => run,
+        let (acp_session_id, oc_session_id, run_context) = match self.prepare_new_session() {
+            Ok(prepared) => prepared,
             Err(error) => {
                 self.send_error(id, _INTERNAL_ERROR, &error);
                 return;
             }
         };
-
-        // Generate an ACP-facing session ID
-        let acp_session_id = uuid::Uuid::new_v4().to_string();
-        self.upsert_session_mapping(acp_session_id.clone(), oc_session_id, run_context);
-        self.messages.clear();
-        self.provider_native_state = None;
-        self.active_conversation_acp_session_id = Some(acp_session_id.clone());
-        if let Some(oc_session_id) = self.session_map.get(&acp_session_id) {
-            self.reset_state_for_session(oc_session_id);
+        if let Err(reason) = self.admit_session_start(&run_context, &oc_session_id).await {
+            crate::tools::retire_run(&run_context);
+            self.send_error(
+                id,
+                _INTERNAL_ERROR,
+                &format!("SessionStart hook blocked ACP session creation: {reason}"),
+            );
+            return;
         }
 
+        self.install_new_session(&acp_session_id, oc_session_id, run_context);
+        self.send_new_session_response(id, &acp_session_id);
+    }
+
+    async fn admit_session_start(
+        &self,
+        run_context: &Arc<crate::tools::ToolRunContext>,
+        openclaudia_session_id: &str,
+    ) -> Result<(), String> {
+        let input =
+            crate::hooks::HookInput::for_run(run_context, crate::hooks::HookEvent::SessionStart)
+                .with_session_id(openclaudia_session_id)
+                .with_extra("frontend", serde_json::Value::String("acp".to_string()));
+        let receipt = self
+            .hook_engine
+            .run_lifecycle(crate::hooks::HookEvent::SessionStart, &input)
+            .await;
+        receipt.blocking_reason().map_or(Ok(()), Err)
+    }
+
+    fn prepare_new_session(
+        &mut self,
+    ) -> Result<(String, String, Arc<crate::tools::ToolRunContext>), String> {
+        let oc_session_id = self.session_manager.get_or_create_session().id.clone();
+        let run_context = self.build_run_context(&oc_session_id)?;
+        Ok((uuid::Uuid::new_v4().to_string(), oc_session_id, run_context))
+    }
+
+    fn install_new_session(
+        &mut self,
+        acp_session_id: &str,
+        oc_session_id: String,
+        run_context: Arc<crate::tools::ToolRunContext>,
+    ) {
+        self.upsert_session_mapping(acp_session_id.to_string(), oc_session_id, run_context);
+        self.messages.clear();
+        self.provider_native_state = None;
+        self.active_conversation_acp_session_id = Some(acp_session_id.to_string());
+        if let Some(oc_session_id) = self.session_map.get(acp_session_id) {
+            self.reset_state_for_session(oc_session_id);
+        }
+    }
+
+    fn send_new_session_response(&self, id: Value, acp_session_id: &str) {
         self.send_response(
             id,
             Some(json!({
@@ -1278,7 +1319,7 @@ impl AcpServer {
         info!(acp_session_id = %acp_session_id, "Created new ACP session");
     }
 
-    fn handle_session_load(&mut self, id: Option<Value>, params: &Value) {
+    async fn handle_session_load(&mut self, id: Option<Value>, params: &Value) {
         let Some(id) = id else { return };
 
         let acp_session_id =
@@ -1299,8 +1340,6 @@ impl AcpServer {
         if let Some(oc_id) = self.session_map.get(&acp_session_id).cloned() {
             // Try to load the persisted OpenClaudia session
             if let Some(session) = self.session_manager.load_session(&oc_id) {
-                // Restore it as active
-                self.session_manager.start_coding(&session.id);
                 let run_context = match self.build_run_context(&oc_id) {
                     Ok(run) => run,
                     Err(error) => {
@@ -1308,6 +1347,17 @@ impl AcpServer {
                         return;
                     }
                 };
+                if let Err(reason) = self.admit_session_start(&run_context, &oc_id).await {
+                    crate::tools::retire_run(&run_context);
+                    self.send_error(
+                        id,
+                        _INTERNAL_ERROR,
+                        &format!("SessionStart hook blocked ACP session load: {reason}"),
+                    );
+                    return;
+                }
+                // Restore it as active only after canonical admission.
+                self.session_manager.start_coding(&session.id);
                 self.replace_run_context(acp_session_id.clone(), run_context);
                 self.reset_state_for_session(&oc_id);
                 self.messages.clear();
@@ -1337,6 +1387,15 @@ impl AcpServer {
                 return;
             }
         };
+        if let Err(reason) = self.admit_session_start(&run_context, &oc_session_id).await {
+            crate::tools::retire_run(&run_context);
+            self.send_error(
+                id,
+                _INTERNAL_ERROR,
+                &format!("SessionStart hook blocked ACP session load fallback: {reason}"),
+            );
+            return;
+        }
         self.upsert_session_mapping(acp_session_id.clone(), oc_session_id, run_context);
         self.messages.clear();
         self.provider_native_state = None;
@@ -1567,25 +1626,53 @@ impl AcpServer {
         "error".to_string()
     }
 
+    fn parse_prompt_params(params: &Value) -> Result<(String, String), String> {
+        let session_id = Self::required_string_param(params, "sessionId", "Missing sessionId")?;
+        if session_id.is_empty() {
+            return Err("sessionId must not be empty".to_string());
+        }
+        let prompt = Self::required_string_param(params, "prompt", "Missing prompt")?;
+        Ok((session_id.to_string(), prompt.to_string()))
+    }
+
+    fn prepare_prompt_run_context(
+        &mut self,
+        acp_session_id: &str,
+        oc_session_id: &str,
+    ) -> Result<Arc<crate::tools::ToolRunContext>, String> {
+        let persisted_workspace = self
+            .run_contexts
+            .get(acp_session_id)
+            .and_then(|run| run.isolated_workspace().cloned());
+        if persisted_workspace.is_some() {
+            if let Some(retired) = self.run_contexts.remove(acp_session_id) {
+                crate::tools::worktree::release_workspace_descriptor_owner(&retired)?;
+                crate::tools::retire_run(&retired);
+            }
+        }
+        let base_run = self.build_run_context(oc_session_id)?;
+        let run_context = if let Some(workspace) = persisted_workspace.as_ref() {
+            match crate::tools::ToolRunContext::resume_isolated_workspace(&base_run, workspace) {
+                Ok(run) => {
+                    crate::tools::retire_run(&base_run);
+                    run
+                }
+                Err(error) => {
+                    crate::tools::retire_run(&base_run);
+                    return Err(error.to_string());
+                }
+            }
+        } else {
+            base_run
+        };
+        self.replace_run_context(acp_session_id.to_string(), Arc::clone(&run_context));
+        Ok(run_context)
+    }
+
     async fn handle_session_prompt(&mut self, id: Option<Value>, params: Value) {
         let Some(id) = id else { return };
-
-        let acp_session_id =
-            match Self::required_string_param(&params, "sessionId", "Missing sessionId") {
-                Ok(sid) => sid.to_string(),
-                Err(message) => {
-                    self.send_error(id, INVALID_PARAMS, &message);
-                    return;
-                }
-            };
-
-        if acp_session_id.is_empty() {
-            self.send_error(id, INVALID_PARAMS, "sessionId must not be empty");
-            return;
-        }
-
-        let prompt = match Self::required_string_param(&params, "prompt", "Missing prompt") {
-            Ok(prompt) => prompt.to_string(),
+        let (acp_session_id, prompt) = match Self::parse_prompt_params(&params) {
+            Ok(parsed) => parsed,
             Err(message) => {
                 self.send_error(id, INVALID_PARAMS, &message);
                 return;
@@ -1605,46 +1692,51 @@ impl AcpServer {
         // A prompt is one cancellable run generation. Rotate the capability
         // rather than clearing a process-global cancellation bit so a prior
         // cancelled turn can never poison or revive another turn.
-        let persisted_workspace = self
-            .run_contexts
-            .get(&acp_session_id)
-            .and_then(|run| run.isolated_workspace().cloned());
-        if persisted_workspace.is_some() {
-            if let Some(retired) = self.run_contexts.remove(&acp_session_id) {
-                if let Err(error) =
-                    crate::tools::worktree::release_workspace_descriptor_owner(&retired)
-                {
-                    self.send_error(id, _INTERNAL_ERROR, &error);
-                    return;
-                }
-                crate::tools::retire_run(&retired);
-            }
-        }
-        let base_run = match self.build_run_context(&oc_session_id) {
+        let run_context = match self.prepare_prompt_run_context(&acp_session_id, &oc_session_id) {
             Ok(run) => run,
             Err(error) => {
                 self.send_error(id, _INTERNAL_ERROR, &error);
                 return;
             }
         };
-        let run_context = if let Some(workspace) = persisted_workspace.as_ref() {
-            match crate::tools::ToolRunContext::resume_isolated_workspace(&base_run, workspace) {
-                Ok(run) => run,
-                Err(error) => {
-                    self.send_error(id, _INTERNAL_ERROR, &error.to_string());
-                    return;
-                }
-            }
-        } else {
-            base_run
-        };
-        self.replace_run_context(acp_session_id.clone(), Arc::clone(&run_context));
+
+        let prompt_input = crate::hooks::HookInput::for_run(
+            &run_context,
+            crate::hooks::HookEvent::UserPromptSubmit,
+        )
+        .with_session_id(&oc_session_id)
+        .with_prompt(&prompt)
+        .with_extra("frontend", serde_json::Value::String("acp".to_string()));
+        let prompt_receipt = self
+            .hook_engine
+            .run_lifecycle(crate::hooks::HookEvent::UserPromptSubmit, &prompt_input)
+            .await;
+        if let Some(reason) = prompt_receipt.blocking_reason() {
+            self.send_error(
+                id,
+                INVALID_REQUEST,
+                &format!("UserPromptSubmit hook blocked ACP prompt: {reason}"),
+            );
+            return;
+        }
 
         // Add user message
         self.messages.push(json!({
             "role": "user",
             "content": prompt.clone(),
         }));
+        let hook_items = crate::context::hook_result_reference_items(
+            &prompt_receipt.into_result(),
+            "user_prompt_submit",
+            500,
+        );
+        if !hook_items.is_empty() {
+            let projection = crate::context::ContextProjector::project(
+                hook_items,
+                crate::context::ContextBudget::default(),
+            );
+            projection.append_reference_to_json_messages(&mut self.messages);
+        }
         let task_obs = crate::grounded_loop::observe_session_user_task(
             &run_context,
             &oc_session_id,
@@ -1653,9 +1745,29 @@ impl AcpServer {
         );
 
         // Run the agentic loop
-        let stop_reason = self
+        let mut stop_reason = self
             .run_prompt_loop(run_context, &acp_session_id, &oc_session_id, task_obs)
             .await;
+
+        if let Some(run_context) = self.run_context_for_acp(&acp_session_id) {
+            let stop_input =
+                crate::hooks::HookInput::for_run(run_context, crate::hooks::HookEvent::Stop)
+                    .with_session_id(&oc_session_id)
+                    .with_extra(
+                        "stop_reason",
+                        serde_json::Value::String(stop_reason.clone()),
+                    );
+            let stop_receipt = self
+                .hook_engine
+                .run_lifecycle(crate::hooks::HookEvent::Stop, &stop_input)
+                .await;
+            if let Some(reason) = stop_receipt.blocking_reason() {
+                self.record_failed_prompt_turn(&format!(
+                    "Stop hook blocked ACP turn finalization: {reason}"
+                ));
+                stop_reason = "hook_blocked".to_string();
+            }
+        }
 
         // Record turn metrics
         if let Some(session) = self.session_manager.get_session_mut() {
@@ -3876,7 +3988,22 @@ pub async fn run_acp_server(
         server.handle_message(msg).await;
     }
 
-    // Clean up — dropping server drops stdout_tx, which causes the writer thread to exit
+    // Close every admitted ACP session through the same observable lifecycle
+    // before releasing its capability generation.
+    let active_runs = server.run_contexts.values().cloned().collect::<Vec<_>>();
+    for run_context in active_runs {
+        let input =
+            crate::hooks::HookInput::for_run(&run_context, crate::hooks::HookEvent::SessionEnd)
+                .with_session_id(run_context.session_id())
+                .with_extra("frontend", serde_json::Value::String("acp".to_string()));
+        let _receipt = server
+            .hook_engine
+            .run_lifecycle(crate::hooks::HookEvent::SessionEnd, &input)
+            .await;
+        crate::tools::retire_run(&run_context);
+    }
+
+    // Dropping server drops stdout_tx, which causes the writer thread to exit.
     drop(server);
     let _ = writer_handle.join();
 
@@ -6671,11 +6798,13 @@ blast_radius:
         assert_eq!(acp_mode_label(SessionMode::Coding), "coding");
     }
 
-    #[test]
-    fn session_set_mode_updates_active_session_without_replacing_id() {
+    #[tokio::test]
+    async fn session_set_mode_updates_active_session_without_replacing_id() {
         let (mut server, mut rx, _tmp) = test_server();
 
-        server.handle_session_new(Some(json!(1)), Value::Null);
+        server
+            .handle_session_new_canonical(Some(json!(1)), Value::Null)
+            .await;
         let created = next_response(&mut rx);
         let acp_session_id = created["result"]["sessionId"]
             .as_str()
@@ -6757,8 +6886,8 @@ blast_radius:
         );
     }
 
-    #[test]
-    fn session_load_rejects_invalid_session_id_before_creating_session() {
+    #[tokio::test]
+    async fn session_load_rejects_invalid_session_id_before_creating_session() {
         let (mut server, mut rx, _tmp) = test_server();
 
         for (id, params, expected) in [
@@ -6773,7 +6902,7 @@ blast_radius:
                 "sessionId must not be empty",
             ),
         ] {
-            server.handle_session_load(Some(id), &params);
+            server.handle_session_load(Some(id), &params).await;
             let response = next_response(&mut rx);
 
             assert_invalid_params(&response, expected);
@@ -6815,10 +6944,12 @@ blast_radius:
         }
     }
 
-    #[test]
-    fn session_set_mode_rejects_unknown_modes_without_mutation() {
+    #[tokio::test]
+    async fn session_set_mode_rejects_unknown_modes_without_mutation() {
         let (mut server, mut rx, _tmp) = test_server();
-        server.handle_session_new(Some(json!(1)), Value::Null);
+        server
+            .handle_session_new_canonical(Some(json!(1)), Value::Null)
+            .await;
         let _ = next_response(&mut rx);
         let session_id = server
             .session_manager
@@ -6839,14 +6970,16 @@ blast_radius:
         assert_eq!(session.mode, SessionMode::Initializer);
     }
 
-    #[test]
-    fn session_new_advertises_config_options_matching_active_state() {
+    #[tokio::test]
+    async fn session_new_advertises_config_options_matching_active_state() {
         let (mut server, mut rx, _tmp) = test_server();
         server.state.update(|state, _| {
             state.ide.active_file = Some("src/stale.rs".to_string());
         });
 
-        server.handle_session_new(Some(json!(1)), Value::Null);
+        server
+            .handle_session_new_canonical(Some(json!(1)), Value::Null)
+            .await;
         let response = next_response(&mut rx);
 
         assert_eq!(
@@ -6870,10 +7003,12 @@ blast_radius:
         });
     }
 
-    #[test]
-    fn session_set_config_option_mode_updates_session_and_returns_full_state() {
+    #[tokio::test]
+    async fn session_set_config_option_mode_updates_session_and_returns_full_state() {
         let (mut server, mut rx, _tmp) = test_server();
-        server.handle_session_new(Some(json!(1)), Value::Null);
+        server
+            .handle_session_new_canonical(Some(json!(1)), Value::Null)
+            .await;
         let created = next_response(&mut rx);
         let acp_session_id = created["result"]["sessionId"]
             .as_str()
@@ -6904,12 +7039,14 @@ blast_radius:
         );
     }
 
-    #[test]
-    fn session_set_config_option_model_updates_provider_request_model() {
+    #[tokio::test]
+    async fn session_set_config_option_model_updates_provider_request_model() {
         let (mut server, mut rx, _tmp) = test_server();
         server.config.proxy.target = "anthropic".to_string();
         server.model = "claude-opus-4-8".to_string();
-        server.handle_session_new(Some(json!(1)), Value::Null);
+        server
+            .handle_session_new_canonical(Some(json!(1)), Value::Null)
+            .await;
         let created = next_response(&mut rx);
         let acp_session_id = created["result"]["sessionId"]
             .as_str()
@@ -6933,12 +7070,14 @@ blast_radius:
         );
     }
 
-    #[test]
-    fn session_set_config_option_accepts_unadvertised_model_without_static_catalog_gate() {
+    #[tokio::test]
+    async fn session_set_config_option_accepts_unadvertised_model_without_static_catalog_gate() {
         let (mut server, mut rx, _tmp) = test_server();
         server.config.proxy.target = "anthropic".to_string();
         server.model = "claude-opus-4-8".to_string();
-        server.handle_session_new(Some(json!(1)), Value::Null);
+        server
+            .handle_session_new_canonical(Some(json!(1)), Value::Null)
+            .await;
         let created = next_response(&mut rx);
         let acp_session_id = created["result"]["sessionId"]
             .as_str()
@@ -6962,8 +7101,8 @@ blast_radius:
         );
     }
 
-    #[test]
-    fn session_set_config_option_rejects_policy_denied_model_without_mutation() {
+    #[tokio::test]
+    async fn session_set_config_option_rejects_policy_denied_model_without_mutation() {
         let (mut server, mut rx, _tmp) = test_server();
         server.model = "allowed-model".to_string();
         server.policy_enforcer = Arc::new(crate::services::policy::PolicyEnforcer::new(
@@ -6972,7 +7111,9 @@ blast_radius:
                 ..Default::default()
             },
         ));
-        server.handle_session_new(Some(json!(1)), Value::Null);
+        server
+            .handle_session_new_canonical(Some(json!(1)), Value::Null)
+            .await;
         let created = next_response(&mut rx);
         let acp_session_id = created["result"]["sessionId"]
             .as_str()

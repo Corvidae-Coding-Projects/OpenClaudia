@@ -104,6 +104,86 @@ pub struct HooksConfig {
     pub vdd_converged: Vec<HookEntry>,
 }
 
+impl HooksConfig {
+    /// Validate the exact hook surface supported by production composition
+    /// roots. This runs before an engine is constructed so malformed matchers,
+    /// empty definitions, zero timeouts, and provider callbacks that no
+    /// production runtime owns cannot become silently inert configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a source-oriented validation error for the first unsupported
+    /// entry in canonical event order.
+    pub fn validate_runtime(&self) -> Result<(), String> {
+        let events: [(&str, &[HookEntry]); 16] = [
+            ("session_start", &self.session_start),
+            ("user_prompt_submit", &self.user_prompt_submit),
+            ("pre_tool_use", &self.pre_tool_use),
+            ("permission_request", &self.permission_request),
+            ("post_tool_use", &self.post_tool_use),
+            ("post_tool_use_failure", &self.post_tool_use_failure),
+            ("pre_compact", &self.pre_compact),
+            ("subagent_start", &self.subagent_start),
+            ("subagent_stop", &self.subagent_stop),
+            ("pre_adversary_review", &self.pre_adversary_review),
+            ("post_adversary_review", &self.post_adversary_review),
+            ("vdd_conflict", &self.vdd_conflict),
+            ("vdd_converged", &self.vdd_converged),
+            ("notification", &self.notification),
+            ("stop", &self.stop),
+            ("session_end", &self.session_end),
+        ];
+
+        for (event, entries) in events {
+            for (entry_index, entry) in entries.iter().enumerate() {
+                if entry.hooks.is_empty() {
+                    return Err(format!(
+                        "hooks.{event}[{entry_index}] must contain at least one hook"
+                    ));
+                }
+                if let Some(matcher) = entry.matcher.as_deref() {
+                    crate::hooks::validate_hook_matcher(matcher, "").map_err(|error| {
+                        format!("hooks.{event}[{entry_index}].matcher is invalid: {error}")
+                    })?;
+                }
+                for (hook_index, hook) in entry.hooks.iter().enumerate() {
+                    let timeout = match hook {
+                        Hook::Command {
+                            command, timeout, ..
+                        } => {
+                            if command.trim().is_empty() {
+                                return Err(format!(
+                                    "hooks.{event}[{entry_index}].hooks[{hook_index}].command must not be empty"
+                                ));
+                            }
+                            *timeout
+                        }
+                        Hook::Prompt { prompt, timeout } => {
+                            if prompt.trim().is_empty() {
+                                return Err(format!(
+                                    "hooks.{event}[{entry_index}].hooks[{hook_index}].prompt must not be empty"
+                                ));
+                            }
+                            *timeout
+                        }
+                        Hook::Model { .. } => {
+                            return Err(format!(
+                                "hooks.{event}[{entry_index}].hooks[{hook_index}] uses type=model, which is unavailable until a canonical provider callback is owned by every frontend"
+                            ));
+                        }
+                    };
+                    if timeout == 0 {
+                        return Err(format!(
+                            "hooks.{event}[{entry_index}].hooks[{hook_index}].timeout must be at least one second"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Which slot of [`crate::hooks::HookInput`] the [`HookEntry::matcher`] regex
 /// is tested against.
 ///

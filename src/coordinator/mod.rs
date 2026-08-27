@@ -16,11 +16,22 @@
 //! than living on the coordinator struct long-term — Phase 2 will
 //! convert them to an `AppHandles` param passed per dispatch.
 pub mod permission;
+pub mod planner;
 pub mod task_queue;
 pub mod tasks;
 pub mod teammate;
 
 pub use permission::{LeaderPermissionBridge, QueuedPermission};
+pub use planner::{
+    PlannerAmendment, PlannerAmendmentId, PlannerApprovalEvidence, PlannerApprovalId,
+    PlannerApprovalState, PlannerArtifact, PlannerArtifactId, PlannerAttempt, PlannerAttemptId,
+    PlannerAttemptState, PlannerCheckpoint, PlannerCheckpointError, PlannerCheckpointGeneration,
+    PlannerCheckpointStore, PlannerChild, PlannerChildDisposition, PlannerChildOwner,
+    PlannerChildState, PlannerContradiction, PlannerContradictionId, PlannerContradictionState,
+    PlannerDecision, PlannerDecisionId, PlannerEvidenceSource, PlannerEvidenceSourceRecord,
+    PlannerLease, PlannerLeaseId, PlannerLeaseTombstone, PlannerObjective, PlannerObjectiveId,
+    PlannerRotation, PlannerRuntime, PlannerSourceId, PlannerState, StoredPlannerCheckpoint,
+};
 pub use task_queue::{Task, TaskId, TaskQueue, TaskQueueError, TaskState};
 pub use teammate::{AgentColor, Teammate, TeammateId, TeammateState, TransitionError};
 

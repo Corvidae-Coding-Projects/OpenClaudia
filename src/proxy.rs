@@ -734,19 +734,15 @@ async fn prepare_request_context(
     let hook_input = HookInput::for_run(&state.run_context, HookEvent::UserPromptSubmit)
         .with_prompt(last_user_message.unwrap_or_default());
 
-    let hook_result = state
+    let hook_receipt = state
         .hook_engine
-        .run(HookEvent::UserPromptSubmit, &hook_input)
+        .run_lifecycle(HookEvent::UserPromptSubmit, &hook_input)
         .await;
 
-    if !hook_result.allowed {
-        let reason = hook_result
-            .outputs
-            .first()
-            .and_then(|o| o.reason.clone())
-            .unwrap_or_else(|| "Request blocked by hook".to_string());
+    if let Some(reason) = hook_receipt.blocking_reason() {
         return Err(ProxyError::HookBlocked(reason));
     }
+    let hook_result = hook_receipt.into_result();
 
     context_items.extend(hook_result_reference_items(
         &hook_result,
@@ -3076,8 +3072,8 @@ fn mcp_trust_grants_from_startup() -> Result<std::collections::HashSet<String>, 
     Ok(trusted)
 }
 
-/// Fire the `SessionStart` hook and return the session ID.
-async fn fire_session_start(state: &ProxyState) -> String {
+/// Admit the proxy session through the canonical lifecycle and return its ID.
+async fn fire_session_start(state: &ProxyState) -> Result<String, ProxyError> {
     let session_id = {
         let mut sm = state.session_manager.write().await;
         let id = sm.get_or_create_session().id.clone();
@@ -3087,18 +3083,27 @@ async fn fire_session_start(state: &ProxyState) -> String {
 
     let start_input = HookInput::for_run(&state.run_context, HookEvent::SessionStart)
         .with_session_id(&session_id);
-    let start_result = state
+    let start_receipt = state
         .hook_engine
-        .run(HookEvent::SessionStart, &start_input)
+        .run_lifecycle(HookEvent::SessionStart, &start_input)
         .await;
+
+    if let Some(reason) = start_receipt.blocking_reason() {
+        if let Err(error) = state.mcp_manager.write().await.disconnect_all().await {
+            warn!(%error, "Failed to disconnect MCP servers after proxy admission denial");
+        }
+        crate::tools::retire_run(&state.run_context);
+        return Err(ProxyError::HookBlocked(format!(
+            "SessionStart hook blocked proxy startup: {reason}"
+        )));
+    }
 
     info!(
         session_id = %session_id,
-        hooks_allowed = start_result.allowed,
         "Session started"
     );
 
-    session_id
+    Ok(session_id)
 }
 
 async fn finish_proxy_runtime(state: &ProxyState, handoff: Option<&str>) {
@@ -3136,7 +3141,7 @@ async fn finish_proxy_runtime(state: &ProxyState, handoff: Option<&str>) {
 pub async fn start_server(config: AppConfig) -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.proxy.host, config.proxy.port);
     let state = build_proxy_state(config).await?;
-    fire_session_start(&state).await;
+    fire_session_start(&state).await?;
 
     let app = create_router(state.clone());
 
@@ -3172,7 +3177,7 @@ pub async fn start_server_with_shutdown(
     // SessionStart hook). Any change to provisioning had to land in
     // two places — classic stovepipe. See crosslink #246.
     let state = build_proxy_state(config).await?;
-    fire_session_start(&state).await;
+    fire_session_start(&state).await?;
 
     let app = create_router(state.clone());
 
@@ -3216,7 +3221,7 @@ pub async fn start_loop_server(config: AppConfig, max_iterations: u32) -> anyhow
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let control = Arc::new(LoopControl::new(max_iterations, shutdown_tx.clone()));
     let state = build_proxy_state_with_loop_control(config, Some(control.clone())).await?;
-    let session_id = fire_session_start(&state).await;
+    let session_id = fire_session_start(&state).await?;
     let app = create_router(state.clone());
 
     info!(

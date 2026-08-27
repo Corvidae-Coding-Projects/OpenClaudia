@@ -48,7 +48,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::time::timeout;
@@ -115,7 +115,150 @@ pub enum HookEvent {
     VddConverged,
 }
 
+/// Whether an event is allowed to affect the causal action it surrounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookFailureMode {
+    /// A deny, approval request, invalid output, timeout, cancellation, or
+    /// execution failure prevents the guarded action from starting.
+    Block,
+    /// The action has already happened (or the event is informational), so
+    /// failures are retained as observations without rewriting its outcome.
+    Observe,
+}
+
+/// Typed decision composed from every matching hook in configuration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookDecision {
+    Allow,
+    Ask,
+    Deny,
+}
+
+/// Terminal status of one event batch, independent of its decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookBatchStatus {
+    Complete,
+    PartiallyFailed,
+    Failed,
+    Cancelled,
+}
+
+/// Canonical semantics attached to an event variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookEventContract {
+    pub failure_mode: HookFailureMode,
+    pub accepts_decision: bool,
+    pub accepts_prompt_suggestion: bool,
+}
+
+/// Typed receipt produced for every hook event, including an empty batch.
+///
+/// `sequence` is monotonic within the exact run generation. Outputs remain in
+/// configuration order, and errors identify a partial/failed batch instead of
+/// disappearing behind a frontend-specific log message.
+#[derive(Debug, Clone)]
+pub struct HookReceipt {
+    pub run_id: crate::runtime::RunId,
+    pub sequence: u64,
+    pub event: HookEvent,
+    pub contract: HookEventContract,
+    pub decision: HookDecision,
+    pub status: HookBatchStatus,
+    pub outputs: Vec<HookOutput>,
+    pub errors: Vec<HookError>,
+}
+
+struct HookExecution {
+    outputs: Vec<HookOutput>,
+    errors: Vec<HookError>,
+    decision: HookDecision,
+    cancelled: bool,
+}
+
+impl HookReceipt {
+    /// Whether the guarded action may proceed without another approval step.
+    #[must_use]
+    pub const fn allowed(&self) -> bool {
+        match self.contract.failure_mode {
+            HookFailureMode::Observe => true,
+            HookFailureMode::Block => {
+                matches!(self.decision, HookDecision::Allow) && self.errors.is_empty()
+            }
+        }
+    }
+
+    /// Compatibility projection for callers not yet rendering the receipt.
+    #[must_use]
+    pub fn into_result(self) -> HookResult {
+        let allowed = self.allowed();
+        HookResult {
+            allowed,
+            outputs: self.outputs,
+            errors: self.errors,
+        }
+    }
+
+    /// Stable human-readable explanation for a blocked lifecycle action.
+    #[must_use]
+    pub fn blocking_reason(&self) -> Option<String> {
+        if self.allowed() {
+            return None;
+        }
+        let reasons = self
+            .outputs
+            .iter()
+            .filter_map(|output| output.reason.as_deref())
+            .collect::<Vec<_>>();
+        if !reasons.is_empty() {
+            return Some(reasons.join("; "));
+        }
+        if let Some(error) = self.errors.first() {
+            return Some(error.to_string());
+        }
+        Some(match self.decision {
+            HookDecision::Ask => "Hook requested explicit approval".to_string(),
+            HookDecision::Deny => "Action denied by hook".to_string(),
+            HookDecision::Allow => "Blocking hook lifecycle failed".to_string(),
+        })
+    }
+}
+
 impl HookEvent {
+    /// Canonical decision, output, and failure policy for this event.
+    #[must_use]
+    pub const fn contract(self) -> HookEventContract {
+        match self {
+            Self::SessionStart
+            | Self::PreToolUse
+            | Self::UserPromptSubmit
+            | Self::Stop
+            | Self::SubagentStart
+            | Self::PreCompact
+            | Self::PermissionRequest => HookEventContract {
+                failure_mode: HookFailureMode::Block,
+                accepts_decision: true,
+                accepts_prompt_suggestion: matches!(self, Self::UserPromptSubmit),
+            },
+            Self::SessionEnd
+            | Self::PostToolUse
+            | Self::PostToolUseFailure
+            | Self::SubagentStop
+            | Self::Notification
+            | Self::PreAdversaryReview
+            | Self::PostAdversaryReview
+            | Self::VddConflict
+            | Self::VddConverged => HookEventContract {
+                failure_mode: HookFailureMode::Observe,
+                accepts_decision: false,
+                accepts_prompt_suggestion: false,
+            },
+        }
+    }
+
     /// Get the config field name for this event
     #[must_use]
     pub const fn config_key(&self) -> &'static str {
@@ -351,6 +494,14 @@ fn notification_input(
         .with_extra("data", data)
 }
 
+fn lock_lifecycle_sequences(
+    sequences: &Mutex<HashMap<crate::runtime::RunId, Arc<tokio::sync::Mutex<u64>>>>,
+) -> MutexGuard<'_, HashMap<crate::runtime::RunId, Arc<tokio::sync::Mutex<u64>>>> {
+    sequences
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Output from a hook execution
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
@@ -430,6 +581,24 @@ pub enum HookError {
     #[error("Invalid matcher regex: {0}")]
     InvalidMatcher(String),
 
+    #[error("Hook input event {input:?} does not match dispatched event {dispatched:?}")]
+    EventMismatch {
+        input: HookEvent,
+        dispatched: HookEvent,
+    },
+
+    #[error("Invalid hook decision {0:?}; expected allow, deny, block, or ask")]
+    InvalidDecision(String),
+
+    #[error("Hook output field {field} is unsupported for {event:?}")]
+    UnsupportedOutput {
+        event: HookEvent,
+        field: &'static str,
+    },
+
+    #[error("Hook event was cancelled before all configured hooks ran")]
+    Cancelled,
+
     /// Allowlist enforcement rejected the command's executable.
     #[error("Hook command denied by allowlist: binary '{binary}' is not in allowed_commands")]
     Denied { binary: String },
@@ -494,6 +663,9 @@ pub struct HookEngine {
     /// Serialize those publications within one engine so hooks from the same
     /// event observe and preserve the effects of earlier configured hooks.
     command_projection_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Per-run event serialization supplies one causal ordering regardless of
+    /// which frontend initiated the event.
+    lifecycle_sequences: Arc<Mutex<HashMap<crate::runtime::RunId, Arc<tokio::sync::Mutex<u64>>>>>,
 }
 
 impl HookEngine {
@@ -503,6 +675,7 @@ impl HookEngine {
             config,
             model_hook_callback: None,
             command_projection_lock: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle_sequences: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -524,6 +697,7 @@ impl HookEngine {
             config: merge::merge_host_hooks(hooks, self.config.clone()),
             model_hook_callback: self.model_hook_callback.clone(),
             command_projection_lock: Arc::clone(&self.command_projection_lock),
+            lifecycle_sequences: Arc::clone(&self.lifecycle_sequences),
         }
     }
 
@@ -571,61 +745,84 @@ impl HookEngine {
         }
     }
 
-    /// Run all matching hooks for an event
-    pub async fn run(&self, event: HookEvent, input: &HookInput) -> HookResult {
-        let entries = self.get_entries_for_event(event);
+    /// Run one event through the canonical lifecycle and retain its typed
+    /// receipt. Events for the same run are serialized for the full batch, so
+    /// configured hooks and their receipts have one causal order even when a
+    /// frontend initiates work concurrently.
+    pub async fn run_lifecycle(&self, event: HookEvent, input: &HookInput) -> HookReceipt {
+        let run_id = input.run_context.run_id();
+        let sequence = self.lifecycle_sequence(run_id);
+        let mut sequence_guard = sequence.lock().await;
+        let current_sequence = *sequence_guard;
+        *sequence_guard = (*sequence_guard).saturating_add(1);
+        let contract = event.contract();
 
-        if entries.is_empty() {
-            return HookResult::allowed();
-        }
-
-        // Resolve matcher context strictly from the *event variant*.
-        //
-        // Crosslink #350: previously the context was inferred at runtime from
-        // "whichever input field happens to be populated", which let a
-        // `PreToolUse` matcher like `"rm"` accidentally match a user-prompt
-        // string of `"I want to rm a file"`. Now each event has a fixed
-        // [`HookMatcherTarget`] (see [`HookEvent::default_matcher_target`])
-        // which selects exactly one typed accessor — `match_tool`,
-        // `match_prompt`, or `match_event` — and there is no cross-target
-        // fallback.
-        //
-        // Crosslink #758: `event` is still threaded through to `matches_entry`
-        // so a matcher-regex *failure* on a deny-intent event
-        // (PreToolUse / PermissionRequest) fails CLOSED — the hook still
-        // runs and can block.
-        let target = event.default_matcher_target();
-        let matcher_context = Self::resolve_matcher_context(input, target);
-        let matching_entries: Vec<&HookEntry> = entries
-            .iter()
-            .filter(|entry| Self::matches_entry(entry, &matcher_context, event))
-            .collect();
-
-        if matching_entries.is_empty() {
-            return HookResult::allowed();
-        }
-
-        info!(
-            event = ?event,
-            count = matching_entries.len(),
-            "Running hooks"
+        let receipt = if input.event == event {
+            self.run_ordered(event, input, current_sequence).await
+        } else {
+            HookReceipt {
+                run_id,
+                sequence: current_sequence,
+                event,
+                contract,
+                decision: HookDecision::Allow,
+                status: HookBatchStatus::Failed,
+                outputs: Vec::new(),
+                errors: vec![HookError::EventMismatch {
+                    input: input.event,
+                    dispatched: event,
+                }],
+            }
+        };
+        tracing::info!(
+            target: "openclaudia::hooks",
+            run_id = %receipt.run_id,
+            hook_sequence = receipt.sequence,
+            event = ?receipt.event,
+            decision = ?receipt.decision,
+            status = ?receipt.status,
+            output_count = receipt.outputs.len(),
+            error_count = receipt.errors.len(),
+            "Canonical hook lifecycle receipt"
         );
-
-        // Collect all hooks to run
-        let mut hooks_to_run: Vec<(&Hook, u64)> = Vec::new();
-        for entry in &matching_entries {
-            for hook in &entry.hooks {
-                let timeout_secs = match hook {
-                    Hook::Command { timeout, .. }
-                    | Hook::Prompt { timeout, .. }
-                    | Hook::Model { timeout, .. } => *timeout,
-                };
-                hooks_to_run.push((hook, timeout_secs));
+        drop(sequence_guard);
+        if event == HookEvent::SessionEnd {
+            let mut sequences = lock_lifecycle_sequences(&self.lifecycle_sequences);
+            if sequences.get(&run_id).is_some_and(|stored| {
+                Arc::ptr_eq(stored, &sequence) && Arc::strong_count(stored) == 2
+            }) {
+                sequences.remove(&run_id);
             }
         }
+        receipt
+    }
 
-        // Run hooks in parallel.
-        //
+    /// Compatibility projection of [`Self::run_lifecycle`]. All callers,
+    /// including frontends that still consume [`HookResult`], therefore share
+    /// the same ordering, decision, timeout, and partial-failure semantics.
+    pub async fn run(&self, event: HookEvent, input: &HookInput) -> HookResult {
+        self.run_lifecycle(event, input).await.into_result()
+    }
+
+    async fn run_ordered(&self, event: HookEvent, input: &HookInput, sequence: u64) -> HookReceipt {
+        let run_id = input.run_context.run_id();
+        let contract = event.contract();
+        let hooks_to_run = self.matching_hooks(event, input);
+        if hooks_to_run.is_empty() {
+            return HookReceipt {
+                run_id,
+                sequence,
+                event,
+                contract,
+                decision: HookDecision::Allow,
+                status: HookBatchStatus::Complete,
+                outputs: Vec::new(),
+                errors: Vec::new(),
+            };
+        }
+
+        info!(event = ?event, count = hooks_to_run.len(), "Running hooks");
+
         // Crosslink #835: a serialization failure here previously fell
         // through to String::default() and sent empty stdin to every
         // hook — silently neutralising the entire hook batch. Surface
@@ -642,63 +839,204 @@ impl HookEngine {
                     "failed to serialize HookInput; aborting hook batch \
                      (see crosslink #835)"
                 );
-                let mut failed = HookResult::allowed();
-                if event.is_deny_intent() {
-                    failed.allowed = false;
-                }
-                failed.errors.push(HookError::ParseError(format!(
-                    "hook input serialize failed: {e}"
-                )));
-                return failed;
+                return HookReceipt {
+                    run_id,
+                    sequence,
+                    event,
+                    contract,
+                    decision: HookDecision::Allow,
+                    status: HookBatchStatus::Failed,
+                    outputs: Vec::new(),
+                    errors: vec![HookError::ParseError(format!(
+                        "hook input serialize failed: {e}"
+                    ))],
+                };
             }
         };
-        let futures: Vec<_> = hooks_to_run
-            .iter()
-            .map(|(hook, timeout_secs)| {
-                self.run_hook(&input.run_context, hook, &input_json, *timeout_secs)
-            })
-            .collect();
+        let execution = self
+            .execute_hooks(event, contract, input, &input_json, hooks_to_run)
+            .await;
+        let HookExecution {
+            outputs,
+            errors,
+            decision,
+            cancelled,
+        } = execution;
 
-        let results = futures::future::join_all(futures).await;
+        let status = if cancelled {
+            HookBatchStatus::Cancelled
+        } else if errors.is_empty() {
+            HookBatchStatus::Complete
+        } else if outputs.is_empty() {
+            HookBatchStatus::Failed
+        } else {
+            HookBatchStatus::PartiallyFailed
+        };
+        if matches!(contract.failure_mode, HookFailureMode::Block) && !errors.is_empty() {
+            warn!(
+                event = ?event,
+                error_count = errors.len(),
+                "Blocking hook event failed; unscheduled hooks were not started"
+            );
+        }
 
-        // Combine results
-        let mut hook_result = HookResult::allowed();
-        for result in results {
-            match result {
+        HookReceipt {
+            run_id,
+            sequence,
+            event,
+            contract,
+            decision,
+            status,
+            outputs,
+            errors,
+        }
+    }
+
+    async fn execute_hooks(
+        &self,
+        event: HookEvent,
+        contract: HookEventContract,
+        input: &HookInput,
+        input_json: &str,
+        hooks_to_run: Vec<(&Hook, u64)>,
+    ) -> HookExecution {
+        let mut execution = HookExecution {
+            outputs: Vec::new(),
+            errors: Vec::new(),
+            decision: HookDecision::Allow,
+            cancelled: false,
+        };
+        for (hook, timeout_secs) in hooks_to_run {
+            if input.run_context.runtime().cancellation().is_cancelled() {
+                execution.errors.push(HookError::Cancelled);
+                execution.cancelled = true;
+                break;
+            }
+
+            match self
+                .run_hook(&input.run_context, hook, input_json, timeout_secs)
+                .await
+            {
                 Ok((output, exit_code)) => {
-                    // Exit code 2 means block
                     if exit_code == 2 {
-                        hook_result.allowed = false;
+                        execution.decision =
+                            Self::compose_decision(execution.decision, HookDecision::Deny);
                         let reason = output
                             .reason
                             .clone()
                             .unwrap_or_else(|| "Hook blocked action".to_string());
                         warn!(reason = %reason, "Hook blocked action");
                     }
-                    // Check decision field
-                    if let Some(decision) = &output.decision {
-                        if decision == "deny" || decision == "block" {
-                            hook_result.allowed = false;
+
+                    match Self::validate_output(event, &output) {
+                        Ok(output_decision) => {
+                            execution.decision =
+                                Self::compose_decision(execution.decision, output_decision);
+                        }
+                        Err(mut output_errors) => {
+                            execution.errors.append(&mut output_errors);
                         }
                     }
-                    hook_result.outputs.push(output);
+                    execution.outputs.push(output);
                 }
                 Err(e) => {
                     error!(error = %e, "Hook execution failed");
-                    hook_result.errors.push(e);
+                    execution.errors.push(e);
                 }
             }
+
+            let blocks = matches!(contract.failure_mode, HookFailureMode::Block)
+                && (!execution.errors.is_empty()
+                    || !matches!(execution.decision, HookDecision::Allow));
+            if blocks {
+                break;
+            }
         }
-        if event.is_deny_intent() && !hook_result.errors.is_empty() {
-            warn!(
-                event = ?event,
-                error_count = hook_result.errors.len(),
-                "Deny-intent hook execution failed; failing closed"
-            );
-            hook_result.allowed = false;
+        execution
+    }
+
+    fn matching_hooks<'a>(&'a self, event: HookEvent, input: &HookInput) -> Vec<(&'a Hook, u64)> {
+        // Matcher context is selected by the event variant, never whichever
+        // optional input field happens to be populated. Invalid deny-intent
+        // regexes still fail closed through `matches_entry`.
+        let matcher_context = Self::resolve_matcher_context(input, event.default_matcher_target());
+        self.get_entries_for_event(event)
+            .iter()
+            .filter(|entry| Self::matches_entry(entry, &matcher_context, event))
+            .flat_map(|entry| {
+                entry.hooks.iter().map(|hook| {
+                    let timeout = match hook {
+                        Hook::Command { timeout, .. }
+                        | Hook::Prompt { timeout, .. }
+                        | Hook::Model { timeout, .. } => *timeout,
+                    };
+                    (hook, timeout)
+                })
+            })
+            .collect()
+    }
+
+    fn lifecycle_sequence(&self, run_id: crate::runtime::RunId) -> Arc<tokio::sync::Mutex<u64>> {
+        let mut sequences = lock_lifecycle_sequences(&self.lifecycle_sequences);
+        Arc::clone(
+            sequences
+                .entry(run_id)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(0))),
+        )
+    }
+
+    const fn compose_decision(current: HookDecision, next: HookDecision) -> HookDecision {
+        match (current, next) {
+            (HookDecision::Deny, _) | (_, HookDecision::Deny) => HookDecision::Deny,
+            (HookDecision::Ask, _) | (_, HookDecision::Ask) => HookDecision::Ask,
+            (HookDecision::Allow, HookDecision::Allow) => HookDecision::Allow,
+        }
+    }
+
+    fn validate_output(
+        event: HookEvent,
+        output: &HookOutput,
+    ) -> Result<HookDecision, Vec<HookError>> {
+        let contract = event.contract();
+        let mut errors = Vec::new();
+        let decision = output
+            .decision
+            .as_deref()
+            .map_or(HookDecision::Allow, |value| {
+                match value.trim().to_ascii_lowercase().as_str() {
+                    "allow" => HookDecision::Allow,
+                    "deny" | "block" => HookDecision::Deny,
+                    "ask" => HookDecision::Ask,
+                    _ => {
+                        errors.push(HookError::InvalidDecision(value.to_string()));
+                        HookDecision::Allow
+                    }
+                }
+            });
+        if output.decision.is_some() && !contract.accepts_decision {
+            errors.push(HookError::UnsupportedOutput {
+                event,
+                field: "decision",
+            });
+        }
+        if output.prompt.is_some() && !contract.accepts_prompt_suggestion {
+            errors.push(HookError::UnsupportedOutput {
+                event,
+                field: "prompt",
+            });
+        }
+        if !output.extra.is_empty() {
+            errors.push(HookError::UnsupportedOutput {
+                event,
+                field: "extra",
+            });
         }
 
-        hook_result
+        if errors.is_empty() {
+            Ok(decision)
+        } else {
+            Err(errors)
+        }
     }
 
     /// Get hook entries for a specific event. `PostToolUseFailure` falls
@@ -781,7 +1119,7 @@ impl HookEngine {
         match Self::validate_and_match(pattern, context) {
             Ok(matched) => matched,
             Err(e) => {
-                let fail_closed = event.is_deny_intent();
+                let fail_closed = matches!(event.contract().failure_mode, HookFailureMode::Block);
                 warn!(
                     event = ?event,
                     pattern = %pattern,
@@ -811,13 +1149,26 @@ impl HookEngine {
 
         // Only try JSON parse if it looks like JSON (starts with '{')
         if trimmed.starts_with('{') {
-            match serde_json::from_str(trimmed) {
-                Ok(output) => return output,
-                Err(_) => {
-                    // Invalid JSON that starts with { — treat as plain text
-                    debug!("Hook output starts with '{{' but is not valid JSON, treating as plain text");
+            if let Ok(mut value) = serde_json::from_str::<Value>(trimmed) {
+                let compatibility_context = value
+                    .as_object_mut()
+                    .and_then(|object| object.remove("hookSpecificOutput"))
+                    .and_then(|specific| {
+                        specific
+                            .get("additionalContext")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    });
+                if let Ok(mut output) = serde_json::from_value::<HookOutput>(value) {
+                    if output.additional_context.is_none() {
+                        output.additional_context = compatibility_context;
+                    }
+                    return output;
                 }
             }
+            // Invalid or non-object JSON is retained as inert reference text;
+            // it never acquires decision authority through parse recovery.
+            debug!("Hook output starts with '{{' but is not a valid hook object, treating as plain text");
         }
 
         // Plain text output — wrap as additionalContext (like Claude Code does)
@@ -1335,6 +1686,37 @@ mod tests {
 
         assert!(result.allowed);
         assert!(result.outputs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn canonical_lifecycle_sequence_is_shared_and_retired_at_session_end() {
+        let run = test_run_with_environment(std::collections::HashMap::new());
+        let engine = HookEngine::new(HooksConfig::default());
+        let scoped = engine.clone().with_scoped_hooks(HooksConfig::default());
+
+        let start = engine
+            .run_lifecycle(
+                HookEvent::SessionStart,
+                &HookInput::for_run(&run, HookEvent::SessionStart),
+            )
+            .await;
+        let prompt = scoped
+            .run_lifecycle(
+                HookEvent::UserPromptSubmit,
+                &HookInput::for_run(&run, HookEvent::UserPromptSubmit).with_prompt("continue"),
+            )
+            .await;
+        let end = engine
+            .run_lifecycle(
+                HookEvent::SessionEnd,
+                &HookInput::for_run(&run, HookEvent::SessionEnd),
+            )
+            .await;
+
+        assert_eq!((start.sequence, prompt.sequence, end.sequence), (0, 1, 2));
+        assert_eq!(start.status, HookBatchStatus::Complete);
+        assert_eq!(prompt.decision, HookDecision::Allow);
+        assert!(lock_lifecycle_sequences(&engine.lifecycle_sequences).is_empty());
     }
 
     #[test]
@@ -2565,6 +2947,10 @@ mod tests {
             HookEngine::matches_entry(&entry, "Write", HookEvent::PermissionRequest),
             "PermissionRequest with malformed matcher MUST fail-closed"
         );
+        assert!(
+            HookEngine::matches_entry(&entry, "Write", HookEvent::UserPromptSubmit),
+            "UserPromptSubmit with malformed matcher MUST fail-closed"
+        );
     }
 
     /// Crosslink #758: observe-intent events (e.g. `PostToolUse`) with a
@@ -2588,10 +2974,6 @@ mod tests {
         assert!(
             !HookEngine::matches_entry(&entry, "Write", HookEvent::Notification),
             "Notification with malformed matcher MUST fail-open"
-        );
-        assert!(
-            !HookEngine::matches_entry(&entry, "Write", HookEvent::UserPromptSubmit),
-            "UserPromptSubmit with malformed matcher MUST fail-open"
         );
     }
 

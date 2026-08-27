@@ -85,6 +85,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # Filesystem
 dirs = "6"
 tempfile = "3"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 # Absolute-path resolution for trusted binaries (e.g. the `git` plugin
 # helper). Resolves once at first use via PATH lookup and caches the

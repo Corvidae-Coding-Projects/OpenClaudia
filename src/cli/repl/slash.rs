@@ -2574,7 +2574,8 @@ fn plugin_action_help() {
     println!("    /plugin install              - Browse and install plugins");
     println!("    /plugin install <plugin>      - Install specific plugin");
     println!("    /plugin install <p>@<market>  - Install from marketplace");
-    println!("    /plugin install <git-url>#<ref> - Install pinned git plugin\n");
+    println!("    /plugin install <git-url>#<ref> - Install pinned git plugin");
+    println!("    /plugin install cache:<sha256> - Install verified offline archive\n");
     println!("  Management:");
     println!("    /plugin                      - List installed plugins");
     println!("    /plugin manage               - Manage installed plugins");
@@ -2778,6 +2779,10 @@ fn plugin_install_from_source(
     run: &openclaudia::tools::ToolRunContext,
 ) {
     println!("\nInstalling plugin '{plugin}'...");
+    if let Some(sha256) = plugin.strip_prefix("cache:") {
+        install_cached_plugin(sha256, plugin_manager);
+        return;
+    }
     let requested = std::path::Path::new(plugin);
     let candidate = if requested.is_absolute() {
         requested.to_path_buf()
@@ -2789,7 +2794,7 @@ fn plugin_install_from_source(
         .ok()
         .filter(|path| path.is_dir() && run.permits_read(path));
     if let Some(path) = local_path.as_deref() {
-        install_local_plugin_path(path, plugin_manager, run.project_root());
+        install_local_plugin_path(path, plugin_manager);
     } else if looks_like_git_plugin_source(plugin) {
         install_git_plugin_source(plugin, plugin_manager);
     } else {
@@ -2800,54 +2805,25 @@ fn plugin_install_from_source(
     }
 }
 
-fn install_local_plugin_path(
-    path: &std::path::Path,
-    plugin_manager: &mut plugins::PluginManager,
-    project_root: &std::path::Path,
-) {
-    match plugins::Plugin::load(path) {
-        Ok(loaded) => {
-            let name = loaded.name().to_string();
-            let dest = match plugin_install_dir_for_name(&name, project_root) {
-                Ok(path) => path,
-                Err(e) => {
-                    eprintln!("Failed to install plugin: invalid plugin name '{name}': {e}\n");
-                    return;
-                }
-            };
-            if let Err(e) = plugins::copy_dir_recursive(path, &dest) {
-                eprintln!("Failed to install plugin: {e}\n");
-                return;
-            }
-            record_local_plugin_install(&name, &dest, loaded.manifest.version, project_root);
-            let _ = plugin_manager.reload();
-            println!("Installed plugin '{name}'. Restart to apply changes.\n");
-        }
-        Err(e) => eprintln!("Failed to load plugin from path: {e}\n"),
+fn install_cached_plugin(sha256: &str, plugin_manager: &mut plugins::PluginManager) {
+    let Some(home) = dirs::home_dir() else {
+        eprintln!("Failed to install cached plugin: cannot determine the home directory\n");
+        return;
+    };
+    let cache =
+        plugins::zip_cache::ZipCache::new(home.join(".openclaudia").join("plugins").join("cache"));
+    let policy = repl_plugin_policy();
+    match plugin_manager.install_from_cache_with_policy(&cache, sha256, &policy) {
+        Ok(name) => println!("Installed cached plugin '{name}'. Restart to apply changes.\n"),
+        Err(error) => eprintln!("Failed to install cached plugin: {error}\n"),
     }
 }
 
-fn record_local_plugin_install(
-    name: &str,
-    dest: &std::path::Path,
-    version: Option<String>,
-    project_root: &std::path::Path,
-) {
-    let mut installed = plugins::InstalledPlugins::load(project_root);
-    installed.upsert(
-        name,
-        plugins::PluginInstallEntry {
-            scope: plugins::InstallScope::Project,
-            project_path: Some(project_root.to_string_lossy().to_string()),
-            install_path: dest.to_string_lossy().to_string(),
-            version,
-            installed_at: Some(chrono::Utc::now().to_rfc3339()),
-            last_updated: None,
-            git_commit_sha: None,
-        },
-    );
-    if let Err(e) = installed.save(project_root) {
-        tracing::warn!("Failed to save install tracking: {}", e);
+fn install_local_plugin_path(path: &std::path::Path, plugin_manager: &mut plugins::PluginManager) {
+    let policy = repl_plugin_policy();
+    match plugin_manager.install_from_directory_with_policy(path, &policy) {
+        Ok(name) => println!("Installed plugin '{name}'. Restart to apply changes.\n"),
+        Err(error) => eprintln!("Failed to install plugin from path: {error}\n"),
     }
 }
 
@@ -2877,7 +2853,8 @@ fn print_available_plugin_installs(plugin_manager: &plugins::PluginManager) {
         println!("\nNo marketplaces configured.");
         println!("Add a marketplace: /plugin marketplace add <path-or-url>");
         println!("Install from local directory: /plugin install /path/to/plugin");
-        println!("Install from git: /plugin install <git-url>#<ref>\n");
+        println!("Install from git: /plugin install <git-url>#<ref>");
+        println!("Install from cache: /plugin install cache:<sha256>\n");
     } else {
         println!("\n=== Available Plugins ===\n");
         for (mkt, plug) in &available {

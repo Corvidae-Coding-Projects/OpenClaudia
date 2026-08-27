@@ -230,6 +230,9 @@ pub struct ChatRepl {
     audit_logger: openclaudia::session::AuditLogger,
     memory_db: Option<memory::MemoryDb>,
     task_manager: std::sync::Mutex<session::TaskManager>,
+    planner_runtime: Option<openclaudia::coordinator::PlannerRuntime>,
+    planner_context: Option<openclaudia::context::ContextItem>,
+    planner_turn_start: Option<usize>,
     permissions: openclaudia::permissions::LocalApprovalCache,
     transient_allowed_tool_rules: Vec<PermissionRule>,
     transient_model_restore: Option<String>,
@@ -523,6 +526,27 @@ fn runtime_mode_for_repl_session(
     }
 }
 
+fn coordinator_policy_context_item() -> openclaudia::context::ContextItem {
+    openclaudia::context::ContextItem::host_instruction(
+        "repl.coordinator_policy",
+        openclaudia::context::HostInstructionSource::CoordinatorPolicy,
+        "host:coordinator-role",
+        openclaudia::subagent::AgentType::Coordinator.system_prompt(),
+        openclaudia::context::ContextFreshness::Static,
+        5,
+    )
+}
+
+fn planner_checkpoint_included(blocks: &prompt::SystemPromptBlocks) -> bool {
+    blocks.context_trace().entries.iter().any(|entry| {
+        entry.id == "repl.planner_checkpoint"
+            && matches!(
+                &entry.disposition,
+                openclaudia::context::ContextDisposition::Included
+            )
+    })
+}
+
 fn effectful_slash_operation(input: &str) -> Option<&'static str> {
     let command_line = input.trim().strip_prefix('/')?;
     let mut parts = command_line.split_whitespace();
@@ -589,6 +613,21 @@ impl ChatRepl {
             .configure_lsp_service_for_run(&self.run_context);
         let permission_bypass = self.chat_session.permission_bypass_enabled();
         self.task_manager = std::sync::Mutex::new(next_tasks);
+        self.planner_runtime = if self.coordinator {
+            match openclaudia::coordinator::PlannerRuntime::open_for_run(&self.run_context) {
+                Ok(runtime) => Some(runtime),
+                Err(error) => {
+                    rebind_errors.push(format!(
+                        "cannot bind the durable planner checkpoint: {error}"
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        self.planner_context = None;
+        self.planner_turn_start = None;
         self.permission_mgr =
             init_permission_manager(&self.config, permission_bypass, &self.run_context);
         self.permissions = openclaudia::permissions::LocalApprovalCache::for_run(&self.run_context);
@@ -784,6 +823,14 @@ impl ChatRepl {
         let task_manager = std::sync::Mutex::new(
             session::TaskManager::open_for_run(&run_context).map_err(anyhow::Error::msg)?,
         );
+        let planner_runtime = if args.coordinator {
+            Some(
+                openclaudia::coordinator::PlannerRuntime::open_for_run(&run_context)
+                    .map_err(anyhow::Error::new)?,
+            )
+        } else {
+            None
+        };
         guardrails::configure(&run_context, &config.guardrails).map_err(anyhow::Error::msg)?;
         let permission_mgr =
             init_permission_manager(&config, args.dangerously_skip_permissions, &run_context);
@@ -816,6 +863,9 @@ impl ChatRepl {
             audit_logger,
             memory_db,
             task_manager,
+            planner_runtime,
+            planner_context: None,
+            planner_turn_start: None,
             permissions,
             transient_allowed_tool_rules: Vec::new(),
             transient_model_restore: None,
@@ -831,29 +881,47 @@ impl ChatRepl {
     pub async fn run(mut self) -> anyhow::Result<()> {
         let memory_db = self.memory_db.take();
 
-        loop {
-            let prompt = self.build_prompt_string();
-            let readline = self.rl.readline(&prompt);
-            match readline {
-                Ok(line) => {
-                    let should_break =
-                        self.process_line(line, memory_db.as_ref()).await? == Some(true);
-                    self.analytics_subscriber.drain_pending();
-                    if should_break {
+        let start_input = openclaudia::hooks::HookInput::for_run(
+            &self.run_context,
+            openclaudia::hooks::HookEvent::SessionStart,
+        )
+        .with_session_id(self.chat_session.id());
+        let start_receipt = self
+            .hook_engine
+            .run_lifecycle(openclaudia::hooks::HookEvent::SessionStart, &start_input)
+            .await;
+        if let Some(reason) = start_receipt.blocking_reason() {
+            tools::retire_run(&self.run_context);
+            anyhow::bail!("SessionStart hook blocked legacy REPL startup: {reason}");
+        }
+
+        let outcome: anyhow::Result<()> = async {
+            loop {
+                let prompt = self.build_prompt_string();
+                let readline = self.rl.readline(&prompt);
+                match readline {
+                    Ok(line) => {
+                        let should_break =
+                            self.process_line(line, memory_db.as_ref()).await? == Some(true);
+                        self.analytics_subscriber.drain_pending();
+                        if should_break {
+                            break;
+                        }
+                    }
+                    Err(ReadlineError::Interrupted) => {
+                        println!("\n\x1b[90mInterrupted - saving session...\x1b[0m");
+                        break;
+                    }
+                    Err(ReadlineError::Eof) => break,
+                    Err(err) => {
+                        eprintln!("Error: {err:?}");
                         break;
                     }
                 }
-                Err(ReadlineError::Interrupted) => {
-                    println!("\n\x1b[90mInterrupted - saving session...\x1b[0m");
-                    break;
-                }
-                Err(ReadlineError::Eof) => break,
-                Err(err) => {
-                    eprintln!("Error: {err:?}");
-                    break;
-                }
             }
+            Ok(())
         }
+        .await;
         finalize_chat(
             &self.chat_session,
             memory_db.as_ref(),
@@ -869,12 +937,12 @@ impl ChatRepl {
         .with_session_id(self.chat_session.id());
         let _ = self
             .hook_engine
-            .run(openclaudia::hooks::HookEvent::SessionEnd, &end_input)
+            .run_lifecycle(openclaudia::hooks::HookEvent::SessionEnd, &end_input)
             .await;
         tools::retire_run(&self.run_context);
         drop(memory_db);
         println!("\nGoodbye!");
-        Ok(())
+        outcome
     }
 
     /// Build the readline prompt string and render the status/bottom bars.
@@ -973,8 +1041,20 @@ impl ChatRepl {
             )
         });
 
-        let prompt_blocks = self.build_prompt_blocks_for_turn();
-        let request_state = self.chat_session.messages_snapshot();
+        let planner_instruction = latest_user_message_content(&task_messages)
+            .unwrap_or(&input)
+            .to_string();
+        self.prepare_planner_turn(
+            &planner_instruction,
+            task_messages.iter().rposition(|message| {
+                message.get("role").and_then(serde_json::Value::as_str) == Some("user")
+            }),
+        )?;
+
+        let prompt_blocks = self
+            .build_prompt_blocks_for_turn()
+            .map_err(anyhow::Error::msg)?;
+        let request_state = self.planner_request_messages();
         let grounded_messages = match request_messages_with_cli_grounding(
             &self.run_context,
             &self.chat_session.id(),
@@ -1078,6 +1158,8 @@ impl ChatRepl {
         let exit = self
             .send_and_process_turn(transport, request_body, &prompt_blocks, memory_db)
             .await;
+
+        self.checkpoint_planner_progress()?;
 
         self.clear_transient_prompt_options();
         save_session_to_short_term_memory(&self.chat_session, memory_db);
@@ -1212,6 +1294,16 @@ impl ChatRepl {
         )?;
         let next_audit = openclaudia::session::AuditLogger::new(&loaded.id())
             .map_err(|error| format!("cannot initialize session audit log: {error}"))?;
+        let next_tasks = session::TaskManager::open_for_run(&next_run)
+            .map_err(|error| format!("cannot bind loaded session task graph: {error}"))?;
+        let next_planner = if self.coordinator {
+            Some(
+                openclaudia::coordinator::PlannerRuntime::open_for_run(&next_run)
+                    .map_err(|error| format!("cannot bind loaded planner checkpoint: {error}"))?,
+            )
+        } else {
+            None
+        };
         let permission_bypass = self.chat_session.permission_bypass_enabled();
         guardrails::configure(&next_run, &self.config.guardrails)?;
 
@@ -1221,6 +1313,10 @@ impl ChatRepl {
         self.chat_session.set_permission_bypass(permission_bypass);
         self.model.clone_from(&loaded.model);
         self.run_context = next_run;
+        self.task_manager = std::sync::Mutex::new(next_tasks);
+        self.planner_runtime = next_planner;
+        self.planner_context = None;
+        self.planner_turn_start = None;
         self.permission_mgr =
             init_permission_manager(&self.config, permission_bypass, &self.run_context);
         self.audit_logger = next_audit;
@@ -1713,21 +1809,17 @@ impl ChatRepl {
 
         let hook_input = HookInput::for_run(&self.run_context, HookEvent::UserPromptSubmit)
             .with_prompt(&expanded_input);
-        let hook_result = self
+        let hook_receipt = self
             .active_hook_engine()
-            .run(HookEvent::UserPromptSubmit, &hook_input)
+            .run_lifecycle(HookEvent::UserPromptSubmit, &hook_input)
             .await;
 
-        if !hook_result.allowed {
-            let reason = hook_result
-                .outputs
-                .first()
-                .and_then(|o| o.reason.clone())
-                .unwrap_or_else(|| "Request blocked by hook".to_string());
+        if let Some(reason) = hook_receipt.blocking_reason() {
             eprintln!("\nBlocked: {reason}\n");
             self.record_failed_turn(&format!("UserPromptSubmit hook blocked the turn: {reason}"));
             return false;
         }
+        let hook_result = hook_receipt.into_result();
 
         let hook_items = openclaudia::context::hook_result_reference_items(
             &hook_result,
@@ -1747,7 +1839,7 @@ impl ChatRepl {
     }
 
     fn request_messages_with_grounding(&self) -> Result<Vec<serde_json::Value>, String> {
-        let session_messages = self.chat_session.messages_snapshot();
+        let session_messages = self.planner_request_messages();
         let mut messages = request_messages_with_cli_grounding(
             &self.run_context,
             &self.chat_session.id(),
@@ -1964,30 +2056,108 @@ impl ChatRepl {
         persist_chat_session_update(&mut self.chat_session, "failed turn marker");
     }
 
+    fn prepare_planner_turn(
+        &mut self,
+        user_instruction: &str,
+        turn_start: Option<usize>,
+    ) -> anyhow::Result<()> {
+        let Some(planner) = self.planner_runtime.as_mut() else {
+            if self.coordinator {
+                anyhow::bail!("coordinator planner checkpoint runtime is unavailable");
+            }
+            return Ok(());
+        };
+        let task_graph = {
+            let mut manager = self
+                .task_manager
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            manager.refresh().map_err(anyhow::Error::msg)?;
+            manager.graph().clone()
+        };
+        let behavior_mode = self.chat_session.behavior_mode();
+        let run_context = std::sync::Arc::clone(&self.run_context);
+        let transient_context = self.transient_skill_context.clone();
+        let context = planner
+            .prepare_turn(
+                &self.run_context,
+                &task_graph,
+                user_instruction,
+                chrono::Utc::now(),
+                |candidate| {
+                    let mut items = vec![coordinator_policy_context_item()];
+                    items.push(candidate.clone());
+                    items.extend(transient_context.iter().cloned());
+                    let blocks = prompt::build_prompt_context_with_items_for_run(
+                        &behavior_mode,
+                        &run_context,
+                        items,
+                        openclaudia::context::ContextBudget::default(),
+                    );
+                    planner_checkpoint_included(&blocks)
+                },
+            )
+            .map_err(anyhow::Error::new)?;
+        self.planner_context = Some(context);
+        self.planner_turn_start = turn_start;
+        self.chat_session.clear_provider_native_state();
+        Ok(())
+    }
+
+    fn checkpoint_planner_progress(&mut self) -> anyhow::Result<()> {
+        let Some(planner) = self.planner_runtime.as_mut() else {
+            return Ok(());
+        };
+        let task_graph = {
+            let mut manager = self
+                .task_manager
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            manager.refresh().map_err(anyhow::Error::msg)?;
+            manager.graph().clone()
+        };
+        planner
+            .checkpoint_progress(&self.run_context, &task_graph, chrono::Utc::now())
+            .map_err(anyhow::Error::new)
+    }
+
     /// Build Claudia's typed, bounded prompt context for this turn.
-    fn build_prompt_blocks_for_turn(&self) -> prompt::SystemPromptBlocks {
+    fn build_prompt_blocks_for_turn(&self) -> Result<prompt::SystemPromptBlocks, String> {
         let behavior_mode = self.chat_session.behavior_mode();
         let mut additional_items = Vec::new();
 
         if self.coordinator {
-            additional_items.push(openclaudia::context::ContextItem::host_instruction(
-                "repl.coordinator_policy",
-                openclaudia::context::HostInstructionSource::CoordinatorPolicy,
-                "host:coordinator-role",
-                openclaudia::subagent::AgentType::Coordinator.system_prompt(),
-                openclaudia::context::ContextFreshness::Static,
-                5,
-            ));
+            additional_items.push(coordinator_policy_context_item());
+        }
+
+        if let Some(checkpoint) = self.planner_context.as_ref() {
+            additional_items.push(checkpoint.clone());
         }
 
         additional_items.extend(self.transient_skill_context.iter().cloned());
 
-        prompt::build_prompt_context_with_items_for_run(
+        let blocks = prompt::build_prompt_context_with_items_for_run(
             &behavior_mode,
             &self.run_context,
             additional_items,
             openclaudia::context::ContextBudget::default(),
-        )
+        );
+        if self.coordinator && !planner_checkpoint_included(&blocks) {
+            return Err(
+                "complete planner checkpoint projection was not admitted for this turn".to_string(),
+            );
+        }
+        Ok(blocks)
+    }
+
+    fn planner_request_messages(&self) -> Vec<serde_json::Value> {
+        let messages = self.chat_session.messages_snapshot();
+        if !self.coordinator {
+            return messages;
+        }
+        self.planner_turn_start
+            .and_then(|start| messages.get(start..).map(<[_]>::to_vec))
+            .unwrap_or_default()
     }
 
     fn reserve_provider_call(
@@ -2313,7 +2483,7 @@ impl ChatRepl {
     async fn build_native_json_followup_request(&self) -> Result<serde_json::Value, String> {
         let grounded = self.request_messages_with_grounding()?;
         let (messages, _) = self.project_request_messages(grounded, None).await?;
-        let prompt_blocks = self.build_prompt_blocks_for_turn();
+        let prompt_blocks = self.build_prompt_blocks_for_turn()?;
         let effort = self
             .transient_effort_override
             .unwrap_or_else(|| self.chat_session.effort_level());

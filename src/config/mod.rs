@@ -336,6 +336,13 @@ pub fn load_config() -> Result<AppConfig, ConfigError> {
         return Err(ConfigError::Message(e));
     }
 
+    // Hook configuration is a runtime contract, not a bag of best-effort
+    // callbacks. Reject fields whose semantics cannot be honored uniformly by
+    // every production frontend before any hook process can be scheduled.
+    if let Err(e) = config.hooks.validate_runtime() {
+        return Err(ConfigError::Message(e));
+    }
+
     // The pre-S-103 shared-path proposal is permanently rejected. A repository
     // may select a strict team ID, but membership and credentials are resolved
     // only from the host-owned authority store and signed service descriptor.

@@ -449,6 +449,21 @@ pub struct BackgroundAgent {
     /// has reached the durable graph. The background registry remains a live
     /// process handle; it is never a second planning truth.
     canonical_task_id: Mutex<Option<String>>,
+    /// Immutable child-run identity retained for planner checkpoint fencing.
+    child_descriptor: Mutex<Option<crate::runtime::RunDescriptor>>,
+    /// Live cancellation capability retained so a stopped child yields an
+    /// exact receipt instead of an inferred terminal flag.
+    child_cancellation: Mutex<Option<crate::runtime::CancellationHandle>>,
+}
+
+/// Canonical child-run snapshot consumed by the rotating planner ledger.
+pub(crate) struct BackgroundChildSnapshot {
+    pub agent_id: String,
+    pub task_id: String,
+    pub descriptor: crate::runtime::RunDescriptor,
+    pub finished: bool,
+    pub failed: bool,
+    pub cancellation_receipt: Option<crate::runtime::CancellationReceipt>,
 }
 
 /// Manager for background agents
@@ -566,6 +581,8 @@ impl BackgroundAgentManager {
             abort_handle: Mutex::new(None),
             terminal_lock: Mutex::new(()),
             canonical_task_id: Mutex::new(None),
+            child_descriptor: Mutex::new(None),
+            child_cancellation: Mutex::new(None),
         });
         agents.insert(id.to_string(), agent);
         Ok(true)
@@ -629,6 +646,117 @@ impl BackgroundAgentManager {
             "canonical_task_id",
         )
         .and_then(|slot| slot.clone())
+    }
+
+    fn bind_child_run(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+        id: &str,
+        child: &crate::tools::ToolRunContext,
+    ) -> Result<(), String> {
+        let agent = self
+            .get_for_run(owner, id)
+            .ok_or_else(|| format!("Agent '{id}' not found"))?;
+        let Some(mut descriptor) = agent_field_guard(
+            &agent.child_descriptor,
+            "bind_child_run",
+            id,
+            "child_descriptor",
+        ) else {
+            return Err(format!("Agent '{id}' child descriptor lock poisoned"));
+        };
+        let Some(mut cancellation) = agent_field_guard(
+            &agent.child_cancellation,
+            "bind_child_run",
+            id,
+            "child_cancellation",
+        ) else {
+            return Err(format!("Agent '{id}' child cancellation lock poisoned"));
+        };
+        let next = child.runtime().descriptor();
+        if descriptor
+            .as_ref()
+            .is_some_and(|current| current.run_id != next.run_id)
+        {
+            return Err(format!(
+                "Agent '{id}' is already bound to a different child run"
+            ));
+        }
+        *descriptor = Some(next.clone());
+        *cancellation = Some(child.runtime().cancellation());
+        Ok(())
+    }
+
+    /// Snapshot every child with a concrete run binding owned by this exact
+    /// supervisor. An active registration without its run binding fails
+    /// closed so planner rotation cannot silently omit a starting child.
+    pub(crate) fn child_snapshots_for_run(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+    ) -> Result<Vec<BackgroundChildSnapshot>, String> {
+        let agents = {
+            let Some(agents) = self.agents_guard("child_snapshots_for_run") else {
+                return Err("Background agent registry is unavailable".to_string());
+            };
+            agents
+                .values()
+                .filter(|agent| agent.owner_run == owner.run_id())
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let mut snapshots = Vec::new();
+        for agent in agents {
+            let finished = agent.finished.load(Ordering::SeqCst);
+            let descriptor = agent_field_guard(
+                &agent.child_descriptor,
+                "child_snapshots_for_run",
+                &agent.id,
+                "child_descriptor",
+            )
+            .ok_or_else(|| format!("Agent '{}' child descriptor lock poisoned", agent.id))?
+            .clone();
+            let Some(descriptor) = descriptor else {
+                if finished {
+                    continue;
+                }
+                return Err(format!(
+                    "Agent '{}' is active before its child run binding is available",
+                    agent.id
+                ));
+            };
+            let task_id = agent_field_guard(
+                &agent.canonical_task_id,
+                "child_snapshots_for_run",
+                &agent.id,
+                "canonical_task_id",
+            )
+            .ok_or_else(|| format!("Agent '{}' canonical task lock poisoned", agent.id))?
+            .clone()
+            .ok_or_else(|| format!("Agent '{}' has no canonical delegation task", agent.id))?;
+            let failed =
+                agent_field_guard(&agent.error, "child_snapshots_for_run", &agent.id, "error")
+                    .ok_or_else(|| format!("Agent '{}' error-state lock poisoned", agent.id))?
+                    .is_some();
+            let cancellation_receipt = agent_field_guard(
+                &agent.child_cancellation,
+                "child_snapshots_for_run",
+                &agent.id,
+                "child_cancellation",
+            )
+            .ok_or_else(|| format!("Agent '{}' cancellation lock poisoned", agent.id))?
+            .as_ref()
+            .and_then(crate::runtime::CancellationHandle::receipt);
+            snapshots.push(BackgroundChildSnapshot {
+                agent_id: agent.id.clone(),
+                task_id,
+                descriptor,
+                finished,
+                failed,
+                cancellation_receipt,
+            });
+        }
+        snapshots.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+        Ok(snapshots)
     }
 
     /// Mark an agent as finished with a result
@@ -753,6 +881,14 @@ impl BackgroundAgentManager {
             }
             if let Some(mut t) = agent_field_guard(&agent.finished_at, "stop", id, "finished_at") {
                 *t = Some(Instant::now());
+            }
+            let Some(cancellation) =
+                agent_field_guard(&agent.child_cancellation, "stop", id, "child_cancellation")
+            else {
+                return Err(format!("Agent '{id}' child cancellation lock poisoned"));
+            };
+            if let Some(cancellation) = cancellation.as_ref() {
+                let _ = cancellation.cancel(crate::runtime::CancellationReason::User);
             }
             let abort_handle = agent_field_guard(&agent.abort_handle, "stop", id, "abort_handle")
                 .and_then(|mut h| h.take());
@@ -1780,6 +1916,117 @@ async fn run_subagent_inner(
     preallocated_agent_id: Option<&str>,
     effect_receipt: Option<&AtomicBool>,
 ) -> SubagentResult {
+    let hook_engine =
+        crate::hooks::HookEngine::new(crate::hooks::load_effective_hooks(app_config.hooks.clone()));
+    let lifecycle_agent_id = preallocated_agent_id
+        .or(config.resume_agent_id.as_deref())
+        .unwrap_or_default();
+    let start_input =
+        crate::hooks::HookInput::for_run(parent_run, crate::hooks::HookEvent::SubagentStart)
+            .with_session_id(parent_run.session_id())
+            .with_extra(
+                "agent_id",
+                serde_json::Value::String(lifecycle_agent_id.to_string()),
+            )
+            .with_extra(
+                "agent_type",
+                serde_json::Value::String(format!("{:?}", config.agent_type)),
+            )
+            .with_extra("task", serde_json::Value::String(config.task.clone()));
+    let start_receipt = hook_engine
+        .run_lifecycle(crate::hooks::HookEvent::SubagentStart, &start_input)
+        .await;
+    if let Some(reason) = start_receipt.blocking_reason() {
+        return SubagentResult {
+            agent_id: lifecycle_agent_id.to_string(),
+            success: false,
+            output: format!("SubagentStart hook blocked child creation: {reason}"),
+            turns_used: 0,
+            is_background: config.run_in_background,
+            worktree: None,
+        };
+    }
+
+    let prompt_input =
+        crate::hooks::HookInput::for_run(parent_run, crate::hooks::HookEvent::UserPromptSubmit)
+            .with_session_id(parent_run.session_id())
+            .with_prompt(&config.prompt)
+            .with_extra(
+                "frontend",
+                serde_json::Value::String("subagent".to_string()),
+            );
+    let prompt_receipt = hook_engine
+        .run_lifecycle(crate::hooks::HookEvent::UserPromptSubmit, &prompt_input)
+        .await;
+    if let Some(reason) = prompt_receipt.blocking_reason() {
+        let result = SubagentResult {
+            agent_id: lifecycle_agent_id.to_string(),
+            success: false,
+            output: format!("UserPromptSubmit hook blocked subagent prompt: {reason}"),
+            turns_used: 0,
+            is_background: config.run_in_background,
+            worktree: None,
+        };
+        emit_subagent_stop(&hook_engine, parent_run, &result).await;
+        return result;
+    }
+    let hook_context = crate::context::hook_result_reference_items(
+        &prompt_receipt.into_result(),
+        "subagent_user_prompt_submit",
+        500,
+    );
+
+    let result = run_subagent_core(
+        parent_run,
+        config,
+        app_config,
+        client,
+        memory_db,
+        preallocated_agent_id,
+        effect_receipt,
+        &hook_engine,
+        hook_context,
+    )
+    .await;
+
+    emit_subagent_stop(&hook_engine, parent_run, &result).await;
+    result
+}
+
+async fn emit_subagent_stop(
+    hook_engine: &crate::hooks::HookEngine,
+    parent_run: &Arc<crate::tools::ToolRunContext>,
+    result: &SubagentResult,
+) {
+    let stop_input =
+        crate::hooks::HookInput::for_run(parent_run, crate::hooks::HookEvent::SubagentStop)
+            .with_session_id(parent_run.session_id())
+            .with_extra(
+                "agent_id",
+                serde_json::Value::String(result.agent_id.clone()),
+            )
+            .with_extra("success", serde_json::Value::Bool(result.success))
+            .with_extra(
+                "turns_used",
+                serde_json::Value::Number(result.turns_used.into()),
+            );
+    let _receipt = hook_engine
+        .run_lifecycle(crate::hooks::HookEvent::SubagentStop, &stop_input)
+        .await;
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+async fn run_subagent_core(
+    parent_run: &Arc<crate::tools::ToolRunContext>,
+    config: &SubagentConfig,
+    app_config: &AppConfig,
+    client: &Client,
+    memory_db: Option<Arc<crate::memory::MemoryDb>>,
+    preallocated_agent_id: Option<&str>,
+    effect_receipt: Option<&AtomicBool>,
+    hook_engine: &crate::hooks::HookEngine,
+    hook_context: Vec<crate::context::ContextItem>,
+) -> SubagentResult {
     let child_registration = match parent_run.begin_child_run_registration() {
         Ok(registration) => registration,
         Err(error) => {
@@ -2025,6 +2272,17 @@ async fn run_subagent_inner(
             };
         }
     };
+    if let Err(error) = BACKGROUND_AGENTS.bind_child_run(parent_run, &agent_id, &subagent_run) {
+        BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
+        return SubagentResult {
+            agent_id,
+            success: false,
+            output: format!("Cannot bind subagent runtime ownership: {error}"),
+            turns_used: 0,
+            is_background: config.run_in_background,
+            worktree,
+        };
+    }
     let model = config
         .model_override
         .clone()
@@ -2074,6 +2332,7 @@ async fn run_subagent_inner(
         crate::context::ContextFreshness::Static,
         10,
     )];
+    subagent_context.extend(hook_context);
     if let Some(worktree) = &worktree {
         subagent_context.push(crate::context::ContextItem::host_instruction(
             "subagent.worktree_policy",
@@ -2337,7 +2596,7 @@ async fn run_subagent_inner(
                     .auto_compact(
                         &mut typed_request,
                         None,
-                        None,
+                        Some(hook_engine),
                         &subagent_run,
                         Some(&agent_id),
                         memory_db.clone(),
@@ -2767,16 +3026,61 @@ async fn run_subagent_inner(
             // list lives in its own bucket. Claude Code uses the
             // `agentId ?? sessionId` fallback; here agent_id is always
             // present. Closes crosslink #518 for subagents.
-            let result = execute_subagent_local_tool(&mut SubagentToolExecution {
-                run: &subagent_run,
-                tool_call: &executable_tc,
-                memory_db: memory_db.as_deref(),
-                app_config,
-                task_manager: &mut task_manager,
-                permission_manager: &permission_mgr,
-                agent_id: &agent_id,
-                policy_enforcer: &policy_enforcer,
-            });
+            let tool_input = match crate::services::tool_executor::ToolExecutor::parse_arguments(
+                &executable_tc.function.name,
+                &executable_tc.function.arguments,
+            ) {
+                Ok(input) => input,
+                Err(error) => {
+                    let result = crate::tools::ToolResult::failure(
+                        &executable_tc,
+                        crate::tools::ToolFailureCode::InvalidArguments,
+                        error,
+                        crate::tools::ToolRetryability::Never,
+                    );
+                    observe_subagent_tool_result(&subagent_run, &agent_id, &result);
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": executable_tc.id,
+                        "content": result.content()
+                    }));
+                    continue;
+                }
+            };
+            let result = match crate::services::tool_executor::ToolExecutor::run_pre_tool_use(
+                &subagent_run,
+                hook_engine,
+                Some(&agent_id),
+                &executable_tc.function.name,
+                &tool_input,
+            )
+            .await
+            {
+                Ok(()) => {
+                    let result = execute_subagent_local_tool(&mut SubagentToolExecution {
+                        run: &subagent_run,
+                        tool_call: &executable_tc,
+                        memory_db: memory_db.as_deref(),
+                        app_config,
+                        task_manager: &mut task_manager,
+                        permission_manager: &permission_mgr,
+                        agent_id: &agent_id,
+                        policy_enforcer: &policy_enforcer,
+                    });
+                    crate::services::tool_executor::ToolExecutor::fire_post_tool(
+                        &subagent_run,
+                        hook_engine,
+                        !result.is_error() && !result.is_partial(),
+                        &executable_tc.function.name,
+                        tool_input,
+                        result.content(),
+                        Some(&agent_id),
+                    )
+                    .await;
+                    result
+                }
+                Err(block) => block.into_tool_result(&executable_tc),
+            };
             observe_subagent_tool_result(&subagent_run, &agent_id, &result);
 
             messages.push(json!({

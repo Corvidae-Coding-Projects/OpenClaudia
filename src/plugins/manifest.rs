@@ -472,13 +472,12 @@ pub struct PluginManifest {
         skip_serializing_if = "Option::is_none"
     )]
     pub lsp_servers: Option<HashMap<String, LspServerConfig>>,
-    /// Optional detached ed25519 signature over the manifest bytes.
+    /// Legacy inline signature retained for manifest compatibility.
     ///
-    /// When present, the signature is verified by
-    /// [`crate::plugins::validate::verify_signature`] during install if the
-    /// active [`crate::plugins::policy::PluginPolicy`] includes a
-    /// `RequireSignature` action. The field is skipped during serialization
-    /// when absent so existing manifests are unaffected.
+    /// Inline metadata cannot authenticate the package containing it and is
+    /// never an activation authority. Install/update verification uses the
+    /// detached `.claude-plugin/artifact.json` statement, which binds the
+    /// canonical package tree before a generation can be published.
     ///
     /// On-disk shape: serialized as a base64 string via the `Serialize` /
     /// `Deserialize` impls on `PluginSignature` itself.

@@ -1715,88 +1715,125 @@ impl App {
         // Capture the tokio runtime handle (must be called inside an async context).
         self.runtime_handle = tokio::runtime::Handle::try_current().ok();
 
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
-        let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend)?;
-
-        // Single event handler — MUST NOT create two, or they steal each other's keypresses
-        let events = EventHandler::new(Duration::from_millis(100));
-        // Store a sender clone so spawn_api_turn can push events into the same channel
-        self.api_event_tx = Some(events.sender());
-
-        // No welcome message added to the message list — the welcome
-        // box is rendered directly in draw() as a ratatui widget.
-
-        loop {
-            // crosslink #910: out-of-band shutdown signal. Any process
-            // (signal handler, background task, test fixture) can
-            // request a clean exit by flipping TUI_SHUTDOWN — the loop
-            // checks it before every tick so we exit promptly without
-            // a synthetic keypress.
-            if TUI_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
+        // Session admission is a runtime lifecycle boundary shared with the
+        // proxy, ACP, and legacy frontend. It runs before terminal mutation so
+        // a deny, approval request, timeout, or hook failure cannot leave a
+        // partially-started UI session behind.
+        if let (Some(engine), Ok(run_context)) =
+            (self.hook_engine.as_ref(), self.run_context.as_ref())
+        {
+            let session_id = self.chat_session.id();
+            let input = crate::hooks::HookInput::for_run(
+                run_context,
+                crate::hooks::HookEvent::SessionStart,
+            )
+            .with_session_id(session_id);
+            let receipt = engine
+                .run_lifecycle(crate::hooks::HookEvent::SessionStart, &input)
+                .await;
+            if let Some(reason) = receipt.blocking_reason() {
+                if let Some(runtime) = self.mcp_runtime.as_ref() {
+                    if let Err(error) = runtime.manager.write().await.disconnect_all().await {
+                        tracing::warn!(%error, "failed to disconnect MCP servers after TUI admission denial");
+                    }
+                }
+                crate::tools::retire_run(run_context);
+                return Err(io::Error::other(format!(
+                    "SessionStart hook blocked TUI startup: {reason}"
+                )));
             }
+        }
 
-            // Drain ALL pending events before drawing so the next
-            // frame reflects the most recent state. The previous
-            // "draw → handle one event → loop" order painted the
-            // OLD state on every iteration that received an event,
-            // and the NEW state only appeared on the iteration
-            // after — producing the "responses one turn behind"
-            // symptom users reported when streaming events arrived
-            // back-to-back. Draining the channel first eliminates
-            // that one-frame lag without changing per-event
-            // dispatch semantics.
-            let mut channel_dead = false;
+        let outcome: io::Result<()> = async {
+            enable_raw_mode()?;
+            let mut stdout = io::stdout();
+            execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+            let backend = CrosstermBackend::new(stdout);
+            let mut terminal = Terminal::new(backend)?;
+
+            // Single event handler — MUST NOT create two, or they steal each other's keypresses
+            let events = EventHandler::new(Duration::from_millis(100));
+            // Store a sender clone so spawn_api_turn can push events into the same channel
+            self.api_event_tx = Some(events.sender());
+
+            // No welcome message added to the message list — the welcome
+            // box is rendered directly in draw() as a ratatui widget.
+
             loop {
-                match events.try_next() {
-                    Ok(event) => {
-                        if !self.handle_app_event(Ok(event)) {
+                // crosslink #910: out-of-band shutdown signal. Any process
+                // (signal handler, background task, test fixture) can
+                // request a clean exit by flipping TUI_SHUTDOWN — the loop
+                // checks it before every tick so we exit promptly without
+                // a synthetic keypress.
+                if TUI_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+
+                // Drain ALL pending events before drawing so the next
+                // frame reflects the most recent state. The previous
+                // "draw → handle one event → loop" order painted the
+                // OLD state on every iteration that received an event,
+                // and the NEW state only appeared on the iteration
+                // after — producing the "responses one turn behind"
+                // symptom users reported when streaming events arrived
+                // back-to-back. Draining the channel first eliminates
+                // that one-frame lag without changing per-event
+                // dispatch semantics.
+                let mut channel_dead = false;
+                loop {
+                    match events.try_next() {
+                        Ok(event) => {
+                            if !self.handle_app_event(Ok(event)) {
+                                channel_dead = true;
+                                break;
+                            }
+                            if self.should_quit {
+                                break;
+                            }
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            let _ = self.handle_app_event(Err(std::sync::mpsc::RecvError));
                             channel_dead = true;
                             break;
                         }
-                        if self.should_quit {
-                            break;
-                        }
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        let _ = self.handle_app_event(Err(std::sync::mpsc::RecvError));
-                        channel_dead = true;
-                        break;
                     }
                 }
+                self.drain_state_subscribers();
+                if channel_dead || self.should_quit {
+                    break;
+                }
+
+                // Render once per loop iteration with the post-drain state.
+                terminal.draw(|frame| self.draw(frame))?;
+
+                // Yield to the runtime so spawned tasks
+                // (`run_api_turn_async`, tool calls, hook execution)
+                // can drive their futures. Under
+                // `flavor = "current_thread"` this `.await` is the only
+                // place the executor regains control between events.
+                // 16 ms ≈ 60 fps — keypress echo feels instant without
+                // burning CPU between events.
+                tokio::time::sleep(Duration::from_millis(16)).await;
             }
-            self.drain_state_subscribers();
-            if channel_dead || self.should_quit {
-                break;
+
+            // Save session and any final transcript tail on exit.
+            self.chat_session.touch();
+            self.persist_session();
+            if let Some(analytics) = self.analytics_subscriber.as_mut() {
+                analytics.finish();
             }
-
-            // Render once per loop iteration with the post-drain state.
-            terminal.draw(|frame| self.draw(frame))?;
-
-            // Yield to the runtime so spawned tasks
-            // (`run_api_turn_async`, tool calls, hook execution)
-            // can drive their futures. Under
-            // `flavor = "current_thread"` this `.await` is the only
-            // place the executor regains control between events.
-            // 16 ms ≈ 60 fps — keypress echo feels instant without
-            // burning CPU between events.
-            tokio::time::sleep(Duration::from_millis(16)).await;
+            debug_assert!(self.service_registry.analytics_is_enabled());
+            Ok(())
         }
+        .await;
 
-        disable_raw_mode()?;
-        execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen)?;
-
-        // Save session and any final transcript tail on exit.
-        self.chat_session.touch();
-        self.persist_session();
-        if let Some(analytics) = self.analytics_subscriber.as_mut() {
-            analytics.finish();
-        }
-        debug_assert!(self.service_registry.analytics_is_enabled());
+        // Restore the terminal even when setup or drawing failed after raw
+        // mode/alternate-screen activation. Preserve the operational error
+        // when both the run loop and cleanup fail.
+        let terminal_cleanup = disable_raw_mode()
+            .and_then(|()| execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen));
+        let outcome = outcome.and(terminal_cleanup);
 
         // Fire SessionEnd hooks. Best-effort: the app is already exiting
         // so we can't recover from a failure, and we must not spam the
@@ -1829,7 +1866,7 @@ impl App {
             crate::tools::retire_run(run_context);
         }
 
-        Ok(())
+        outcome
     }
 
     /// Process one async event from the event loop. Returns `false` when the loop should stop.
@@ -4777,19 +4814,16 @@ async fn run_preturn_hooks(
     let hook_input =
         crate::hooks::HookInput::for_run(run_context, crate::hooks::HookEvent::UserPromptSubmit)
             .with_prompt(&user_prompt);
-    let hook_result = engine
-        .run(crate::hooks::HookEvent::UserPromptSubmit, &hook_input)
+    let hook_receipt = engine
+        .run_lifecycle(crate::hooks::HookEvent::UserPromptSubmit, &hook_input)
         .await;
-    if !hook_result.allowed {
-        let reason = hook_result.errors.first().map_or_else(
-            || "Hook blocked the request".to_string(),
-            std::string::ToString::to_string,
-        );
+    if let Some(reason) = hook_receipt.blocking_reason() {
         let _ = tx.send(super::events::AppEvent::ApiError(
             format!("Blocked by hook: {reason}").into(),
         ));
         return false;
     }
+    let hook_result = hook_receipt.into_result();
     let hook_items =
         crate::context::hook_result_reference_items(&hook_result, "user_prompt_submit", 500);
     if !hook_items.is_empty() {

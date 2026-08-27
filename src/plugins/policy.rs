@@ -24,9 +24,81 @@
 //! locked-down environments.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 use super::marketplace::MarketplaceSource;
 use super::validate::PublicKey;
+
+/// One host-approved signer for detached plugin artifact statements.
+///
+/// The signer identifier is part of the detached signature envelope; the
+/// public key and namespace grants remain host-owned policy. A package cannot
+/// enlarge these grants by changing its own metadata.
+#[derive(Debug, Clone)]
+pub struct TrustedArtifactSigner {
+    /// Stable key identifier recorded beside detached signatures.
+    pub key_id: String,
+    /// Ed25519 verification key owned by the host trust store.
+    pub public_key: PublicKey,
+    /// Publisher identity this key is allowed to assert.
+    pub publisher: String,
+    /// Exact package names or `prefix/*` namespaces this signer may publish.
+    pub package_namespaces: Vec<String>,
+    /// Earliest accepted statement publication time, in Unix seconds.
+    pub valid_from_unix: Option<u64>,
+    /// Last accepted statement publication time, in Unix seconds.
+    pub valid_until_unix: Option<u64>,
+}
+
+impl TrustedArtifactSigner {
+    /// Return whether this signer is authorized for an exact package statement.
+    #[must_use]
+    pub fn authorizes(&self, publisher: &str, package: &str, published_at_unix: u64) -> bool {
+        if self.publisher != publisher
+            || self
+                .valid_from_unix
+                .is_some_and(|start| published_at_unix < start)
+            || self
+                .valid_until_unix
+                .is_some_and(|end| published_at_unix > end)
+        {
+            return false;
+        }
+        self.package_namespaces.iter().any(|namespace| {
+            namespace == package
+                || namespace
+                    .strip_suffix("/*")
+                    .is_some_and(|prefix| package.starts_with(&format!("{prefix}/")))
+        })
+    }
+}
+
+/// Host-owned trust and freshness policy for detached plugin artifacts.
+#[derive(Debug, Clone)]
+pub struct ArtifactTrustPolicy {
+    /// Minimum number of distinct authorized signatures required.
+    pub signature_threshold: usize,
+    /// Approved signing keys and their publisher/package grants.
+    pub trusted_signers: Vec<TrustedArtifactSigner>,
+    /// Signer identifiers revoked by current host policy.
+    pub revoked_signer_ids: BTreeSet<String>,
+    /// Artifact digests revoked by current host policy.
+    pub revoked_artifact_digests: BTreeSet<String>,
+    /// Maximum permitted age of signed metadata, when configured.
+    pub max_statement_age_seconds: Option<u64>,
+}
+
+impl Default for ArtifactTrustPolicy {
+    fn default() -> Self {
+        Self {
+            signature_threshold: 1,
+            trusted_signers: Vec::new(),
+            revoked_signer_ids: BTreeSet::new(),
+            revoked_artifact_digests: BTreeSet::new(),
+            max_statement_age_seconds: None,
+        }
+    }
+}
 
 /// Actions that the policy can mandate on every plugin install.
 ///
@@ -34,9 +106,9 @@ use super::validate::PublicKey;
 /// non-`None` actions in sequence before allowing an install to proceed.
 #[derive(Debug, Clone)]
 pub enum PolicyAction {
-    /// Require a valid ed25519 signature over the manifest bytes. The install
-    /// is rejected unless the plugin's `signature` field is present **and**
-    /// verifies against at least one key in `trusted_keys`.
+    /// Require a valid Ed25519 signature over the detached artifact statement.
+    /// The install is rejected unless `.claude-plugin/artifact.json` binds the
+    /// complete staged tree and verifies against at least one trusted key.
     ///
     /// Corresponds to crosslink #249 / #521 mandated-refactor point 2
     /// (signed-manifest scheme).
@@ -45,6 +117,12 @@ pub enum PolicyAction {
         /// keys). An empty vec is treated as "no key is trusted" and will
         /// always reject.
         trusted_keys: Vec<PublicKey>,
+    },
+    /// Require a detached, artifact-bound statement satisfying publisher,
+    /// namespace, threshold, rotation, freshness, and revocation policy.
+    RequireArtifactVerification {
+        /// Host-owned artifact trust snapshot.
+        trust: ArtifactTrustPolicy,
     },
 }
 

@@ -23,6 +23,7 @@ pub mod manager;
 pub mod manifest;
 pub mod marketplace;
 pub mod policy;
+pub mod transaction;
 pub mod validate;
 pub mod zip_cache;
 
@@ -38,6 +39,13 @@ pub use manifest::{
 pub use marketplace::{
     GitHubSource, MarketplaceManifest, MarketplaceMetadata, MarketplacePlugin, MarketplaceSource,
     NpmSource, PipSource, PluginSource, PluginSourceDef, UrlSource,
+};
+pub use policy::{ArtifactTrustPolicy, TrustedArtifactSigner};
+pub use transaction::{
+    canonical_statement_bytes, digest_package_tree, public_key_id, ArtifactDependency,
+    ArtifactEnvelope, ArtifactGenerationReceipt, ArtifactSignature, ArtifactSourceProvenance,
+    ArtifactStatement, ArtifactVerificationLevel, PluginInstallTransaction, PluginTransactionError,
+    ARTIFACT_ENVELOPE_PATH, ARTIFACT_SCHEMA_VERSION,
 };
 pub use validate::{
     derive_dir_name_from_url, validate_plugin_dir_name, validate_source_url, PublicKey,
@@ -233,6 +241,14 @@ pub enum PluginError {
     /// tampered with after signing).
     #[error("plugin '{0}' signature is cryptographically invalid (manifest may be tampered)")]
     SignatureMismatch(String),
+
+    /// Staged package verification, publication, or recovery failed.
+    #[error(transparent)]
+    Transaction(#[from] transaction::PluginTransactionError),
+
+    /// Offline cache lookup, integrity, or extraction failed.
+    #[error(transparent)]
+    ZipCache(#[from] zip_cache::ZipCacheError),
 }
 
 // ---------------------------------------------------------------------------

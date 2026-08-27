@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- S-086: Implement rotating planner checkpoints (#1164)
+- S-062: Make plugin install and update verifiable transactions (#1162)
+- S-059: Unify the hook lifecycle across frontends (#1163)
 - S-074: Bind isolated workspaces to run capabilities (#1159)
 - S-073: Make worktree apply and cleanup transactional (#1156)
 - S-072: Supervise browser and web work (#1154)

@@ -453,6 +453,16 @@ fn atomic_save_to(view: &InstalledPlugins, path: &Path) -> Result<(), PluginErro
         PluginError::IoError(e.to_string())
     })?;
 
+    // The tracker is the active-generation pointer. Synchronize its parent
+    // after rename so a power loss cannot expose the new filename without the
+    // directory entry being durable.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| PluginError::IoError(e.to_string()))?;
+    }
+
     debug!(path = ?path, count = view.plugins.len(), "Saved installed plugins");
     Ok(())
 }

@@ -50,6 +50,10 @@ __pycache__/
 # agent worktrees are represented by their branches, not committed as a tree.
 .openclaudia/reality-ledgers/
 .openclaudia/schedules.json.lock
+.openclaudia/sandbox-transactions/
+.openclaudia/plugins/transactions.lock
+.openclaudia/plugins/.transactions/
+.openclaudia/plugins/.generations/
 
 # oh-my-claudecode / aider machine-local orchestration state (never commit)
 .omc/

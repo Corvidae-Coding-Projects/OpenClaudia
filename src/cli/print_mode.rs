@@ -608,31 +608,48 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
     .build()
     .map_err(anyhow::Error::msg)?;
     let mut print_turn = resolve_print_turn(prompt, &print_run)?;
+    let mut hook_engine = crate::build_hook_engine(&config);
     if let Some(skill_hooks) = print_turn.skill_hooks.take() {
-        use openclaudia::hooks::{HookEvent, HookInput};
-
-        let hook_engine = crate::build_hook_engine(&config).with_scoped_hooks(skill_hooks);
-        let hook_input = HookInput::for_run(&print_run, HookEvent::UserPromptSubmit)
-            .with_prompt(&print_turn.prompt);
-        let hook_result = hook_engine
-            .run(HookEvent::UserPromptSubmit, &hook_input)
-            .await;
-        if !hook_result.allowed {
-            let reason = hook_result
-                .outputs
-                .first()
-                .and_then(|output| output.reason.clone())
-                .unwrap_or_else(|| "Request blocked by skill hook".to_string());
-            anyhow::bail!("Print request blocked by hook: {reason}");
-        }
-        print_turn
-            .context_items
-            .extend(openclaudia::context::hook_result_reference_items(
-                &hook_result,
-                "print_user_prompt_submit",
-                500,
-            ));
+        hook_engine = hook_engine.with_scoped_hooks(skill_hooks);
     }
+    let session_id = print_run.session_id().to_string();
+    let start_input = openclaudia::hooks::HookInput::for_run(
+        &print_run,
+        openclaudia::hooks::HookEvent::SessionStart,
+    )
+    .with_session_id(&session_id);
+    let start_receipt = hook_engine
+        .run_lifecycle(openclaudia::hooks::HookEvent::SessionStart, &start_input)
+        .await;
+    if let Some(reason) = start_receipt.blocking_reason() {
+        openclaudia::tools::retire_run(&print_run);
+        anyhow::bail!("SessionStart hook blocked print request: {reason}");
+    }
+
+    let outcome: anyhow::Result<()> = async {
+    let hook_input = openclaudia::hooks::HookInput::for_run(
+        &print_run,
+        openclaudia::hooks::HookEvent::UserPromptSubmit,
+    )
+    .with_session_id(&session_id)
+    .with_prompt(&print_turn.prompt);
+    let prompt_receipt = hook_engine
+        .run_lifecycle(
+            openclaudia::hooks::HookEvent::UserPromptSubmit,
+            &hook_input,
+        )
+        .await;
+    if let Some(reason) = prompt_receipt.blocking_reason() {
+        anyhow::bail!("UserPromptSubmit hook blocked print request: {reason}");
+    }
+    print_turn
+        .context_items
+        .extend(openclaudia::context::hook_result_reference_items(
+            &prompt_receipt.into_result(),
+            "print_user_prompt_submit",
+            500,
+        ));
+
     let mut provider = config.active_provider().cloned().ok_or_else(|| {
         anyhow::anyhow!(
             "no provider configured for target '{}'",
@@ -801,6 +818,19 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
         .finish_unknown()
         .map_err(|error| anyhow::anyhow!("Provider budget reconciliation failed: {error}"))?;
     result
+    }
+    .await;
+
+    let end_input = openclaudia::hooks::HookInput::for_run(
+        &print_run,
+        openclaudia::hooks::HookEvent::SessionEnd,
+    )
+    .with_session_id(session_id);
+    let _receipt = hook_engine
+        .run_lifecycle(openclaudia::hooks::HookEvent::SessionEnd, &end_input)
+        .await;
+    openclaudia::tools::retire_run(&print_run);
+    outcome
 }
 
 #[cfg(test)]
