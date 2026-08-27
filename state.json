@@ -1,6 +1,6 @@
 {
   "next_display_id": 1165,
-  "next_comment_id": 1775,
+  "next_comment_id": 1776,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8860,7 +8860,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-27T10:35:59.800440782Z",
+      "updated_at": "2026-08-27T10:37:31.789265400Z",
       "labels": [
         "remediation"
       ],
@@ -8953,6 +8953,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA6DoUVFs4PhWNVbk1gPrFHZHzV3Ugn7QlN5gvIe5ou8IWU4F5bh2uEavAQjNb0BvC8AN0lBQefuzGA4wfnbeeDA=="
+        },
+        "0bd25b60-9861-48d6-99d8-13954c20c83a": {
+          "display_id": 1775,
+          "author": "6Vw9",
+          "content": "Wave-one feature wiring committed as 399a19e9: S-059 canonical hook lifecycle across ACP/legacy/print/TUI/proxy/subagents, S-062 verified atomic plugin transactions with bounded offline ZIP installation and crash recovery, and S-086 rotating capability-limited planner checkpoints. Child issues #1162, #1163, and #1164 are closed with detailed verification records. Rust 1.98 fmt and strict all-target/all-feature Clippy pass; focused unit and selected integration suites pass. Full serialized library run reached 2948 passed, 4 known dirty-real-worktree fixture failures tracked in #1055/#1062, 1 ignored. Cargo cache cleaned after verification (97.1 GiB removed).",
+          "created_at": "2026-08-27T10:37:31.786742317Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABASuHvf1bZ5dzgjs7jaVLZEUmXXcc/yZEdozZQ23Of+YgcZ7NPTU+uJXJstTjrL4RvCfoRnSFLnI4FL5N/JZv7Cg=="
         },
         "0d1b7df2-c9f5-4166-b3dd-affa1264e3cd": {
           "display_id": 1499,
@@ -44614,11 +44623,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1967,
       "timestamp": "2026-08-27T10:35:59.800440782Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1968,
+      "timestamp": "2026-08-27T10:37:31.789265400Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T10:35:59.800440782Z",
+    "timestamp": "2026-08-27T10:37:31.789265400Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1967
+    "agent_seq": 1968
   }
 }
