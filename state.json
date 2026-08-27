@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1163,
+  "next_display_id": 1164,
   "next_comment_id": 1761,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -387,6 +387,7 @@
     "5cd2a889-64bf-40f0-b355-8e0e7f138b2f": 69,
     "5ce89883-ca14-48ca-bc22-74d5ae8a9301": 814,
     "5d070d30-6e61-43c7-a7a0-fe284bd99643": 4,
+    "5d0a6c29-1897-4b5a-be61-53eb4fa7c059": 1163,
     "5d60a948-e127-456c-9a1e-39b6669328a7": 971,
     "5d7b6286-c825-4534-a185-f609634f526a": 989,
     "5dbe587b-0d71-4ebb-910a-7d1f4b92a892": 550,
@@ -13112,6 +13113,18 @@
         }
       }
     },
+    "5d0a6c29-1897-4b5a-be61-53eb4fa7c059": {
+      "uuid": "5d0a6c29-1897-4b5a-be61-53eb4fa7c059",
+      "display_id": 1163,
+      "title": "S-059: Unify the hook lifecycle across frontends",
+      "description": "Implement docs/remediation-slices/059-canonical-hook-lifecycle.md as production wiring. Code-only worker; parent owns integration and verification.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-27T08:44:23.359623873Z",
+      "updated_at": "2026-08-27T08:44:23.359623873Z"
+    },
     "5d60a948-e127-456c-9a1e-39b6669328a7": {
       "uuid": "5d60a948-e127-456c-9a1e-39b6669328a7",
       "display_id": 971,
@@ -25475,7 +25488,10 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T08:44:18.413311708Z",
-      "updated_at": "2026-08-27T08:44:18.413311708Z"
+      "updated_at": "2026-08-27T08:44:23.489035329Z",
+      "labels": [
+        "feature"
+      ]
     },
     "b8dabe61-f6e1-455a-92b8-dc087a583c22": {
       "uuid": "b8dabe61-f6e1-455a-92b8-dc087a583c22",
@@ -44234,11 +44250,21 @@
       "agent_id": "6Vw9",
       "agent_seq": 1948,
       "timestamp": "2026-08-27T08:44:18.413311708Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1948,
+      "timestamp": "2026-08-27T08:44:23.359623873Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1949,
+      "timestamp": "2026-08-27T08:44:23.489035329Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T08:44:18.413311708Z",
+    "timestamp": "2026-08-27T08:44:23.489035329Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1948
+    "agent_seq": 1949
   }
 }
