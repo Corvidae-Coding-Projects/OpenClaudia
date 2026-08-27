@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1185,
+  "next_display_id": 1186,
   "next_comment_id": 1850,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -230,6 +230,7 @@
     "33ddbc8c-ecd2-44f0-b296-f0e09cd7c2df": 1174,
     "341e49f0-ad6a-48d3-aa1e-057ff907b982": 52,
     "342218b1-909d-46d6-ac09-6bd04ecd5cea": 364,
+    "344732fe-1a55-4c39-a62c-c900dab216c3": 1185,
     "34f3c26d-31c8-4e3f-9e30-d98f53383158": 1131,
     "35491088-6cfd-4320-a2c9-8ca65c96176a": 674,
     "3585b217-d0f8-4cc6-9e2b-545580a1114a": 311,
@@ -7223,6 +7224,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAfNqXpOVB+h/dZHapR54vO6B6U0cuRTY+aBeLJhpQeS5+8F2MV4clIfFJTVBOL30PphsHXTDq4R9vQblMB4jJBw=="
         }
       }
+    },
+    "344732fe-1a55-4c39-a62c-c900dab216c3": {
+      "uuid": "344732fe-1a55-4c39-a62c-c900dab216c3",
+      "display_id": 1185,
+      "title": "Join verifier-owned processes before publishing a VDD receipt",
+      "description": "The host-only verifier exposes bash with its normal run_in_background argument. A verifier can start a background shell, return a final report, and reach BACKGROUND_AGENTS.finish; the normal successful terminal path does not cancel or join owned shells, while only stop/drop cancellation reaps them. A receipt can therefore be published while verifier work is still running and resources remain live. Forbid background bash for the verifier or explicitly join/cancel every verifier-owned process before terminal validation and artifact re-observation. Test success, failure, timeout, and cancellation paths with no live owned process after receipt publication.",
+      "status": "open",
+      "priority": "medium",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-27T22:18:20.056506398Z",
+      "updated_at": "2026-08-27T22:18:20.056506398Z"
     },
     "34f3c26d-31c8-4e3f-9e30-d98f53383158": {
       "uuid": "34f3c26d-31c8-4e3f-9e30-d98f53383158",
@@ -46593,11 +46606,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2137,
       "timestamp": "2026-08-27T22:18:15.537710237Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2138,
+      "timestamp": "2026-08-27T22:18:20.056506398Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T22:18:15.537710237Z",
+    "timestamp": "2026-08-27T22:18:20.056506398Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2137
+    "agent_seq": 2138
   }
 }
