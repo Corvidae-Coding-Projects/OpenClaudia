@@ -9096,12 +9096,13 @@
       "display_id": 1183,
       "title": "Make canonical verifier evidence use one artifact-bound ledger",
       "description": "S-088 production verifier tools do not publish authoritative FileRead/CommandRun observations into the ledger that its grounding and final citation gate read: ToolExecutor scopes the active ledger by agent_id, while file/bash observers use ToolRunContext.session_id. Align the evidence key without mixing concurrent child runs, then require cited artifact evidence to bind to the reviewed locator/current generation rather than any run-local file or command (including scratch or an irrelevant command). Add a production-path test that executes read_file and a bounded command through ToolExecutor, obtains model-visible ObsIds, accepts current artifact evidence, and rejects cross-run, scratch, irrelevant, stale, and mutated evidence.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T22:17:56.756101588Z",
-      "updated_at": "2026-08-27T22:30:07.092516966Z",
+      "updated_at": "2026-08-27T22:30:14.191705429Z",
+      "closed_at": "2026-08-27T22:30:14.191699475Z",
       "labels": [
         "bug",
         "vdd"
@@ -46805,11 +46806,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2156,
       "timestamp": "2026-08-27T22:30:07.092516966Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2157,
+      "timestamp": "2026-08-27T22:30:14.191705429Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T22:30:07.092516966Z",
+    "timestamp": "2026-08-27T22:30:14.191705429Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2156
+    "agent_seq": 2157
   }
 }
