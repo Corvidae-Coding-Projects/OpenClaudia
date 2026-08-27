@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1170,
+  "next_display_id": 1171,
   "next_comment_id": 1802,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -608,6 +608,7 @@
     "9056ad0c-5006-44eb-b9da-af4952319f14": 1021,
     "90ccf966-61b6-4f94-9cb8-bb4394ffe719": 66,
     "90ed3939-45f3-4472-a731-124ea9c2e9cc": 793,
+    "910d63d1-4aab-40f9-b5e1-448633faff7e": 1170,
     "91788026-8231-4aa6-a997-9e15199b9183": 7,
     "91839fca-5749-4e67-87f4-29dcb47491a4": 109,
     "91b0478e-fad7-44e9-a70f-1a4f98a94919": 1104,
@@ -20599,6 +20600,16 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA5ZdMNHfTwTHjJeq2NQBpvYL2jySErmGcOYFFmtrb4OehPLScrj2/tRJZKllnfK1FVv72QQcYoEDZ9J2UpXxbCQ=="
         }
       }
+    },
+    "910d63d1-4aab-40f9-b5e1-448633faff7e": {
+      "uuid": "910d63d1-4aab-40f9-b5e1-448633faff7e",
+      "display_id": 1170,
+      "title": "Allow trusted Codex Git mutations in repository hooks",
+      "status": "open",
+      "priority": "high",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-27T12:44:51.073286792Z",
+      "updated_at": "2026-08-27T12:44:51.073286792Z"
     },
     "91788026-8231-4aa6-a997-9e15199b9183": {
       "uuid": "91788026-8231-4aa6-a997-9e15199b9183",
@@ -45236,11 +45247,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2009,
       "timestamp": "2026-08-27T12:41:37.443519075Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2010,
+      "timestamp": "2026-08-27T12:44:51.073286792Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T12:41:37.443519075Z",
+    "timestamp": "2026-08-27T12:44:51.073286792Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2009
+    "agent_seq": 2010
   }
 }
