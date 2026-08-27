@@ -1,6 +1,6 @@
 {
   "next_display_id": 1181,
-  "next_comment_id": 1836,
+  "next_comment_id": 1837,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -27242,7 +27242,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T18:59:46.335046185Z",
-      "updated_at": "2026-08-27T19:03:12.751780976Z",
+      "updated_at": "2026-08-27T19:09:47.887111328Z",
       "labels": [
         "remediation"
       ],
@@ -27276,6 +27276,15 @@
           "driver_key_fingerprint": "SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABASRVAXjz+I60OfpAfSsjcZMhtGyb2K5KwcVl4ZpieNx4RNDjTDCfQ/ft6OinYPM8/Fyp0jHxmKHcM7lh+1rXeAQ=="
+        },
+        "5841ce98-ba78-4d12-8933-3664e934199e": {
+          "display_id": 1836,
+          "author": "6Vw9",
+          "content": "Architecture decision: prefer three typed shared boundaries—one generation-bound plugin activation snapshot consumed by canonical registries, one contextual key resolver dispatching typed actions, and one verifier child profile derived from the canonical run/worker harness. Reject frontend-by-frontend plugin/key patches and a privileged VDD sidecar because those would preserve the audited duplication and make revocation/failure semantics diverge. Compatibility remains explicit: current plugin formats and Rustyline Vi stay operational; existing VDD provider/auth transports are reused behind the stricter verifier run.",
+          "created_at": "2026-08-27T19:09:47.884415290Z",
+          "kind": "decision",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAsUwOGKakX0j8YvT96oAAIAHgX2sHgpKwUCEueUd8ZXW+VcMDBySsNDLc2/9wntGTlgk02DFva1EeKNQguAphBA=="
         }
       }
     },
@@ -46186,11 +46195,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2096,
       "timestamp": "2026-08-27T19:03:12.751780976Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2097,
+      "timestamp": "2026-08-27T19:09:47.887111328Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T19:03:12.751780976Z",
+    "timestamp": "2026-08-27T19:09:47.887111328Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2096
+    "agent_seq": 2097
   }
 }
