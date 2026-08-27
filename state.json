@@ -1,6 +1,6 @@
 {
   "next_display_id": 1170,
-  "next_comment_id": 1788,
+  "next_comment_id": 1789,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -10855,10 +10855,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T11:25:20.668792623Z",
-      "updated_at": "2026-08-27T11:25:25.298830245Z",
+      "updated_at": "2026-08-27T11:27:55.720392965Z",
       "labels": [
         "feature"
-      ]
+      ],
+      "comments": {
+        "83fab281-c996-44f2-84f7-cbe26d59f566": {
+          "display_id": 1788,
+          "author": "6Vw9",
+          "content": "Implement S-094 within src/proxy.rs and focused proxy tests: classify each supported OpenAI chat, legacy completion, Anthropic-compatible, and raw passthrough route before credential resolution; normalize canonical routes into an explicit capability profile and one lifecycle entrypoint; preserve bounded exact raw method/path/query/body forwarding without agent/session authority; add deterministic route-parity, rejection-before-credential, and forwarding tests. Parent coordinator will run formatting, builds, tests, Clippy, and integration verification.",
+          "created_at": "2026-08-27T11:27:55.717972406Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAVe44AT86uwQVtDYYzw1I12k31oju2HoHGkGRHOuLsf80iqrDcE7bEve/uc0S7JQaI1juRL3fwJ48PDm0sJetBg=="
+        }
+      }
     },
     "4aba17c7-1b3c-411b-b388-591e7001ab3c": {
       "uuid": "4aba17c7-1b3c-411b-b388-591e7001ab3c",
@@ -44999,11 +45010,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2000,
       "timestamp": "2026-08-27T11:27:45.533812145Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2001,
+      "timestamp": "2026-08-27T11:27:55.720392965Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T11:27:45.533812145Z",
+    "timestamp": "2026-08-27T11:27:55.720392965Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2000
+    "agent_seq": 2001
   }
 }
