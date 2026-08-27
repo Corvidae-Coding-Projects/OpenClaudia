@@ -1,6 +1,6 @@
 {
   "next_display_id": 1188,
-  "next_comment_id": 1854,
+  "next_comment_id": 1855,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -20468,11 +20468,22 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T22:18:11.166741687Z",
-      "updated_at": "2026-08-27T22:18:43.118729546Z",
+      "updated_at": "2026-08-27T22:37:46.258029271Z",
       "labels": [
         "bug",
         "vdd"
-      ]
+      ],
+      "comments": {
+        "9bfc010e-47f6-482c-978d-186513f505ac": {
+          "display_id": 1854,
+          "author": "6Vw9",
+          "content": "Canonical VDD now records the actual provider route and resolved model from each successful verifier transport turn. Response-envelope providers must return a non-empty model; Google uses its official model-specific endpoint; the official Codex SDK uses its pinned model argument. The first route is immutable across turns, missing/changed identity fails closed, final receipts use the observed identity, and worker/verifier independence is rechecked postflight. Rust 1.98 focused tests cover response-model capture, missing identity rejection, route drift rejection, and observed-family independence.",
+          "created_at": "2026-08-27T22:37:46.253201468Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAIFJd2MTLUJhLNy39MvHGo2rU6p0t2hhFBin5hOkFrb8Dp6Tkf4GmZTZxM11dQ2n5VsIEQrHZ3kkYFGuh77jsDQ=="
+        }
+      }
     },
     "8b1a21f2-7f4f-46ad-8108-aeca11053ab8": {
       "uuid": "8b1a21f2-7f4f-46ad-8108-aeca11053ab8",
@@ -46821,11 +46832,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2159,
       "timestamp": "2026-08-27T22:30:27.867408153Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2160,
+      "timestamp": "2026-08-27T22:37:46.258029271Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T22:30:27.867408153Z",
+    "timestamp": "2026-08-27T22:37:46.258029271Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2159
+    "agent_seq": 2160
   }
 }
