@@ -3678,32 +3678,23 @@ mod tests {
     /// worktree (or otherwise unsafe to destroy) returns `is_error=true`
     /// with a clear message — regardless of process CWD.
     ///
-    /// Three valid rejection messages exist after crosslink #623:
-    ///
-    /// 1. "Not in an isolated worktree" (path is the repo root).
-    /// 2. "not inside a git worktree" (path is not a git workspace).
-    /// 3. "uncommitted changes ... `discard_changes=true`" (#623 safety
-    ///    gate — fires when the path *is* a worktree but it is dirty,
-    ///    which is the common case when tests run inside the harness's
-    ///    own agent worktree).
-    ///
-    /// All three are legitimate refusals and must produce `is_error=true`.
+    /// The disposable repository root is a valid Git workspace but is not an
+    /// isolated worktree, so the refusal must identify that exact condition.
     #[test]
     fn exit_worktree_with_main_tree_path_is_error() {
         let _lock = cwd_lock();
-        let main = std::env::current_dir().unwrap();
+        let (_root, run) = isolated_git_fixture();
+        let main = run.project_root();
         let mut args = HashMap::new();
         args.insert(
             "path".to_string(),
             serde_json::Value::String(main.display().to_string()),
         );
-        let (msg, is_err) = execute_exit_worktree(test_run(), &args).into_legacy();
+        let (msg, is_err) = execute_exit_worktree(&run, &args).into_legacy();
         assert!(is_err, "exit on main worktree must produce is_error=true");
         assert!(
-            msg.contains("Not in an isolated worktree")
-                || msg.contains("not inside a git worktree")
-                || msg.contains("uncommitted changes"),
-            "error must indicate a legitimate refusal reason; got: {msg}"
+            msg.contains("Not in an isolated worktree"),
+            "error must identify the main-worktree refusal; got: {msg}"
         );
     }
 
