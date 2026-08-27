@@ -1,6 +1,6 @@
 {
   "next_display_id": 1170,
-  "next_comment_id": 1801,
+  "next_comment_id": 1802,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15220,7 +15220,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T11:21:20.380295946Z",
-      "updated_at": "2026-08-27T12:40:41.815979207Z",
+      "updated_at": "2026-08-27T12:41:37.443519075Z",
       "labels": [
         "feature"
       ],
@@ -15248,6 +15248,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAb3nkIOK8BUCeIAzljPWoeXMhsarKfDbKkmW6y3wiKs+8qMFHteFCssGZMBidstLrkcUPSmVnqYcsw+8krk8fBQ=="
+        },
+        "ca6d14af-d707-455a-92ab-66b975c328d6": {
+          "display_id": 1801,
+          "author": "6Vw9",
+          "content": "Parent verification isolated four full-suite failures to existing #1055. Stale fixture cleanup did not change the exact failure. Wave two will retain this as an explicit pre-existing local gate exception rather than expand scope.",
+          "created_at": "2026-08-27T12:41:37.441020572Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAtmlatIIOKsnkOLISASRDF3jQWKIslG+vAawoiVRBxzGq7dLvO3za/B1qwPdzIQMUA/OUYG1yUzD5B4rBXG9tAQ=="
         },
         "e9145a2f-dc65-4983-bda6-a7abfbfdb04b": {
           "display_id": 1795,
@@ -45222,11 +45231,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2008,
       "timestamp": "2026-08-27T12:41:33.018147570Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2009,
+      "timestamp": "2026-08-27T12:41:37.443519075Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T12:41:33.018147570Z",
+    "timestamp": "2026-08-27T12:41:37.443519075Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2008
+    "agent_seq": 2009
   }
 }
