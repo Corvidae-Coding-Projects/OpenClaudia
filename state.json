@@ -7254,12 +7254,13 @@
       "display_id": 1185,
       "title": "Join verifier-owned processes before publishing a VDD receipt",
       "description": "The host-only verifier exposes bash with its normal run_in_background argument. A verifier can start a background shell, return a final report, and reach BACKGROUND_AGENTS.finish; the normal successful terminal path does not cancel or join owned shells, while only stop/drop cancellation reaps them. A receipt can therefore be published while verifier work is still running and resources remain live. Forbid background bash for the verifier or explicitly join/cancel every verifier-owned process before terminal validation and artifact re-observation. Test success, failure, timeout, and cancellation paths with no live owned process after receipt publication.",
-      "status": "open",
+      "status": "closed",
       "priority": "medium",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T22:18:20.056506398Z",
-      "updated_at": "2026-08-27T22:39:54.322092797Z",
+      "updated_at": "2026-08-27T22:40:02.401024480Z",
+      "closed_at": "2026-08-27T22:40:02.401022919Z",
       "labels": [
         "bug",
         "vdd"
@@ -46869,11 +46870,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2164,
       "timestamp": "2026-08-27T22:39:54.322092797Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2165,
+      "timestamp": "2026-08-27T22:40:02.401024480Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T22:39:54.322092797Z",
+    "timestamp": "2026-08-27T22:40:02.401024480Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2164
+    "agent_seq": 2165
   }
 }
