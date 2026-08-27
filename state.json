@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1160,
+  "next_display_id": 1161,
   "next_comment_id": 1748,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -547,6 +547,7 @@
     "80c4bd35-680c-43a5-8712-a4f740b407a4": 467,
     "8122bdd0-f681-4b52-89bb-957333cdce41": 546,
     "81ca948a-cdee-4ed1-86ad-0a4e20947c97": 252,
+    "81fee3f8-7f6c-4d50-9596-b7f7009440b9": 1160,
     "821e556a-8225-401a-8baa-34d533e618e9": 1138,
     "82788825-a530-4909-9ca3-88848daf58d7": 677,
     "82f93069-d1a1-4519-b36f-e7d1ad37def2": 130,
@@ -18192,6 +18193,18 @@
         "qa-seam-vdd",
         "refactor"
       ]
+    },
+    "81fee3f8-7f6c-4d50-9596-b7f7009440b9": {
+      "uuid": "81fee3f8-7f6c-4d50-9596-b7f7009440b9",
+      "display_id": 1160,
+      "title": "Preserve isolated workspace capability across frontend replacement",
+      "description": "Discovered during S-074 review. TUI provider switching derives a new run from the isolated root without transferring the IsolatedWorkspaceDescriptor, while TUI/CLI session replacement uses the isolated run as launch authority and can reject a valid persisted repository-root resume. Implement an explicit host-authorized owner transfer/rebind for provider and loaded-session generation replacement; never silently downgrade to the legacy path-only exit handler, never steal a live cross-agent owner, and retain current provider/session functionality. This is adjacent to S-074 enter/exit/resume and must be handled separately.",
+      "status": "open",
+      "priority": "medium",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-27T05:57:56.276155035Z",
+      "updated_at": "2026-08-27T05:57:56.276155035Z"
     },
     "821e556a-8225-401a-8baa-34d533e618e9": {
       "uuid": "821e556a-8225-401a-8baa-34d533e618e9",
@@ -43902,11 +43915,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1915,
       "timestamp": "2026-08-27T05:49:47.869047923Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1916,
+      "timestamp": "2026-08-27T05:57:56.276155035Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T05:49:47.869047923Z",
+    "timestamp": "2026-08-27T05:57:56.276155035Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1915
+    "agent_seq": 1916
   }
 }
