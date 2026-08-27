@@ -192,6 +192,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- Make sandboxed worktree tests support linked checkout git metadata (#1055)
 - Commit, push, and monitor wave-two integration (#1171)
 - Allow trusted Codex Git mutations in repository hooks (#1170)
 - Monitor and repair wave-one CI (#1165)
