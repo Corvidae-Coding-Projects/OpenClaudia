@@ -1,6 +1,6 @@
 {
   "next_display_id": 1172,
-  "next_comment_id": 1809,
+  "next_comment_id": 1810,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -17289,10 +17289,21 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T13:00:35.834567825Z",
-      "updated_at": "2026-08-27T13:00:40.758623245Z",
+      "updated_at": "2026-08-27T13:00:52.405489012Z",
       "labels": [
         "workflow"
-      ]
+      ],
+      "comments": {
+        "7129f274-953d-4901-bed6-3fbe88f2ccb6": {
+          "display_id": 1809,
+          "author": "6Vw9",
+          "content": "Create one signed commit containing only the reviewed wave-two implementation, requested trusted-driver hook policy, canonical generated evidence, slice records, tests, and exact Crosslink changelog output; push the active refactor branch; monitor draft PR #66 runners at the exact commit; repair concrete failures only.",
+          "created_at": "2026-08-27T13:00:52.402935547Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAturV3neVHyY701tT2n1Fyfjpn1dZ5XxoETAbN2zoWVqn0LCU8GxvGcFlIaIMESHs5SK9uGV5QsyThB24VzGSAQ=="
+        }
+      }
     },
     "7b7677f6-2896-4c57-bc57-cd7566fff977": {
       "uuid": "7b7677f6-2896-4c57-bc57-cd7566fff977",
@@ -45434,11 +45445,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2029,
       "timestamp": "2026-08-27T13:00:46.771657798Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2030,
+      "timestamp": "2026-08-27T13:00:52.405489012Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T13:00:46.771657798Z",
+    "timestamp": "2026-08-27T13:00:52.405489012Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2029
+    "agent_seq": 2030
   }
 }
