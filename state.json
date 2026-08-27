@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1178,
+  "next_display_id": 1179,
   "next_comment_id": 1834,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -575,6 +575,7 @@
     "86e2d86b-d90a-4f2d-9ccb-fc9dc184ef09": 1093,
     "8711a2ba-b931-4042-be4e-09b785005c99": 515,
     "874537b8-4e1d-4dc2-8058-234c7ffa11fd": 162,
+    "876fbe8f-2853-4b56-a8df-b58441acd6fa": 1178,
     "877278c1-4bf8-44d7-921f-6cc3fcbcd6f1": 755,
     "87765c1a-ab26-4d2f-9867-93e0bc73594d": 624,
     "87b9f874-574a-45b6-8cdd-5a2c636b50fb": 1100,
@@ -19507,6 +19508,18 @@
       "labels": [
         "qa"
       ]
+    },
+    "876fbe8f-2853-4b56-a8df-b58441acd6fa": {
+      "uuid": "876fbe8f-2853-4b56-a8df-b58441acd6fa",
+      "display_id": 1178,
+      "title": "S-063: Activate plugin capabilities through canonical registries",
+      "description": "Implement docs/remediation-slices/063-plugin-capability-activation.md. Make reviewed plugin commands, hooks, skills, agents, MCP, and LSP components operational as namespaced generation-bound canonical registrations with exact provenance, effects, schemas, capabilities, activation/revocation ownership, and no private bypass paths. Preserve intended capabilities; do not remove features or broaden into adjacent cleanup.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-27T19:00:25.427833535Z",
+      "updated_at": "2026-08-27T19:00:25.427833535Z"
     },
     "877278c1-4bf8-44d7-921f-6cc3fcbcd6f1": {
       "uuid": "877278c1-4bf8-44d7-921f-6cc3fcbcd6f1",
@@ -46072,11 +46085,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2088,
       "timestamp": "2026-08-27T19:00:14.900713208Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2089,
+      "timestamp": "2026-08-27T19:00:25.427833535Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T19:00:14.900713208Z",
+    "timestamp": "2026-08-27T19:00:25.427833535Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2088
+    "agent_seq": 2089
   }
 }
