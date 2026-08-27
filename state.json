@@ -1,6 +1,6 @@
 {
   "next_display_id": 1171,
-  "next_comment_id": 1802,
+  "next_comment_id": 1803,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -20613,10 +20613,21 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T12:44:51.073286792Z",
-      "updated_at": "2026-08-27T12:44:56.174038564Z",
+      "updated_at": "2026-08-27T12:46:25.564844827Z",
       "labels": [
         "workflow"
-      ]
+      ],
+      "comments": {
+        "5cef3e72-63ee-414c-899e-2d3e7dcddee9": {
+          "display_id": 1802,
+          "author": "6Vw9",
+          "content": "Add provider-specific hook overrides, grant Codex normal in-scope Git mutation and push operations while retaining active-issue gating for commits and explicit blocks for force-push, hard reset, destructive clean, and whole-tree checkout/restore. Validate merged config and hook decisions directly.",
+          "created_at": "2026-08-27T12:46:25.562320195Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAkg/BSP7CZ/nXspYaGLW0Q+Hk7z+KS5D4Ca8xiFZJVwTSA1WxUYm0pNs6PZzLOtIgGsSSffD33uRj02+QnR4eDA=="
+        }
+      }
     },
     "91788026-8231-4aa6-a997-9e15199b9183": {
       "uuid": "91788026-8231-4aa6-a997-9e15199b9183",
@@ -45269,11 +45280,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2012,
       "timestamp": "2026-08-27T12:45:02.231238171Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2013,
+      "timestamp": "2026-08-27T12:46:25.564844827Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T12:45:02.231238171Z",
+    "timestamp": "2026-08-27T12:46:25.564844827Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2012
+    "agent_seq": 2013
   }
 }
