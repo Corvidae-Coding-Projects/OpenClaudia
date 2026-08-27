@@ -1360,7 +1360,7 @@ fn record_active_file_read_observation_digest(
     end_line: usize,
     excerpt: String,
 ) {
-    let Some(ledger) = crate::ledger::active_ledger_for_session(run.session_id()) else {
+    let Some(ledger) = crate::ledger::active_ledger_for_session(run.evidence_session_key()) else {
         return;
     };
     let digest = generation.to_string();
@@ -1390,7 +1390,7 @@ pub(super) fn require_fresh_file_observation_if_ledger_active(
     path: &Path,
     action: &str,
 ) -> Result<(), String> {
-    let session_key = run.session_id();
+    let session_key = run.evidence_session_key();
     let Some(ledger) = crate::ledger::active_ledger_for_session(session_key) else {
         return Ok(());
     };

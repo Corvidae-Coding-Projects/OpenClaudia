@@ -1398,6 +1398,12 @@ pub(crate) fn project_session_ledger_path_for_run(
         session_key: session_key.to_string(),
         reason,
     })?;
+    if run.runtime().descriptor().actor.role == crate::runtime::ActorRole::Verifier {
+        return Ok(run
+            .private_temp_root()
+            .join("reality-ledgers")
+            .join(format!("{session_key}.sqlite3")));
+    }
     run.isolated_workspace().map_or_else(
         || {
             Ok(run

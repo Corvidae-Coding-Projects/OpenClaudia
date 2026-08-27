@@ -2357,6 +2357,9 @@ pub struct ProviderNativeJsonDecodedTurn {
     pub usage: TokenUsage,
     pub terminal_outcome: ProviderTerminalOutcome,
     pub finish_reason: Option<String>,
+    /// Exact model identity proven by the native response or provider-owned
+    /// model-specific route.
+    pub resolved_model: String,
     pub provider_native_state: crate::runtime::ProviderNativeState,
 }
 
@@ -2423,6 +2426,7 @@ pub fn decode_provider_native_json_turn(
                 },
                 terminal_outcome,
                 finish_reason: classification.finish_reason,
+                resolved_model: model_identity.to_string(),
                 provider_native_state,
             })
         }
@@ -2437,6 +2441,11 @@ pub fn decode_provider_native_json_turn(
             }
             let output = crate::providers::OllamaChatTurnOutput::new(response)
                 .map_err(|error| error.to_string())?;
+            let resolved_model = response
+                .get("model")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Ollama response lost its validated model identity".to_string())?
+                .to_string();
             if !output.done() {
                 return Err("Ollama response ended before done=true".to_string());
             }
@@ -2486,6 +2495,7 @@ pub fn decode_provider_native_json_turn(
                 },
                 terminal_outcome,
                 finish_reason,
+                resolved_model,
                 provider_native_state,
             })
         }
@@ -2552,6 +2562,7 @@ async fn handle_provider_native_json_response(
         usage,
         terminal_outcome,
         finish_reason,
+        resolved_model: _,
         provider_native_state,
     } = decoded;
 

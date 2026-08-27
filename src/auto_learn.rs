@@ -1024,6 +1024,13 @@ fn classify_verification_command(command: &str) -> Option<VerificationClass> {
     }
 }
 
+/// Whether one shell command is a narrow build, lint, test, format, or
+/// type-check invocation suitable for artifact-verification evidence.
+#[must_use]
+pub(crate) fn is_recognized_verification_command(command: &str) -> bool {
+    classify_verification_command(command).is_some()
+}
+
 fn retained_command(run: &ToolRunContext, command: &str) -> String {
     let diagnostic = run.sanitize_diagnostic(command);
     let sanitized = redact_sensitive_command_words(diagnostic.as_str());

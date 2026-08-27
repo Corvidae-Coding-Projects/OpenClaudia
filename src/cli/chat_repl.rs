@@ -2534,6 +2534,7 @@ impl ChatRepl {
                 usage: _,
                 terminal_outcome: _,
                 finish_reason: _,
+                resolved_model: _,
                 provider_native_state,
             } = decoded;
             if tool_calls.is_empty() {

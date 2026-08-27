@@ -277,9 +277,10 @@ impl ToolExecutor {
             );
         }
 
-        let _ledger_guard = session_id.and_then(|session_id| {
-            crate::grounded_loop::install_active_project_ledger_for_session(run_context, session_id)
-        });
+        let _ledger_guard = crate::grounded_loop::install_active_project_ledger_for_session(
+            run_context,
+            run_context.evidence_session_key(),
+        );
 
         let authorization = match authorization {
             Some(permit) => permit,
@@ -989,6 +990,67 @@ mod tests {
             })
             .build()
             .expect("run")
+    }
+
+    #[test]
+    fn authoritative_tool_observations_use_the_run_evidence_bucket() {
+        let root = tempfile::tempdir().expect("root");
+        let artifact = root.path().join("artifact.txt");
+        std::fs::write(&artifact, "reviewed artifact\n").expect("artifact fixture");
+        let evidence_key = "verifier-evidence-bucket";
+        let run =
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), root.path())
+                .working_directory(root.path())
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(std::collections::HashMap::new())
+                .workspace_access(crate::tools::WorkspaceAccess::ReadOnly)
+                .process(false)
+                .network(false)
+                .secrets(false)
+                .provider("test")
+                .evidence_session_key(evidence_key)
+                .build()
+                .expect("run");
+        let call = ToolCall {
+            id: "call_read".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({ "path": artifact }).to_string(),
+            },
+        };
+        let manager = PermissionManager::unrestricted();
+
+        let result = ToolExecutor::execute(ToolExecutorRequest {
+            run_context: &run,
+            tool_call: &call,
+            memory_db: None,
+            app_config: None,
+            task_mgr: None,
+            permission_mgr: &manager,
+            authorization: None,
+            session_id: Some("different-logical-session"),
+            policy_enforcer: None,
+        });
+
+        assert!(
+            !result.is_error(),
+            "unexpected result: {}",
+            result.content()
+        );
+        let ledger = crate::ledger::RealityLedger::open_project_session_for_run(&run, evidence_key)
+            .expect("evidence ledger");
+        assert!(ledger
+            .observations_chronological()
+            .iter()
+            .any(|observation| {
+                matches!(
+                    &observation.kind,
+                    crate::ledger::ObservationKind::FileRead { path, .. }
+                        if path == &artifact.display().to_string()
+                )
+            }));
     }
 
     #[test]

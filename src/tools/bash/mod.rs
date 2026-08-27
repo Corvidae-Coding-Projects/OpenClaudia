@@ -1286,7 +1286,7 @@ fn record_active_command_observation(
     let binding = crate::ledger::RunBinding::from_run(run);
     record_command_observation_for_session(
         &binding,
-        run.session_id(),
+        run.evidence_session_key(),
         cwd,
         command,
         exit_code,

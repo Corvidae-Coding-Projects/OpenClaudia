@@ -1,6 +1,6 @@
 # S-088: Run VDD as the canonical alternate-model verifier
 
-Status: Implemented — bootstrap independent review pending
+Status: Implemented — bootstrap manual review and repair complete
 Effort: Medium
 Primary findings: Design requirement (no primary audit finding)
 Workstreams: W2, W3, W4, W10, W12, W28
@@ -60,7 +60,33 @@ Verification used Rust 1.98.0 with `CARGO_BUILD_JOBS=4`:
 - `cargo +1.98.0 test --quiet --locked --all-targets --all-features --
   --test-threads=1` passed every non-ignored target.
 
-This slice cannot honestly bootstrap its own trust. No external alternate-model
-verifier was run during the parent integration pass, so independent manual or
-external review remains required and no VDD pass receipt is claimed.
-Completion of this slice does not imply completion of its parent workstream.
+## Bootstrap manual review and repair — 2026-08-27
+
+The independent manual bootstrap review at Crosslink #1182 returned
+`CHANGES REQUIRED`. It found that production tool observations were split
+across ledger keys (#1183), receipt identity described the requested rather
+than resolved verifier route (#1184), successful verifier completion could
+leave detached process work live (#1185), selected source bytes were absent
+from the verifier contract (#1187), and the tests did not exercise the real
+child/tool harness (#1186).
+
+Those findings are repaired. The verifier now has one immutable
+capability-bound evidence key; artifact citations must bind to the review root;
+the transport records and pins the resolved route/model used by receipts;
+detached verifier bash is forbidden and owned processes are reaped before
+publication; exact bounded source snapshots are digest-checked and delivered;
+and a two-turn provider fixture drives the real child harness, `read_file`,
+Reality grounding, strict report parsing, and the unchanged-artifact fence in
+a linked Git worktree. The integration test also keeps verifier ledger state in
+private scratch and covers OpenAI-compatible null assistant content between
+tool turns.
+
+Rust 1.98.0 formatting and strict all-target/all-feature Clippy pass. The full
+all-feature suite passes across 2,991 library tests, every integration/example
+target, and doc tests. Regenerating the technical-memory evaluation after the
+`src/tools/bash/mod.rs` evidence-key correction preserves its deliberately
+rejected independent-review verdict.
+
+This manual review satisfies the bootstrap review requirement; it is not
+represented as an alternate-model VDD pass receipt. Completion of this slice
+does not imply completion of its parent workstream.

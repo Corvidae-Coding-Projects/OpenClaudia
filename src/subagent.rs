@@ -491,6 +491,9 @@ pub struct BackgroundAgent {
     /// Canonical VDD receipts snapshot it after terminal publication instead
     /// of estimating verifier usage from model text.
     child_budget: Mutex<Option<crate::runtime::RunBudgetAuthority>>,
+    /// Transport-observed provider route for canonical verifier turns. The
+    /// first successful call pins it; later turns must match exactly.
+    verifier_route: Mutex<Option<CanonicalVerifierRouteObservation>>,
     /// Coordinator-only immutable semantic slice and terminal handoff.
     semantic_slice: Mutex<Option<SemanticWorkerSlice>>,
 }
@@ -651,6 +654,7 @@ impl BackgroundAgentManager {
             child_descriptor: Mutex::new(None),
             child_cancellation: Mutex::new(None),
             child_budget: Mutex::new(None),
+            verifier_route: Mutex::new(None),
             semantic_slice: Mutex::new(None),
         });
         agents.insert(id.to_string(), agent);
@@ -805,11 +809,51 @@ impl BackgroundAgentManager {
         .ok_or_else(|| format!("Verifier '{id}' cancellation lock poisoned"))?
         .as_ref()
         .and_then(crate::runtime::CancellationHandle::receipt);
+        let verifier_route = agent_field_guard(
+            &agent.verifier_route,
+            "verifier_run_snapshot",
+            id,
+            "verifier_route",
+        )
+        .ok_or_else(|| format!("Verifier '{id}' route-observation lock poisoned"))?
+        .clone();
         Ok(CanonicalVerifierRunSnapshot {
             descriptor,
             budget,
             cancellation_receipt,
+            verifier_route,
         })
+    }
+
+    fn observe_verifier_route(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+        id: &str,
+        observation: CanonicalVerifierRouteObservation,
+    ) -> Result<(), String> {
+        let agent = self
+            .get_for_run(owner, id)
+            .filter(|agent| agent.agent_type == AgentType::Verifier)
+            .ok_or_else(|| format!("Canonical VDD verifier '{id}' not found"))?;
+        let mut route = agent_field_guard(
+            &agent.verifier_route,
+            "observe_verifier_route",
+            id,
+            "verifier_route",
+        )
+        .ok_or_else(|| format!("Verifier '{id}' route-observation lock poisoned"))?;
+        if let Some(current) = route.as_ref() {
+            if current != &observation {
+                return Err(format!(
+                    "Canonical VDD verifier route or resolved model changed between turns: {} -> {}",
+                    current.model, observation.model
+                ));
+            }
+        } else {
+            *route = Some(observation);
+        }
+        drop(route);
+        Ok(())
     }
 
     fn bind_semantic_slice(
@@ -2169,6 +2213,27 @@ pub(crate) struct CanonicalVerifierRunSnapshot {
     pub descriptor: crate::runtime::RunDescriptor,
     pub budget: crate::runtime::BudgetSnapshot,
     pub cancellation_receipt: Option<crate::runtime::CancellationReceipt>,
+    pub verifier_route: Option<CanonicalVerifierRouteObservation>,
+}
+
+/// Provider identity evidence retained from the actual verifier transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CanonicalVerifierRouteObservation {
+    pub provider: String,
+    pub endpoint_sha256: crate::runtime::ContentDigest,
+    pub model: String,
+    pub authority: CanonicalVerifierIdentityAuthority,
+}
+
+/// Why the transport can bind the resolved verifier model identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CanonicalVerifierIdentityAuthority {
+    /// The provider returned the resolved model in its response envelope.
+    ResponseEnvelope,
+    /// An official provider route embeds the exact model in its URL.
+    ProviderModelEndpoint,
+    /// The official account-backed SDK was invoked with a pinned model.
+    OfficialSdkModelArgument,
 }
 
 /// Result of dispatching a host-only verifier through the normal agent loop.
@@ -2573,6 +2638,18 @@ pub async fn run_plugin_agent(
 /// entry point always starts a fresh transcript, applies a hard wall-clock
 /// timeout, and returns the exact child descriptor, budget snapshot, and
 /// cancellation receipt when those bindings were established.
+fn canonical_verifier_subagent_config(prompt: String, model: String) -> SubagentConfig {
+    SubagentConfig {
+        agent_type: AgentType::Verifier,
+        task: "Independently verify the exact artifact generation".to_string(),
+        prompt,
+        run_in_background: false,
+        model_override: Some(model),
+        resume_agent_id: None,
+        isolation: None,
+    }
+}
+
 pub(crate) async fn run_canonical_vdd_verifier(
     parent_run: &Arc<crate::tools::ToolRunContext>,
     prompt: String,
@@ -2600,15 +2677,7 @@ pub(crate) async fn run_canonical_vdd_verifier(
             snapshot: None,
         };
     }
-    let config = SubagentConfig {
-        agent_type: AgentType::Verifier,
-        task: "Independently verify the exact artifact generation".to_string(),
-        prompt,
-        run_in_background: false,
-        model_override: Some(model),
-        resume_agent_id: None,
-        isolation: None,
-    };
+    let config = canonical_verifier_subagent_config(prompt, model);
     let verifier = run_subagent_inner_with_policy(
         parent_run,
         &config,
@@ -2650,9 +2719,24 @@ pub(crate) async fn run_canonical_vdd_verifier(
             };
         }
     };
+    let process_cleanup =
+        crate::tools::BACKGROUND_SHELLS.kill_for_process_owner(parent_run, &agent_id);
+    let verifier_owned_process_was_running = process_cleanup.starts_with("Terminated ");
     let snapshot = BACKGROUND_AGENTS
         .verifier_run_snapshot(parent_run, &agent_id)
         .ok();
+    if verifier_owned_process_was_running {
+        return CanonicalVerifierExecution {
+            agent_id: agent_id.clone(),
+            outcome: CanonicalVerifierExecutionOutcome::Failed,
+            output: None,
+            error: Some(format!(
+                "Canonical VDD verifier attempted detached process work; cleanup completed before receipt publication: {process_cleanup}"
+            )),
+            turns_used: result.turns_used,
+            snapshot,
+        };
+    }
     if result.success {
         CanonicalVerifierExecution {
             agent_id: agent_id.clone(),
@@ -3146,6 +3230,7 @@ async fn run_subagent_core(
         .network(!is_verifier && parent_run.grants_resource(crate::tools::ToolResource::Network))
         .secrets(!is_verifier && parent_run.grants_resource(crate::tools::ToolResource::Secrets))
         .process_owner(&agent_id)
+        .evidence_session_key(&agent_id)
         .actor_role(if is_verifier {
             crate::runtime::ActorRole::Verifier
         } else {
@@ -3191,6 +3276,7 @@ async fn run_subagent_core(
                 .and_then(|p| p.model.clone())
                 .unwrap_or_else(|| "claude-sonnet-4-6".to_string())
         });
+    let mut effective_model_identity = model.clone();
     if coordinator_slice {
         let semantic_binding = (|| -> Result<_, String> {
             crate::evidence_freshness::sync_model(&subagent_run, &model)?;
@@ -3837,7 +3923,9 @@ async fn run_subagent_core(
         // ProviderAdapter trait (canonical implementation in
         // `src/providers/`) handles request/response transformation for
         // every supported provider. See crosslink #407.
-        let (mut assistant_message, next_provider_native_state) = if wire_api.is_responses() {
+        let (mut assistant_message, next_provider_native_state, verifier_route) = if wire_api
+            .is_responses()
+        {
             let request = provider_request_body
                 .as_ref()
                 .expect("Responses request uses the canonical wire builder");
@@ -3865,7 +3953,20 @@ async fn run_subagent_core(
                 .await
             };
             match turn {
-                Ok(turn) => (codex_sdk_subagent_assistant_message(&turn), None),
+                Ok(turn) => (
+                    codex_sdk_subagent_assistant_message(&turn),
+                    None,
+                    is_verifier.then(|| {
+                        Ok(CanonicalVerifierRouteObservation {
+                            provider: app_config.proxy.target.clone(),
+                            endpoint_sha256: crate::runtime::ContentDigest::sha256(
+                                b"provider-route:codex-agent-sdk",
+                            ),
+                            model: model.clone(),
+                            authority: CanonicalVerifierIdentityAuthority::OfficialSdkModelArgument,
+                        })
+                    }),
+                ),
                 Err(error) => {
                     BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
                     store_transcript_with_state(
@@ -3926,7 +4027,19 @@ async fn run_subagent_core(
             match turn {
                 Ok(decoded) => {
                     let assistant = native_json_subagent_assistant_message(&decoded);
-                    (assistant, Some(decoded.provider_native_state))
+                    let verifier_route = is_verifier.then(|| {
+                        native_json_verifier_route(
+                            &app_config.proxy.target,
+                            &model,
+                            &base_url,
+                            &decoded.resolved_model,
+                        )
+                    });
+                    (
+                        assistant,
+                        Some(decoded.provider_native_state),
+                        verifier_route,
+                    )
                 }
                 Err(error) => {
                     BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
@@ -4012,8 +4125,42 @@ async fn run_subagent_core(
                     };
                 }
             };
-            (assistant, None)
+            let verifier_route = is_verifier.then(|| {
+                chat_verifier_route(&app_config.proxy.target, &model, &base_url, &response)
+            });
+            (assistant, None, verifier_route)
         };
+
+        if let Some(route) = verifier_route {
+            let route = match route {
+                Ok(route) => route,
+                Err(error) => {
+                    BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
+                    return SubagentResult {
+                        agent_id,
+                        success: false,
+                        output: error,
+                        turns_used: turns,
+                        is_background: config.run_in_background,
+                        worktree: worktree.clone(),
+                    };
+                }
+            };
+            effective_model_identity.clone_from(&route.model);
+            if let Err(error) =
+                BACKGROUND_AGENTS.observe_verifier_route(parent_run, &agent_id, route)
+            {
+                BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
+                return SubagentResult {
+                    agent_id,
+                    success: false,
+                    output: error,
+                    turns_used: turns,
+                    is_background: config.run_in_background,
+                    worktree: worktree.clone(),
+                };
+            }
+        }
 
         // Text belongs to this exact provider turn. Never carry a tool-bearing
         // preamble forward as the final answer for a later empty response.
@@ -4031,7 +4178,7 @@ async fn run_subagent_core(
                 &subagent_run,
                 &agent_id,
                 &final_output,
-                &model,
+                &effective_model_identity,
                 config.agent_type,
             ) {
                 Ok(rendered) => {
@@ -4194,7 +4341,7 @@ async fn run_subagent_core(
         }
         if let Some(report) = crate::guardrails::run_quality_gates_at(
             &subagent_run,
-            &model,
+            &effective_model_identity,
             crate::config::RunAfter::EveryTurn,
         ) {
             if report.prevents_progress() {
@@ -4369,7 +4516,24 @@ fn resolve_subagent_openai_auth(
 fn build_chat_completion_request(
     request_body: &Value,
 ) -> Result<crate::proxy::ChatCompletionRequest, String> {
-    serde_json::from_value::<crate::proxy::ChatCompletionRequest>(request_body.clone())
+    let mut request_body = request_body.clone();
+    if let Some(messages) = request_body
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+    {
+        for message in messages {
+            let tool_bearing_assistant = message.get("role").and_then(Value::as_str)
+                == Some("assistant")
+                && message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| !calls.is_empty());
+            if tool_bearing_assistant && message.get("content").is_some_and(Value::is_null) {
+                message["content"] = Value::String(String::new());
+            }
+        }
+    }
+    serde_json::from_value::<crate::proxy::ChatCompletionRequest>(request_body)
         .map_err(|e| format!("Failed to materialize ChatCompletionRequest: {e}"))
 }
 
@@ -4502,6 +4666,11 @@ fn validate_subagent_tool_decision_for_session(
         &tool_call.function.name,
         &tool_call.function.arguments,
     )?;
+    validate_verifier_process_policy(
+        run.runtime().descriptor().actor.role,
+        &tool_call.function.name,
+        &args,
+    )?;
     match validate_subagent_tool_decision_against_ledger(
         run,
         &tool_call.function.name,
@@ -4524,6 +4693,27 @@ fn validate_subagent_tool_decision_for_session(
             crate::grounded_loop::observe_policy_decision_for_session(run, agent_id, false, &err);
             Err(err)
         }
+    }
+}
+
+fn validate_verifier_process_policy(
+    actor_role: crate::runtime::ActorRole,
+    tool_name: &str,
+    args: &Value,
+) -> Result<(), String> {
+    if actor_role != crate::runtime::ActorRole::Verifier || tool_name != "bash" {
+        return Ok(());
+    }
+    match args.get("run_in_background") {
+        None | Some(Value::Bool(false)) => Ok(()),
+        Some(Value::Bool(true)) => Err(
+            "Canonical VDD verifier bash must complete synchronously; detached background processes are forbidden"
+                .to_string(),
+        ),
+        Some(_) => Err(
+            "Canonical VDD verifier bash run_in_background must be a boolean when supplied"
+                .to_string(),
+        ),
     }
 }
 
@@ -4932,6 +5122,73 @@ async fn make_api_call(
     .await
 }
 
+fn native_json_verifier_route(
+    provider: &str,
+    requested_model: &str,
+    base_url: &str,
+    resolved_model: &str,
+) -> Result<CanonicalVerifierRouteObservation, String> {
+    let endpoint = crate::pipeline::resolve_endpoint(provider, requested_model, base_url, None)
+        .map_err(|error| format!("Provider endpoint error: {error}"))?;
+    if resolved_model.trim().is_empty() {
+        return Err(
+            "Canonical VDD provider did not establish a resolved model identity".to_string(),
+        );
+    }
+    let authority = if matches!(
+        provider.trim().to_ascii_lowercase().as_str(),
+        "google" | "gemini"
+    ) {
+        CanonicalVerifierIdentityAuthority::ProviderModelEndpoint
+    } else {
+        CanonicalVerifierIdentityAuthority::ResponseEnvelope
+    };
+    Ok(CanonicalVerifierRouteObservation {
+        provider: provider.to_string(),
+        endpoint_sha256: crate::runtime::ContentDigest::sha256(endpoint.as_bytes()),
+        model: resolved_model.to_string(),
+        authority,
+    })
+}
+
+fn resolve_subagent_chat_endpoint(
+    provider: &str,
+    model: &str,
+    base_url: &str,
+) -> Result<String, String> {
+    let adapter = resolve_subagent_adapter(provider)?;
+    let normalized_base = base_url
+        .trim_end_matches('/')
+        .trim_end_matches("/v1")
+        .trim_end_matches('/');
+    let endpoint = format!("{normalized_base}{}", adapter.chat_endpoint(model));
+    crate::provider_transport::validate_endpoint(provider, &endpoint)
+        .map_err(|error| error.to_string())?;
+    Ok(endpoint)
+}
+
+fn chat_verifier_route(
+    provider: &str,
+    requested_model: &str,
+    base_url: &str,
+    response: &Value,
+) -> Result<CanonicalVerifierRouteObservation, String> {
+    let model = response
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.trim().is_empty())
+        .ok_or_else(|| {
+            "Canonical VDD provider response omitted the resolved model identity".to_string()
+        })?;
+    let endpoint = resolve_subagent_chat_endpoint(provider, requested_model, base_url)?;
+    Ok(CanonicalVerifierRouteObservation {
+        provider: provider.to_string(),
+        endpoint_sha256: crate::runtime::ContentDigest::sha256(endpoint.as_bytes()),
+        model: model.to_string(),
+        authority: CanonicalVerifierIdentityAuthority::ResponseEnvelope,
+    })
+}
+
 async fn make_api_call_with_output_limit(
     run: &crate::tools::ToolRunContext,
     client: &Client,
@@ -4970,16 +5227,7 @@ async fn make_api_call_with_output_limit(
     // every adapter's endpoint already encodes its own version
     // segment — matching the URL composition rule in
     // `src/vdd/transport.rs::forward_request`.
-    let normalized_base = base_url
-        .trim_end_matches('/')
-        .trim_end_matches("/v1")
-        .trim_end_matches('/');
-    let endpoint = format!(
-        "{normalized_base}{}",
-        adapter.chat_endpoint(&typed_request.model)
-    );
-    crate::provider_transport::validate_endpoint(provider, &endpoint)
-        .map_err(|error| error.to_string())?;
+    let endpoint = resolve_subagent_chat_endpoint(provider, &typed_request.model, base_url)?;
 
     // Headers come from the adapter when an api_key is present. We
     // ensure a content-type header is set in all cases so providers
@@ -6027,6 +6275,45 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn canonical_verifier_route_uses_the_response_model_and_rejects_drift() {
+        let route = chat_verifier_route(
+            "openai",
+            "gpt-5.6",
+            "https://api.openai.com/v1",
+            &serde_json::json!({"model": "gpt-5.6-2026-08-01"}),
+        )
+        .expect("transport-observed route");
+        assert_eq!(route.model, "gpt-5.6-2026-08-01");
+        assert_eq!(
+            route.authority,
+            CanonicalVerifierIdentityAuthority::ResponseEnvelope
+        );
+        assert!(chat_verifier_route(
+            "openai",
+            "gpt-5.6",
+            "https://api.openai.com/v1",
+            &serde_json::json!({"choices": []}),
+        )
+        .expect_err("missing model identity must fail closed")
+        .contains("omitted the resolved model"));
+
+        let manager = BackgroundAgentManager::new();
+        let agent_id = "canonical-route-pin";
+        manager
+            .register_with_id(test_run(), AgentType::Verifier, "verify", agent_id)
+            .expect("register verifier");
+        manager
+            .observe_verifier_route(test_run(), agent_id, route.clone())
+            .expect("pin first route");
+        let mut drifted = route;
+        drifted.model = "gpt-5.6-2026-08-02".to_string();
+        assert!(manager
+            .observe_verifier_route(test_run(), agent_id, drifted)
+            .expect_err("resolved route drift must fail")
+            .contains("changed between turns"));
+    }
+
     fn spawn_openai_no_tool_final_server(
         final_content: &'static str,
     ) -> (std::thread::JoinHandle<Result<(), String>>, String) {
@@ -6892,6 +7179,29 @@ memory:
 
         validate_subagent_tool_decision_against_ledger(test_run(), "bash", &args, &ledger)
             .expect("grounded command decision must be accepted");
+    }
+
+    #[test]
+    fn canonical_verifier_forbids_detached_bash_processes() {
+        validate_verifier_process_policy(
+            crate::runtime::ActorRole::Verifier,
+            "bash",
+            &json!({"run_in_background": false}),
+        )
+        .expect("foreground verifier command");
+        assert!(validate_verifier_process_policy(
+            crate::runtime::ActorRole::Verifier,
+            "bash",
+            &json!({"run_in_background": true}),
+        )
+        .expect_err("detached verifier command must fail")
+        .contains("synchronously"));
+        validate_verifier_process_policy(
+            crate::runtime::ActorRole::Worker,
+            "bash",
+            &json!({"run_in_background": true}),
+        )
+        .expect("ordinary workers retain background bash support");
     }
 
     #[test]

@@ -194,6 +194,7 @@ enum EnvironmentGrantSource {
 
 pub struct ToolRunContextBuilder {
     session_id: SessionId,
+    evidence_session_key: Option<String>,
     project_root: PathBuf,
     working_directory: PathBuf,
     read_only_roots: Option<Vec<PathBuf>>,
@@ -236,6 +237,7 @@ impl ToolRunContextBuilder {
         let process_owner = session_id.as_str().to_string();
         Self {
             session_id,
+            evidence_session_key: None,
             working_directory: project_root.clone(),
             project_root,
             read_only_roots: None,
@@ -445,6 +447,16 @@ impl ToolRunContextBuilder {
         self
     }
 
+    /// Select the Reality-ledger bucket for authoritative tool observations.
+    ///
+    /// Derived agents share their parent session id, so their evidence bucket
+    /// must be explicit rather than inferred from that shared persistence id.
+    #[must_use]
+    pub(crate) fn evidence_session_key(mut self, key: impl Into<String>) -> Self {
+        self.evidence_session_key = Some(key.into());
+        self
+    }
+
     #[must_use]
     pub const fn actor_role(mut self, role: ActorRole) -> Self {
         self.actor_role = role;
@@ -560,6 +572,7 @@ pub struct ToolRunContext {
     network_available: bool,
     secrets_available: bool,
     process_owner: String,
+    evidence_session_key: String,
     #[cfg(any(unix, windows))]
     root_handles: Vec<CapabilityRootHandle>,
 }
@@ -596,6 +609,7 @@ impl std::fmt::Debug for ToolRunContext {
             .field("network_available", &self.network_available)
             .field("secrets_available", &self.secrets_available)
             .field("process_owner", &self.process_owner)
+            .field("evidence_session_key", &self.evidence_session_key)
             .finish_non_exhaustive()
     }
 }
@@ -644,6 +658,7 @@ impl ToolRunContext {
     fn new(builder: ToolRunContextBuilder) -> Result<Self, String> {
         let ToolRunContextBuilder {
             session_id,
+            evidence_session_key,
             project_root,
             working_directory,
             read_only_roots,
@@ -674,6 +689,8 @@ impl ToolRunContext {
             workspace_control,
             workspace_transition_gate,
         } = builder;
+        let evidence_session_key =
+            evidence_session_key.unwrap_or_else(|| session_id.as_str().to_string());
         if isolated_workspace.is_some() != workspace_parent.is_some()
             || isolated_workspace.is_some() != workspace_control.is_some()
         {
@@ -758,6 +775,16 @@ impl ToolRunContext {
         {
             return Err(
                 "Process owner must be 1-128 ASCII letters, digits, '-' or '_'".to_string(),
+            );
+        }
+        if evidence_session_key.is_empty()
+            || evidence_session_key.len() > 128
+            || !evidence_session_key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(
+                "Evidence session key must be 1-128 ASCII letters, digits, or '-'".to_string(),
             );
         }
         match workspace_access {
@@ -915,6 +942,7 @@ impl ToolRunContext {
             network_policy,
             &grants,
             &process_owner,
+            &evidence_session_key,
             isolated_workspace.as_ref(),
         );
         let cancellation = crate::runtime::CancellationTree::new();
@@ -995,6 +1023,7 @@ impl ToolRunContext {
             network_available: network,
             secrets_available: secrets,
             process_owner,
+            evidence_session_key,
             #[cfg(any(unix, windows))]
             root_handles,
         };
@@ -1287,6 +1316,12 @@ impl ToolRunContext {
     #[must_use]
     pub fn process_owner(&self) -> &str {
         &self.process_owner
+    }
+
+    /// Reality-ledger bucket that owns authoritative observations for this run.
+    #[must_use]
+    pub(crate) fn evidence_session_key(&self) -> &str {
+        &self.evidence_session_key
     }
 
     /// Active isolated-workspace descriptor, if this run is rebound.
@@ -1684,6 +1719,7 @@ impl ToolRunContext {
             self.network_policy,
             grants,
             &self.process_owner,
+            &self.evidence_session_key,
             self.isolated_workspace.as_ref(),
         );
         if descriptor.capabilities.manifest_digest != expected_manifest {
@@ -1868,6 +1904,7 @@ impl ToolRunContext {
             .network(self.grants_resource(ToolResource::Network))
             .secrets(self.grants_resource(ToolResource::Secrets))
             .process_owner(process_owner)
+            .evidence_session_key(self.evidence_session_key.clone())
             .actor_role(ActorRole::Frontend)
             .provider(provider)
             .budget_limits(self.runtime.descriptor().budget.limits.clone())
@@ -2291,6 +2328,7 @@ fn capability_manifest_digest(
     network_policy: AgentNetworkPolicy,
     grants: &BTreeSet<CapabilityKind>,
     process_owner: &str,
+    evidence_session_key: &str,
     isolated_workspace: Option<&IsolatedWorkspaceDescriptor>,
 ) -> ContentDigest {
     let mut manifest = format!(
@@ -2301,6 +2339,9 @@ fn capability_manifest_digest(
     );
     manifest.push_str("process_owner=");
     manifest.push_str(process_owner);
+    manifest.push('\n');
+    manifest.push_str("evidence_session_key=");
+    manifest.push_str(evidence_session_key);
     manifest.push('\n');
     manifest.push_str("isolated_workspace=");
     if let Some(descriptor) = isolated_workspace {
@@ -3484,6 +3525,7 @@ mod tests {
             AgentNetworkPolicy::Denied,
             &grants,
             "owner",
+            "evidence",
             None,
         );
         let second = capability_manifest_digest(
@@ -3505,6 +3547,7 @@ mod tests {
             AgentNetworkPolicy::Denied,
             &grants,
             "owner",
+            "evidence",
             None,
         );
         assert_ne!(first, second, "environment values must bind the manifest");

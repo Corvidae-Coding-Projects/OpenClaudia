@@ -13,7 +13,7 @@ use crate::coordinator::{
     PlannerEvidenceSourceRecord, PlannerSourceId, WorkerArtifactState, WorkerModelBinding,
     WorkerSliceAssignment, WorkerSliceResult, WorkerTerminalState,
 };
-use crate::ledger::{EvidenceTrust, ObsId, ObservationKind, RealityLedger};
+use crate::ledger::{ArtifactBinding, EvidenceTrust, ObsId, ObservationKind, RealityLedger};
 use crate::runtime::{BudgetSnapshot, CancellationReceipt, ContentDigest, RunDescriptor};
 use crate::subagent::{CanonicalVerifierExecutionOutcome, CanonicalVerifierRunPolicy};
 use crate::tools::ToolRunContext;
@@ -114,6 +114,59 @@ impl VddModelIdentity {
             identity_sha256: ContentDigest::sha256(identity_material.as_bytes()),
         })
     }
+
+    fn resolve_observed(
+        route: &crate::subagent::CanonicalVerifierRouteObservation,
+        policy_generation: u64,
+    ) -> Result<Self, CanonicalVddPreflightError> {
+        if policy_generation == 0 {
+            return Err(CanonicalVddPreflightError::InvalidContract(
+                "model policy generation must be non-zero".to_string(),
+            ));
+        }
+        crate::providers::get_adapter(&route.provider)
+            .map_err(|error| CanonicalVddPreflightError::ModelUnavailable(error.to_string()))?;
+        match route.authority {
+            crate::subagent::CanonicalVerifierIdentityAuthority::ResponseEnvelope => {}
+            crate::subagent::CanonicalVerifierIdentityAuthority::ProviderModelEndpoint
+                if matches!(
+                    route.provider.trim().to_ascii_lowercase().as_str(),
+                    "google" | "gemini"
+                ) => {}
+            crate::subagent::CanonicalVerifierIdentityAuthority::OfficialSdkModelArgument
+                if canonical_provider_identity(&route.provider) == "openai" => {}
+            _ => {
+                return Err(CanonicalVddPreflightError::ModelUnavailable(
+                    "transport model-identity authority does not match the resolved provider"
+                        .to_string(),
+                ));
+            }
+        }
+        let model = route.model.trim();
+        if model.is_empty() || model.len() > 512 {
+            return Err(CanonicalVddPreflightError::ModelUnavailable(
+                "transport-observed model identity must be a bounded non-empty value".to_string(),
+            ));
+        }
+        let model_family = classify_model_family(model).ok_or_else(|| {
+            CanonicalVddPreflightError::ModelUnavailable(format!(
+                "model family is ambiguous for transport-observed model '{model}'"
+            ))
+        })?;
+        let provider = canonical_provider_identity(&route.provider);
+        let endpoint_sha256 = route.endpoint_sha256;
+        let identity_material = format!(
+            "vdd-model-identity-v1\0{provider}\0{endpoint_sha256}\0{model}\0{model_family}\0{policy_generation}"
+        );
+        Ok(Self {
+            provider,
+            endpoint_sha256,
+            model: model.to_string(),
+            model_family,
+            policy_generation,
+            identity_sha256: ContentDigest::sha256(identity_material.as_bytes()),
+        })
+    }
 }
 
 /// One exact acceptance criterion from the worker assignment.
@@ -155,6 +208,24 @@ pub struct CanonicalDeterministicReceipt {
     pub observed_at: DateTime<Utc>,
 }
 
+/// Immutable planner-selected source bytes delivered to the fresh verifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalSourceSnapshot {
+    pub receipt: PlannerEvidenceSourceRecord,
+    pub content: String,
+}
+
+impl CanonicalSourceSnapshot {
+    #[must_use]
+    pub fn new(receipt: PlannerEvidenceSourceRecord, content: impl Into<String>) -> Self {
+        Self {
+            receipt,
+            content: content.into(),
+        }
+    }
+}
+
 /// Validated inputs for one fresh canonical VDD run.
 #[derive(Debug, Clone, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -163,7 +234,7 @@ pub struct CanonicalVddRequest {
     worker_result: WorkerSliceResult,
     objective: String,
     acceptance_criteria: Vec<CanonicalAcceptanceCriterion>,
-    source_receipts: Vec<PlannerEvidenceSourceRecord>,
+    source_snapshots: Vec<CanonicalSourceSnapshot>,
     worker_identity: VddModelIdentity,
     deterministic_receipts: Vec<CanonicalDeterministicReceipt>,
     unresolved_uncertainties: Vec<String>,
@@ -176,7 +247,7 @@ pub struct CanonicalVddRequestParts {
     pub worker_result: WorkerSliceResult,
     pub objective: String,
     pub acceptance_criteria: Vec<CanonicalAcceptanceCriterion>,
-    pub source_receipts: Vec<PlannerEvidenceSourceRecord>,
+    pub source_snapshots: Vec<CanonicalSourceSnapshot>,
     pub worker_provider: String,
     pub worker_endpoint: String,
     pub worker_model: String,
@@ -212,8 +283,8 @@ impl CanonicalVddRequest {
     }
 
     #[must_use]
-    pub fn source_receipts(&self) -> &[PlannerEvidenceSourceRecord] {
-        &self.source_receipts
+    pub fn source_snapshots(&self) -> &[CanonicalSourceSnapshot] {
+        &self.source_snapshots
     }
 
     #[must_use]
@@ -244,7 +315,7 @@ impl CanonicalVddRequest {
             worker_result: parts.worker_result,
             objective: parts.objective,
             acceptance_criteria: parts.acceptance_criteria,
-            source_receipts: parts.source_receipts,
+            source_snapshots: parts.source_snapshots,
             worker_identity,
             deterministic_receipts: parts.deterministic_receipts,
             unresolved_uncertainties: parts.unresolved_uncertainties,
@@ -338,7 +409,7 @@ impl CanonicalVddRequest {
                 "acceptance criteria do not match the worker assignment".to_string(),
             ));
         }
-        validate_sources(self)?;
+        contract_bytes = contract_bytes.saturating_add(validate_sources(self)?);
         for uncertainty in &self.unresolved_uncertainties {
             validate_bounded_text("unresolved uncertainty", uncertainty)?;
             contract_bytes = contract_bytes.saturating_add(uncertainty.len());
@@ -632,53 +703,76 @@ pub async fn run_canonical_verification(
     )
     .await;
 
-    let mut receipt = match execution.outcome {
-        CanonicalVerifierExecutionOutcome::TimedOut => CanonicalVddReceipt::terminal(
-            request,
-            Some(verifier_identity),
-            CanonicalVddVerdict::VerifierError,
-            CanonicalVddTerminalReason::TimedOut,
-            execution
-                .error
-                .as_deref()
-                .unwrap_or("canonical verifier timed out"),
-        ),
-        CanonicalVerifierExecutionOutcome::Failed => {
-            let detail = execution
-                .error
-                .as_deref()
-                .unwrap_or("canonical verifier failed without a diagnostic");
-            let reason = classify_execution_failure(detail);
-            CanonicalVddReceipt::terminal(
+    let observed_identity = observed_verifier_identity(
+        execution.snapshot.as_ref(),
+        &verifier_identity,
+        &request.worker_identity,
+    );
+
+    let mut receipt = match observed_identity {
+        Err(error) => receipt_for_preflight_error(request, None, &error),
+        Ok(None) if execution.outcome == CanonicalVerifierExecutionOutcome::Completed => {
+            receipt_for_preflight_error(
                 request,
-                Some(verifier_identity),
-                CanonicalVddVerdict::VerifierError,
-                reason,
-                detail,
+                None,
+                &CanonicalVddPreflightError::ModelUnavailable(
+                    "canonical verifier completed without transport-observed model identity"
+                        .to_string(),
+                ),
             )
         }
-        CanonicalVerifierExecutionOutcome::Completed => {
-            if let Some(output) = execution.output.as_deref() {
-                match validate_completed_report(output, request) {
-                    Ok(report) => receipt_for_report(request, verifier_identity, output, report),
-                    Err(detail) => CanonicalVddReceipt::terminal(
+        Ok(observed_identity) => match execution.outcome {
+            CanonicalVerifierExecutionOutcome::TimedOut => CanonicalVddReceipt::terminal(
+                request,
+                observed_identity,
+                CanonicalVddVerdict::VerifierError,
+                CanonicalVddTerminalReason::TimedOut,
+                execution
+                    .error
+                    .as_deref()
+                    .unwrap_or("canonical verifier timed out"),
+            ),
+            CanonicalVerifierExecutionOutcome::Failed => {
+                let detail = execution
+                    .error
+                    .as_deref()
+                    .unwrap_or("canonical verifier failed without a diagnostic");
+                let reason = classify_execution_failure(detail);
+                CanonicalVddReceipt::terminal(
+                    request,
+                    observed_identity,
+                    CanonicalVddVerdict::VerifierError,
+                    reason,
+                    detail,
+                )
+            }
+            CanonicalVerifierExecutionOutcome::Completed => {
+                let verifier_identity = observed_identity
+                    .expect("completed verifier identity was required by the enclosing match");
+                if let Some(output) = execution.output.as_deref() {
+                    match validate_completed_report(output, request) {
+                        Ok(report) => {
+                            receipt_for_report(request, verifier_identity, output, report)
+                        }
+                        Err(detail) => CanonicalVddReceipt::terminal(
+                            request,
+                            Some(verifier_identity),
+                            CanonicalVddVerdict::VerifierError,
+                            CanonicalVddTerminalReason::ParseFailure,
+                            detail,
+                        ),
+                    }
+                } else {
+                    CanonicalVddReceipt::terminal(
                         request,
                         Some(verifier_identity),
                         CanonicalVddVerdict::VerifierError,
-                        CanonicalVddTerminalReason::ParseFailure,
-                        detail,
-                    ),
+                        CanonicalVddTerminalReason::Truncated,
+                        "canonical verifier completed without assistant output",
+                    )
                 }
-            } else {
-                CanonicalVddReceipt::terminal(
-                    request,
-                    Some(verifier_identity),
-                    CanonicalVddVerdict::VerifierError,
-                    CanonicalVddTerminalReason::Truncated,
-                    "canonical verifier completed without assistant output",
-                )
             }
-        }
+        },
     };
     receipt.verifier_agent_id = Some(execution.agent_id);
     receipt.verifier_turns = Some(execution.turns_used);
@@ -882,13 +976,7 @@ fn validate_citations(
                 "canonical verifier cited observation {id} without authoritative provenance"
             ));
         }
-        artifact_evidence |= matches!(
-            observation.kind,
-            ObservationKind::FileRead { .. }
-                | ObservationKind::CommandRun { .. }
-                | ObservationKind::DiffObserved { .. }
-                | ObservationKind::Verification { .. }
-        );
+        artifact_evidence |= observation_is_bound_to_review_root(run, observation);
     }
     if required && !artifact_evidence {
         return Err(
@@ -896,6 +984,73 @@ fn validate_citations(
         );
     }
     Ok(())
+}
+
+fn observation_is_bound_to_review_root(
+    run: &ToolRunContext,
+    observation: &crate::ledger::Observation,
+) -> bool {
+    match (&observation.kind, &observation.provenance.artifact) {
+        (
+            ObservationKind::FileRead { path, .. },
+            Some(ArtifactBinding::File {
+                path: bound_path, ..
+            }),
+        ) if path == bound_path => artifact_path_is_in_review_root(run, path),
+        (
+            ObservationKind::CommandRun {
+                cwd,
+                argv,
+                exit_code,
+                ..
+            },
+            Some(ArtifactBinding::Command { cwd: bound_cwd, .. }),
+        ) if cwd == bound_cwd => {
+            *exit_code == 0
+                && artifact_path_is_in_review_root(run, cwd)
+                && command_is_recognized_artifact_check(argv)
+        }
+        (
+            ObservationKind::DiffObserved { files, .. },
+            Some(ArtifactBinding::Diff {
+                files: bound_files, ..
+            }),
+        ) if files == bound_files => files
+            .iter()
+            .all(|path| artifact_path_is_in_review_root(run, path)),
+        // Quality-gate receipts are already bound to this run's workspace
+        // generation and verifier executable by ledger validation.
+        (ObservationKind::Verification { .. }, Some(ArtifactBinding::Executable { .. })) => true,
+        _ => false,
+    }
+}
+
+fn command_is_recognized_artifact_check(argv: &[String]) -> bool {
+    let [shell, flag, command] = argv else {
+        return false;
+    };
+    shell == "bash"
+        && flag == "-c"
+        && crate::auto_learn::is_recognized_verification_command(command)
+}
+
+fn artifact_path_is_in_review_root(run: &ToolRunContext, raw_path: &str) -> bool {
+    let path = Path::new(raw_path);
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::Prefix(_)
+        )
+    }) {
+        return false;
+    }
+    if path.is_absolute() {
+        path.starts_with(run.project_root())
+    } else {
+        run.project_root()
+            .join(path)
+            .starts_with(run.project_root())
+    }
 }
 
 fn validate_completed_report(
@@ -1107,6 +1262,25 @@ fn ensure_independent_models(
     Ok(())
 }
 
+fn observed_verifier_identity(
+    snapshot: Option<&crate::subagent::CanonicalVerifierRunSnapshot>,
+    requested: &VddModelIdentity,
+    worker: &VddModelIdentity,
+) -> Result<Option<VddModelIdentity>, CanonicalVddPreflightError> {
+    let Some(route) = snapshot.and_then(|snapshot| snapshot.verifier_route.as_ref()) else {
+        return Ok(None);
+    };
+    let observed = VddModelIdentity::resolve_observed(route, requested.policy_generation)?;
+    if observed.provider != requested.provider {
+        return Err(CanonicalVddPreflightError::ModelUnavailable(format!(
+            "canonical verifier provider drifted from '{}' to '{}'",
+            requested.provider, observed.provider
+        )));
+    }
+    ensure_independent_models(worker, &observed)?;
+    Ok(Some(observed))
+}
+
 fn build_verifier_prompt(
     request: &CanonicalVddRequest,
     verifier: &VddModelIdentity,
@@ -1121,21 +1295,21 @@ fn build_verifier_prompt(
         task_revision: u64,
         objective: &'a str,
         acceptance_criteria: &'a [CanonicalAcceptanceCriterion],
-        source_receipts: &'a [PlannerEvidenceSourceRecord],
+        source_snapshots: &'a [CanonicalSourceSnapshot],
         worker_identity: &'a VddModelIdentity,
         verifier_identity: &'a VddModelIdentity,
         deterministic_receipts: &'a [CanonicalDeterministicReceipt],
         unresolved_uncertainties: &'a [String],
     }
     let contract = PromptContract {
-        schema: "canonical-vdd-input-v1",
+        schema: "canonical-vdd-input-v2",
         artifact_locator: locator,
         artifact_generation: &request.worker_result.artifact.generation,
         task_id: &request.assignment.task_id,
         task_revision: request.assignment.task_revision,
         objective: &request.objective,
         acceptance_criteria: &request.acceptance_criteria,
-        source_receipts: &request.source_receipts,
+        source_snapshots: &request.source_snapshots,
         worker_identity: &request.worker_identity,
         verifier_identity: verifier,
         deterministic_receipts: &request.deterministic_receipts,
@@ -1171,9 +1345,11 @@ fn validate_worker_model_binding(
     Ok(())
 }
 
-fn validate_sources(request: &CanonicalVddRequest) -> Result<(), CanonicalVddPreflightError> {
+fn validate_sources(request: &CanonicalVddRequest) -> Result<usize, CanonicalVddPreflightError> {
     let mut sources = BTreeMap::<PlannerSourceId, &PlannerEvidenceSourceRecord>::new();
-    for source in &request.source_receipts {
+    let mut source_bytes = 0_usize;
+    for snapshot in &request.source_snapshots {
+        let source = &snapshot.receipt;
         if source.reference.trim().is_empty() || source.reference.len() > MAX_DETAIL_BYTES {
             return Err(CanonicalVddPreflightError::InvalidContract(
                 "source receipt reference is absent or oversized".to_string(),
@@ -1184,6 +1360,19 @@ fn validate_sources(request: &CanonicalVddRequest) -> Result<(), CanonicalVddPre
                 "source receipt identities must be unique".to_string(),
             ));
         }
+        if snapshot.content.is_empty() || snapshot.content.len() > MAX_CONTRACT_TEXT_BYTES {
+            return Err(CanonicalVddPreflightError::InvalidContract(format!(
+                "source snapshot content must contain 1..={MAX_CONTRACT_TEXT_BYTES} bytes"
+            )));
+        }
+        if ContentDigest::sha256(snapshot.content.as_bytes()) != source.content_digest {
+            return Err(CanonicalVddPreflightError::InvalidContract(
+                "source snapshot content does not match its planner receipt digest".to_string(),
+            ));
+        }
+        source_bytes = source_bytes
+            .saturating_add(source.reference.len())
+            .saturating_add(snapshot.content.len());
     }
     let supplied = sources.keys().copied().collect::<BTreeSet<_>>();
     if supplied != request.assignment.sources || supplied != request.worker_result.evidence {
@@ -1191,7 +1380,7 @@ fn validate_sources(request: &CanonicalVddRequest) -> Result<(), CanonicalVddPre
             "source receipts do not match the exact assignment and worker evidence set".to_string(),
         ));
     }
-    Ok(())
+    Ok(source_bytes)
 }
 
 fn validate_bounded_text(
@@ -1319,8 +1508,188 @@ mod tests {
     };
     use crate::runtime::RunId;
     use crate::task_graph::TaskId;
+    use serde_json::Value;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::{Request, Respond, ResponseTemplate};
 
     const WORKER_MODEL: &str = "gpt-5.6-sol";
+
+    #[derive(Clone)]
+    struct CanonicalHarnessResponder {
+        calls: Arc<AtomicUsize>,
+        criterion: ContentDigest,
+        artifact_path: String,
+    }
+
+    impl Respond for CanonicalHarnessResponder {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let turn = self.calls.fetch_add(1, Ordering::SeqCst);
+            let message = if turn == 0 {
+                serde_json::json!({
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "read-reviewed-artifact",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": serde_json::json!({
+                                "path": self.artifact_path,
+                            }).to_string(),
+                        }
+                    }]
+                })
+            } else {
+                let body: Value =
+                    serde_json::from_slice(&request.body).expect("canonical provider request JSON");
+                let observation = body
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|message| message.get("content").and_then(Value::as_str))
+                    .flat_map(str::lines)
+                    .find(|line| line.contains("FilesystemRead"))
+                    .and_then(|line| line.trim_start().strip_prefix("- ["))
+                    .and_then(|line| line.split_once(']'))
+                    .map(|(id, _)| id.to_string())
+                    .expect("second verifier turn contains the file-read observation");
+                let report = serde_json::json!({
+                    "schema_version": REPORT_SCHEMA_VERSION,
+                    "verdict": "pass",
+                    "summary": "The reviewed artifact contains the required behavior.",
+                    "criteria": [{
+                        "criterion_sha256": self.criterion,
+                        "outcome": "pass",
+                        "detail": "Read the exact current artifact from the review root.",
+                        "evidence": [observation],
+                    }],
+                    "findings": [],
+                    "uncertainties": [],
+                });
+                serde_json::json!({
+                    "role": "assistant",
+                    "content": report.to_string(),
+                })
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": format!("canonical-vdd-turn-{turn}"),
+                "object": "chat.completion",
+                "model": "claude-opus-4-1",
+                "choices": [{
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": if turn == 0 { "tool_calls" } else { "stop" },
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 10,
+                    "total_tokens": 20,
+                }
+            }))
+        }
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .expect("run git fixture command");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn canonical_test_app_config(base_url: String) -> AppConfig {
+        use crate::config::{
+            GuardrailsConfig, HooksConfig, KeybindingsConfig, MemoryConfig, PermissionsConfig,
+            ProxyConfig, SessionConfig, ThinkingConfig, WebFetchConfig,
+        };
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "local".to_string(),
+            ProviderConfig {
+                api_key: None,
+                base_url,
+                model: Some("claude-opus-4-1".to_string()),
+                headers: crate::secrets::SensitiveHeaders::new(),
+                thinking: ThinkingConfig::default(),
+            },
+        );
+        AppConfig {
+            proxy: ProxyConfig::default(),
+            providers,
+            hooks: HooksConfig::default(),
+            session: SessionConfig::default(),
+            keybindings: KeybindingsConfig::default(),
+            vdd: VddConfig::default(),
+            guardrails: GuardrailsConfig::default(),
+            permissions: PermissionsConfig::default(),
+            memory: MemoryConfig::default(),
+            web_fetch: WebFetchConfig::default(),
+            remote_actions: crate::config::RemoteActionsConfig::default(),
+            policy: crate::services::policy::EnterprisePolicy::default(),
+            managed_settings_path: None,
+        }
+    }
+
+    fn canonical_git_fixture() -> (tempfile::TempDir, Arc<ToolRunContext>, PathBuf, String) {
+        let fixture = tempfile::tempdir().expect("git fixture parent");
+        let main = fixture.path().join("main");
+        let review = main.join(".worktrees/review");
+        std::fs::create_dir(&main).expect("main worktree directory");
+        run_git(&main, &["init", "-b", "main"]);
+        std::fs::write(main.join("artifact.txt"), "base artifact\n").expect("base artifact");
+        std::fs::write(main.join(".gitignore"), ".worktrees/\n").expect("fixture ignore");
+        run_git(&main, &["add", "artifact.txt", ".gitignore"]);
+        run_git(
+            &main,
+            &[
+                "-c",
+                "user.name=Canonical VDD Test",
+                "-c",
+                "user.email=vdd@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        );
+        std::fs::create_dir(main.join(".worktrees")).expect("worktree parent");
+        run_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "review-feature",
+                review.to_str().expect("UTF-8 review path"),
+            ],
+        );
+        let review_artifact = review.join("artifact.txt");
+        std::fs::write(&review_artifact, "reviewed operational behavior\n")
+            .expect("review artifact");
+        let run = crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), &main)
+            .working_directory(&main)
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(std::collections::HashMap::new())
+            .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+            .process(true)
+            .network(false)
+            .secrets(false)
+            .provider("canonical-vdd-test")
+            .build()
+            .expect("parent run");
+        let generation = crate::tools::worktree::inspect_worker_artifacts(&run, &review)
+            .expect("canonical artifact observation");
+        assert!(generation.unstaged);
+        (fixture, run, review_artifact, generation.generation)
+    }
 
     fn valid_request_parts() -> CanonicalVddRequestParts {
         let objective = "Implement the assigned behavior".to_string();
@@ -1373,14 +1742,17 @@ mod tests {
             worker_result,
             objective,
             acceptance_criteria: vec![criterion],
-            source_receipts: vec![PlannerEvidenceSourceRecord {
-                id: source_id,
-                source: PlannerEvidenceSource::Runtime,
-                content_digest: ContentDigest::sha256(b"source contents"),
-                reference: "runtime:canonical-vdd-test".to_string(),
-                observed_by: run_id,
-                recorded_at: Utc::now(),
-            }],
+            source_snapshots: vec![CanonicalSourceSnapshot::new(
+                PlannerEvidenceSourceRecord {
+                    id: source_id,
+                    source: PlannerEvidenceSource::Runtime,
+                    content_digest: ContentDigest::sha256(b"source contents"),
+                    reference: "runtime:canonical-vdd-test".to_string(),
+                    observed_by: run_id,
+                    recorded_at: Utc::now(),
+                },
+                "source contents",
+            )],
             worker_provider: "openai".to_string(),
             worker_endpoint: "https://api.openai.com/v1".to_string(),
             worker_model: WORKER_MODEL.to_string(),
@@ -1426,8 +1798,46 @@ mod tests {
         );
         assert_eq!(request.worker_identity().model(), WORKER_MODEL);
         assert_eq!(request.acceptance_criteria().len(), 1);
-        assert_eq!(request.source_receipts().len(), 1);
+        assert_eq!(request.source_snapshots().len(), 1);
         assert_eq!(request.deterministic_receipts().len(), 1);
+        let verifier = VddModelIdentity::resolve(
+            "anthropic",
+            "https://api.anthropic.com",
+            "claude-opus-4-1",
+            7,
+        )
+        .expect("verifier identity");
+        let prompt = build_verifier_prompt(&request, &verifier, "/tmp/canonical-vdd-artifact")
+            .expect("verifier prompt");
+        assert!(prompt.contains("canonical-vdd-input-v2"));
+        assert!(prompt.contains("source contents"));
+    }
+
+    #[test]
+    fn request_rejects_missing_tampered_or_oversized_source_snapshots() {
+        let mut missing = valid_request_parts();
+        missing.source_snapshots.clear();
+        assert!(matches!(
+            CanonicalVddRequest::new(missing),
+            Err(CanonicalVddPreflightError::InvalidContract(_))
+        ));
+
+        let mut tampered = valid_request_parts();
+        tampered.source_snapshots[0].content = "tampered source contents".to_string();
+        assert!(CanonicalVddRequest::new(tampered)
+            .expect_err("tampered snapshot must fail")
+            .to_string()
+            .contains("does not match its planner receipt digest"));
+
+        let mut oversized = valid_request_parts();
+        let content = "x".repeat(MAX_CONTRACT_TEXT_BYTES + 1);
+        oversized.source_snapshots[0].receipt.content_digest =
+            ContentDigest::sha256(content.as_bytes());
+        oversized.source_snapshots[0].content = content;
+        assert!(CanonicalVddRequest::new(oversized)
+            .expect_err("oversized snapshot must fail")
+            .to_string()
+            .contains("source snapshot content"));
     }
 
     #[test]
@@ -1491,6 +1901,18 @@ mod tests {
             Err(CanonicalVddPreflightError::ModelCollision(_))
         ));
         ensure_independent_models(&worker, &independent).expect("independent verifier identity");
+
+        let observed_route = crate::subagent::CanonicalVerifierRouteObservation {
+            provider: "anthropic".to_string(),
+            endpoint_sha256: ContentDigest::sha256(b"https://api.anthropic.com/v1/messages"),
+            model: "claude-opus-4-1-20260801".to_string(),
+            authority: crate::subagent::CanonicalVerifierIdentityAuthority::ResponseEnvelope,
+        };
+        let observed = VddModelIdentity::resolve_observed(&observed_route, 4)
+            .expect("transport-observed identity");
+        assert_eq!(observed.model(), "claude-opus-4-1-20260801");
+        ensure_independent_models(&worker, &observed)
+            .expect("transport-observed verifier remains independent");
     }
 
     #[test]
@@ -1572,6 +1994,148 @@ mod tests {
         assert!(parse_and_validate_report(&run, agent_id, &unsupported)
             .expect_err("uncited conclusion must fail")
             .contains("lacks Reality evidence"));
+
+        let mut ledger = RealityLedger::open_project_session_for_run(&run, agent_id)
+            .expect("isolated Reality ledger");
+        let irrelevant_command = ledger
+            .observe_command_run(
+                &run,
+                workspace.path().display().to_string(),
+                vec!["bash".to_string(), "-c".to_string(), "pwd".to_string()],
+                0,
+                workspace.path().display().to_string(),
+                "",
+            )
+            .expect("irrelevant command observation");
+        let artifact_check = ledger
+            .observe_command_run(
+                &run,
+                workspace.path().display().to_string(),
+                vec![
+                    "bash".to_string(),
+                    "-c".to_string(),
+                    "cargo test --lib".to_string(),
+                ],
+                0,
+                "tests passed",
+                "",
+            )
+            .expect("artifact-check command observation");
+        drop(ledger);
+        let irrelevant = serde_json::to_string(&report_for(criterion, vec![irrelevant_command]))
+            .expect("report serialization");
+        assert!(parse_and_validate_report(&run, agent_id, &irrelevant)
+            .expect_err("irrelevant command must not prove the reviewed artifact")
+            .contains("lacks a current artifact observation"));
+        let checked = serde_json::to_string(&report_for(criterion, vec![artifact_check]))
+            .expect("report serialization");
+        parse_and_validate_report(&run, agent_id, &checked)
+            .expect("successful recognized artifact check must validate");
+
+        let mut ledger = RealityLedger::open_project_session_for_run(&run, agent_id)
+            .expect("isolated Reality ledger");
+        let scratch_observation = ledger
+            .observe_file_read(
+                &run,
+                run.private_temp_root()
+                    .join("unrelated.txt")
+                    .display()
+                    .to_string(),
+                "unrelated\n",
+                1,
+                1,
+                "unrelated",
+            )
+            .expect("current scratch observation");
+        drop(ledger);
+        let scratch_supported =
+            serde_json::to_string(&report_for(criterion, vec![scratch_observation]))
+                .expect("report serialization");
+        assert!(
+            parse_and_validate_report(&run, agent_id, &scratch_supported)
+                .expect_err("scratch evidence must not prove the reviewed artifact")
+                .contains("lacks a current artifact observation")
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_vdd_runs_through_the_real_child_and_tool_harness() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer};
+
+        let (_fixture, run, review_artifact, artifact_generation) = canonical_git_fixture();
+        let review = review_artifact
+            .parent()
+            .expect("review artifact parent")
+            .to_path_buf();
+
+        let mut parts = valid_request_parts();
+        let locator = review.display().to_string();
+        parts.assignment.artifact_locator = Some(locator.clone());
+        parts.worker_result.artifact.locator = Some(locator);
+        parts.worker_result.artifact.generation = artifact_generation.clone();
+        parts.worker_result.artifact.states = BTreeSet::from([WorkerArtifactState::Unstaged]);
+        parts.deterministic_receipts[0].artifact_generation = artifact_generation;
+        let request = CanonicalVddRequest::new(parts).expect("canonical request");
+
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(CanonicalHarnessResponder {
+                calls: Arc::clone(&calls),
+                criterion: request.acceptance_criteria()[0].digest,
+                artifact_path: review_artifact.display().to_string(),
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let app_config = canonical_test_app_config(server.uri());
+        let vdd_config = VddConfig {
+            enabled: true,
+            adversary: crate::config::VddAdversaryConfig {
+                provider: "local".to_string(),
+                model: Some("claude-opus-4-1".to_string()),
+                request_timeout_seconds: 30,
+                ..crate::config::VddAdversaryConfig::default()
+            },
+            ..VddConfig::default()
+        };
+
+        let receipt = run_canonical_verification(
+            &run,
+            &reqwest::Client::new(),
+            &app_config,
+            &vdd_config,
+            Some(&VddProviderAuth::None),
+            &request,
+        )
+        .await;
+
+        assert_eq!(receipt.verdict, CanonicalVddVerdict::Pass, "{receipt:?}");
+        assert_eq!(receipt.reason, CanonicalVddTerminalReason::Passed);
+        assert_eq!(receipt.verifier_turns, Some(2));
+        let identity = receipt
+            .verifier_identity
+            .as_ref()
+            .expect("transport-observed verifier identity");
+        assert_eq!(identity.provider(), "local");
+        assert_eq!(identity.model(), "claude-opus-4-1");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            receipt.artifact_generation_after.as_deref(),
+            Some(receipt.artifact_generation_before.as_str())
+        );
+        assert!(receipt.report.is_some());
+        assert!(
+            !review.join(".openclaudia").exists(),
+            "verifier evidence must stay out of the reviewed artifact"
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .expect("received provider requests");
+        assert!(String::from_utf8_lossy(&requests[0].body).contains("source contents"));
     }
 
     #[test]

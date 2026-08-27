@@ -122,6 +122,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - TUI: every turn now dual-writes — the existing JSON snapshot at `~/.local/share/openclaudia/chat_sessions/<uuid>.json` stays for backward compat, and new entries also append to the JSONL transcript via `App::persist_transcript_tail`. Watermark tracking skips re-appending on resume
 
 ### Fixed
+- Deliver the selected source snapshot to canonical VDD (#1187)
+- Join verifier-owned processes before publishing a VDD receipt (#1185)
+- Bind canonical VDD identity to the actual resolved verifier route (#1184)
+- Make canonical verifier evidence use one artifact-bound ledger (#1183)
 - Bash timeout waits for descendant-held pipes and weak test masks delay (#1020)
 - Emit Gemini-compatible JSON Schemas for tool declarations (#1094)
 - Process-tree termination accepts Unix sentinel PID 0 (#1022)
@@ -195,6 +199,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- Exercise canonical VDD through the real child harness end to end (#1186)
 - Replace yanked chacha20 dependency blocking repository policy (#1181)
 - Treat successful hook stdin EPIPE as an early close (#1174)
 - Make sandboxed worktree tests support linked checkout git metadata (#1055)
