@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1189,
+  "next_display_id": 1190,
   "next_comment_id": 1861,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -295,6 +295,7 @@
     "45f3bb9f-e9b5-4936-a055-38e0107a505f": 156,
     "460c1743-20d3-4a46-aced-9e405dfbe3dd": 1183,
     "461c9e6d-ca13-496b-abc6-e797fc51764e": 144,
+    "46445e15-1bb3-4957-ae99-54ec36de0e66": 1189,
     "4682bf6f-9850-4f51-8fd6-9de2c36c8813": 116,
     "4690884c-2ff5-4dcb-b1eb-73d5f335780f": 330,
     "46c4da74-c0dc-4d10-a388-5c75c9c8c14b": 453,
@@ -9196,6 +9197,18 @@
       "labels": [
         "qa"
       ]
+    },
+    "46445e15-1bb3-4957-ae99-54ec36de0e66": {
+      "uuid": "46445e15-1bb3-4957-ae99-54ec36de0e66",
+      "display_id": 1189,
+      "title": "S-084: Turn cron metadata into a scheduler service",
+      "description": "Production-wire durable authorized scheduled runs with timezone/DST, misfire, overlap, retry, expiry, leases/fencing, canonical dispatch, budgets, revocation, and exact history. Worker is code-only; parent owns all execution and verification.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "5ea8af88-cc85-47d9-943c-8e2e851b5e5a",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-27T23:55:04.905141396Z",
+      "updated_at": "2026-08-27T23:55:04.905141396Z"
     },
     "4682bf6f-9850-4f51-8fd6-9de2c36c8813": {
       "uuid": "4682bf6f-9850-4f51-8fd6-9de2c36c8813",
@@ -47025,11 +47038,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2182,
       "timestamp": "2026-08-27T23:54:00.540097114Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2183,
+      "timestamp": "2026-08-27T23:55:04.905141396Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T23:54:00.540097114Z",
+    "timestamp": "2026-08-27T23:55:04.905141396Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2182
+    "agent_seq": 2183
   }
 }
