@@ -1,6 +1,6 @@
 {
   "next_display_id": 1172,
-  "next_comment_id": 1811,
+  "next_comment_id": 1812,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -17289,7 +17289,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T13:00:35.834567825Z",
-      "updated_at": "2026-08-27T13:01:33.143940680Z",
+      "updated_at": "2026-08-27T13:29:30.881440496Z",
       "labels": [
         "workflow"
       ],
@@ -17302,6 +17302,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAturV3neVHyY701tT2n1Fyfjpn1dZ5XxoETAbN2zoWVqn0LCU8GxvGcFlIaIMESHs5SK9uGV5QsyThB24VzGSAQ=="
+        },
+        "8e73b8e7-9060-4114-85ec-7dcd91a39aa9": {
+          "display_id": 1811,
+          "author": "6Vw9",
+          "content": "Wave-two integration commit 7b378a66e3e192190b9f6e300b10d9d8862165ad was pushed to origin/agent/refactor-agent-system-remediation and verified by exact-head GitHub Actions run 33074741119. All five jobs passed: repository-policy (2m53s), msrv/Rust 1.98 (6m10s), platform-fail-closed macOS (10m9s), platform-fail-closed Windows including all eight Windows-only contracts (15m3s), and Linux including fmt, locked checks, strict Clippy, full serialized all-target/all-feature tests, fuzz harness validation, sandbox escape E2E, and session filesystem capability E2E (27m11s). Draft PR #66 remains open.",
+          "created_at": "2026-08-27T13:29:30.878823616Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAO1Kc3nc3LrCw2NcEHRjQe/6oUz6D2hu0Bo+w68iV3spz6fsoWlwHpZ2BQzr+HkjqvI7oAfNrIfMdYzVQ9O+MDA=="
         },
         "b95c6469-2570-4b7f-bd07-2feeacc03887": {
           "display_id": 1810,
@@ -45464,11 +45473,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2031,
       "timestamp": "2026-08-27T13:01:33.143940680Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2032,
+      "timestamp": "2026-08-27T13:29:30.881440496Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T13:01:33.143940680Z",
+    "timestamp": "2026-08-27T13:29:30.881440496Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2031
+    "agent_seq": 2032
   }
 }
