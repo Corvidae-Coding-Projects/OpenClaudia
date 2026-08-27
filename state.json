@@ -1,6 +1,6 @@
 {
   "next_display_id": 1182,
-  "next_comment_id": 1844,
+  "next_comment_id": 1845,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -26846,11 +26846,20 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T20:47:39.842404779Z",
-      "updated_at": "2026-08-27T20:58:26.729606828Z",
+      "updated_at": "2026-08-27T20:59:04.754067522Z",
       "labels": [
         "maintenance"
       ],
       "comments": {
+        "644556de-2fdb-4bd5-b6ae-74e15fe57bee": {
+          "display_id": 1844,
+          "author": "6Vw9",
+          "content": "Repair the fresh-index repository-policy failure at its dependency cause: inspect both locked workspaces, update only the yanked chacha20 patch to the current compatible release, preserve deny policy, then verify fresh-index deny, Rust 1.98 all-target/all-feature gates, fuzz compilation, and the full serialized suite before publishing a replacement exact head.",
+          "created_at": "2026-08-27T20:59:04.751514562Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAU2lzL488FJLd0nNlgHw+uXpv5mzqXv7AlBbjzFNpLSEpQe8tKyONo/5QIlCchHmVqlp/ZSIp8pBqSpMI/KCeDw=="
+        },
         "7849eb5a-9b6b-47ef-98bb-3e8ec97fd81e": {
           "display_id": 1843,
           "author": "6Vw9",
@@ -46407,11 +46416,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2121,
       "timestamp": "2026-08-27T20:58:36.610507039Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2122,
+      "timestamp": "2026-08-27T20:59:04.754067522Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T20:58:36.610507039Z",
+    "timestamp": "2026-08-27T20:59:04.754067522Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2121
+    "agent_seq": 2122
   }
 }
