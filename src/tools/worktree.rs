@@ -863,10 +863,8 @@ fn parse_porcelain_v2(bytes: &[u8], include_ignored: bool) -> Result<GitStatusOb
     }
     let branch = branch.ok_or_else(|| "Git status omitted branch identity".to_string())?;
     let head = head.ok_or_else(|| "Git status omitted HEAD identity".to_string())?;
-    if branch == "(detached)" || head == "(initial)" {
-        return Err(
-            "Worktree transaction requires an attached branch with an existing HEAD".to_string(),
-        );
+    if head == "(initial)" {
+        return Err("Worktree transaction requires an existing HEAD".to_string());
     }
     Ok(GitStatusObservation {
         branch,
@@ -1133,6 +1131,12 @@ fn inspect_worktree(
         identity_digest(&(worktree_root_id, git_dir.to_string_lossy(), &repository_id))?;
 
     let worktree_status = inspect_changes(run, &worktree_path, true)?;
+    if worktree_status.branch == "(detached)" {
+        return Err(
+            "Worktree transaction requires the linked worktree to have an attached branch"
+                .to_string(),
+        );
+    }
     // Ignored files in the merge target are not touched by any S-073 phase.
     // Traversing target/, .worktrees/, and other ignored caches would make a
     // small worktree transaction proportional to unrelated build artifacts.
@@ -1901,6 +1905,16 @@ fn execute_merge<S: std::hash::BuildHasher>(
             WorktreeOperation::Merge,
             Some(snapshot),
             "Review both returned generations before authorizing another merge",
+        );
+    }
+    if snapshot.view.target_branch == "(detached)" {
+        return failure_with_snapshot(
+            crate::tools::ToolFailureCode::Conflict,
+            "Merge requires the target worktree to have an attached branch",
+            crate::tools::ToolRetryability::Safe,
+            WorktreeOperation::Merge,
+            Some(snapshot),
+            "Attach the target HEAD to the intended branch, then preview and review the new generation",
         );
     }
     if !snapshot.view.changes.tracked_and_untracked_clean() {
@@ -3112,6 +3126,69 @@ mod tests {
             ),
         ]);
         execute_exit_worktree(run, &args)
+    }
+
+    #[test]
+    fn detached_target_allows_exact_cleanup_but_refuses_merge() {
+        let fixture = TransactionFixture::new(true);
+        fixture_git(
+            &fixture.git,
+            &fixture.main,
+            &["checkout", "--detach", "-q", "HEAD"],
+        );
+        let target_head_before = fixture_git(
+            &fixture.git,
+            &fixture.main,
+            &["rev-parse", "--verify", "HEAD"],
+        )
+        .stdout;
+
+        let preview = preview_result(&fixture.run, &fixture.worktree);
+        assert!(
+            !handler_is_error(&preview),
+            "detached target preview failed: {}",
+            preview.content()
+        );
+        assert_eq!(
+            structured_result(&preview)
+                .pointer("/transaction/target_branch")
+                .and_then(Value::as_str),
+            Some("(detached)")
+        );
+
+        let merge = invoke_phase(
+            &fixture.run,
+            &fixture.worktree,
+            "merge",
+            &result_generation(&preview),
+            None,
+            None,
+            None,
+        );
+        assert!(handler_is_error(&merge), "detached target merge must fail");
+        assert!(
+            merge.content().contains("attached branch"),
+            "merge failure must explain recovery: {}",
+            merge.content()
+        );
+        assert_eq!(
+            fixture_git(
+                &fixture.git,
+                &fixture.main,
+                &["rev-parse", "--verify", "HEAD"],
+            )
+            .stdout,
+            target_head_before,
+            "refused merge must not move detached target HEAD"
+        );
+
+        let cleanup = transact_cleanup(&fixture.run, &fixture.worktree, "remove");
+        assert!(
+            !handler_is_error(&cleanup),
+            "exact clean removal must work with a detached target: {}",
+            cleanup.content()
+        );
+        assert!(!fixture.worktree.exists());
     }
 
     #[test]

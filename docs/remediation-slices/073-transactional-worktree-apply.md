@@ -81,6 +81,8 @@ They prove:
 - a required clean-filter/quality-gate failure never reaches cleanup;
 - a real merge conflict is aborted in the target while the source commit,
   worktree, and recovery ref remain available;
+- a detached merge target still permits exact preview and cleanup, while merge
+  fails before mutation with instructions to attach the intended target branch;
 - a same-path edit changes the generation, so stale discard approval cannot
   destroy newer bytes;
 - porcelain-v2 parsing distinguishes ordinary, rename, untracked, ignored,
@@ -92,14 +94,14 @@ They prove:
 
 `S073-G1` is the exact seven-file implementation/test artifact set below. The
 SHA-256 digest of its sorted `sha256sum` manifest is
-`4857652caf8a1c802977be00cee7f5a8c12b022d030db2c4a3c7c72ec646380c`.
+`d0d9118004ef73192c9a174397988ade905d5aab611cb3fe856d710443dcaf95`.
 
 | Artifact | SHA-256 |
 | --- | --- |
 | `README.md` | `8b8f89d6292d4610fa19289603df6c1027445a41868b2ee86e029d4cabcdbaf4` |
 | `src/services/tool_executor.rs` | `0f96ed5e0ddf50b3e580d721c008244b67bab2716ff463e4a1d44c4cd4e1e650` |
 | `src/tools/registry.rs` | `4e8e9d08f3d1b606695eafe03a714797e34c437ae594e8d53702ee1262c5047d` |
-| `src/tools/worktree.rs` | `c4a959beb24f941c768a5588165853660f7a3974f23ae63a1fa2b06f1971b282` |
+| `src/tools/worktree.rs` | `3c04e4395b61bd0c6beca8a091ab1ef29772f671973ffb18df6cc6cc2ac60aaf` |
 | `tests/mandatory_tool_effect_classification_e2e.rs` | `16f1ada4675704ed06f703fda135fa78a12c1075fcbab48c5a625083023baefb` |
 | `tests/run_scoped_blast_radius_guardrails_e2e.rs` | `29232eb9847193ed1dbb1855055b97df7f3ba56b51c3e3cd0f050efdb69c4be3` |
 | `tests/worktree_dispatch_validation_e2e.rs` | `2bc208ac11645e1d61bac39c1675d140547971e3f6efd516b01bd0565d37e1ca` |
@@ -120,14 +122,14 @@ commands were serialized with `--test-threads=1` where applicable.
 
 - Focused transaction tests passed, including the fresh-run happy path and
   commit-identity, clean-filter, merge-conflict, and stale-discard failures.
-  The complete worktree module passed 33/33 tests.
+  The complete worktree module passed 34/34 tests.
 - Updated integration contracts passed: worktree dispatch 36/36, mandatory
   effect classification 52/52, tool schema 29/29, blast-radius guardrails
   14/14, and worktree/LSP 9/9.
 - `cargo fmt --all -- --check`, locked all-target checking, and locked strict
   all-target/all-feature Clippy with `-D warnings` passed.
 - The complete locked all-target/all-feature native test matrix exited zero.
-  The library ran 2,933 tests: 2,932 passed and one intentional test was
+  The library ran 2,934 tests: 2,933 passed and one intentional test was
   ignored; all main, integration, and example targets also passed.
 - The fuzz workspace passed locked check, strict Clippy, and all four library
   tests. Root and fuzz locked metadata and cargo-deny 0.20.2 advisory, license,
@@ -135,6 +137,12 @@ commands were serialized with `--test-threads=1` where applicable.
 - Repository-policy tests passed 27/27 and repository hygiene returned
   `status: verified`. `git diff --check` and the changed-code debug/stub scan
   were clean.
+- The first exact-head PR run passed repository policy, MSRV, macOS, and
+  Windows. Linux exposed a detached-target inspection defect in four lifecycle
+  tests. The root repair accepts an existing detached target for exact preview
+  and cleanup but refuses merge until the target is attached; the exact failed
+  test and the complete serialized native matrix then passed locally. Final
+  exact-head runner evidence remains pending publication of that repair.
 
 ## Residual boundaries
 
