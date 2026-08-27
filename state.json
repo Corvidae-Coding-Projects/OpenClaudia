@@ -1,6 +1,6 @@
 {
   "next_display_id": 1161,
-  "next_comment_id": 1751,
+  "next_comment_id": 1752,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -19782,7 +19782,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T00:36:32.320359690Z",
-      "updated_at": "2026-08-27T01:40:32.318006131Z",
+      "updated_at": "2026-08-27T07:10:11.533815264Z",
       "labels": [
         "feature"
       ],
@@ -19795,6 +19795,15 @@
           "kind": "observation",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAPJJa9jtbzLB9HcQ4IIXIGsbnRXl/L2fD4oBEL5+zxaOrBrUl2m2GbjmgiFJNgD/LsEA4f+s+DVxKjVTDpBAHDw=="
+        },
+        "ebb56502-b835-470a-a492-5866212aa6a3": {
+          "display_id": 1751,
+          "author": "6Vw9",
+          "content": "Queue S074-G1 for canonical S-088 alternate-model verification. Exact implementation commit: a2fbf85abd6be5dd14bd147e8deb6b84cd42e00c; tree: 9f111abece07e28ac9feb7a6e04c7c1ea1dae22d; parent: 95137ef2530f1d3044e7456556b69290b39c21a6; sorted 23-source-file sha256sum manifest digest: 90a92a8317871eb391529ee1378528321425fb356bded378e951f79db6609701. The complete per-file manifest, criteria, evidence, and residual boundaries are recorded in docs/remediation-slices/074-workspace-capability-binding.md at this commit. Rust 1.98 final all-target/all-feature suite, strict Clippy, fuzz, dependency, and repository-policy gates passed. VDD was not run and no approval is claimed. Any mutation to the 23 listed source artifacts makes S074-G1 stale and requires a new generation.",
+          "created_at": "2026-08-27T07:10:11.531295215Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA+rPY9CF5P946r/72VFyJbLR9tvkXd2hEv7ZotUxn4pZnyFDbjlYjR5lPoDk1WC1MAI8Ka6BfTgCYcI6LVCR1Aw=="
         }
       }
     },
@@ -43976,11 +43985,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1921,
       "timestamp": "2026-08-27T07:09:44.926994574Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1922,
+      "timestamp": "2026-08-27T07:10:11.533815264Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T07:09:44.926994574Z",
+    "timestamp": "2026-08-27T07:10:11.533815264Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1921
+    "agent_seq": 1922
   }
 }
