@@ -1,6 +1,6 @@
 {
   "next_display_id": 1159,
-  "next_comment_id": 1733,
+  "next_comment_id": 1734,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11359,7 +11359,7 @@
       "priority": "medium",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T00:41:06.296173668Z",
-      "updated_at": "2026-08-27T00:41:51.920414367Z",
+      "updated_at": "2026-08-27T00:42:36.475552715Z",
       "labels": [
         "maintenance"
       ],
@@ -11372,6 +11372,15 @@
           "kind": "observation",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAOILKTaejj4G/ws37XBx5zvZQoJQknG3XyJ9i97+Yd3kKT68OPdWBhGPqff72/6Pw90Ht7asjggyRcjbG6lChBA=="
+        },
+        "667e1fc3-2324-410d-ae9e-bd9b5bc8aa5a": {
+          "display_id": 1733,
+          "author": "6Vw9",
+          "content": "Blocked after three exact remote refreshes: local signed head 7e856b23d33bcde085b7b222b0dee6fd220d2cbb has not been published; origin and draft PR #66 remain at 9792e9a8a03d6bd950e01585b855d8969ea16436. The S-073 goal explicitly forbids the agent from pushing. Existing green checks belong only to the older head and cannot serve as S-073 runner evidence. Resume after the user runs git push origin agent/refactor-agent-system-remediation.",
+          "created_at": "2026-08-27T00:42:36.472877629Z",
+          "kind": "blocker",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAuNW9FnsK3HIoBThhIuK6ME4HE455Wid30lmq144gcLnIs8T76YLT2aagAadL+vm/Y5rGC/WKqvlitNs1NwRIAg=="
         }
       }
     },
@@ -43630,11 +43639,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 1894,
       "timestamp": "2026-08-27T00:41:51.920414367Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 1895,
+      "timestamp": "2026-08-27T00:42:36.475552715Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T00:41:51.920414367Z",
+    "timestamp": "2026-08-27T00:42:36.475552715Z",
     "agent_id": "6Vw9",
-    "agent_seq": 1894
+    "agent_seq": 1895
   }
 }
