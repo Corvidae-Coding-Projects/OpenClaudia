@@ -1,6 +1,6 @@
 {
   "next_display_id": 1188,
-  "next_comment_id": 1856,
+  "next_comment_id": 1857,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8025,11 +8025,22 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T22:19:23.856453007Z",
-      "updated_at": "2026-08-27T22:19:32.434340830Z",
+      "updated_at": "2026-08-27T22:42:37.904319907Z",
       "labels": [
         "bug",
         "vdd"
-      ]
+      ],
+      "comments": {
+        "e9a16b4a-6b7a-48e9-a3ae-5bb5caa6ca50": {
+          "display_id": 1856,
+          "author": "6Vw9",
+          "content": "Replaced receipt-only canonical VDD sources with CanonicalSourceSnapshot values containing the exact selected text plus its PlannerEvidenceSourceRecord. Request preflight verifies content digests, unique/exact assignment and worker evidence sets, per-source bounds, and total contract bytes. Prompt schema v2 delivers the snapshots as explicitly untrusted evidence to the fresh verifier. Rust 1.98 focused tests cover prompt delivery and missing, tampered, and oversized snapshots.",
+          "created_at": "2026-08-27T22:42:37.900921071Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAiRwYvyqiNgc5Yw1qbDEIAYVzzZfwGRKvJfMizuLdbWoyl6KaMzDL+RXMQgZ/5orHiyb93uefGtDTvDybRYaFDA=="
+        }
+      }
     },
     "3b61ba85-3cf3-4932-8309-c9220f1a6f60": {
       "uuid": "3b61ba85-3cf3-4932-8309-c9220f1a6f60",
@@ -46885,11 +46896,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2167,
       "timestamp": "2026-08-27T22:40:16.728146583Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2168,
+      "timestamp": "2026-08-27T22:42:37.904319907Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T22:40:16.728146583Z",
+    "timestamp": "2026-08-27T22:42:37.904319907Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2167
+    "agent_seq": 2168
   }
 }
