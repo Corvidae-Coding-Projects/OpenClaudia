@@ -1,6 +1,6 @@
 {
   "next_display_id": 1188,
-  "next_comment_id": 1858,
+  "next_comment_id": 1859,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9133,7 +9133,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T22:17:56.756101588Z",
-      "updated_at": "2026-08-27T22:30:14.191705429Z",
+      "updated_at": "2026-08-27T23:20:30.376170947Z",
       "closed_at": "2026-08-27T22:30:14.191699475Z",
       "labels": [
         "bug",
@@ -9148,6 +9148,15 @@
           "kind": "result",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAxZbsCZJWuFCu0LmPGweUUrMhECT9TWERCglxa3TpIUddmz38Jm+FSYnY/ZFadrMY38K9dThKtn2zlf90/h9rBQ=="
+        },
+        "bb2a7033-828e-46f9-9056-05c613792ae6": {
+          "display_id": 1858,
+          "author": "6Vw9",
+          "content": "Final pre-commit architecture trace closed the remaining irrelevant-command acceptance gap: canonical VDD now counts only successful recognized build, lint, test, format, or type-check commands from the review root as command evidence. A focused test proves a generic pwd observation cannot support a claim while cargo test can. Rust 1.98 formatting, strict all-target/all-feature Clippy, the 9-test canonical VDD suite, typed-tool-result E2E, and the complete all-feature suite pass.",
+          "created_at": "2026-08-27T23:20:30.372303879Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA3V/Q6mJWacqoXqbCAUmMN7ZKtPoHLZbxhxxwZpeJ6viDDElzdWp3lPbWfmD5/QZxuijzuAymjkrjvE8qZfFrBg=="
         }
       }
     },
@@ -46940,11 +46949,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2174,
       "timestamp": "2026-08-27T22:51:17.498809273Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2175,
+      "timestamp": "2026-08-27T23:20:30.376170947Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-27T22:51:17.498809273Z",
+    "timestamp": "2026-08-27T23:20:30.376170947Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2174
+    "agent_seq": 2175
   }
 }
