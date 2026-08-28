@@ -1,6 +1,6 @@
 {
   "next_display_id": 1200,
-  "next_comment_id": 1900,
+  "next_comment_id": 1901,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9223,11 +9223,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-28T11:44:45.921120190Z",
-      "updated_at": "2026-08-28T11:45:00.920666073Z",
+      "updated_at": "2026-08-28T11:51:43.382477900Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "bdd633cd-9cd4-4eab-97dd-91f664b38598": {
+          "display_id": 1900,
+          "author": "6Vw9",
+          "content": "Preflight: S-102 will move VDD persistence and Crosslink promotion out of the review loop and behind host-owned finalization. Preferred design is a versioned redacted evidence ledger committed with descriptor-safe generation checks, plus a durable reconciliation journal whose deterministic markers make Crosslink SQLite transactions retry-safe after crashes. Only final checked unresolved findings are promoted; earlier revision findings remain historical and become resolved. Existing behavior remains configurable rather than removed. Alternative rejected: serializing VddSession in the engine, because that stores raw provider/build/analyzer content before the S-100 publication decision and cannot recover partial Crosslink writes. Scope is src/vdd persistence/finalization/engine, VDD tracking config, focused tests/docs only; no adjacent cleanup. Verification: Rust 1.98 fmt/check/strict Clippy, focused then full resource-aware tests, policy/deny/fuzz gates, exact-head PR runners.",
+          "created_at": "2026-08-28T11:51:43.379412024Z",
+          "kind": "progress",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAQLM9bIYRToGW0zr2jv2qWoQ8VVP2culSJiUj4c9r0FrBvBY9GqMkNXs4prtwhw3UIf2YXJya1JZeliTmRHn8Dg=="
+        },
         "de8c1d0e-3a3f-4e52-b35d-beadb62f20ee": {
           "display_id": 1899,
           "author": "6Vw9",
@@ -48052,11 +48061,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2272,
       "timestamp": "2026-08-28T11:45:00.920666073Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2273,
+      "timestamp": "2026-08-28T11:51:43.382477900Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-28T11:45:00.920666073Z",
+    "timestamp": "2026-08-28T11:51:43.382477900Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2272
+    "agent_seq": 2273
   }
 }
