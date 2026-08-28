@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1199,
+  "next_display_id": 1200,
   "next_comment_id": 1899,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -294,6 +294,7 @@
     "45664df3-df63-40de-bf3c-4f69afeb2534": 220,
     "458cbc83-74ca-41de-85a8-877dbc6d6530": 608,
     "45bb659e-5d03-41a1-866a-63f7209e607c": 403,
+    "45cb62d5-1b2d-4419-aae9-0840fabad1ae": 1199,
     "45f3bb9f-e9b5-4936-a055-38e0107a505f": 156,
     "460c1743-20d3-4a46-aced-9e405dfbe3dd": 1183,
     "461c9e6d-ca13-496b-abc6-e797fc51764e": 144,
@@ -9207,6 +9208,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAowfQ9NZFJqVxmv6Om+yPUGaotWOdD1CiVt6vdoFMfzo5j4uzJV2v8vzxBS9giA5XMuMbMqH2w9Pa1gHun9P0Cw=="
         }
       }
+    },
+    "45cb62d5-1b2d-4419-aae9-0840fabad1ae": {
+      "uuid": "45cb62d5-1b2d-4419-aae9-0840fabad1ae",
+      "display_id": 1199,
+      "title": "S-102: Persist VDD evidence and issues transactionally",
+      "description": "Implement remediation slice S-102 from docs/remediation-slices/102-vdd-transactional-evidence-and-issues.md. Persist resumable redacted VDD evidence and reconcile checked unresolved findings into task state atomically and idempotently, preserving exact artifact bindings and history. Do not remove intended VDD functionality or expand into adjacent cleanup.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-28T11:44:45.921120190Z",
+      "updated_at": "2026-08-28T11:44:45.921120190Z"
     },
     "45f3bb9f-e9b5-4936-a055-38e0107a505f": {
       "uuid": "45f3bb9f-e9b5-4936-a055-38e0107a505f",
@@ -48001,11 +48014,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2268,
       "timestamp": "2026-08-28T11:37:19.236138257Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2269,
+      "timestamp": "2026-08-28T11:44:45.921120190Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-28T11:37:19.236138257Z",
+    "timestamp": "2026-08-28T11:44:45.921120190Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2268
+    "agent_seq": 2269
   }
 }
