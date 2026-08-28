@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1196,
+  "next_display_id": 1197,
   "next_comment_id": 1879,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -432,6 +432,7 @@
     "62403f03-075f-434e-ab12-46788de19975": 539,
     "62651369-fdf3-4a92-81e0-e85f053e21a1": 646,
     "6277adb8-655a-4265-bd38-8709d1b84574": 208,
+    "6283cb3e-42e5-41b1-b514-65252ed85dcd": 1196,
     "6286612a-8a0c-498c-b4fe-814f4ad920fe": 499,
     "62d22475-df22-4b77-a992-4ee9d35fface": 766,
     "62d69a22-3d02-4ebc-aa3a-5b6da4354d69": 941,
@@ -14842,6 +14843,17 @@
           "signature": "U1NIU0lHAAAAAQAAAGgAAAATZWNkc2Etc2hhMi1uaXN0cDI1NgAAAAhuaXN0cDI1NgAAAEEEe0KY4l/Z7G/vfkx00kFwZtY3FjD8lde6VcPNSNT06kyL5ZUnzQGbJUMzOdlFd65s/RCzZhVJQVonLQ3yKzipGAAAABFjcm9zc2xpbmstY29tbWVudAAAAAAAAAAGc2hhNTEyAAAAZAAAABNlY2RzYS1zaGEyLW5pc3RwMjU2AAAASQAAACABPctTCC/BpIfAIAuowfwBN/KijG8JpYVOxa2siBVougAAACEAxdPQhakMPIWk50f7apJ4viCn6t654yWfEmkQMqREdQY="
         }
       }
+    },
+    "6283cb3e-42e5-41b1-b514-65252ed85dcd": {
+      "uuid": "6283cb3e-42e5-41b1-b514-65252ed85dcd",
+      "display_id": 1196,
+      "title": "S-099: Make VDD verdict parsing strict and fail closed",
+      "description": "Complete remediation slice S-099 under parent #1071: finish the versioned canonical VDD verdict schema, stable finding identities, bounded normalized paths and ranges, duplicate and contradiction rejection, and deterministic parser/triage tests without expanding into S-100/S-101/S-102.",
+      "status": "open",
+      "priority": "high",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-28T07:47:31.467293979Z",
+      "updated_at": "2026-08-28T07:47:31.467293979Z"
     },
     "6286612a-8a0c-498c-b4fe-814f4ad920fe": {
       "uuid": "6286612a-8a0c-498c-b4fe-814f4ad920fe",
@@ -47551,11 +47563,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2227,
       "timestamp": "2026-08-28T07:21:27.294093301Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2228,
+      "timestamp": "2026-08-28T07:47:31.467293979Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-28T07:21:27.294093301Z",
+    "timestamp": "2026-08-28T07:47:31.467293979Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2227
+    "agent_seq": 2228
   }
 }
