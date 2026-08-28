@@ -1,6 +1,6 @@
 {
   "next_display_id": 1193,
-  "next_comment_id": 1868,
+  "next_comment_id": 1869,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -15810,10 +15810,21 @@
       "parent_uuid": "5ea8af88-cc85-47d9-943c-8e2e851b5e5a",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T23:55:23.830113893Z",
-      "updated_at": "2026-08-27T23:55:28.271504078Z",
+      "updated_at": "2026-08-28T01:36:31.321844081Z",
       "labels": [
         "feature"
-      ]
+      ],
+      "comments": {
+        "972ae90f-a064-4379-b1a9-3ba7d6c2a87e": {
+          "display_id": 1868,
+          "author": "6Vw9",
+          "content": "Delivered S-095 with bounded incremental SSE decoding and client-protocol translation for OpenAI chat/completions, Anthropic messages, Google generate content and OpenAI Responses. Pull-driven backpressure, terminal validation, usage/budget settlement, timeout/error handling and client-drop upstream cancellation are owned through completion. Configured VDD requests switch honestly to buffered non-stream delivery so exact candidates are reviewed before success; blocking failure remains fail-closed and advisory outcomes are labeled. Evidence: focused proxy 63/63, strict Rust 1.98 Clippy green, and the complete serialized all-target/all-feature suite green.",
+          "created_at": "2026-08-28T01:36:31.319250002Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAKaCT9NdAyPYb/7gNUfnmXGDY3Y8MqZj6Jv/0B5weOpbQ6692y+f+h9n+b/5w9R2s2/HHiJvw9vntKMr/bYOPCw=="
+        }
+      }
     },
     "696fad29-b1b0-4559-b8fc-03789028d7ca": {
       "uuid": "696fad29-b1b0-4559-b8fc-03789028d7ca",
@@ -47253,11 +47264,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2198,
       "timestamp": "2026-08-28T01:36:20.017085322Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2199,
+      "timestamp": "2026-08-28T01:36:31.321844081Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-28T01:36:20.017085322Z",
+    "timestamp": "2026-08-28T01:36:31.321844081Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2198
+    "agent_seq": 2199
   }
 }
