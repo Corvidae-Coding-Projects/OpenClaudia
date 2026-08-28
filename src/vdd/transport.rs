@@ -1,5 +1,10 @@
 //! HTTP transport for the VDD loop: adversary + builder request plumbing.
 
+use std::future::Future;
+use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
+
+use chrono::Utc;
 use reqwest::Client;
 use serde_json::Value;
 use tracing::{debug, info};
@@ -10,8 +15,581 @@ use crate::providers::{get_adapter, ApiKey, ProviderAdapter};
 use crate::proxy::ChatCompletionRequest;
 use crate::session::TokenUsage;
 
-use crate::vdd::error::VddError;
+use crate::vdd::error::{VddError, VddProviderCallOutcome, VddProviderCallReceipt};
 use crate::vdd::helpers::truncate_output;
+
+const MAX_VDD_MODEL_INPUT_TOKENS_PER_CALL: u64 = 64 * 1024;
+const MAX_VDD_REVIEW_INPUT_TOKENS: u64 = 512 * 1024;
+const VDD_TRANSPORT_INPUT_TOKEN_OVERHEAD: u64 = 4 * 1024;
+const MAX_VDD_STRUCTURED_RESPONSE_BYTES: usize = 512 * 1024;
+const MAX_VDD_ANALYZER_BYTES_PER_STREAM: usize = 128 * 1024;
+
+/// Aggregate, review-scoped admission held across every model and analyzer
+/// stage. The canonical run ledger receives one worst-case reservation before
+/// work starts; individual stages settle only against this local authority so
+/// a multi-stage review cannot multiply the parent run's limits.
+pub struct VddReviewBudget {
+    reservation: Mutex<Option<crate::runtime::BudgetReservation>>,
+    state: Mutex<VddReviewBudgetState>,
+    limits: VddReviewLimits,
+    deadline: tokio::time::Instant,
+    timeout_seconds: u64,
+    cancellation: crate::runtime::CancellationHandle,
+}
+
+#[derive(Clone, Copy)]
+struct VddReviewLimits {
+    input_tokens: u64,
+    output_tokens: u64,
+    model_calls: u64,
+    process_calls: u64,
+    storage_bytes: u64,
+}
+
+#[derive(Default)]
+struct VddReviewBudgetState {
+    charged: crate::runtime::BudgetAmounts,
+    storage_bytes: u64,
+    active_calls: u64,
+    provider_receipts: Vec<VddProviderCallReceipt>,
+}
+
+#[derive(Debug)]
+pub enum VddReviewWaitError {
+    Deadline,
+    Cancelled(crate::runtime::CancellationReason),
+}
+
+impl VddReviewBudget {
+    #[allow(clippy::too_many_lines)] // Aggregate admission calculates every bounded resource in one reservation.
+    pub(crate) fn admit(
+        run: &crate::tools::ToolRunContext,
+        config: &VddConfig,
+        blocking: bool,
+    ) -> Result<Self, VddError> {
+        config.validate_settings().map_err(VddError::ConfigError)?;
+        let iterations = if blocking {
+            u64::from(config.thresholds.max_iterations)
+        } else {
+            1
+        };
+        // One adversary and one verifier call per iteration, plus a possible
+        // builder revision after every non-terminal blocking iteration.
+        let model_calls = if blocking {
+            iterations
+                .checked_mul(3)
+                .and_then(|calls| calls.checked_sub(1))
+        } else {
+            Some(2)
+        }
+        .ok_or_else(|| VddError::ConfigError("VDD model-call budget overflow".to_string()))?;
+        let commands_per_iteration = if !config.static_analysis.enabled {
+            0
+        } else if config.static_analysis.commands.is_empty() {
+            u64::try_from(crate::config::VddStaticAnalysis::MAX_COMMANDS)
+                .map_err(|_| VddError::ConfigError("VDD process budget overflow".to_string()))?
+        } else {
+            u64::try_from(config.static_analysis.commands.len())
+                .map_err(|_| VddError::ConfigError("VDD process budget overflow".to_string()))?
+        };
+        let process_calls = iterations
+            .checked_mul(commands_per_iteration)
+            .ok_or_else(|| VddError::ConfigError("VDD process budget overflow".to_string()))?;
+        let input_tokens = model_calls
+            .checked_mul(MAX_VDD_MODEL_INPUT_TOKENS_PER_CALL)
+            .ok_or_else(|| VddError::ConfigError("VDD input budget overflow".to_string()))?
+            .min(MAX_VDD_REVIEW_INPUT_TOKENS);
+        let output_tokens = model_calls
+            .checked_mul(u64::from(config.adversary.max_tokens))
+            .ok_or_else(|| VddError::ConfigError("VDD output budget overflow".to_string()))?;
+        let model_storage = model_calls
+            .checked_mul(
+                u64::try_from(MAX_VDD_STRUCTURED_RESPONSE_BYTES).map_err(|_| {
+                    VddError::ConfigError("VDD storage budget overflow".to_string())
+                })?,
+            )
+            .ok_or_else(|| VddError::ConfigError("VDD storage budget overflow".to_string()))?;
+        let process_storage = process_calls
+            .checked_mul(
+                u64::try_from(MAX_VDD_ANALYZER_BYTES_PER_STREAM)
+                    .map_err(|_| VddError::ConfigError("VDD storage budget overflow".to_string()))?
+                    .checked_mul(2)
+                    .ok_or_else(|| {
+                        VddError::ConfigError("VDD storage budget overflow".to_string())
+                    })?,
+            )
+            .ok_or_else(|| VddError::ConfigError("VDD storage budget overflow".to_string()))?;
+        let storage_bytes = model_storage
+            .checked_add(process_storage)
+            .ok_or_else(|| VddError::ConfigError("VDD storage budget overflow".to_string()))?;
+        let conservative_cost = crate::session::conservative_budget_cost_microusd(&TokenUsage {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        })
+        .map_err(|error| VddError::ConfigError(format!("VDD cost budget overflow: {error}")))?;
+        let requested = Duration::from_secs(config.adversary.request_timeout_seconds);
+        let remaining = run.budget().remaining_time().map_err(|error| {
+            VddError::ConfigError(format!("Run budget denied VDD review deadline: {error}"))
+        })?;
+        let timeout = requested.min(remaining);
+        if timeout.is_zero() {
+            return Err(VddError::ConfigError(
+                "Run budget has no time remaining for VDD review".to_string(),
+            ));
+        }
+        let now = tokio::time::Instant::now();
+        let reservation = run
+            .budget()
+            .reserve(crate::runtime::BudgetAmounts {
+                input_tokens,
+                output_tokens,
+                turns: model_calls,
+                provider_calls: model_calls,
+                tool_calls: process_calls,
+                retries: 0,
+                concurrent_calls: 1,
+                cost_microusd: conservative_cost.microusd,
+                ..crate::runtime::BudgetAmounts::default()
+            })
+            .map_err(|error| {
+                VddError::ConfigError(format!("Run budget denied aggregate VDD review: {error}"))
+            })?;
+        let timeout_seconds = timeout.as_secs().max(1);
+        Ok(Self {
+            reservation: Mutex::new(Some(reservation)),
+            state: Mutex::new(VddReviewBudgetState::default()),
+            limits: VddReviewLimits {
+                input_tokens,
+                output_tokens,
+                model_calls,
+                process_calls,
+                storage_bytes,
+            },
+            deadline: now + timeout,
+            timeout_seconds,
+            cancellation: run.runtime().cancellation(),
+        })
+    }
+
+    pub(crate) fn begin_model_call<'a>(
+        &'a self,
+        provider: &str,
+        model: &str,
+        request: &mut Value,
+        configured_max_output: u64,
+    ) -> Result<VddModelCall<'a>, String> {
+        if !request.is_object() {
+            return Err("VDD provider request must be a JSON object".to_string());
+        }
+        self.ensure_live()?;
+        let mut state = self.lock_state();
+        if state.active_calls >= 1 {
+            return Err("VDD review concurrency budget is exhausted".to_string());
+        }
+        let remaining_calls = self
+            .limits
+            .model_calls
+            .saturating_sub(state.charged.provider_calls);
+        if remaining_calls == 0 {
+            return Err("VDD aggregate model-call budget is exhausted".to_string());
+        }
+        let remaining_output = self
+            .limits
+            .output_tokens
+            .saturating_sub(state.charged.output_tokens);
+        let output_cap = configured_max_output.min(remaining_output);
+        if output_cap == 0 {
+            return Err("VDD aggregate output-token budget is exhausted".to_string());
+        }
+        let reserved_output = clamp_vdd_provider_output(request, output_cap)?;
+        let request_bytes = u64::try_from(request.to_string().len())
+            .map_err(|_| "VDD provider request is too large to account for".to_string())?;
+        if request_bytes > MAX_VDD_MODEL_INPUT_TOKENS_PER_CALL {
+            return Err(format!(
+                "VDD provider input exceeded the {MAX_VDD_MODEL_INPUT_TOKENS_PER_CALL}-byte call limit"
+            ));
+        }
+        let remaining_input = self
+            .limits
+            .input_tokens
+            .saturating_sub(state.charged.input_tokens);
+        // UTF-8 byte length is a conservative upper bound for provider-visible
+        // request tokens. Keep an additional fixed allowance for the owned SDK
+        // transport prefixes that are added after this JSON boundary.
+        let estimated_input = request_bytes
+            .saturating_add(VDD_TRANSPORT_INPUT_TOKEN_OVERHEAD)
+            .min(MAX_VDD_MODEL_INPUT_TOKENS_PER_CALL);
+        let reserved_input = estimated_input.min(remaining_input);
+        if reserved_input == 0 {
+            return Err("VDD aggregate input-token budget is exhausted".to_string());
+        }
+        state.active_calls += 1;
+        drop(state);
+        Ok(VddModelCall {
+            budget: self,
+            provider: provider.to_string(),
+            model: model.to_string(),
+            reserved_input,
+            reserved_output,
+            settled: false,
+        })
+    }
+
+    pub(crate) fn begin_process(&self) -> Result<(), String> {
+        self.ensure_live()?;
+        let mut state = self.lock_state();
+        if state.active_calls >= 1 {
+            return Err("VDD review concurrency budget is exhausted".to_string());
+        }
+        if state.charged.tool_calls >= self.limits.process_calls {
+            return Err("VDD aggregate process budget is exhausted".to_string());
+        }
+        state.active_calls += 1;
+        drop(state);
+        Ok(())
+    }
+
+    pub(crate) fn finish_process(&self, storage_bytes: usize) -> Result<(), String> {
+        let mut state = self.lock_state();
+        let tool_calls = state
+            .charged
+            .tool_calls
+            .checked_add(1)
+            .ok_or_else(|| "VDD process accounting overflow".to_string())?;
+        let storage_bytes = u64::try_from(storage_bytes)
+            .map_err(|_| "VDD storage accounting overflow".to_string())?;
+        let total_storage = state
+            .storage_bytes
+            .checked_add(storage_bytes)
+            .filter(|total| *total <= self.limits.storage_bytes)
+            .ok_or_else(|| "VDD aggregate storage budget is exhausted".to_string())?;
+        state.active_calls = state.active_calls.saturating_sub(1);
+        state.charged.tool_calls = tool_calls;
+        state.storage_bytes = total_storage;
+        drop(state);
+        Ok(())
+    }
+
+    pub(crate) fn abandon_process(&self) {
+        let mut state = self.lock_state();
+        state.active_calls = state.active_calls.saturating_sub(1);
+        state.charged.tool_calls = state.charged.tool_calls.saturating_add(1);
+    }
+
+    pub(crate) fn remaining_time(&self) -> Result<Duration, String> {
+        self.ensure_live()?;
+        self.deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| "VDD aggregate review deadline expired".to_string())
+    }
+
+    pub(crate) const fn deadline(&self) -> tokio::time::Instant {
+        self.deadline
+    }
+
+    pub(crate) const fn timeout_seconds(&self) -> u64 {
+        self.timeout_seconds
+    }
+
+    pub(crate) const fn response_limit() -> usize {
+        MAX_VDD_STRUCTURED_RESPONSE_BYTES
+    }
+
+    pub(crate) const fn analyzer_output_limit() -> usize {
+        MAX_VDD_ANALYZER_BYTES_PER_STREAM
+    }
+
+    pub(crate) async fn wait<F: Future>(&self, future: F) -> Result<F::Output, VddReviewWaitError> {
+        tokio::select! {
+            biased;
+            receipt = self.cancellation.cancelled() => {
+                Err(VddReviewWaitError::Cancelled(receipt.reason))
+            }
+            () = tokio::time::sleep_until(self.deadline) => Err(VddReviewWaitError::Deadline),
+            output = future => Ok(output),
+        }
+    }
+
+    pub(crate) fn cancellation(&self) -> crate::runtime::CancellationHandle {
+        self.cancellation.clone()
+    }
+
+    pub(crate) fn provider_receipts(&self) -> Vec<VddProviderCallReceipt> {
+        self.lock_state().provider_receipts.clone()
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // One settlement binds identity, reservation, usage, storage, and terminal outcome atomically.
+    fn settle_model(
+        &self,
+        provider: &str,
+        requested_model: &str,
+        resolved_model: Option<&str>,
+        reserved_input: u64,
+        reserved_output: u64,
+        usage: Option<&TokenUsage>,
+        storage_bytes: usize,
+        completed: bool,
+    ) -> Result<(), String> {
+        let cost_model = resolved_model.unwrap_or(requested_model);
+        let (input_tokens, output_tokens, cost_microusd, usage_known) = usage.map_or_else(
+            || {
+                let usage = TokenUsage {
+                    input_tokens: reserved_input,
+                    output_tokens: reserved_output,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                };
+                crate::session::conservative_budget_cost_microusd(&usage)
+                    .map(|cost| (reserved_input, reserved_output, cost.microusd, false))
+                    .map_err(|error| format!("VDD unknown-usage cost overflow: {error}"))
+            },
+            |usage| {
+                let input = usage
+                    .input_tokens
+                    .checked_add(usage.cache_read_tokens)
+                    .and_then(|value| value.checked_add(usage.cache_write_tokens))
+                    .ok_or_else(|| "VDD provider usage overflow".to_string())?;
+                if input > reserved_input || usage.output_tokens > reserved_output {
+                    return Err(
+                        "VDD provider usage exceeded its pre-reserved call budget".to_string()
+                    );
+                }
+                crate::session::calculate_budget_cost_microusd(cost_model, usage)
+                    .map(|cost| (input, usage.output_tokens, cost.microusd, true))
+                    .map_err(|error| format!("VDD provider cost overflow: {error}"))
+            },
+        )?;
+        let storage_bytes = u64::try_from(storage_bytes)
+            .map_err(|_| "VDD storage accounting overflow".to_string())?;
+        let mut state = self.lock_state();
+        let input_total = state
+            .charged
+            .input_tokens
+            .checked_add(input_tokens)
+            .ok_or_else(|| "VDD input accounting overflow".to_string())?;
+        let output_total = state
+            .charged
+            .output_tokens
+            .checked_add(output_tokens)
+            .ok_or_else(|| "VDD output accounting overflow".to_string())?;
+        let turns = state
+            .charged
+            .turns
+            .checked_add(1)
+            .ok_or_else(|| "VDD turn accounting overflow".to_string())?;
+        let provider_calls = state
+            .charged
+            .provider_calls
+            .checked_add(1)
+            .ok_or_else(|| "VDD provider-call accounting overflow".to_string())?;
+        let cost_total = state
+            .charged
+            .cost_microusd
+            .checked_add(cost_microusd)
+            .ok_or_else(|| "VDD cost accounting overflow".to_string())?;
+        let storage_total = state
+            .storage_bytes
+            .checked_add(storage_bytes)
+            .filter(|total| *total <= self.limits.storage_bytes)
+            .ok_or_else(|| "VDD aggregate storage budget is exhausted".to_string())?;
+        if input_total > self.limits.input_tokens
+            || output_total > self.limits.output_tokens
+            || provider_calls > self.limits.model_calls
+        {
+            return Err("VDD aggregate model budget is exhausted".to_string());
+        }
+        state.active_calls = state.active_calls.saturating_sub(1);
+        state.charged.input_tokens = input_total;
+        state.charged.output_tokens = output_total;
+        state.charged.turns = turns;
+        state.charged.provider_calls = provider_calls;
+        state.charged.cost_microusd = cost_total;
+        state.storage_bytes = storage_total;
+        state.provider_receipts.push(VddProviderCallReceipt {
+            provider: provider.to_string(),
+            requested_model: requested_model.to_string(),
+            resolved_model: resolved_model.map(ToString::to_string),
+            outcome: if completed {
+                VddProviderCallOutcome::Completed
+            } else {
+                VddProviderCallOutcome::FailedOrUnknown
+            },
+            usage_known,
+            input_tokens,
+            output_tokens,
+            response_bytes: storage_bytes,
+            completed_at: Utc::now(),
+        });
+        drop(state);
+        tracing::info!(
+            provider,
+            requested_model,
+            resolved_model,
+            input_tokens,
+            output_tokens,
+            usage_known,
+            "VDD provider call reconciled against aggregate review budget"
+        );
+        Ok(())
+    }
+
+    fn ensure_live(&self) -> Result<(), String> {
+        if let Some(receipt) = self.cancellation.receipt() {
+            return Err(format!("VDD review was cancelled: {:?}", receipt.reason));
+        }
+        self.remaining_deadline_only()
+    }
+
+    fn remaining_deadline_only(&self) -> Result<(), String> {
+        if tokio::time::Instant::now() >= self.deadline {
+            Err("VDD aggregate review deadline expired".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, VddReviewBudgetState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Drop for VddReviewBudget {
+    fn drop(&mut self) {
+        let actual = self.lock_state().charged;
+        let reservation = self
+            .reservation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(reservation) = reservation {
+            if let Err(error) = reservation.reconcile(actual) {
+                tracing::error!("VDD aggregate budget reconciliation failed: {error}");
+                let _receipt =
+                    self.cancellation
+                        .cancel(crate::runtime::CancellationReason::RuntimeFailure {
+                            detail: error.to_string(),
+                        });
+            }
+        }
+    }
+}
+
+pub struct VddModelCall<'a> {
+    budget: &'a VddReviewBudget,
+    provider: String,
+    model: String,
+    reserved_input: u64,
+    reserved_output: u64,
+    settled: bool,
+}
+
+impl VddModelCall<'_> {
+    pub(crate) fn finish(
+        mut self,
+        usage: Option<&TokenUsage>,
+        storage_bytes: usize,
+        resolved_model: Option<&str>,
+    ) -> Result<(), String> {
+        let result = self.budget.settle_model(
+            &self.provider,
+            &self.model,
+            resolved_model,
+            self.reserved_input,
+            self.reserved_output,
+            usage,
+            storage_bytes,
+            true,
+        );
+        let (result, settled) = match result {
+            Ok(()) => (Ok(()), true),
+            Err(error) => match self.budget.settle_model(
+                &self.provider,
+                &self.model,
+                None,
+                self.reserved_input,
+                self.reserved_output,
+                None,
+                0,
+                false,
+            ) {
+                Ok(()) => (Err(error), true),
+                Err(unknown_error) => (
+                    Err(format!(
+                        "{error}; retaining the conservative reservation also failed: {unknown_error}"
+                    )),
+                    false,
+                ),
+            },
+        };
+        self.settled = settled;
+        result
+    }
+}
+
+impl Drop for VddModelCall<'_> {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        if let Err(error) = self.budget.settle_model(
+            &self.provider,
+            &self.model,
+            None,
+            self.reserved_input,
+            self.reserved_output,
+            None,
+            0,
+            false,
+        ) {
+            tracing::error!("VDD failed to retain unknown provider reservation: {error}");
+            let _receipt = self
+                .budget
+                .cancellation
+                .cancel(crate::runtime::CancellationReason::RuntimeFailure { detail: error });
+        }
+    }
+}
+
+fn clamp_vdd_provider_output(request: &mut Value, hard_cap: u64) -> Result<u64, String> {
+    let current = if request.get("generationConfig").is_some() {
+        request
+            .pointer("/generationConfig/maxOutputTokens")
+            .and_then(Value::as_u64)
+    } else if request.get("options").is_some() {
+        request
+            .pointer("/options/num_predict")
+            .and_then(Value::as_u64)
+    } else if request.get("input").is_some() && request.get("messages").is_none() {
+        request.get("max_output_tokens").and_then(Value::as_u64)
+    } else {
+        request
+            .get("max_completion_tokens")
+            .or_else(|| request.get("max_tokens"))
+            .and_then(Value::as_u64)
+    }
+    .unwrap_or_else(|| u64::from(crate::DEFAULT_MAX_TOKENS));
+    let capped = current.min(hard_cap);
+    if capped == 0 {
+        return Err("VDD provider output budget is exhausted".to_string());
+    }
+    if request.get("generationConfig").is_some() {
+        request["generationConfig"]["maxOutputTokens"] = Value::from(capped);
+    } else if request.get("options").is_some() {
+        request["options"]["num_predict"] = Value::from(capped);
+    } else if request.get("input").is_some() && request.get("messages").is_none() {
+        request["max_output_tokens"] = Value::from(capped);
+    } else if request.get("max_completion_tokens").is_some() {
+        request["max_completion_tokens"] = Value::from(capped);
+    } else {
+        request["max_tokens"] = Value::from(capped);
+    }
+    Ok(capped)
+}
 
 /// Runtime authentication material for a provider used by VDD.
 ///
@@ -65,21 +643,16 @@ async fn complete_vdd_via_codex_agent_sdk(
     sdk: &crate::codex_agent_sdk::CodexAgentSdk,
     provider_name: &str,
     request: &Value,
-    timeout: std::time::Duration,
+    budget: &VddReviewBudget,
 ) -> Result<crate::codex_agent_sdk::CodexAgentSdkTurn, String> {
     if !provider_name.eq_ignore_ascii_case("openai") {
         return Err(format!(
             "Codex SDK auth can only be used with OpenAI, got '{provider_name}'"
         ));
     }
-    let turn = tokio::time::timeout(timeout, sdk.complete_turn(request, "high"))
+    let turn = sdk
+        .complete_turn_bounded(request, "high", budget.deadline(), budget.cancellation())
         .await
-        .map_err(|_| {
-            format!(
-                "Codex SDK VDD request timed out after {} seconds",
-                timeout.as_secs()
-            )
-        })?
         .map_err(|error| error.to_string())?;
     if !turn.tool_calls.is_empty() {
         return Err(format!(
@@ -109,21 +682,16 @@ async fn complete_vdd_via_claude_agent_sdk(
     sdk: &crate::claude_agent_sdk::ClaudeAgentSdk,
     provider_name: &str,
     request: &Value,
-    timeout: std::time::Duration,
+    budget: &VddReviewBudget,
 ) -> Result<crate::claude_agent_sdk::ClaudeAgentSdkTurn, String> {
     if !provider_name.eq_ignore_ascii_case("anthropic") {
         return Err(format!(
             "Claude Agent SDK auth can only be used with Anthropic, got '{provider_name}'"
         ));
     }
-    let turn = tokio::time::timeout(timeout, sdk.complete_turn(request, "high"))
+    let turn = sdk
+        .complete_turn_bounded(request, "high", budget.deadline(), budget.cancellation())
         .await
-        .map_err(|_| {
-            format!(
-                "Claude Agent SDK VDD request timed out after {} seconds",
-                timeout.as_secs()
-            )
-        })?
         .map_err(|error| error.to_string())?;
     if !turn.tool_calls.is_empty() {
         return Err(format!(
@@ -163,6 +731,7 @@ pub async fn forward_request(
     endpoint: &str,
     body: &Value,
     mut headers: crate::secrets::SensitiveHeaders,
+    deadline: tokio::time::Instant,
 ) -> Result<reqwest::Response, String> {
     let base_url = provider
         .base_url
@@ -189,7 +758,9 @@ pub async fn forward_request(
         .apply(client.post(&url).json(body))
         .map_err(|error| format!("invalid provider headers: {error}"))?;
 
-    let response = crate::provider_transport::send(req)
+    let header_deadline = deadline
+        .min(tokio::time::Instant::now() + crate::provider_transport::RESPONSE_HEADER_TIMEOUT);
+    let response = crate::provider_transport::send_until(req, header_deadline)
         .await
         .map_err(|error| error.to_string())?;
     if response.status().is_success() {
@@ -197,7 +768,9 @@ pub async fn forward_request(
     }
 
     let status = response.status();
-    let body = read_bounded_failure_body(response).await?;
+    let body = tokio::time::timeout_at(deadline, read_bounded_failure_body(response))
+        .await
+        .map_err(|_| "provider error body exceeded the VDD review deadline".to_string())??;
     Err(format!(
         "provider returned HTTP {status}: {}",
         headers.sanitize_diagnostic(&body)
@@ -365,6 +938,70 @@ fn validate_vdd_chat_terminal(
     Ok(())
 }
 
+fn validate_resolved_model_identity(
+    provider_name: &str,
+    requested_model: &str,
+    endpoint: &str,
+    response: &Value,
+) -> Result<String, String> {
+    let canonical_provider = get_adapter(provider_name)
+        .map_err(|error| error.to_string())?
+        .name()
+        .to_ascii_lowercase();
+    let envelope_model = response
+        .get("model")
+        .or_else(|| response.get("modelVersion"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty());
+    let resolved = if matches!(canonical_provider.as_str(), "google" | "gemini") {
+        // Gemini identifies the selected model in the model-addressed endpoint;
+        // newer responses additionally expose `modelVersion`.
+        if !endpoint.contains(requested_model) {
+            return Err("Google VDD endpoint does not bind the requested model".to_string());
+        }
+        envelope_model.unwrap_or(requested_model)
+    } else {
+        envelope_model.ok_or_else(|| {
+            "VDD provider response is missing its resolved model identity".to_string()
+        })?
+    };
+    if resolved.len() > 512 {
+        return Err("VDD provider returned an oversized model identity".to_string());
+    }
+    tracing::info!(
+        provider = canonical_provider,
+        requested_model,
+        resolved_model = resolved,
+        "VDD transport observed resolved provider model identity"
+    );
+    Ok(resolved.to_string())
+}
+
+fn nonzero_usage(usage: &TokenUsage) -> Option<&TokenUsage> {
+    (usage.input_tokens != 0
+        || usage.output_tokens != 0
+        || usage.cache_read_tokens != 0
+        || usage.cache_write_tokens != 0)
+        .then_some(usage)
+}
+
+fn map_review_wait_error(
+    error: VddReviewWaitError,
+    provider: &str,
+    budget: &VddReviewBudget,
+) -> VddError {
+    match error {
+        VddReviewWaitError::Deadline => VddError::Timeout {
+            provider: provider.to_string(),
+            elapsed_secs: budget.timeout_seconds(),
+        },
+        VddReviewWaitError::Cancelled(reason) => VddError::AdversaryRequestFailed(format!(
+            "VDD review was cancelled before provider completion: {reason:?}"
+        )),
+    }
+}
+
 fn adversary_headers_and_endpoint(
     config: &VddConfig,
     provider_config: &ProviderConfig,
@@ -423,13 +1060,11 @@ fn adversary_headers_and_endpoint(
 
 /// Send a request to the adversary provider. Returns (`response_text`, `token_usage`).
 ///
-/// Per-request timeout — crosslink #496 — wraps both the HTTP send and the
-/// body read in `tokio::time::timeout` so a hung adversary cannot block the
-/// VDD loop indefinitely. The timeout is configurable via
-/// `vdd.adversary.request_timeout_seconds` (default 120 s).
+/// The caller-owned aggregate review deadline covers the send and bounded body
+/// read, so no stage receives a fresh full timeout.
 #[allow(clippy::too_many_lines)] // Keep the bounded VDD request and its budget settlement in one transaction.
 pub async fn send_to_adversary(
-    run: &crate::tools::ToolRunContext,
+    budget: &VddReviewBudget,
     client: &Client,
     config: &VddConfig,
     app_config: &AppConfig,
@@ -446,10 +1081,6 @@ pub async fn send_to_adversary(
             ))
         })?;
 
-    let timeout_secs = config.adversary.request_timeout_seconds;
-    let timeout = std::time::Duration::from_secs(timeout_secs);
-    let deadline = tokio::time::Instant::now() + timeout;
-
     // Crosslink #433: a typo in `config.adversary.provider` now surfaces
     // as `ConfigError` instead of being silently mapped to OpenAIAdapter.
     let adapter = get_adapter(&config.adversary.provider)
@@ -459,39 +1090,36 @@ pub async fn send_to_adversary(
         .map_err(|e| VddError::AdversaryRequestFailed(e.to_string()))?;
 
     if let Some(VddProviderAuth::CodexAgentSdk(sdk)) = runtime_auth {
-        let provider_budget = crate::provider_budget::reserve_provider_call(
-            run,
-            &config.adversary.provider,
-            &request.model,
-            &mut transformed,
-            u64::from(config.adversary.max_tokens),
-        )
-        .map_err(|error| {
-            VddError::AdversaryRequestFailed(format!("Run budget denied provider call: {error}"))
-        })?;
-        let turn = match complete_vdd_via_codex_agent_sdk(
-            sdk,
-            &config.adversary.provider,
-            &transformed,
-            timeout,
-        )
-        .await
-        {
-            Ok(turn) => turn,
-            Err(error) => {
-                provider_budget.finish_unknown().map_err(|budget_error| {
-                    VddError::AdversaryRequestFailed(format!(
-                        "Codex SDK request failed: {error}; budget reconciliation failed: {budget_error}"
-                    ))
-                })?;
-                return Err(VddError::AdversaryRequestFailed(error));
-            }
-        };
-        provider_budget.reconcile(&turn.usage).map_err(|error| {
-            VddError::AdversaryRequestFailed(format!(
-                "Provider budget reconciliation failed: {error}"
-            ))
-        })?;
+        let model_call = budget
+            .begin_model_call(
+                &config.adversary.provider,
+                &request.model,
+                &mut transformed,
+                u64::from(config.adversary.max_tokens),
+            )
+            .map_err(|error| {
+                VddError::AdversaryRequestFailed(format!(
+                    "Run budget denied provider call: {error}"
+                ))
+            })?;
+        let turn =
+            complete_vdd_via_codex_agent_sdk(sdk, &config.adversary.provider, &transformed, budget)
+                .await
+                .map_err(VddError::AdversaryRequestFailed)?;
+        if turn.content.len() > VddReviewBudget::response_limit() {
+            return Err(VddError::AdversaryRequestFailed(format!(
+                "Codex SDK VDD output exceeded the {}-byte review limit",
+                VddReviewBudget::response_limit()
+            )));
+        }
+        let usage = nonzero_usage(&turn.usage);
+        model_call
+            .finish(usage, turn.content.len(), Some(&request.model))
+            .map_err(|error| {
+                VddError::AdversaryRequestFailed(format!(
+                    "Aggregate VDD budget reconciliation failed: {error}"
+                ))
+            })?;
         info!(
             response_length = turn.content.len(),
             "VDD: Received Codex SDK adversary response"
@@ -500,29 +1128,40 @@ pub async fn send_to_adversary(
     }
 
     if let Some(VddProviderAuth::ClaudeAgentSdk(sdk)) = runtime_auth {
-        let provider_budget = crate::provider_budget::reserve_provider_call(
-            run,
-            &config.adversary.provider,
-            &request.model,
-            &mut transformed,
-            u64::from(config.adversary.max_tokens),
-        )
-        .map_err(|error| {
-            VddError::AdversaryRequestFailed(format!("Run budget denied provider call: {error}"))
-        })?;
+        let model_call = budget
+            .begin_model_call(
+                &config.adversary.provider,
+                &request.model,
+                &mut transformed,
+                u64::from(config.adversary.max_tokens),
+            )
+            .map_err(|error| {
+                VddError::AdversaryRequestFailed(format!(
+                    "Run budget denied provider call: {error}"
+                ))
+            })?;
         let turn = complete_vdd_via_claude_agent_sdk(
             sdk,
             &config.adversary.provider,
             &transformed,
-            timeout,
+            budget,
         )
         .await
         .map_err(VddError::AdversaryRequestFailed)?;
-        provider_budget.reconcile(&turn.usage).map_err(|error| {
-            VddError::AdversaryRequestFailed(format!(
-                "Provider budget reconciliation failed: {error}"
-            ))
-        })?;
+        if turn.content.len() > VddReviewBudget::response_limit() {
+            return Err(VddError::AdversaryRequestFailed(format!(
+                "Claude Agent SDK VDD output exceeded the {}-byte review limit",
+                VddReviewBudget::response_limit()
+            )));
+        }
+        let usage = nonzero_usage(&turn.usage);
+        model_call
+            .finish(usage, turn.content.len(), Some(&request.model))
+            .map_err(|error| {
+                VddError::AdversaryRequestFailed(format!(
+                    "Aggregate VDD budget reconciliation failed: {error}"
+                ))
+            })?;
         info!(
             response_length = turn.content.len(),
             "VDD: Received Agent SDK adversary response"
@@ -540,50 +1179,41 @@ pub async fn send_to_adversary(
     )?;
 
     let provider_name = config.adversary.provider.clone();
-    let provider_budget = crate::provider_budget::reserve_provider_call(
-        run,
-        &provider_name,
-        &request.model,
-        &mut transformed,
-        u64::from(config.adversary.max_tokens),
-    )
-    .map_err(|error| {
-        VddError::AdversaryRequestFailed(format!("Run budget denied provider call: {error}"))
-    })?;
+    let model_call = budget
+        .begin_model_call(
+            &provider_name,
+            &request.model,
+            &mut transformed,
+            u64::from(config.adversary.max_tokens),
+        )
+        .map_err(|error| {
+            VddError::AdversaryRequestFailed(format!("Run budget denied provider call: {error}"))
+        })?;
 
-    let response = tokio::time::timeout_at(
-        deadline,
-        forward_request(
+    let response = budget
+        .wait(forward_request(
             client,
             &config.adversary.provider,
             provider_config,
             &endpoint,
             &transformed,
             headers,
-        ),
-    )
-    .await
-    .map_err(|_| VddError::Timeout {
-        provider: provider_name.clone(),
-        elapsed_secs: timeout_secs,
-    })?
-    .map_err(VddError::AdversaryRequestFailed)?;
+            budget.deadline(),
+        ))
+        .await
+        .map_err(|error| map_review_wait_error(error, &provider_name, budget))?
+        .map_err(VddError::AdversaryRequestFailed)?;
 
     // The body consumes the remainder of the same deadline rather than
     // receiving a fresh timeout window after response headers arrive.
-    let response_json: Value = tokio::time::timeout_at(
-        deadline,
-        crate::provider_transport::read_json_capped(
+    let response_json: Value = budget
+        .wait(crate::provider_transport::read_json_capped(
             response,
-            crate::provider_transport::MAX_JSON_RESPONSE_BYTES,
-        ),
-    )
-    .await
-    .map_err(|_| VddError::Timeout {
-        provider: provider_name.clone(),
-        elapsed_secs: timeout_secs,
-    })?
-    .map_err(|e| VddError::AdversaryRequestFailed(e.to_string()))?;
+            VddReviewBudget::response_limit(),
+        ))
+        .await
+        .map_err(|error| map_review_wait_error(error, &provider_name, budget))?
+        .map_err(|e| VddError::AdversaryRequestFailed(e.to_string()))?;
     validate_vdd_chat_terminal(adapter, &response_json)
         .map_err(VddError::AdversaryRequestFailed)?;
 
@@ -600,12 +1230,22 @@ pub async fn send_to_adversary(
             "Adversary completed without assistant content".to_string(),
         ));
     }
-    let tokens = adapter
-        .extract_token_usage(&response_json)
-        .unwrap_or_default();
-    provider_budget.reconcile(&tokens).map_err(|error| {
-        VddError::AdversaryRequestFailed(format!("Provider budget reconciliation failed: {error}"))
-    })?;
+    let resolved_model =
+        validate_resolved_model_identity(&provider_name, &request.model, &endpoint, &response_json)
+            .map_err(VddError::AdversaryRequestFailed)?;
+    let reported_tokens = adapter.extract_token_usage(&response_json);
+    let tokens = reported_tokens.clone().unwrap_or_default();
+    model_call
+        .finish(
+            reported_tokens.as_ref().and_then(nonzero_usage),
+            response_json.to_string().len(),
+            Some(&resolved_model),
+        )
+        .map_err(|error| {
+            VddError::AdversaryRequestFailed(format!(
+                "Aggregate VDD budget reconciliation failed: {error}"
+            ))
+        })?;
 
     // Always log at INFO level for debugging, truncated
     info!(
@@ -627,17 +1267,14 @@ pub async fn send_to_adversary(
 
 /// Send a revision request back to the builder provider.
 ///
-/// Symmetric per-request timeout for the builder (crosslink #496). The
-/// builder revision call sits inside the same blocking-loop iteration as
-/// the adversary call, so a hung builder would block the loop just as
-/// badly. The timeout reuses the adversary's configured value for
-/// simplicity — they're the same upper bound on how long any single
-/// HTTP round-trip in the loop is allowed to take.
+/// The builder revision consumes the same aggregate review deadline as the
+/// adversary, verifier, and analyzer stages. It cannot start a fresh timeout
+/// window after earlier stages have spent the review's wall-clock allowance.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Existing transport boundary plus the shared run authority.
 pub async fn send_to_builder(
-    run: &crate::tools::ToolRunContext,
+    budget: &VddReviewBudget,
     client: &Client,
-    config: &VddConfig,
+    _config: &VddConfig,
     app_config: &AppConfig,
     request: &ChatCompletionRequest,
     provider_name: &str,
@@ -653,66 +1290,81 @@ pub async fn send_to_builder(
     // Crosslink #433: explicit error for an unknown builder provider
     // name, no silent OpenAIAdapter fallback.
     let adapter = get_adapter(provider_name).map_err(|e| VddError::ConfigError(e.to_string()))?;
-    let timeout_secs = config.adversary.request_timeout_seconds;
-    let timeout = std::time::Duration::from_secs(timeout_secs);
-    let deadline = tokio::time::Instant::now() + timeout;
-
     let mut transformed = adapter
         .transform_request(request)
         .map_err(|e| VddError::BuilderRevisionFailed(e.to_string()))?;
 
     if let Some(VddProviderAuth::CodexAgentSdk(sdk)) = runtime_auth {
-        let provider_budget = crate::provider_budget::reserve_provider_call(
-            run,
-            provider_name,
-            &request.model,
-            &mut transformed,
-            u64::from(request.max_tokens.unwrap_or(crate::DEFAULT_MAX_TOKENS)),
-        )
-        .map_err(|error| {
-            VddError::BuilderRevisionFailed(format!("Run budget denied provider call: {error}"))
-        })?;
-        let turn = match complete_vdd_via_codex_agent_sdk(sdk, provider_name, &transformed, timeout)
+        let model_call = budget
+            .begin_model_call(
+                provider_name,
+                &request.model,
+                &mut transformed,
+                u64::from(request.max_tokens.unwrap_or(crate::DEFAULT_MAX_TOKENS)),
+            )
+            .map_err(|error| {
+                VddError::BuilderRevisionFailed(format!("Run budget denied provider call: {error}"))
+            })?;
+        let turn = match complete_vdd_via_codex_agent_sdk(sdk, provider_name, &transformed, budget)
             .await
         {
             Ok(turn) => turn,
             Err(error) => {
-                provider_budget.finish_unknown().map_err(|budget_error| {
-                    VddError::BuilderRevisionFailed(format!(
-                        "Codex SDK request failed: {error}; budget reconciliation failed: {budget_error}"
-                    ))
-                })?;
                 return Err(VddError::BuilderRevisionFailed(error));
             }
         };
-        provider_budget.reconcile(&turn.usage).map_err(|error| {
-            VddError::BuilderRevisionFailed(format!(
-                "Provider budget reconciliation failed: {error}"
-            ))
-        })?;
+        if turn.content.len() > VddReviewBudget::response_limit() {
+            return Err(VddError::BuilderRevisionFailed(format!(
+                "Codex SDK VDD output exceeded the {}-byte review limit",
+                VddReviewBudget::response_limit()
+            )));
+        }
+        model_call
+            .finish(
+                nonzero_usage(&turn.usage),
+                turn.content.len(),
+                Some(&request.model),
+            )
+            .map_err(|error| {
+                VddError::BuilderRevisionFailed(format!(
+                    "Aggregate VDD budget reconciliation failed: {error}"
+                ))
+            })?;
         let response = codex_agent_sdk_response_json(&turn);
         return Ok((turn.content, response, turn.usage));
     }
 
     if let Some(VddProviderAuth::ClaudeAgentSdk(sdk)) = runtime_auth {
-        let provider_budget = crate::provider_budget::reserve_provider_call(
-            run,
-            provider_name,
-            &request.model,
-            &mut transformed,
-            u64::from(request.max_tokens.unwrap_or(crate::DEFAULT_MAX_TOKENS)),
-        )
-        .map_err(|error| {
-            VddError::BuilderRevisionFailed(format!("Run budget denied provider call: {error}"))
-        })?;
-        let turn = complete_vdd_via_claude_agent_sdk(sdk, provider_name, &transformed, timeout)
+        let model_call = budget
+            .begin_model_call(
+                provider_name,
+                &request.model,
+                &mut transformed,
+                u64::from(request.max_tokens.unwrap_or(crate::DEFAULT_MAX_TOKENS)),
+            )
+            .map_err(|error| {
+                VddError::BuilderRevisionFailed(format!("Run budget denied provider call: {error}"))
+            })?;
+        let turn = complete_vdd_via_claude_agent_sdk(sdk, provider_name, &transformed, budget)
             .await
             .map_err(VddError::BuilderRevisionFailed)?;
-        provider_budget.reconcile(&turn.usage).map_err(|error| {
-            VddError::BuilderRevisionFailed(format!(
-                "Provider budget reconciliation failed: {error}"
-            ))
-        })?;
+        if turn.content.len() > VddReviewBudget::response_limit() {
+            return Err(VddError::BuilderRevisionFailed(format!(
+                "Claude Agent SDK VDD output exceeded the {}-byte review limit",
+                VddReviewBudget::response_limit()
+            )));
+        }
+        model_call
+            .finish(
+                nonzero_usage(&turn.usage),
+                turn.content.len(),
+                Some(&request.model),
+            )
+            .map_err(|error| {
+                VddError::BuilderRevisionFailed(format!(
+                    "Aggregate VDD budget reconciliation failed: {error}"
+                ))
+            })?;
         let response = claude_agent_sdk_response_json(&turn);
         return Ok((turn.content, response, turn.usage));
     }
@@ -751,48 +1403,39 @@ pub async fn send_to_builder(
     };
 
     let pname = provider_name.to_string();
-    let provider_budget = crate::provider_budget::reserve_provider_call(
-        run,
-        provider_name,
-        &request.model,
-        &mut transformed,
-        u64::from(request.max_tokens.unwrap_or(crate::DEFAULT_MAX_TOKENS)),
-    )
-    .map_err(|error| {
-        VddError::BuilderRevisionFailed(format!("Run budget denied provider call: {error}"))
-    })?;
+    let model_call = budget
+        .begin_model_call(
+            provider_name,
+            &request.model,
+            &mut transformed,
+            u64::from(request.max_tokens.unwrap_or(crate::DEFAULT_MAX_TOKENS)),
+        )
+        .map_err(|error| {
+            VddError::BuilderRevisionFailed(format!("Run budget denied provider call: {error}"))
+        })?;
 
-    let response = tokio::time::timeout_at(
-        deadline,
-        forward_request(
+    let response = budget
+        .wait(forward_request(
             client,
             provider_name,
             provider_config,
             &endpoint,
             &transformed,
             headers,
-        ),
-    )
-    .await
-    .map_err(|_| VddError::Timeout {
-        provider: pname.clone(),
-        elapsed_secs: timeout_secs,
-    })?
-    .map_err(VddError::BuilderRevisionFailed)?;
+            budget.deadline(),
+        ))
+        .await
+        .map_err(|error| map_review_wait_error(error, &pname, budget))?
+        .map_err(VddError::BuilderRevisionFailed)?;
 
-    let response_json: Value = tokio::time::timeout_at(
-        deadline,
-        crate::provider_transport::read_json_capped(
+    let response_json: Value = budget
+        .wait(crate::provider_transport::read_json_capped(
             response,
-            crate::provider_transport::MAX_JSON_RESPONSE_BYTES,
-        ),
-    )
-    .await
-    .map_err(|_| VddError::Timeout {
-        provider: pname,
-        elapsed_secs: timeout_secs,
-    })?
-    .map_err(|e| VddError::BuilderRevisionFailed(e.to_string()))?;
+            VddReviewBudget::response_limit(),
+        ))
+        .await
+        .map_err(|error| map_review_wait_error(error, &pname, budget))?
+        .map_err(|e| VddError::BuilderRevisionFailed(e.to_string()))?;
     validate_vdd_chat_terminal(adapter, &response_json).map_err(VddError::BuilderRevisionFailed)?;
 
     // Crosslink #479: trait dispatch instead of hardcoded shape matching.
@@ -804,12 +1447,22 @@ pub async fn send_to_builder(
             "Builder completed without assistant content".to_string(),
         ));
     }
-    let tokens = adapter
-        .extract_token_usage(&response_json)
-        .unwrap_or_default();
-    provider_budget.reconcile(&tokens).map_err(|error| {
-        VddError::BuilderRevisionFailed(format!("Provider budget reconciliation failed: {error}"))
-    })?;
+    let resolved_model =
+        validate_resolved_model_identity(provider_name, &request.model, &endpoint, &response_json)
+            .map_err(VddError::BuilderRevisionFailed)?;
+    let reported_tokens = adapter.extract_token_usage(&response_json);
+    let tokens = reported_tokens.clone().unwrap_or_default();
+    model_call
+        .finish(
+            reported_tokens.as_ref().and_then(nonzero_usage),
+            response_json.to_string().len(),
+            Some(&resolved_model),
+        )
+        .map_err(|error| {
+            VddError::BuilderRevisionFailed(format!(
+                "Aggregate VDD budget reconciliation failed: {error}"
+            ))
+        })?;
 
     Ok((text, response_json, tokens))
 }
@@ -819,9 +1472,9 @@ pub async fn send_to_builder(
 /// simpler interface (no revision response needed).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Existing transport boundary plus the shared run authority.
 pub async fn send_to_builder_for_verification(
-    run: &crate::tools::ToolRunContext,
+    budget: &VddReviewBudget,
     client: &Client,
-    config: &VddConfig,
+    _config: &VddConfig,
     app_config: &AppConfig,
     request: &ChatCompletionRequest,
     provider_name: &str,
@@ -836,74 +1489,89 @@ pub async fn send_to_builder_for_verification(
     })?;
 
     // Crosslink #433: explicit error for an unknown verifier provider name.
-    let timeout_secs = config.adversary.request_timeout_seconds;
-    let timeout = std::time::Duration::from_secs(timeout_secs);
-    let deadline = tokio::time::Instant::now() + timeout;
-
     let adapter = get_adapter(provider_name).map_err(|e| VddError::ConfigError(e.to_string()))?;
     let mut transformed = adapter
         .transform_request(request)
         .map_err(|e| VddError::AdversaryRequestFailed(format!("verifier transform: {e}")))?;
 
     if let Some(VddProviderAuth::CodexAgentSdk(sdk)) = runtime_auth {
-        let provider_budget = crate::provider_budget::reserve_provider_call(
-            run,
-            provider_name,
-            &request.model,
-            &mut transformed,
-            u64::from(request.max_tokens.unwrap_or(crate::DEFAULT_MAX_TOKENS)),
-        )
-        .map_err(|error| {
-            VddError::AdversaryRequestFailed(format!(
-                "Run budget denied verifier provider call: {error}"
-            ))
-        })?;
-        let turn = match complete_vdd_via_codex_agent_sdk(sdk, provider_name, &transformed, timeout)
+        let model_call = budget
+            .begin_model_call(
+                provider_name,
+                &request.model,
+                &mut transformed,
+                u64::from(request.max_tokens.unwrap_or(crate::DEFAULT_MAX_TOKENS)),
+            )
+            .map_err(|error| {
+                VddError::AdversaryRequestFailed(format!(
+                    "Run budget denied verifier provider call: {error}"
+                ))
+            })?;
+        let turn = match complete_vdd_via_codex_agent_sdk(sdk, provider_name, &transformed, budget)
             .await
         {
             Ok(turn) => turn,
             Err(error) => {
-                provider_budget.finish_unknown().map_err(|budget_error| {
-                    VddError::AdversaryRequestFailed(format!(
-                        "Codex SDK verifier request failed: {error}; budget reconciliation failed: {budget_error}"
-                    ))
-                })?;
                 return Err(VddError::AdversaryRequestFailed(format!(
                     "verifier request: {error}"
                 )));
             }
         };
-        provider_budget.reconcile(&turn.usage).map_err(|error| {
-            VddError::AdversaryRequestFailed(format!(
-                "Verifier budget reconciliation failed: {error}"
-            ))
-        })?;
+        if turn.content.len() > VddReviewBudget::response_limit() {
+            return Err(VddError::AdversaryRequestFailed(format!(
+                "Codex SDK verifier output exceeded the {}-byte review limit",
+                VddReviewBudget::response_limit()
+            )));
+        }
+        model_call
+            .finish(
+                nonzero_usage(&turn.usage),
+                turn.content.len(),
+                Some(&request.model),
+            )
+            .map_err(|error| {
+                VddError::AdversaryRequestFailed(format!(
+                    "Aggregate verifier budget reconciliation failed: {error}"
+                ))
+            })?;
         return Ok((turn.content, turn.usage));
     }
 
     if let Some(VddProviderAuth::ClaudeAgentSdk(sdk)) = runtime_auth {
-        let provider_budget = crate::provider_budget::reserve_provider_call(
-            run,
-            provider_name,
-            &request.model,
-            &mut transformed,
-            u64::from(request.max_tokens.unwrap_or(crate::DEFAULT_MAX_TOKENS)),
-        )
-        .map_err(|error| {
-            VddError::AdversaryRequestFailed(format!(
-                "Run budget denied verifier provider call: {error}"
-            ))
-        })?;
-        let turn = complete_vdd_via_claude_agent_sdk(sdk, provider_name, &transformed, timeout)
+        let model_call = budget
+            .begin_model_call(
+                provider_name,
+                &request.model,
+                &mut transformed,
+                u64::from(request.max_tokens.unwrap_or(crate::DEFAULT_MAX_TOKENS)),
+            )
+            .map_err(|error| {
+                VddError::AdversaryRequestFailed(format!(
+                    "Run budget denied verifier provider call: {error}"
+                ))
+            })?;
+        let turn = complete_vdd_via_claude_agent_sdk(sdk, provider_name, &transformed, budget)
             .await
             .map_err(|error| {
                 VddError::AdversaryRequestFailed(format!("verifier request: {error}"))
             })?;
-        provider_budget.reconcile(&turn.usage).map_err(|error| {
-            VddError::AdversaryRequestFailed(format!(
-                "Verifier budget reconciliation failed: {error}"
-            ))
-        })?;
+        if turn.content.len() > VddReviewBudget::response_limit() {
+            return Err(VddError::AdversaryRequestFailed(format!(
+                "Claude Agent SDK verifier output exceeded the {}-byte review limit",
+                VddReviewBudget::response_limit()
+            )));
+        }
+        model_call
+            .finish(
+                nonzero_usage(&turn.usage),
+                turn.content.len(),
+                Some(&request.model),
+            )
+            .map_err(|error| {
+                VddError::AdversaryRequestFailed(format!(
+                    "Aggregate verifier budget reconciliation failed: {error}"
+                ))
+            })?;
         return Ok((turn.content, turn.usage));
     }
 
@@ -941,50 +1609,41 @@ pub async fn send_to_builder_for_verification(
     };
 
     let pname = provider_name.to_string();
-    let provider_budget = crate::provider_budget::reserve_provider_call(
-        run,
-        provider_name,
-        &request.model,
-        &mut transformed,
-        u64::from(request.max_tokens.unwrap_or(crate::DEFAULT_MAX_TOKENS)),
-    )
-    .map_err(|error| {
-        VddError::AdversaryRequestFailed(format!(
-            "Run budget denied verifier provider call: {error}"
-        ))
-    })?;
+    let model_call = budget
+        .begin_model_call(
+            provider_name,
+            &request.model,
+            &mut transformed,
+            u64::from(request.max_tokens.unwrap_or(crate::DEFAULT_MAX_TOKENS)),
+        )
+        .map_err(|error| {
+            VddError::AdversaryRequestFailed(format!(
+                "Run budget denied verifier provider call: {error}"
+            ))
+        })?;
 
-    let response = tokio::time::timeout_at(
-        deadline,
-        forward_request(
+    let response = budget
+        .wait(forward_request(
             client,
             provider_name,
             provider_config,
             &endpoint,
             &transformed,
             headers,
-        ),
-    )
-    .await
-    .map_err(|_| VddError::Timeout {
-        provider: pname.clone(),
-        elapsed_secs: timeout_secs,
-    })?
-    .map_err(|e| VddError::AdversaryRequestFailed(format!("verifier request: {e}")))?;
+            budget.deadline(),
+        ))
+        .await
+        .map_err(|error| map_review_wait_error(error, &pname, budget))?
+        .map_err(|e| VddError::AdversaryRequestFailed(format!("verifier request: {e}")))?;
 
-    let response_json: Value = tokio::time::timeout_at(
-        deadline,
-        crate::provider_transport::read_json_capped(
+    let response_json: Value = budget
+        .wait(crate::provider_transport::read_json_capped(
             response,
-            crate::provider_transport::MAX_JSON_RESPONSE_BYTES,
-        ),
-    )
-    .await
-    .map_err(|_| VddError::Timeout {
-        provider: pname,
-        elapsed_secs: timeout_secs,
-    })?
-    .map_err(|e| VddError::AdversaryRequestFailed(format!("verifier response: {e}")))?;
+            VddReviewBudget::response_limit(),
+        ))
+        .await
+        .map_err(|error| map_review_wait_error(error, &pname, budget))?
+        .map_err(|e| VddError::AdversaryRequestFailed(format!("verifier response: {e}")))?;
     validate_vdd_chat_terminal(adapter, &response_json).map_err(|error| {
         VddError::AdversaryRequestFailed(format!("verifier terminal validation: {error}"))
     })?;
@@ -998,12 +1657,24 @@ pub async fn send_to_builder_for_verification(
             "Verifier completed without assistant content".to_string(),
         ));
     }
-    let tokens = adapter
-        .extract_token_usage(&response_json)
-        .unwrap_or_default();
-    provider_budget.reconcile(&tokens).map_err(|error| {
-        VddError::AdversaryRequestFailed(format!("Verifier budget reconciliation failed: {error}"))
-    })?;
+    let resolved_model =
+        validate_resolved_model_identity(provider_name, &request.model, &endpoint, &response_json)
+            .map_err(|error| {
+                VddError::AdversaryRequestFailed(format!("verifier model identity: {error}"))
+            })?;
+    let reported_tokens = adapter.extract_token_usage(&response_json);
+    let tokens = reported_tokens.clone().unwrap_or_default();
+    model_call
+        .finish(
+            reported_tokens.as_ref().and_then(nonzero_usage),
+            response_json.to_string().len(),
+            Some(&resolved_model),
+        )
+        .map_err(|error| {
+            VddError::AdversaryRequestFailed(format!(
+                "Aggregate verifier budget reconciliation failed: {error}"
+            ))
+        })?;
 
     Ok((text, tokens))
 }
@@ -1075,6 +1746,82 @@ mod tests {
         assert_eq!(usage.output_tokens, 10);
         assert_eq!(usage.cache_read_tokens, 30);
         assert_eq!(usage.cache_write_tokens, 20);
+    }
+
+    #[test]
+    fn resolved_model_identity_is_required_and_preserved() {
+        let missing = validate_resolved_model_identity(
+            "openai",
+            "requested-model",
+            "/v1/chat/completions",
+            &serde_json::json!({}),
+        );
+        assert!(missing.is_err());
+
+        let resolved = validate_resolved_model_identity(
+            "openai",
+            "requested-model",
+            "/v1/chat/completions",
+            &serde_json::json!({"model": "resolved-model"}),
+        )
+        .expect("provider model identity");
+        assert_eq!(resolved, "resolved-model");
+    }
+
+    #[test]
+    fn review_budget_does_not_multiply_model_calls_between_stages() {
+        let config = cfg_with_timeout(30);
+        let budget =
+            VddReviewBudget::admit(crate::tools::security::test_run_context(), &config, false)
+                .expect("aggregate review budget");
+
+        for _ in 0..2 {
+            let mut request = serde_json::json!({"model": "gpt-4", "max_tokens": 256});
+            budget
+                .begin_model_call("openai", "gpt-4", &mut request, 256)
+                .expect("pre-reserved stage")
+                .finish(None, 0, Some("gpt-4"))
+                .expect("unknown usage retains conservative allowance");
+        }
+        let mut extra = serde_json::json!({"model": "gpt-4", "max_tokens": 256});
+        assert!(
+            budget
+                .begin_model_call("openai", "gpt-4", &mut extra, 256)
+                .is_err(),
+            "a third stage must not receive a fresh review allowance"
+        );
+        let receipts = budget.provider_receipts();
+        assert_eq!(receipts.len(), 2);
+        assert!(receipts.iter().all(|receipt| {
+            receipt.requested_model == "gpt-4"
+                && receipt.resolved_model.as_deref() == Some("gpt-4")
+                && receipt.outcome == VddProviderCallOutcome::Completed
+                && !receipt.usage_known
+        }));
+    }
+
+    #[test]
+    fn blocking_review_has_one_aggregate_input_cap_and_exact_call_ceiling() {
+        let config = cfg_with_timeout(30);
+        let budget =
+            VddReviewBudget::admit(crate::tools::security::test_run_context(), &config, true)
+                .expect("aggregate blocking review budget");
+
+        assert_eq!(budget.limits.model_calls, 14);
+        assert_eq!(budget.limits.input_tokens, MAX_VDD_REVIEW_INPUT_TOKENS);
+
+        for _ in 0..budget.limits.model_calls {
+            let mut request = serde_json::json!({"model": "gpt-4", "max_tokens": 256});
+            budget
+                .begin_model_call("openai", "gpt-4", &mut request, 256)
+                .expect("small request within aggregate call ceiling")
+                .finish(None, 0, Some("gpt-4"))
+                .expect("conservative settlement");
+        }
+        let mut extra = serde_json::json!({"model": "gpt-4", "max_tokens": 256});
+        assert!(budget
+            .begin_model_call("openai", "gpt-4", &mut extra, 256)
+            .is_err());
     }
 
     fn app_cfg_with_provider(provider: &str, base_url: &str) -> AppConfig {
@@ -1158,6 +1905,7 @@ mod tests {
             "/v1/chat/completions",
             &serde_json::json!({}),
             headers,
+            tokio::time::Instant::now() + Duration::from_secs(30),
         )
         .await
         .expect_err("non-success provider response must fail");
@@ -1168,6 +1916,57 @@ mod tests {
         );
         assert!(error.contains(crate::secrets::REDACTED_SECRET), "{error}");
         assert!(error.len() <= crate::secrets::MAX_DIAGNOSTIC_BYTES + 64);
+    }
+
+    #[tokio::test]
+    async fn adversary_transport_rejects_rate_limited_malformed_and_oversized_responses() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let cases = [
+            (
+                "rate-limited",
+                ResponseTemplate::new(429).set_body_string("rate limited"),
+            ),
+            (
+                "malformed",
+                ResponseTemplate::new(200).set_body_string("not-json"),
+            ),
+            (
+                "oversized",
+                ResponseTemplate::new(200).set_body_bytes(vec![
+                    b'x';
+                    MAX_VDD_STRUCTURED_RESPONSE_BYTES
+                        + 1
+                ]),
+            ),
+        ];
+
+        for (case, response) in cases {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(response)
+                .mount(&server)
+                .await;
+            let mut config = cfg_with_timeout(5);
+            config.adversary.provider = "local".to_string();
+            let app_config = app_cfg_with_provider("local", &server.uri());
+            let directory = tempfile::tempdir().expect("run directory");
+            let run = crate::tools::security::test_run_context_for(directory.path());
+            let budget = VddReviewBudget::admit(&run, &config, false).expect("review budget");
+            let error = send_to_adversary(
+                &budget,
+                &Client::new(),
+                &config,
+                &app_config,
+                &dummy_request(),
+                None,
+            )
+            .await
+            .expect_err(case);
+            assert!(matches!(error, VddError::AdversaryRequestFailed(_)));
+        }
     }
 
     // ── Crosslink #496: VDD HTTP timeout ──────────────────────────────────
@@ -1218,18 +2017,13 @@ mod tests {
             .build()
             .unwrap();
         let req = dummy_request();
+        let budget =
+            VddReviewBudget::admit(crate::tools::security::test_run_context(), &cfg, false)
+                .expect("review budget");
 
         // Run the call and advance virtual time past the 1s budget.
         let handle = tokio::spawn(async move {
-            send_to_adversary(
-                crate::tools::security::test_run_context(),
-                &client,
-                &cfg,
-                &app_cfg,
-                &req,
-                None,
-            )
-            .await
+            send_to_adversary(&budget, &client, &cfg, &app_cfg, &req, None).await
         });
         // Drive paused-time forward past the configured timeout.
         tokio::time::sleep(Duration::from_secs(2)).await;

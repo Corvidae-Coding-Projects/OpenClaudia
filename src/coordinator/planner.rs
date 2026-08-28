@@ -35,6 +35,7 @@ use crate::task_graph::{
     CanonicalTaskStatus, FieldUpdate, TaskActor, TaskGraph, TaskGraphError, TaskId, TaskSource,
     UpdateTask,
 };
+use crate::vdd::{VddFinalizationOutcome, VddWorkerFinalizationRecord};
 
 pub const PLANNER_CHECKPOINT_SCHEMA_VERSION: u16 = 1;
 pub const MAX_PLANNER_AMENDMENTS: usize = 256;
@@ -432,6 +433,10 @@ pub struct PlannerState {
     /// Immutable terminal handoff bound to the canonical planner attempt.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub worker_results: BTreeMap<PlannerAttemptId, WorkerSliceResult>,
+    /// Host finalization bound to the exact proposed worker result. Absence for
+    /// a partially delivered result means success is still withheld.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub worker_finalizations: BTreeMap<PlannerAttemptId, VddWorkerFinalizationRecord>,
 }
 
 impl PlannerState {
@@ -458,6 +463,7 @@ impl PlannerState {
             children: BTreeMap::new(),
             worker_assignments: BTreeMap::new(),
             worker_results: BTreeMap::new(),
+            worker_finalizations: BTreeMap::new(),
         }
     }
 }
@@ -990,6 +996,18 @@ pub struct PlannerRuntime {
     budget_observation: BudgetSnapshot,
 }
 
+struct PendingWorkerDecision {
+    attempt_id: PlannerAttemptId,
+    run_id: RunId,
+    task_id: TaskId,
+    task_revision: u64,
+    agent_id: String,
+    accepted: bool,
+    outcome: VddFinalizationOutcome,
+    detail: String,
+    record: VddWorkerFinalizationRecord,
+}
+
 impl PlannerRuntime {
     /// Open any existing session checkpoint without acquiring its lease yet.
     /// A fresh lease is acquired atomically by [`Self::prepare_turn`].
@@ -1086,6 +1104,219 @@ impl PlannerRuntime {
             return Err(PlannerCheckpointError::MissingCheckpoint);
         }
         self.checkpoint_state(supervisor, task_graph, None, now)
+    }
+
+    /// Persist successful worker handoffs as proposed, run required VDD, and
+    /// durably attach the exact receipt before promoting any delegation task.
+    ///
+    /// A crash or error before the receipt checkpoint leaves the task in
+    /// progress and the attempt partially delivered. The task-store promotion
+    /// happens only after that receipt is durable; the next normal checkpoint
+    /// projects the already-authorized terminal state into planner state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a checkpoint error when worker state, verification evidence,
+    /// durable storage, budget state, or task promotion cannot be completed.
+    #[allow(clippy::too_many_lines)] // Ordered receipt durability and promotion are one auditable transaction boundary.
+    pub async fn finalize_pending_workers(
+        &mut self,
+        supervisor: &std::sync::Arc<crate::tools::ToolRunContext>,
+        task_graph: &TaskGraph,
+        app_config: &crate::config::AppConfig,
+        engine: Option<&crate::vdd::VddEngine>,
+        now: DateTime<Utc>,
+    ) -> Result<(), PlannerCheckpointError> {
+        if !app_config.vdd.enabled || app_config.vdd.mode != crate::config::VddMode::Blocking {
+            return Ok(());
+        }
+        let snapshots = crate::subagent::BACKGROUND_AGENTS
+            .child_snapshots_for_run(supervisor)
+            .map_err(|_| PlannerCheckpointError::SubagentStateUnavailable)?;
+        let pending = snapshots
+            .into_iter()
+            .filter(|snapshot| {
+                snapshot.finished
+                    && !snapshot.failed
+                    && snapshot.promotion == crate::subagent::SemanticWorkerPromotion::Pending
+            })
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        // The result/digest/generation checkpoint precedes verifier dispatch,
+        // preventing a receipt from racing an unrecorded worker candidate.
+        self.checkpoint_state(supervisor, task_graph, None, now)?;
+        let proposed_state = self
+            .stored
+            .as_ref()
+            .ok_or(PlannerCheckpointError::MissingCheckpoint)?
+            .checkpoint
+            .state()
+            .clone();
+        let policy = crate::vdd::VddFinalizationPolicy::required();
+        let mut decisions = Vec::with_capacity(pending.len());
+        for snapshot in pending {
+            let verification = snapshot
+                .verification
+                .ok_or(PlannerCheckpointError::WorkerFinalizationUnavailable)?;
+            let candidate = snapshot
+                .candidate
+                .ok_or(PlannerCheckpointError::WorkerFinalizationUnavailable)?
+                .into_bytes();
+            let child = proposed_state
+                .children
+                .get(&snapshot.descriptor.run_id)
+                .ok_or(PlannerCheckpointError::SubagentStateUnavailable)?;
+            let result = proposed_state
+                .worker_results
+                .get(&child.attempt_id)
+                .ok_or(PlannerCheckpointError::SubagentStateUnavailable)?
+                .clone();
+            let acceptance_criteria = verification
+                .acceptance_criteria
+                .into_iter()
+                .map(crate::vdd::CanonicalAcceptanceCriterion::new)
+                .collect::<Vec<_>>();
+            let source_snapshots = vec![crate::vdd::CanonicalSourceSnapshot::new(
+                snapshot.source,
+                verification.source_content,
+            )];
+            let evidence_material =
+                format!("{}:{}", result.artifact.generation, result.output_digest);
+            let request =
+                crate::vdd::CanonicalVddRequest::new(crate::vdd::CanonicalVddRequestParts {
+                    assignment: snapshot.assignment,
+                    worker_result: result.clone(),
+                    objective: verification.objective,
+                    acceptance_criteria,
+                    source_snapshots,
+                    worker_provider: verification.worker_provider,
+                    worker_endpoint: verification.worker_endpoint,
+                    worker_model: verification.worker_model,
+                    policy_generation: verification.policy_generation,
+                    deterministic_receipts: vec![crate::vdd::CanonicalDeterministicReceipt {
+                        check: "worker-artifact-generation".to_string(),
+                        outcome: crate::vdd::DeterministicCheckOutcome::Passed,
+                        artifact_generation: result.artifact.generation.clone(),
+                        evidence_sha256: ContentDigest::sha256(evidence_material.as_bytes()),
+                        observed_at: Utc::now(),
+                    }],
+                    unresolved_uncertainties: Vec::new(),
+                });
+            let finalization = match request {
+                Ok(request) => {
+                    crate::vdd::finalize_worker_candidate_with_receipt(
+                        engine, supervisor, &policy, &request, candidate,
+                    )
+                    .await
+                }
+                Err(error) => crate::vdd::finalize_worker_preflight_failure(
+                    &policy, &result, candidate, &error,
+                ),
+            };
+            let (publication, record) = finalization.into_parts();
+            let (accepted, outcome, detail) = match &publication {
+                crate::vdd::VddPublication::Publish(candidate) => {
+                    (true, candidate.outcome(), candidate.detail().to_string())
+                }
+                crate::vdd::VddPublication::Withhold(candidate) => (
+                    false,
+                    candidate.outcome().into(),
+                    candidate.detail().to_string(),
+                ),
+            };
+            decisions.push(PendingWorkerDecision {
+                attempt_id: child.attempt_id,
+                run_id: result.run_id,
+                task_id: result.task_id,
+                task_revision: result.task_revision,
+                agent_id: snapshot.agent_id,
+                accepted,
+                outcome,
+                detail,
+                record,
+            });
+        }
+
+        // Attach the decision before any externally visible task promotion.
+        let stored = self
+            .stored
+            .as_ref()
+            .ok_or(PlannerCheckpointError::MissingCheckpoint)?;
+        let mut state = stored.checkpoint.state().clone();
+        for decision in &decisions {
+            match state.worker_finalizations.get(&decision.attempt_id) {
+                Some(existing) if existing != &decision.record => {
+                    return Err(PlannerCheckpointError::SubagentStateUnavailable);
+                }
+                Some(_) => {}
+                None => {
+                    state
+                        .worker_finalizations
+                        .insert(decision.attempt_id, decision.record.clone());
+                }
+            }
+        }
+        let live_budget = supervisor
+            .budget()
+            .snapshot()
+            .map_err(|_| PlannerCheckpointError::BudgetUnavailable)?;
+        state.budget = accumulate_budget(&state.budget, &self.budget_observation, &live_budget)?;
+        let finalized_at = Utc::now();
+        let (checkpoint, receipt) = self.store.checkpoint_and_commit(
+            stored,
+            stored.checkpoint.generation(),
+            state,
+            finalized_at,
+        )?;
+        self.stored = Some(StoredPlannerCheckpoint {
+            checkpoint,
+            storage_generation: receipt.generation(),
+        });
+        self.budget_observation = live_budget;
+
+        let mut task_manager = crate::session::TaskManager::open_for_run(supervisor)
+            .map_err(|_| PlannerCheckpointError::SubagentStateUnavailable)?;
+        let mut finalized_runs = BTreeSet::new();
+        let mut withheld = None;
+        for decision in &decisions {
+            let status = if decision.accepted {
+                crate::session::TaskUpdateStatus::Completed
+            } else {
+                crate::session::TaskUpdateStatus::Failed
+            };
+            task_manager
+                .update_delegation_task(
+                    &decision.task_id.to_string(),
+                    &decision.agent_id,
+                    Some(decision.task_revision),
+                    status,
+                    None,
+                )
+                .map_err(|_| PlannerCheckpointError::SubagentStateUnavailable)?;
+            let promotion = if decision.accepted {
+                crate::subagent::SemanticWorkerPromotion::Accepted
+            } else {
+                withheld.get_or_insert(decision.outcome);
+                crate::subagent::SemanticWorkerPromotion::Rejected {
+                    outcome: decision.outcome,
+                    detail: decision.detail.clone(),
+                }
+            };
+            crate::subagent::BACKGROUND_AGENTS
+                .record_semantic_finalization(supervisor, decision.run_id, promotion)
+                .map_err(|_| PlannerCheckpointError::SubagentStateUnavailable)?;
+            finalized_runs.insert(decision.run_id);
+        }
+        crate::subagent::BACKGROUND_AGENTS
+            .acknowledge_semantic_handoffs(supervisor, &finalized_runs)
+            .map_err(|_| PlannerCheckpointError::SubagentStateUnavailable)?;
+        if let Some(outcome) = withheld {
+            return Err(PlannerCheckpointError::WorkerFinalizationWithheld { outcome });
+        }
+        Ok(())
     }
 
     fn checkpoint_state(
@@ -1245,6 +1476,10 @@ pub enum PlannerCheckpointError {
     BudgetUnavailable,
     #[error("live subagent ownership state is unavailable")]
     SubagentStateUnavailable,
+    #[error("required worker VDD finalization is unavailable")]
+    WorkerFinalizationUnavailable,
+    #[error("required worker VDD finalization withheld success with outcome {outcome:?}")]
+    WorkerFinalizationWithheld { outcome: VddFinalizationOutcome },
     #[error("the complete planner checkpoint projection was not admitted")]
     ProjectionNotAdmitted,
     #[error("planner checkpoint identity differs from its store binding")]
@@ -1548,6 +1783,9 @@ fn synchronize_child_snapshot(
         source,
         assignment,
         outcome,
+        candidate: _,
+        verification: _,
+        promotion,
     } = snapshot;
     if descriptor.actor.role != ActorRole::Worker
         || descriptor.session_id.as_str() != supervisor.session_id()
@@ -1600,8 +1838,13 @@ fn synchronize_child_snapshot(
             state.worker_assignments.insert(run_id, assignment.clone());
         }
     }
-    let (attempt_state, child_state) =
-        child_snapshot_states(finished, failed, cancellation_receipt, task_status)?;
+    let (attempt_state, child_state) = child_snapshot_states(
+        finished,
+        failed,
+        cancellation_receipt,
+        task_status,
+        &promotion,
+    )?;
     if let Some(child) = state.children.get_mut(&run_id) {
         let attempt = state
             .attempts
@@ -1702,7 +1945,9 @@ fn record_worker_result(
         (outcome.terminal, attempt_state),
         (
             WorkerTerminalState::Succeeded,
-            PlannerAttemptState::Succeeded
+            PlannerAttemptState::PartiallyDelivered
+                | PlannerAttemptState::Succeeded
+                | PlannerAttemptState::Failed
         ) | (WorkerTerminalState::Failed, PlannerAttemptState::Failed)
             | (
                 WorkerTerminalState::Cancelled,
@@ -1730,13 +1975,36 @@ fn child_snapshot_states(
     failed: bool,
     cancellation_receipt: Option<CancellationReceipt>,
     task_status: CanonicalTaskStatus,
+    promotion: &crate::subagent::SemanticWorkerPromotion,
 ) -> Result<(PlannerAttemptState, PlannerChildState), PlannerCheckpointError> {
     match (finished, failed, cancellation_receipt, task_status) {
         (false, false, None, CanonicalTaskStatus::InProgress) => {
             Ok((PlannerAttemptState::Active, PlannerChildState::Active))
         }
-        (true, false, None, CanonicalTaskStatus::Completed) => {
+        (true, false, None, CanonicalTaskStatus::InProgress)
+            if promotion == &crate::subagent::SemanticWorkerPromotion::Pending =>
+        {
+            Ok((
+                PlannerAttemptState::PartiallyDelivered,
+                PlannerChildState::PartiallyDelivered,
+            ))
+        }
+        (true, false, None, CanonicalTaskStatus::Completed)
+            if matches!(
+                promotion,
+                crate::subagent::SemanticWorkerPromotion::NotRequired
+                    | crate::subagent::SemanticWorkerPromotion::Accepted
+            ) =>
+        {
             Ok((PlannerAttemptState::Succeeded, PlannerChildState::Succeeded))
+        }
+        (true, false, None, CanonicalTaskStatus::Failed)
+            if matches!(
+                promotion,
+                crate::subagent::SemanticWorkerPromotion::Rejected { .. }
+            ) =>
+        {
+            Ok((PlannerAttemptState::Failed, PlannerChildState::Failed))
         }
         (true, true, None, CanonicalTaskStatus::Failed) => {
             Ok((PlannerAttemptState::Failed, PlannerChildState::Failed))
@@ -2203,6 +2471,11 @@ fn validate_map_bounds(state: &PlannerState) -> Result<(), PlannerCheckpointErro
             state.worker_results.len(),
             MAX_PLANNER_RECORDS,
         ),
+        (
+            "worker finalizations",
+            state.worker_finalizations.len(),
+            MAX_PLANNER_RECORDS,
+        ),
     ] {
         if count > limit {
             return Err(PlannerCheckpointError::Capacity { resource, limit });
@@ -2328,8 +2601,67 @@ fn validate_worker_lifecycle(state: &PlannerState) -> Result<(), PlannerCheckpoi
                 reason: "artifact disposition disagrees with its exact state set",
             });
         }
+        let task =
+            state
+                .task_graph
+                .task(&result.task_id)
+                .ok_or(PlannerCheckpointError::InvalidField {
+                    field: "worker result",
+                    reason: "result task is missing",
+                })?;
+        let child =
+            state
+                .children
+                .get(&result.run_id)
+                .ok_or(PlannerCheckpointError::InvalidField {
+                    field: "worker result",
+                    reason: "result child is missing",
+                })?;
+        let finalization = state.worker_finalizations.get(attempt_id);
+        if let Some(finalization) = finalization {
+            if finalization.binding().digest() != result.output_digest
+                || finalization.binding().generation() != result.artifact.generation
+                || finalization.finalized_at() < result.recorded_at
+                || !finalization.receipt_digest_is_valid()
+                || (finalization.outcome() == VddFinalizationOutcome::Pass
+                    && finalization.canonical_receipt().is_none())
+            {
+                return Err(PlannerCheckpointError::InvalidField {
+                    field: "worker finalization",
+                    reason: "finalization is not bound to the exact result and receipt",
+                });
+            }
+        }
         let terminal_matches = match result.terminal {
-            WorkerTerminalState::Succeeded => attempt.state == PlannerAttemptState::Succeeded,
+            WorkerTerminalState::Succeeded => {
+                match finalization.map(VddWorkerFinalizationRecord::outcome) {
+                    None => {
+                        (attempt.state == PlannerAttemptState::PartiallyDelivered
+                            && task.status == CanonicalTaskStatus::InProgress
+                            && child.state == PlannerChildState::PartiallyDelivered)
+                            || (attempt.state == PlannerAttemptState::Succeeded
+                                && task.status == CanonicalTaskStatus::Completed
+                                && child.state == PlannerChildState::Succeeded)
+                    }
+                    Some(_)
+                        if attempt.state == PlannerAttemptState::PartiallyDelivered
+                            && task.status == CanonicalTaskStatus::InProgress
+                            && child.state == PlannerChildState::PartiallyDelivered =>
+                    {
+                        true
+                    }
+                    Some(VddFinalizationOutcome::Pass | VddFinalizationOutcome::FailOpen) => {
+                        attempt.state == PlannerAttemptState::Succeeded
+                            && task.status == CanonicalTaskStatus::Completed
+                            && child.state == PlannerChildState::Succeeded
+                    }
+                    Some(_) => {
+                        attempt.state == PlannerAttemptState::Failed
+                            && task.status == CanonicalTaskStatus::Failed
+                            && child.state == PlannerChildState::Failed
+                    }
+                }
+            }
             WorkerTerminalState::Failed => {
                 attempt.state == PlannerAttemptState::Failed
                     && result
@@ -2361,6 +2693,16 @@ fn validate_worker_lifecycle(state: &PlannerState) -> Result<(), PlannerCheckpoi
                 reason: "result terminal state disagrees with its attempt",
             });
         }
+    }
+    if state
+        .worker_finalizations
+        .keys()
+        .any(|attempt| !state.worker_results.contains_key(attempt))
+    {
+        return Err(PlannerCheckpointError::InvalidField {
+            field: "worker finalization",
+            reason: "finalization references a missing worker result",
+        });
     }
     Ok(())
 }
@@ -2500,6 +2842,7 @@ fn validate_state_evolution(
     require_unchanged_entries(&current.artifacts, &next.artifacts)?;
     require_unchanged_entries(&current.worker_assignments, &next.worker_assignments)?;
     require_unchanged_entries(&current.worker_results, &next.worker_results)?;
+    require_unchanged_entries(&current.worker_finalizations, &next.worker_finalizations)?;
     validate_budget_evolution(&current.budget, &next.budget)?;
     validate_attempt_evolution(&current.attempts, &next.attempts)?;
     validate_approval_evolution(&current.approvals, &next.approvals)?;
@@ -3095,6 +3438,38 @@ mod tests {
         assert_eq!(
             cancelled.state().attempts[&attempt_id].state,
             PlannerAttemptState::Cancelled
+        );
+    }
+
+    #[test]
+    fn pending_worker_result_is_partially_delivered_until_host_promotion() {
+        let pending = child_snapshot_states(
+            true,
+            false,
+            None,
+            CanonicalTaskStatus::InProgress,
+            &crate::subagent::SemanticWorkerPromotion::Pending,
+        )
+        .expect("pending worker proposal");
+        assert_eq!(
+            pending,
+            (
+                PlannerAttemptState::PartiallyDelivered,
+                PlannerChildState::PartiallyDelivered
+            )
+        );
+
+        let accepted = child_snapshot_states(
+            true,
+            false,
+            None,
+            CanonicalTaskStatus::Completed,
+            &crate::subagent::SemanticWorkerPromotion::Accepted,
+        )
+        .expect("host accepted worker result");
+        assert_eq!(
+            accepted,
+            (PlannerAttemptState::Succeeded, PlannerChildState::Succeeded)
         );
     }
 }

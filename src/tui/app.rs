@@ -5262,6 +5262,22 @@ fn latest_assistant_message_content(messages: &[serde_json::Value]) -> Option<&s
     })
 }
 
+fn replace_latest_assistant_message_content(
+    messages: &mut [serde_json::Value],
+    content: String,
+) -> bool {
+    let Some(message) = messages.iter_mut().rev().find(|message| {
+        message.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+    }) else {
+        return false;
+    };
+    let Some(message) = message.as_object_mut() else {
+        return false;
+    };
+    message.insert("content".to_string(), serde_json::Value::String(content));
+    true
+}
+
 fn observe_turn_user_task(
     run: &crate::tools::ToolRunContext,
     session_id: &str,
@@ -6511,7 +6527,23 @@ async fn handle_followup_turn(
         return;
     };
     if let Some(content) = latest_assistant_message_content(&session_messages).map(str::to_string) {
-        run_tui_vdd_review(ctx, &final_run, &content, &mut session_messages).await;
+        match run_tui_vdd_review(ctx, &final_run, content, &session_messages).await {
+            Ok((content, observation)) => {
+                if !replace_latest_assistant_message_content(&mut session_messages, content) {
+                    send_api_error(
+                        ctx.tx,
+                        "VDD finalized a response without a terminal assistant message".to_string(),
+                        ctx.session_id,
+                    );
+                    return;
+                }
+                append_tui_vdd_observation(&mut session_messages, observation);
+            }
+            Err(reason) => {
+                send_api_error(ctx.tx, reason, ctx.session_id);
+                return;
+            }
+        }
     }
     send_or_warn(
         ctx.tx,
@@ -6564,6 +6596,14 @@ async fn handle_direct_turn(
             return;
         }
     };
+    let (rendered_content, vdd_observation) =
+        match run_tui_vdd_review(ctx, ctx.run_context, rendered_content, &session_messages).await {
+            Ok(finalized) => finalized,
+            Err(reason) => {
+                send_api_error(ctx.tx, reason, ctx.session_id);
+                return;
+            }
+        };
     let mut message = serde_json::json!({ "role": "assistant", "content": rendered_content });
     if let Some(reasoning) = turn_result
         .reasoning_content
@@ -6573,13 +6613,7 @@ async fn handle_direct_turn(
         message["reasoning_content"] = serde_json::Value::String(reasoning.to_string());
     }
     session_messages.push(message);
-    run_tui_vdd_review(
-        ctx,
-        ctx.run_context,
-        &rendered_content,
-        &mut session_messages,
-    )
-    .await;
+    append_tui_vdd_observation(&mut session_messages, vdd_observation);
     send_or_warn(
         ctx.tx,
         super::events::AppEvent::SyncSession {
@@ -6599,14 +6633,15 @@ async fn handle_direct_turn(
 async fn run_tui_vdd_review(
     ctx: &TurnContext<'_>,
     run: &std::sync::Arc<crate::tools::ToolRunContext>,
-    content: &str,
-    session_messages: &mut Vec<serde_json::Value>,
-) {
-    let Some(engine) = ctx.vdd_engine.as_ref() else {
-        return;
-    };
-    if content.len() < 100 {
-        return;
+    content: String,
+    session_messages: &[serde_json::Value],
+) -> Result<(String, Option<crate::context::ContextItem>), String> {
+    let policy = ctx.app_config.as_ref().map_or_else(
+        || crate::vdd::VddFinalizationPolicy::from_config(&crate::config::VddConfig::default()),
+        |config| crate::vdd::VddFinalizationPolicy::from_config(&config.vdd),
+    );
+    if policy.requirement() == crate::vdd::VddFinalizationRequirement::Disabled {
+        return Ok((content, None));
     }
 
     send_or_warn(
@@ -6621,55 +6656,75 @@ async fn run_tui_vdd_review(
     let user_task = latest_user_message_content(session_messages)
         .unwrap_or_default()
         .to_string();
-    let builder = crate::vdd::BuilderProvider::with_auth(ctx.provider, ctx.vdd_builder_auth);
-    match engine.review_text(run, content, &user_task, builder).await {
-        Ok(result) => {
-            let genuine_count = result
-                .findings
-                .iter()
-                .filter(|finding| finding.status == crate::vdd::FindingStatus::Genuine)
-                .count();
-            let summary = if result.findings.is_empty() {
-                "VDD review complete: no issues found.".to_string()
-            } else {
-                format!(
-                    "VDD review complete: {} finding(s), {genuine_count} genuine.",
-                    result.findings.len()
-                )
-            };
+    let builder = crate::vdd::BuilderProvider::with_auth(ctx.provider, ctx.vdd_builder_auth)
+        .with_model(ctx.model);
+    let scope = format!("tui:{}:{user_task}", ctx.session_id);
+    let finalization = crate::vdd::finalize_text_candidate(
+        ctx.vdd_engine.as_deref(),
+        run,
+        &policy,
+        content,
+        &scope,
+        &user_task,
+        builder,
+    )
+    .await;
+    let (publication, observation) = finalization.into_parts();
+    match publication {
+        crate::vdd::VddPublication::Publish(candidate) => {
+            let outcome = candidate.outcome();
+            let detail = candidate.detail().to_string();
+            let content = candidate.into_candidate();
             send_or_warn(
                 ctx.tx,
                 super::events::AppEvent::ToolDone {
                     name: "vdd".to_string(),
-                    success: true,
-                    content: summary,
+                    success: !matches!(outcome, crate::vdd::VddFinalizationOutcome::FailOpen),
+                    content: format!("VDD finalization {outcome:?}: {detail}"),
                 },
                 ctx.session_id,
             );
-            if let Some(observation) = result.context_observation {
-                let projection = crate::context::ContextProjector::project(
-                    vec![observation],
-                    crate::context::ContextBudget::default(),
-                );
-                append_context_reference_message(
-                    session_messages,
-                    &projection.reference,
-                    "vdd_reference",
+            if !content.is_empty() {
+                send_or_warn(
+                    ctx.tx,
+                    super::events::AppEvent::StreamText(content.clone()),
+                    ctx.session_id,
                 );
             }
+            Ok((content, observation))
         }
-        Err(error) => {
+        crate::vdd::VddPublication::Withhold(withheld) => {
+            let reason = format!(
+                "VDD finalization withheld assistant success ({:?}): {}",
+                withheld.outcome(),
+                withheld.detail()
+            );
             send_or_warn(
                 ctx.tx,
                 super::events::AppEvent::ToolDone {
                     name: "vdd".to_string(),
                     success: false,
-                    content: format!("VDD review failed: {error}"),
+                    content: reason.clone(),
                 },
                 ctx.session_id,
             );
+            Err(reason)
         }
     }
+}
+
+fn append_tui_vdd_observation(
+    session_messages: &mut Vec<serde_json::Value>,
+    observation: Option<crate::context::ContextItem>,
+) {
+    let Some(observation) = observation else {
+        return;
+    };
+    let projection = crate::context::ContextProjector::project(
+        vec![observation],
+        crate::context::ContextBudget::default(),
+    );
+    append_context_reference_message(session_messages, &projection.reference, "vdd_reference");
 }
 
 fn append_context_reference_message(

@@ -2234,6 +2234,80 @@ impl ChatRepl {
         }
     }
 
+    async fn finalize_vdd_candidate(
+        &mut self,
+        content: String,
+    ) -> Result<(String, Option<openclaudia::context::ContextItem>), String> {
+        if self.coordinator
+            && self.config.vdd.enabled
+            && self.config.vdd.mode == openclaudia::config::VddMode::Blocking
+        {
+            let task_graph = {
+                let mut manager = self
+                    .task_manager
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                manager.refresh()?;
+                manager.graph().clone()
+            };
+            let planner = self.planner_runtime.as_mut().ok_or_else(|| {
+                "required worker VDD finalization cannot run without the planner checkpoint runtime"
+                    .to_string()
+            })?;
+            Box::pin(planner.finalize_pending_workers(
+                &self.run_context,
+                &task_graph,
+                &self.config,
+                self.vdd_engine.as_ref(),
+                chrono::Utc::now(),
+            ))
+            .await
+            .map_err(|error| error.to_string())?;
+        }
+        let messages = self.chat_session.messages_snapshot();
+        run_vdd_review(
+            self.vdd_engine.as_ref(),
+            &self.config.vdd,
+            &self.run_context,
+            content,
+            &messages,
+            &self.config.proxy.target,
+            &self.model,
+            self.api_key.as_ref(),
+        )
+        .await
+    }
+
+    fn append_vdd_observation(
+        &mut self,
+        observation: Option<openclaudia::context::ContextItem>,
+        persistence_reason: &str,
+    ) {
+        let Some(observation) = observation else {
+            return;
+        };
+        let projection = openclaudia::context::ContextProjector::project(
+            vec![observation],
+            openclaudia::context::ContextBudget::default(),
+        );
+        if projection.reference.is_empty() {
+            return;
+        }
+        let mut messages = self.chat_session.messages_snapshot();
+        projection.append_reference_to_json_messages(&mut messages);
+        let native_state = self.chat_session.provider_native_state_snapshot();
+        match self
+            .chat_session
+            .replace_messages_and_provider_native_state(messages, native_state)
+        {
+            Ok(()) => persist_chat_session_update(&mut self.chat_session, persistence_reason),
+            Err(error) => tracing::warn!(
+                error = %error,
+                "refused non-causal VDD transcript mutation"
+            ),
+        }
+    }
+
     fn record_failed_turn(&mut self, reason: &str) {
         self.chat_session.update_messages(|messages| {
             session::append_failed_turn_message(messages, reason);
@@ -2759,6 +2833,15 @@ impl ChatRepl {
             };
             rendered_content
         };
+        let (rendered_content, vdd_observation) =
+            match self.finalize_vdd_candidate(rendered_content).await {
+                Ok(finalized) => finalized,
+                Err(error) => {
+                    self.record_failed_turn(&error);
+                    eprintln!("\n{error}");
+                    return;
+                }
+            };
         if let Err(error) = self.install_native_json_assistant_turn(
             &rendered_content,
             &[],
@@ -2772,36 +2855,7 @@ impl ChatRepl {
         if !rendered_content.is_empty() {
             println!("{rendered_content}");
         }
-
-        if let Some(ref engine) = self.vdd_engine {
-            let original = self.chat_session.messages_snapshot();
-            let mut messages = original.clone();
-            run_vdd_review(
-                engine,
-                &self.run_context,
-                &rendered_content,
-                &mut messages,
-                &self.config.proxy.target,
-                self.api_key.as_ref(),
-            )
-            .await;
-            if messages != original {
-                let native_state = self.chat_session.provider_native_state_snapshot();
-                match self
-                    .chat_session
-                    .replace_messages_and_provider_native_state(messages, native_state)
-                {
-                    Ok(()) => persist_chat_session_update(
-                        &mut self.chat_session,
-                        "native JSON VDD context injection",
-                    ),
-                    Err(error) => tracing::warn!(
-                        error = %error,
-                        "refused non-causal VDD transcript mutation"
-                    ),
-                }
-            }
-        }
+        self.append_vdd_observation(vdd_observation, "native JSON VDD context injection");
 
         let tokens = estimate_session_tokens(&self.chat_session) + rendered_content.len() / 4;
         let billed_usage = openclaudia::session::TokenUsage {
@@ -3202,7 +3256,7 @@ impl ChatRepl {
         prompt_blocks: &prompt::SystemPromptBlocks,
         memory_db: Option<&memory::MemoryDb>,
     ) {
-        let final_content = match self
+        let _final_content = match self
             .run_anthropic_structured_tool_loop(
                 anthropic_accumulator,
                 full_content,
@@ -3219,30 +3273,6 @@ impl ChatRepl {
                 return;
             }
         };
-        if let Some(ref engine) = self.vdd_engine {
-            if final_content.trim().is_empty() {
-                println!();
-                return;
-            }
-            let original = self.chat_session.messages_snapshot();
-            let mut messages = original.clone();
-            run_vdd_review(
-                engine,
-                &self.run_context,
-                &final_content,
-                &mut messages,
-                &self.config.proxy.target,
-                self.api_key.as_ref(),
-            )
-            .await;
-            if messages != original {
-                self.chat_session.replace_messages(messages);
-                persist_chat_session_update(
-                    &mut self.chat_session,
-                    "anthropic VDD context injection",
-                );
-            }
-        }
         println!();
     }
 
@@ -3534,6 +3564,7 @@ impl ChatRepl {
             let Some(rendered) = self.render_final_response(full_content.trim(), false) else {
                 return Err("Anthropic final answer failed grounding validation".to_string());
             };
+            let (rendered, vdd_observation) = self.finalize_vdd_candidate(rendered).await?;
             println!("{rendered}");
             push_chat_session_message_and_persist(
                 &mut self.chat_session,
@@ -3543,6 +3574,7 @@ impl ChatRepl {
                 }),
                 "anthropic final assistant response",
             );
+            self.append_vdd_observation(vdd_observation, "anthropic VDD context injection");
             full_content = rendered;
         }
         Ok(full_content)
@@ -4020,17 +4052,14 @@ impl ChatRepl {
             return;
         }
 
-        let final_allowed = self.persist_openai_loop_state(
+        self.persist_openai_loop_state(
             &state.current_content,
             &state.current_reasoning_content,
             tool_accumulator,
             iteration,
             state.cancelled,
-        );
-        if final_allowed {
-            self.run_openai_vdd_review(&state.current_content, state.cancelled)
-                .await;
-        }
+        )
+        .await;
     }
 
     /// Append the assistant message that initiated this `OpenAI` tool
@@ -4073,7 +4102,7 @@ impl ChatRepl {
     /// Persist the final session state from the `OpenAI` loop, mirroring
     /// the original three-way conditional (terminal content / iterated /
     /// no progress).
-    fn persist_openai_loop_state(
+    async fn persist_openai_loop_state(
         &mut self,
         current_content: &str,
         reasoning_content: &str,
@@ -4092,6 +4121,14 @@ impl ChatRepl {
             else {
                 return false;
             };
+            let (rendered, vdd_observation) = match self.finalize_vdd_candidate(rendered).await {
+                Ok(finalized) => finalized,
+                Err(error) => {
+                    self.record_failed_turn(&error);
+                    eprintln!("\n{error}");
+                    return false;
+                }
+            };
             println!("{rendered}");
             let mut message = serde_json::json!({
                 "role": "assistant",
@@ -4103,6 +4140,7 @@ impl ChatRepl {
                 message,
                 "openai final assistant response",
             );
+            self.append_vdd_observation(vdd_observation, "openai VDD context injection");
             return true;
         }
         if iteration > 0 {
@@ -4115,34 +4153,6 @@ impl ChatRepl {
             return false;
         }
         true
-    }
-
-    /// Run VDD review on the final `OpenAI` loop content when applicable.
-    async fn run_openai_vdd_review(&mut self, current_content: &str, cancelled: bool) {
-        if cancelled {
-            return;
-        }
-        let Some(ref engine) = self.vdd_engine else {
-            return;
-        };
-        if current_content.trim().is_empty() {
-            return;
-        }
-        let original = self.chat_session.messages_snapshot();
-        let mut messages = original.clone();
-        run_vdd_review(
-            engine,
-            &self.run_context,
-            current_content,
-            &mut messages,
-            &self.config.proxy.target,
-            self.api_key.as_ref(),
-        )
-        .await;
-        if messages != original {
-            self.chat_session.replace_messages(messages);
-            persist_chat_session_update(&mut self.chat_session, "openai VDD context injection");
-        }
     }
 
     /// Build the OpenAI-compatible follow-up request body (handles both

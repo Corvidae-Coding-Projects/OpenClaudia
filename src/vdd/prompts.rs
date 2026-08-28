@@ -104,6 +104,7 @@ pub fn build_adversary_request(
 /// Build a revision request to send back to the builder with genuine findings.
 pub fn build_revision_request(
     original_request: &ChatCompletionRequest,
+    prior_builder_output: &str,
     genuine_findings: &[&Finding],
     iteration: u32,
 ) -> ChatCompletionRequest {
@@ -128,8 +129,18 @@ pub fn build_revision_request(
         );
     }
 
-    // Clone original messages and append the revision request
+    // Bind revision to the exact prior candidate. Provider calls are stateless;
+    // without this assistant turn the builder sees findings but not the output
+    // it has been asked to revise.
     let mut messages = original_request.messages.clone();
+    messages.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: MessageContent::Text(prior_builder_output.to_string()),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+        extra: std::collections::HashMap::new(),
+    });
     messages.push(ChatMessage {
         role: "user".to_string(),
         content: MessageContent::Text(format!(
@@ -161,7 +172,9 @@ mod tests {
     //! via `include_str!`, so any failure here means the released binary
     //! itself is broken — not just a runtime path).
 
-    use super::{ADVERSARY_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT};
+    use super::{build_revision_request, ADVERSARY_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT};
+    use crate::proxy::{ChatCompletionRequest, ChatMessage, MessageContent};
+    use crate::vdd::{Finding, FindingStatus, Severity};
 
     /// Tokens that must never make it into a shipped prompt. Each represents
     /// an unfinished-work marker the prompt author may have forgotten to
@@ -227,5 +240,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn revision_request_contains_exact_prior_candidate_before_findings() {
+        let request = ChatCompletionRequest {
+            model: "builder-model".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: MessageContent::Text("write the implementation".to_string()),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                extra: std::collections::HashMap::new(),
+            }],
+            temperature: None,
+            max_tokens: Some(1024),
+            stream: Some(true),
+            tools: None,
+            tool_choice: None,
+            extra: std::collections::HashMap::new(),
+        };
+        let finding = Finding {
+            id: "f-1".to_string(),
+            severity: Severity::High,
+            cwe: None,
+            description: "reachable defect".to_string(),
+            file_path: None,
+            line_range: None,
+            status: FindingStatus::Genuine,
+            adversary_reasoning: "evidence".to_string(),
+            iteration: 1,
+        };
+        let revised = build_revision_request(&request, "exact prior output", &[&finding], 1);
+
+        assert_eq!(revised.messages.len(), 3);
+        assert_eq!(revised.messages[1].role, "assistant");
+        assert!(matches!(
+            &revised.messages[1].content,
+            MessageContent::Text(text) if text == "exact prior output"
+        ));
+        assert_eq!(revised.messages[2].role, "user");
+        assert_eq!(revised.stream, Some(false));
     }
 }

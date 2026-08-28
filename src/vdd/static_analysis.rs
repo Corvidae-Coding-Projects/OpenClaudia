@@ -10,6 +10,9 @@ use std::time::Duration;
 use serde::Serialize;
 
 use super::VddError;
+use crate::vdd::transport::VddReviewBudget;
+
+const VDD_ANALYZER_TRUNCATED_MARKER: &[u8] = b"\n[VDD analyzer output truncated]\n";
 
 // ==========================================================================
 // StaticAnalysisResult
@@ -42,6 +45,7 @@ pub struct StaticAnalysisResult {
 #[allow(clippy::too_many_lines)] // Parsing, sandbox admission, bounded execution, and result mapping are atomic.
 pub(crate) async fn run_shell_command(
     run: &std::sync::Arc<crate::tools::ToolRunContext>,
+    budget: &VddReviewBudget,
     command: &str,
     timeout: Duration,
 ) -> StaticAnalysisResult {
@@ -109,17 +113,75 @@ pub(crate) async fn run_shell_command(
             };
         }
     };
+    if let Err(error) = budget.begin_process() {
+        return StaticAnalysisResult {
+            command: command.to_string(),
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: format!("Static-analysis budget denied process: {error}"),
+            passed: false,
+        };
+    }
+    let timeout = match budget.remaining_time() {
+        Ok(remaining) => timeout.min(remaining),
+        Err(error) => {
+            budget.abandon_process();
+            return StaticAnalysisResult {
+                command: command.to_string(),
+                exit_code: -1,
+                stdout: String::new(),
+                stderr: error,
+                passed: false,
+            };
+        }
+    };
     let result = crate::tools::command::run_prepared_run_owned(
         run,
         sandboxed,
         program,
-        crate::tools::command::ProcessLimits::new(timeout),
+        crate::tools::command::ProcessLimits::new(timeout).with_output_limit(
+            VddReviewBudget::analyzer_output_limit(),
+            VDD_ANALYZER_TRUNCATED_MARKER,
+        ),
         None,
     )
     .await;
 
+    let retained_bytes = match &result {
+        Ok(output) => output
+            .stdout
+            .bytes
+            .len()
+            .saturating_add(output.stderr.bytes.len()),
+        Err(error) => error.partial().map_or(0, |partial| {
+            partial
+                .stdout
+                .bytes
+                .len()
+                .saturating_add(partial.stderr.bytes.len())
+        }),
+    };
+    if let Err(error) = budget.finish_process(retained_bytes) {
+        return StaticAnalysisResult {
+            command: command.to_string(),
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: format!("Static-analysis budget reconciliation failed: {error}"),
+            passed: false,
+        };
+    }
+
     match result {
         Ok(output) => {
+            if output.stdout.truncated || output.stderr.truncated {
+                return StaticAnalysisResult {
+                    command: command.to_string(),
+                    exit_code: output.status.code().unwrap_or(-1),
+                    stdout: String::from_utf8_lossy(&output.stdout.bytes).to_string(),
+                    stderr: "Static-analysis output exceeded the bounded review limit".to_string(),
+                    passed: false,
+                };
+            }
             let output = output.into_std_output();
             let exit_code = output.status.code().unwrap_or(-1);
             StaticAnalysisResult {
@@ -208,7 +270,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_shell_command_rejects_empty_command() {
-        let result = run_shell_command(test_run(), "   ", Duration::from_secs(1)).await;
+        let budget = VddReviewBudget::admit(test_run(), &test_config(), false).expect("budget");
+        let result = run_shell_command(test_run(), &budget, "   ", Duration::from_secs(1)).await;
 
         assert_eq!(result.exit_code, -1);
         assert_eq!(result.stderr, "Empty command");
@@ -217,11 +280,26 @@ mod tests {
 
     #[tokio::test]
     async fn run_shell_command_rejects_unbalanced_quotes() {
-        let result =
-            run_shell_command(test_run(), "echo 'unterminated", Duration::from_secs(1)).await;
+        let budget = VddReviewBudget::admit(test_run(), &test_config(), false).expect("budget");
+        let result = run_shell_command(
+            test_run(),
+            &budget,
+            "echo 'unterminated",
+            Duration::from_secs(1),
+        )
+        .await;
 
         assert_eq!(result.exit_code, -1);
         assert!(result.stderr.contains("Could not parse command"));
+        assert!(!result.passed);
+    }
+
+    #[tokio::test]
+    async fn run_shell_command_reports_nonzero_analyzer_exit_as_failed() {
+        let budget = VddReviewBudget::admit(test_run(), &test_config(), false).expect("budget");
+        let result = run_shell_command(test_run(), &budget, "false", Duration::from_secs(1)).await;
+
+        assert_eq!(result.exit_code, 1);
         assert!(!result.passed);
     }
 
@@ -248,9 +326,17 @@ print("analyzer_confined=" + str(file_blocked and network_blocked).lower())
             "python3 -c {}",
             shlex::try_quote(&script).expect("quote analyzer probe")
         );
-        let result = run_shell_command(test_run(), &command, Duration::from_secs(5)).await;
+        let budget = VddReviewBudget::admit(test_run(), &test_config(), false).expect("budget");
+        let result = run_shell_command(test_run(), &budget, &command, Duration::from_secs(5)).await;
         assert!(result.passed, "analyzer probe failed: {}", result.stderr);
         assert!(result.stdout.contains("analyzer_confined=true"));
         assert!(!result.stdout.contains("analyzer-secret"));
+    }
+
+    fn test_config() -> crate::config::VddConfig {
+        crate::config::VddConfig {
+            enabled: true,
+            ..crate::config::VddConfig::default()
+        }
     }
 }

@@ -72,6 +72,10 @@ pub enum ClaudeAgentSdkError {
     Spawn(String),
     #[error("Claude Agent SDK process timed out after {0} seconds")]
     Timeout(u64),
+    #[error("Claude Agent SDK process exceeded its caller-owned deadline")]
+    Deadline,
+    #[error("Claude Agent SDK process was cancelled: {0:?}")]
+    Cancelled(crate::runtime::CancellationReason),
     #[error("Claude Agent SDK output exceeded its {0}-byte limit")]
     OutputTooLarge(usize),
     #[error("Claude Agent SDK process failed: {0}")]
@@ -190,12 +194,51 @@ impl ClaudeAgentSdk {
     ///
     /// Returns a typed error for malformed requests, process failures, bounded
     /// I/O violations, timeouts, or invalid structured model output.
-    #[allow(clippy::too_many_lines)] // One owned process lifecycle keeps cleanup and I/O limits together.
     pub async fn complete_turn(
         &self,
         request: &Value,
         effort: &str,
     ) -> Result<ClaudeAgentSdkTurn, ClaudeAgentSdkError> {
+        let cancellation = crate::runtime::CancellationTree::new().root();
+        match self
+            .complete_turn_bounded(
+                request,
+                effort,
+                tokio::time::Instant::now() + AGENT_SDK_TURN_TIMEOUT,
+                cancellation,
+            )
+            .await
+        {
+            Err(ClaudeAgentSdkError::Deadline) => Err(ClaudeAgentSdkError::Timeout(
+                AGENT_SDK_TURN_TIMEOUT.as_secs(),
+            )),
+            result => result,
+        }
+    }
+
+    /// Execute one constrained turn under a caller-owned absolute deadline
+    /// and cancellation tree. Every terminal branch kills/reaps the child and
+    /// joins its bounded output readers before returning.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for malformed requests, process failures, bounded
+    /// I/O violations, cancellation, deadline expiry, or invalid output.
+    #[allow(clippy::too_many_lines)] // One owned process lifecycle keeps cleanup and I/O limits together.
+    pub(crate) async fn complete_turn_bounded(
+        &self,
+        request: &Value,
+        effort: &str,
+        deadline: tokio::time::Instant,
+        cancellation: crate::runtime::CancellationHandle,
+    ) -> Result<ClaudeAgentSdkTurn, ClaudeAgentSdkError> {
+        let deadline = deadline.min(tokio::time::Instant::now() + AGENT_SDK_TURN_TIMEOUT);
+        if let Some(receipt) = cancellation.receipt() {
+            return Err(ClaudeAgentSdkError::Cancelled(receipt.reason));
+        }
+        if deadline <= tokio::time::Instant::now() {
+            return Err(ClaudeAgentSdkError::Deadline);
+        }
         let model = request
             .get("model")
             .and_then(Value::as_str)
@@ -253,51 +296,96 @@ impl ClaudeAgentSdk {
             "sending constrained provider request through Anthropic-owned executable"
         );
 
+        if let Some(receipt) = cancellation.receipt() {
+            return Err(ClaudeAgentSdkError::Cancelled(receipt.reason));
+        }
+        if deadline <= tokio::time::Instant::now() {
+            return Err(ClaudeAgentSdkError::Deadline);
+        }
+
         let mut child = command.spawn().map_err(|error| {
             ClaudeAgentSdkError::Spawn(
                 crate::secrets::SafeDiagnostic::from_untrusted(&error.to_string()).to_string(),
             )
         })?;
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            ClaudeAgentSdkError::Spawn("child stdin was not available".to_string())
-        })?;
-        stdin.write_all(prompt.as_bytes()).await.map_err(|error| {
-            ClaudeAgentSdkError::Process(
-                crate::secrets::SafeDiagnostic::from_untrusted(&error.to_string()).to_string(),
-            )
-        })?;
-        stdin.shutdown().await.map_err(|error| {
-            ClaudeAgentSdkError::Process(
-                crate::secrets::SafeDiagnostic::from_untrusted(&error.to_string()).to_string(),
-            )
-        })?;
-        drop(stdin);
-
-        let stdout = child.stdout.take().ok_or_else(|| {
-            ClaudeAgentSdkError::Spawn("child stdout was not available".to_string())
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            ClaudeAgentSdkError::Spawn("child stderr was not available".to_string())
-        })?;
-        let stdout_task = tokio::spawn(read_bounded(stdout, MAX_AGENT_SDK_STDOUT_BYTES));
-        let stderr_task = tokio::spawn(read_bounded(stderr, MAX_AGENT_SDK_STDERR_BYTES));
-        let status = if let Ok(status) =
-            tokio::time::timeout(AGENT_SDK_TURN_TIMEOUT, child.wait()).await
-        {
-            status.map_err(|error| {
-                ClaudeAgentSdkError::Process(
-                    crate::secrets::SafeDiagnostic::from_untrusted(&error.to_string()).to_string(),
-                )
-            })?
-        } else {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            return Err(ClaudeAgentSdkError::Timeout(
-                AGENT_SDK_TURN_TIMEOUT.as_secs(),
+        let Some(mut stdin) = child.stdin.take() else {
+            kill_and_reap(&mut child).await;
+            return Err(ClaudeAgentSdkError::Spawn(
+                "child stdin was not available".to_string(),
             ));
         };
-        let stdout = join_reader(stdout_task).await?;
-        let stderr = join_reader(stderr_task).await?;
+        match wait_for_sdk_boundary(stdin.write_all(prompt.as_bytes()), deadline, &cancellation)
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                kill_and_reap(&mut child).await;
+                return Err(ClaudeAgentSdkError::Process(
+                    crate::secrets::SafeDiagnostic::from_untrusted(&error.to_string()).to_string(),
+                ));
+            }
+            Err(stop) => {
+                kill_and_reap(&mut child).await;
+                return Err(stop.into_claude_error());
+            }
+        }
+        match wait_for_sdk_boundary(stdin.shutdown(), deadline, &cancellation).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                kill_and_reap(&mut child).await;
+                return Err(ClaudeAgentSdkError::Process(
+                    crate::secrets::SafeDiagnostic::from_untrusted(&error.to_string()).to_string(),
+                ));
+            }
+            Err(stop) => {
+                kill_and_reap(&mut child).await;
+                return Err(stop.into_claude_error());
+            }
+        }
+        drop(stdin);
+
+        let Some(stdout) = child.stdout.take() else {
+            kill_and_reap(&mut child).await;
+            return Err(ClaudeAgentSdkError::Spawn(
+                "child stdout was not available".to_string(),
+            ));
+        };
+        let Some(stderr) = child.stderr.take() else {
+            kill_and_reap(&mut child).await;
+            return Err(ClaudeAgentSdkError::Spawn(
+                "child stderr was not available".to_string(),
+            ));
+        };
+        let mut stdout_task = tokio::spawn(read_bounded(stdout, MAX_AGENT_SDK_STDOUT_BYTES));
+        let mut stderr_task = tokio::spawn(read_bounded(stderr, MAX_AGENT_SDK_STDERR_BYTES));
+        let status = match wait_for_sdk_boundary(child.wait(), deadline, &cancellation).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                kill_and_reap(&mut child).await;
+                abort_and_join_readers(stdout_task, stderr_task).await;
+                return Err(ClaudeAgentSdkError::Process(
+                    crate::secrets::SafeDiagnostic::from_untrusted(&error.to_string()).to_string(),
+                ));
+            }
+            Err(stop) => {
+                kill_and_reap(&mut child).await;
+                abort_and_join_readers(stdout_task, stderr_task).await;
+                return Err(stop.into_claude_error());
+            }
+        };
+        let readers = wait_for_sdk_boundary(
+            async { tokio::join!(&mut stdout_task, &mut stderr_task) },
+            deadline,
+            &cancellation,
+        )
+        .await;
+        let (stdout, stderr) = match readers {
+            Ok((stdout, stderr)) => (reader_result(stdout)?, reader_result(stderr)?),
+            Err(stop) => {
+                abort_and_join_readers(stdout_task, stderr_task).await;
+                return Err(stop.into_claude_error());
+            }
+        };
         if !status.success() {
             return Err(ClaudeAgentSdkError::Process(process_diagnostic(
                 &stdout, &stderr,
@@ -307,10 +395,51 @@ impl ClaudeAgentSdk {
     }
 }
 
-async fn join_reader(
-    task: tokio::task::JoinHandle<Result<Vec<u8>, ClaudeAgentSdkError>>,
+enum SdkBoundaryStop {
+    Deadline,
+    Cancelled(crate::runtime::CancellationReason),
+}
+
+impl SdkBoundaryStop {
+    fn into_claude_error(self) -> ClaudeAgentSdkError {
+        match self {
+            Self::Deadline => ClaudeAgentSdkError::Deadline,
+            Self::Cancelled(reason) => ClaudeAgentSdkError::Cancelled(reason),
+        }
+    }
+}
+
+async fn wait_for_sdk_boundary<F: std::future::Future>(
+    future: F,
+    deadline: tokio::time::Instant,
+    cancellation: &crate::runtime::CancellationHandle,
+) -> Result<F::Output, SdkBoundaryStop> {
+    tokio::select! {
+        biased;
+        receipt = cancellation.cancelled() => Err(SdkBoundaryStop::Cancelled(receipt.reason)),
+        () = tokio::time::sleep_until(deadline) => Err(SdkBoundaryStop::Deadline),
+        output = future => Ok(output),
+    }
+}
+
+async fn kill_and_reap(child: &mut tokio::process::Child) {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+async fn abort_and_join_readers(
+    stdout: tokio::task::JoinHandle<Result<Vec<u8>, ClaudeAgentSdkError>>,
+    stderr: tokio::task::JoinHandle<Result<Vec<u8>, ClaudeAgentSdkError>>,
+) {
+    stdout.abort();
+    stderr.abort();
+    let _ = tokio::join!(stdout, stderr);
+}
+
+fn reader_result(
+    result: Result<Result<Vec<u8>, ClaudeAgentSdkError>, tokio::task::JoinError>,
 ) -> Result<Vec<u8>, ClaudeAgentSdkError> {
-    task.await.map_err(|error| {
+    result.map_err(|error| {
         ClaudeAgentSdkError::Process(
             crate::secrets::SafeDiagnostic::from_untrusted(&error.to_string()).to_string(),
         )
@@ -553,6 +682,95 @@ fn decode_turn(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn bounded_turn_rejects_cancelled_authority_before_spawn() {
+        let sdk = ClaudeAgentSdk {
+            binary: PathBuf::from("must-not-spawn-claude"),
+        };
+        let cancellation = crate::runtime::CancellationTree::new().root();
+        let _receipt = cancellation.cancel(crate::runtime::CancellationReason::User);
+        let error = sdk
+            .complete_turn_bounded(
+                &json!({"model": "claude-opus-4-1", "messages": []}),
+                "high",
+                tokio::time::Instant::now() + Duration::from_secs(30),
+                cancellation,
+            )
+            .await
+            .expect_err("cancelled turn");
+        assert!(matches!(error, ClaudeAgentSdkError::Cancelled(_)));
+    }
+
+    #[tokio::test]
+    async fn bounded_turn_rejects_expired_deadline_before_spawn() {
+        let sdk = ClaudeAgentSdk {
+            binary: PathBuf::from("must-not-spawn-claude"),
+        };
+        let error = sdk
+            .complete_turn_bounded(
+                &json!({"model": "claude-opus-4-1", "messages": []}),
+                "high",
+                tokio::time::Instant::now(),
+                crate::runtime::CancellationTree::new().root(),
+            )
+            .await
+            .expect_err("expired deadline");
+        assert!(matches!(error, ClaudeAgentSdkError::Deadline));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_turn_cancellation_kills_and_reaps_a_running_child() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("fake SDK directory");
+        let binary = directory.path().join("claude-blocking");
+        let pid_path = directory.path().join("child.pid");
+        let script = format!(
+            "#!/bin/sh\nset -eu\ncat >/dev/null\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
+            pid_path.display()
+        );
+        std::fs::write(&binary, script).expect("fake SDK executable");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+            .expect("fake SDK permissions");
+
+        let cancellation = crate::runtime::CancellationTree::new().root();
+        let turn_cancellation = cancellation.clone();
+        let turn = tokio::spawn(async move {
+            ClaudeAgentSdk { binary }
+                .complete_turn_bounded(
+                    &json!({
+                        "model": "claude-test",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    }),
+                    "high",
+                    tokio::time::Instant::now() + Duration::from_secs(30),
+                    turn_cancellation,
+                )
+                .await
+        });
+
+        for _ in 0..100 {
+            if pid_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let pid = std::fs::read_to_string(&pid_path).expect("running child PID");
+        let _receipt = cancellation.cancel(crate::runtime::CancellationReason::User);
+        let error = tokio::time::timeout(Duration::from_secs(2), turn)
+            .await
+            .expect("bounded cancellation return")
+            .expect("turn task")
+            .expect_err("cancelled turn");
+        assert!(matches!(error, ClaudeAgentSdkError::Cancelled(_)));
+        #[cfg(target_os = "linux")]
+        assert!(
+            !Path::new("/proc").join(pid.trim()).exists(),
+            "cancelled child must be reaped"
+        );
+    }
 
     #[test]
     fn transport_prompt_removes_system_stream_and_tool_catalog_but_preserves_history() {

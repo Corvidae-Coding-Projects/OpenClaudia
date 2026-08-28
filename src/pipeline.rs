@@ -1706,6 +1706,10 @@ pub struct RunTurnParams<'a> {
     pub tx: mpsc::Sender<AppEvent>,
 }
 
+fn should_emit_live_assistant_text(app_config: Option<&AppConfig>) -> bool {
+    !app_config.is_some_and(|config| config.vdd.enabled)
+}
+
 // ---------------------------------------------------------------------------
 // Retry classifier + backoff helpers (crosslink #592, #595, #596, #597)
 // ---------------------------------------------------------------------------
@@ -2006,6 +2010,7 @@ pub(crate) async fn run_turn_with_speculation(
         tx,
     } = p;
     let mut request_body = request_body.clone();
+    let emit_live_assistant_text = should_emit_live_assistant_text(app_config.as_deref());
     let configured_max_output = app_config.as_ref().map_or(0, |config| {
         u64::from(config.session.token_tracking.max_output_tokens)
     });
@@ -2042,7 +2047,7 @@ pub(crate) async fn run_turn_with_speculation(
         provider_budget
             .reconcile(&sdk_turn.usage)
             .map_err(|error| format!("Provider budget reconciliation failed: {error}"))?;
-        if !sdk_turn.content.is_empty() {
+        if emit_live_assistant_text && !sdk_turn.content.is_empty() {
             tx.send(AppEvent::StreamText(sdk_turn.content.clone()))
                 .map_err(|_| "API event receiver closed during Codex SDK turn".to_string())?;
         }
@@ -2098,7 +2103,7 @@ pub(crate) async fn run_turn_with_speculation(
         provider_budget
             .reconcile(&sdk_turn.usage)
             .map_err(|error| format!("Provider budget reconciliation failed: {error}"))?;
-        if !sdk_turn.content.is_empty() {
+        if emit_live_assistant_text && !sdk_turn.content.is_empty() {
             tx.send(AppEvent::StreamText(sdk_turn.content.clone()))
                 .map_err(|_| {
                     "API event receiver closed during Claude Agent SDK turn".to_string()
@@ -2584,7 +2589,7 @@ async fn handle_provider_native_json_response(
             );
         }
     }
-    if !decoded.content.is_empty() {
+    if should_emit_live_assistant_text(app_config.as_deref()) && !decoded.content.is_empty() {
         send_event!(tx, AppEvent::StreamText(decoded.content.clone()));
     }
 
@@ -2755,6 +2760,7 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
         session_id,
         tx,
     } = p;
+    let emit_live_assistant_text = should_emit_live_assistant_text(app_config.as_deref());
     let mut stream = provider_transport::bounded_byte_stream(
         response,
         provider_transport::MAX_STREAM_RESPONSE_BYTES,
@@ -2818,6 +2824,7 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
                 full_content: &mut full_content,
                 reasoning_content: &mut reasoning_content,
                 in_thinking_block: &mut in_thinking_block,
+                emit_live_assistant_text,
                 tx,
             },
         )?;
@@ -2856,6 +2863,7 @@ struct SseActionDispatch<'a> {
     full_content: &'a mut String,
     reasoning_content: &'a mut String,
     in_thinking_block: &'a mut bool,
+    emit_live_assistant_text: bool,
     tx: &'a mpsc::Sender<AppEvent>,
 }
 
@@ -2864,11 +2872,14 @@ fn dispatch_sse_action(action: SseAction, ctx: SseActionDispatch<'_>) -> Result<
         full_content,
         reasoning_content,
         in_thinking_block,
+        emit_live_assistant_text,
         tx,
     } = ctx;
     match action {
         SseAction::Text(text) => {
-            send_event!(tx, AppEvent::StreamText(text.clone()));
+            if emit_live_assistant_text {
+                send_event!(tx, AppEvent::StreamText(text.clone()));
+            }
             full_content.push_str(&text);
         }
         SseAction::Thinking(text) => {
@@ -3631,6 +3642,7 @@ pub async fn decode_openai_responses_stream(
     })
 }
 
+#[allow(clippy::too_many_lines)] // Streaming validation and the final state commit remain in wire order.
 async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, String> {
     let SseStreamParams {
         run_context,
@@ -3653,6 +3665,7 @@ async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnRes
         tx,
         ..
     } = p;
+    let emit_live_assistant_text = should_emit_live_assistant_text(app_config.as_deref());
     let decoded = decode_openai_responses_stream(
         OpenAiResponsesStreamParams {
             response,
@@ -3663,7 +3676,9 @@ async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnRes
             assistant_message_ordinal,
         },
         |text| {
-            send_event!(tx, AppEvent::StreamText(text.to_string()));
+            if emit_live_assistant_text {
+                send_event!(tx, AppEvent::StreamText(text.to_string()));
+            }
             Ok(())
         },
         |reasoning| {
@@ -5027,6 +5042,20 @@ mod tests {
         ContinuationGeneration, ProviderNativeItem, ProviderNativeItemPurpose, ProviderNativeState,
         ProviderStateFacet, ProviderWireProtocol,
     };
+
+    #[test]
+    fn enabled_vdd_holds_assistant_text_at_the_shared_stream_boundary() {
+        let enabled: AppConfig = serde_yaml::from_str(
+            "proxy: {}\nproviders: {}\nvdd:\n  enabled: true\n  mode: blocking\n",
+        )
+        .expect("enabled VDD config");
+        let disabled: AppConfig =
+            serde_yaml::from_str("proxy: {}\nproviders: {}\n").expect("default config");
+
+        assert!(!should_emit_live_assistant_text(Some(&enabled)));
+        assert!(should_emit_live_assistant_text(Some(&disabled)));
+        assert!(should_emit_live_assistant_text(None));
+    }
 
     fn pipeline_native_state(
         provider: &str,

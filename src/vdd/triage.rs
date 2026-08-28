@@ -4,9 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use reqwest::Client;
+use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::config::{AppConfig, VddConfig};
 use crate::providers::ApiKey;
@@ -21,7 +22,7 @@ use crate::vdd::helpers::truncate_output;
 use crate::vdd::parsing::{extract_json_from_response, parse_severity};
 use crate::vdd::prompts::VERIFIER_SYSTEM_PROMPT;
 use crate::vdd::review::AdversaryResponse;
-use crate::vdd::transport::send_to_builder_for_verification;
+use crate::vdd::transport::{send_to_builder_for_verification, VddReviewBudget};
 
 /// Disposition of a parsed adversary response.
 ///
@@ -309,7 +310,7 @@ fn deterministic_finding_id(
 /// Inputs needed by the triage pipeline. Bundled into a struct so the
 /// `triage_findings` API stays under the `too_many_arguments` lint threshold.
 pub struct TriageContext<'a> {
-    pub run: &'a crate::tools::ToolRunContext,
+    pub budget: &'a VddReviewBudget,
     pub client: &'a Client,
     pub config: &'a VddConfig,
     pub app_config: &'a AppConfig,
@@ -320,6 +321,7 @@ pub struct TriageContext<'a> {
     pub previous_fps: &'a [FindingIdentity],
     pub builder_code: &'a str,
     pub builder_provider: &'a str,
+    pub builder_model: Option<&'a str>,
     pub builder_api_key: Option<&'a ApiKey>,
     pub builder_auth: Option<&'a crate::vdd::transport::VddProviderAuth>,
 }
@@ -518,12 +520,7 @@ async fn verify_findings(
 
     // Use the builder's provider model for verification — independent
     // from the adversary to avoid correlated confabulation.
-    let model = ctx
-        .app_config
-        .providers
-        .get(ctx.builder_provider)
-        .and_then(|p| p.model.clone())
-        .unwrap_or_else(|| "default".to_string());
+    let model = resolve_verifier_model(ctx)?;
 
     let request = ChatCompletionRequest {
         model,
@@ -555,7 +552,7 @@ async fn verify_findings(
 
     // Route through the builder's provider, not the adversary's
     let (response_text, tokens) = send_to_builder_for_verification(
-        ctx.run,
+        ctx.budget,
         ctx.client,
         ctx.config,
         ctx.app_config,
@@ -571,49 +568,91 @@ async fn verify_findings(
         tokens.input_tokens, tokens.output_tokens
     );
 
-    // Parse verdicts from the response
-    Ok(parse_verification_verdicts(&response_text))
+    // Parse verdicts from the response. Every requested finding must receive
+    // exactly one structured terminal verdict; partial or prose output is not
+    // a successful verification pass.
+    parse_verification_verdicts(&response_text, findings)
+}
+
+fn resolve_verifier_model(ctx: &TriageContext<'_>) -> Result<String, VddError> {
+    ctx.builder_model
+        .filter(|model| !model.trim().is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            ctx.app_config
+                .providers
+                .get(ctx.builder_provider)
+                .and_then(|provider| provider.model.clone())
+                .filter(|model| !model.trim().is_empty())
+        })
+        .ok_or_else(|| {
+            VddError::ConfigError(format!(
+                "Builder model is unavailable for verifier routing through '{}'",
+                ctx.builder_provider
+            ))
+        })
 }
 
 /// Parse the verification agent's response into a `finding_id` → verdict map.
-fn parse_verification_verdicts(response: &str) -> HashMap<String, String> {
-    let mut verdicts = HashMap::new();
-
-    // Try to extract JSON from the response
-    let json_str = extract_json_from_response(response).unwrap_or_else(|| response.to_string());
-
-    if let Ok(value) = serde_json::from_str::<Value>(&json_str) {
-        if let Some(arr) = value.get("verdicts").and_then(|v| v.as_array()) {
-            for item in arr {
-                if let (Some(id), Some(verdict)) = (
-                    item.get("finding_id").and_then(|v| v.as_str()),
-                    item.get("verdict").and_then(|v| v.as_str()),
-                ) {
-                    let normalized = verdict.to_lowercase();
-                    if normalized == "genuine" || normalized == "confabulated" {
-                        verdicts.insert(id.to_string(), normalized);
-                    }
-                }
-            }
-        }
+fn parse_verification_verdicts(
+    response: &str,
+    findings: &[&Finding],
+) -> Result<HashMap<String, String>, VddError> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct VerificationReport {
+        verdicts: Vec<VerificationRow>,
     }
 
-    if verdicts.is_empty() && !response.is_empty() {
-        // Fallback: try to extract verdicts from natural language
-        // If the verifier says something like "all findings are confabulated"
-        let lower = response.to_lowercase();
-        if lower.contains("all") && lower.contains("confabulated") {
-            debug!("VDD verifier: bulk confabulation detected in natural language response");
-            // Can't map to specific IDs without parsing, so return empty
-            // and let the convergence math handle it next iteration
-        }
-        warn!(
-            "VDD verifier: could not parse structured verdicts from response ({} chars)",
-            response.len()
-        );
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct VerificationRow {
+        finding_id: String,
+        verdict: VerificationVerdict,
     }
 
-    verdicts
+    #[derive(Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    enum VerificationVerdict {
+        Genuine,
+        Confabulated,
+    }
+
+    let report: VerificationReport = serde_json::from_str(response.trim()).map_err(|error| {
+        VddError::ParseError(format!(
+            "verifier returned malformed terminal JSON: {error}"
+        ))
+    })?;
+    if report.verdicts.len() != findings.len() {
+        return Err(VddError::ParseError(format!(
+            "verifier returned {} verdicts for {} findings",
+            report.verdicts.len(),
+            findings.len()
+        )));
+    }
+    let expected: HashSet<&str> = findings.iter().map(|finding| finding.id.as_str()).collect();
+    let mut verdicts = HashMap::with_capacity(report.verdicts.len());
+    for row in report.verdicts {
+        if !expected.contains(row.finding_id.as_str()) {
+            return Err(VddError::ParseError(format!(
+                "verifier returned an unknown finding id '{}'",
+                row.finding_id
+            )));
+        }
+        let verdict = match row.verdict {
+            VerificationVerdict::Genuine => "genuine",
+            VerificationVerdict::Confabulated => "confabulated",
+        };
+        if verdicts
+            .insert(row.finding_id, verdict.to_string())
+            .is_some()
+        {
+            return Err(VddError::ParseError(
+                "verifier returned a duplicate finding verdict".to_string(),
+            ));
+        }
+    }
+    Ok(verdicts)
 }
 
 /// Build the code view shown to the verification LLM, centered around
@@ -853,6 +892,75 @@ mod tests {
         assert_ne!(a[0].id, c[0].id);
     }
 
+    #[test]
+    fn verification_parser_accepts_one_exact_verdict_per_finding() {
+        let findings = parse_findings(
+            r#"{"findings":[{"severity":"HIGH","description":"reachable defect"},{"severity":"LOW","description":"secondary defect"}],"assessment":"FINDINGS_PRESENT"}"#,
+            1,
+        );
+        let refs = findings.iter().collect::<Vec<_>>();
+        let response = serde_json::json!({
+            "verdicts": [
+                {"finding_id": findings[0].id, "verdict": "genuine"},
+                {"finding_id": findings[1].id, "verdict": "confabulated"},
+            ]
+        });
+
+        let verdicts = parse_verification_verdicts(&response.to_string(), &refs)
+            .expect("complete structured verdicts");
+        assert_eq!(
+            verdicts.get(&findings[0].id).map(String::as_str),
+            Some("genuine")
+        );
+        assert_eq!(
+            verdicts.get(&findings[1].id).map(String::as_str),
+            Some("confabulated")
+        );
+    }
+
+    #[test]
+    fn verification_parser_rejects_partial_duplicate_unknown_and_malformed_output() {
+        let findings = parse_findings(
+            r#"{"findings":[{"severity":"HIGH","description":"reachable defect"},{"severity":"LOW","description":"secondary defect"}],"assessment":"FINDINGS_PRESENT"}"#,
+            1,
+        );
+        let refs = findings.iter().collect::<Vec<_>>();
+        let invalid = [
+            serde_json::json!({
+                "verdicts": [{"finding_id": findings[0].id, "verdict": "genuine"}]
+            })
+            .to_string(),
+            serde_json::json!({
+                "verdicts": [
+                    {"finding_id": findings[0].id, "verdict": "genuine"},
+                    {"finding_id": findings[0].id, "verdict": "confabulated"},
+                ]
+            })
+            .to_string(),
+            serde_json::json!({
+                "verdicts": [
+                    {"finding_id": findings[0].id, "verdict": "genuine"},
+                    {"finding_id": "unknown", "verdict": "confabulated"},
+                ]
+            })
+            .to_string(),
+            "not terminal json".to_string(),
+            format!(
+                "Verifier prose before JSON: {}",
+                serde_json::json!({
+                    "verdicts": [
+                        {"finding_id": findings[0].id, "verdict": "genuine"},
+                        {"finding_id": findings[1].id, "verdict": "confabulated"},
+                    ]
+                })
+            ),
+        ];
+
+        for response in invalid {
+            assert!(parse_verification_verdicts(&response, &refs).is_err());
+        }
+    }
+
     /// Tuple matches are review hints, not authority to demote a finding.
     #[tokio::test]
     async fn test_triage_keeps_tuple_duplicate_genuine_without_verification() {
@@ -882,13 +990,19 @@ mod tests {
             description: "String concatenation vulnerability in users table".to_string(),
         }];
         let ctx = TriageContext {
-            run: crate::tools::security::test_run_context(),
+            budget: &VddReviewBudget::admit(
+                crate::tools::security::test_run_context(),
+                &config,
+                false,
+            )
+            .expect("review budget"),
             client: &client,
             config: &config,
             app_config: &app_config,
             previous_fps: &previous_fps,
             builder_code: "let q = format!(\"SELECT * FROM users WHERE id = {}\", x);",
             builder_provider: "test",
+            builder_model: None,
             builder_api_key: None,
             builder_auth: None,
         };
@@ -925,13 +1039,19 @@ mod tests {
             description: "SQL injection in template renderer".to_string(),
         }];
         let ctx = TriageContext {
-            run: crate::tools::security::test_run_context(),
+            budget: &VddReviewBudget::admit(
+                crate::tools::security::test_run_context(),
+                &config,
+                false,
+            )
+            .expect("review budget"),
             client: &client,
             config: &config,
             app_config: &app_config,
             previous_fps: &previous_fps,
             builder_code: "let html = format!(\"<div>{}</div>\", user_input);",
             builder_provider: "nonexistent-provider", // AI layer will fail; we expect Genuine
+            builder_model: None,
             builder_api_key: None,
             builder_auth: None,
         };
@@ -971,13 +1091,19 @@ mod tests {
             description: "SQL injection at first call site".to_string(),
         }];
         let ctx = TriageContext {
-            run: crate::tools::security::test_run_context(),
+            budget: &VddReviewBudget::admit(
+                crate::tools::security::test_run_context(),
+                &config,
+                false,
+            )
+            .expect("review budget"),
             client: &client,
             config: &config,
             app_config: &app_config,
             previous_fps: &previous_fps,
             builder_code: "fn x() {} fn y() {}",
             builder_provider: "nonexistent-provider",
+            builder_model: None,
             builder_api_key: None,
             builder_auth: None,
         };
@@ -1022,13 +1148,19 @@ mod tests {
                 .to_string(),
         }];
         let ctx = TriageContext {
-            run: crate::tools::security::test_run_context(),
+            budget: &VddReviewBudget::admit(
+                crate::tools::security::test_run_context(),
+                &config,
+                false,
+            )
+            .expect("review budget"),
             client: &client,
             config: &config,
             app_config: &app_config,
             previous_fps: &previous_fps,
             builder_code: "fn auth_helper() {} fn db_helper() {}",
             builder_provider: "nonexistent-provider",
+            builder_model: None,
             builder_api_key: None,
             builder_auth: None,
         };
@@ -1067,13 +1199,19 @@ mod tests {
             description: "Possible panic in helper if input is malformed (re-reported)".to_string(),
         }];
         let ctx = TriageContext {
-            run: crate::tools::security::test_run_context(),
+            budget: &VddReviewBudget::admit(
+                crate::tools::security::test_run_context(),
+                &config,
+                false,
+            )
+            .expect("review budget"),
             client: &client,
             config: &config,
             app_config: &app_config,
             previous_fps: &previous_fps,
             builder_code: "fn helper(s: &str) {}",
             builder_provider: "nonexistent-provider",
+            builder_model: None,
             builder_api_key: None,
             builder_auth: None,
         };
@@ -1103,13 +1241,19 @@ mod tests {
 
         // The historical pattern is visible to triage but cannot demote it.
         let ctx = TriageContext {
-            run: crate::tools::security::test_run_context(),
+            budget: &VddReviewBudget::admit(
+                crate::tools::security::test_run_context(),
+                &config,
+                false,
+            )
+            .expect("review budget"),
             client: &client,
             config: &config,
             app_config: &app_config,
             previous_fps: &[],
             builder_code: "let guard = mutex.lock().unwrap();",
             builder_provider: "test",
+            builder_model: None,
             builder_api_key: None,
             builder_auth: None,
         };
@@ -1140,13 +1284,19 @@ mod tests {
         // AI verification will fail (no provider configured) but should
         // warn the user and keep the finding as Genuine (safe fallback).
         let ctx = TriageContext {
-            run: crate::tools::security::test_run_context(),
+            budget: &VddReviewBudget::admit(
+                crate::tools::security::test_run_context(),
+                &config,
+                false,
+            )
+            .expect("review budget"),
             client: &client,
             config: &config,
             app_config: &app_config,
             previous_fps: &[],
             builder_code: "let query = format!(\"SELECT * FROM users WHERE id = {}\", user_input);",
             builder_provider: "nonexistent-provider",
+            builder_model: None,
             builder_api_key: None,
             builder_auth: None,
         };

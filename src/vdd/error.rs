@@ -1,5 +1,7 @@
 //! VDD error type and result enums.
 
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -45,6 +47,16 @@ pub enum VddError {
     IoError(#[from] std::io::Error),
 }
 
+/// Host-side failures while binding a candidate to the VDD finalization gate.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum VddFinalizationError {
+    #[error("invalid VDD finalization policy: {0}")]
+    InvalidPolicy(String),
+
+    #[error("invalid VDD candidate binding: {0}")]
+    InvalidCandidate(String),
+}
+
 /// Top-level result from VDD processing
 pub enum VddResult {
     /// Advisory mode: single pass, findings for context injection
@@ -55,12 +67,36 @@ pub enum VddResult {
     Skipped(String),
 }
 
+/// Terminal disposition of one provider call owned by a VDD review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VddProviderCallOutcome {
+    Completed,
+    FailedOrUnknown,
+}
+
+/// Transport-observed identity and accounting receipt for one VDD model call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VddProviderCallReceipt {
+    pub provider: String,
+    pub requested_model: String,
+    pub resolved_model: Option<String>,
+    pub outcome: VddProviderCallOutcome,
+    pub usage_known: bool,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub response_bytes: u64,
+    pub completed_at: DateTime<Utc>,
+}
+
 /// Advisory mode result
 pub struct VddAdvisoryResult {
     pub findings: Vec<Finding>,
     pub context_observation: Option<crate::context::ContextItem>,
     pub static_analysis: Vec<StaticAnalysisResult>,
     pub tokens_used: TokenUsage,
+    pub provider_receipts: Vec<VddProviderCallReceipt>,
 }
 
 /// Blocking mode result
@@ -68,4 +104,14 @@ pub struct VddBlockingResult {
     pub final_response: Value,
     pub session: VddSession,
     pub crosslink_issues: Vec<String>,
+    pub provider_receipts: Vec<VddProviderCallReceipt>,
+}
+
+/// Blocking VDD result for frontends whose provider turn is already decoded
+/// to text rather than retained as a provider-native JSON envelope.
+pub struct VddBlockingTextResult {
+    pub final_text: String,
+    pub session: VddSession,
+    pub crosslink_issues: Vec<String>,
+    pub provider_receipts: Vec<VddProviderCallReceipt>,
 }

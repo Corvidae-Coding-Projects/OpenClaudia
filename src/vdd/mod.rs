@@ -27,6 +27,7 @@ mod canonical;
 pub mod confabulation;
 mod engine;
 mod error;
+mod finalization;
 pub mod finding;
 mod helpers;
 pub mod parsing;
@@ -48,7 +49,18 @@ pub use canonical::{
     VddPromotionAuthority,
 };
 pub use engine::{BuilderProvider, VddEngine};
-pub use error::{VddAdvisoryResult, VddBlockingResult, VddError, VddResult};
+pub use error::{
+    VddAdvisoryResult, VddBlockingResult, VddBlockingTextResult, VddError, VddFinalizationError,
+    VddProviderCallOutcome, VddProviderCallReceipt, VddResult,
+};
+pub(crate) use finalization::blocking_session_has_clean_final_iteration;
+pub use finalization::{
+    finalize_review_result, finalize_text_candidate, finalize_worker_candidate,
+    finalize_worker_candidate_with_receipt, finalize_worker_preflight_failure, VddCandidateBinding,
+    VddFinalizationOutcome, VddFinalizationPolicy, VddFinalizationRequirement, VddNonPassOutcome,
+    VddPublication, VddPublishedCandidate, VddResponseFinalization, VddWithheldCandidate,
+    VddWorkerFinalization, VddWorkerFinalizationRecord,
+};
 pub use finding::{Finding, FindingStatus, Severity};
 pub use helpers::findings_context_observation;
 pub use review::{AdversaryReview, VddIteration, VddSession};

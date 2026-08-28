@@ -1869,7 +1869,8 @@ async fn apply_vdd_review(
 
     let vdd_result = {
         let engine = vdd_engine.lock().await;
-        let builder = crate::vdd::BuilderProvider::new(provider_name, api_key);
+        let builder =
+            crate::vdd::BuilderProvider::new(provider_name, api_key).with_model(&request.model);
         engine
             .process_response(&state.run_context, &response_json, request, builder)
             .await
@@ -1902,110 +1903,117 @@ async fn apply_vdd_review(
         }
     }
 
-    // Decide which bytes to ship back. Only a converged blocking review may
-    // replace the candidate. Advisory failures remain explicit fail-open
-    // delivery; blocking skips, failures, and unconverged sessions are typed
-    // non-success responses and never expose the unreviewed candidate.
-    let (body_bytes, mode, outcome): (Vec<u8>, crate::config::VddMode, &'static str) =
-        match vdd_result {
-            Ok(VddResult::Advisory(advisory)) => {
-                let genuine = advisory
-                    .findings
-                    .iter()
-                    .filter(|f| f.status == crate::vdd::FindingStatus::Genuine)
-                    .count();
-                if let Some(observation) = advisory.context_observation {
-                    let mut sm = state.session_manager.write().await;
-                    sm.store_vdd_observation(observation);
-                }
-                info!(
-                    total = advisory.findings.len(),
-                    genuine = genuine,
-                    "VDD advisory review complete"
-                );
-                let outcome = if genuine == 0 {
-                    "advisory"
-                } else {
-                    "advisory-findings"
-                };
-                (
-                    response_bytes.to_vec(),
-                    crate::config::VddMode::Advisory,
-                    outcome,
-                )
-            }
-            Ok(VddResult::Blocking(blocking)) => {
-                info!(
-                    iterations = blocking.session.iterations.len(),
-                    genuine = blocking.session.total_genuine,
-                    converged = blocking.session.converged,
-                    crosslink_issues = blocking.crosslink_issues.len(),
-                    "VDD blocking loop complete"
-                );
-                if !blocking.session.converged {
-                    return blocking_vdd_failure_response(
-                        parts,
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        "failed",
-                        "Blocking VDD review did not converge",
-                    );
-                }
-                let final_response = if route == ProxyRouteKind::ChatCompletions {
+    let policy = crate::vdd::VddFinalizationPolicy::from_config(&state.config.vdd);
+    let scope = format!(
+        "proxy:{}:{}",
+        state.run_context.runtime().descriptor().session_id,
+        route.as_str()
+    );
+    let finalization = crate::vdd::finalize_review_result(
+        &state.run_context,
+        &policy,
+        response_bytes.to_vec(),
+        &scope,
+        vdd_result,
+    );
+    let (publication, observation, provider_receipts) = finalization.into_parts_with_receipts();
+    if let Some(observation) = observation {
+        state
+            .session_manager
+            .write()
+            .await
+            .store_vdd_observation(observation);
+    }
+    info!(
+        provider_calls = provider_receipts.len(),
+        "VDD finalization consumed bounded provider-call receipts"
+    );
+
+    let (body_bytes, mode, outcome) = match publication {
+        crate::vdd::VddPublication::Publish(candidate) => {
+            let finalization_outcome = candidate.outcome();
+            let mut body = candidate.into_candidate();
+            if state.config.vdd.mode == crate::config::VddMode::Blocking {
+                let provider_response: Value = serde_json::from_slice(&body).map_err(|error| {
+                    ProxyError::FinalizationFailed(format!(
+                        "failed to decode the reviewed blocking response: {error}"
+                    ))
+                })?;
+                let client_response = if route == ProxyRouteKind::ChatCompletions {
                     get_adapter(provider_name)
-                    .map_err(|error| ProxyError::FinalizationFailed(error.to_string()))?
-                    .transform_response(blocking.final_response, false)
-                    .map_err(|error| {
-                        ProxyError::FinalizationFailed(format!(
-                            "failed to translate blocking VDD response to the client protocol: {error}"
-                        ))
-                    })?
+                        .map_err(|error| ProxyError::FinalizationFailed(error.to_string()))?
+                        .transform_response(provider_response, false)
+                        .map_err(|error| {
+                            ProxyError::FinalizationFailed(format!(
+                                "failed to translate blocking VDD response to the client protocol: {error}"
+                            ))
+                        })?
                 } else {
-                    blocking.final_response
+                    provider_response
                 };
-                let body = serde_json::to_vec(&final_response).map_err(|error| {
+                body = serde_json::to_vec(&client_response).map_err(|error| {
                     ProxyError::FinalizationFailed(format!(
                         "failed to serialize blocking VDD response: {error}"
                     ))
                 })?;
-                (body, crate::config::VddMode::Blocking, "passed")
             }
-            Ok(VddResult::Skipped(reason)) => {
-                debug!(reason = %reason, "VDD skipped");
-                if state.config.vdd.mode == crate::config::VddMode::Blocking {
-                    return blocking_vdd_failure_response(
-                        parts,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "unavailable",
-                        "Blocking VDD review was unavailable for this candidate",
-                    );
-                }
-                (
-                    response_bytes.to_vec(),
-                    crate::config::VddMode::Advisory,
+            (
+                body,
+                state.config.vdd.mode.clone(),
+                vdd_finalization_outcome_header(finalization_outcome),
+            )
+        }
+        crate::vdd::VddPublication::Withhold(withheld) => {
+            let (status, outcome, message) = match withheld.outcome() {
+                crate::vdd::VddNonPassOutcome::Unavailable => (
+                    StatusCode::SERVICE_UNAVAILABLE,
                     "unavailable",
-                )
-            }
-            Err(e) => {
-                warn!(error = %e, "VDD review failed");
-                if state.config.vdd.mode == crate::config::VddMode::Blocking {
-                    return blocking_vdd_failure_response(
-                        parts,
-                        StatusCode::BAD_GATEWAY,
-                        "failed",
-                        "Blocking VDD review failed",
-                    );
-                }
-                (
-                    response_bytes.to_vec(),
-                    crate::config::VddMode::Advisory,
-                    "failed-open",
-                )
-            }
-        };
+                    "Blocking VDD review was unavailable for this candidate",
+                ),
+                crate::vdd::VddNonPassOutcome::VerifierError => (
+                    StatusCode::BAD_GATEWAY,
+                    "verifier-error",
+                    "Blocking VDD review failed",
+                ),
+                crate::vdd::VddNonPassOutcome::Cancelled => (
+                    StatusCode::REQUEST_TIMEOUT,
+                    "cancelled",
+                    "Blocking VDD review was cancelled",
+                ),
+                crate::vdd::VddNonPassOutcome::Fail
+                | crate::vdd::VddNonPassOutcome::Inconclusive
+                | crate::vdd::VddNonPassOutcome::Stale
+                | crate::vdd::VddNonPassOutcome::Unconverged => (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "failed",
+                    "Blocking VDD review did not produce a publishable candidate",
+                ),
+            };
+            return blocking_vdd_failure_response(parts, status, outcome, message);
+        }
+    };
 
     let mut response = Response::from_parts(parts, Body::from(body_bytes));
     annotate_vdd_response(&mut response, &mode, outcome);
     Ok(response)
+}
+
+const fn vdd_finalization_outcome_header(
+    outcome: crate::vdd::VddFinalizationOutcome,
+) -> &'static str {
+    match outcome {
+        crate::vdd::VddFinalizationOutcome::Pass => "passed",
+        crate::vdd::VddFinalizationOutcome::Advisory => "advisory",
+        crate::vdd::VddFinalizationOutcome::SkippedByPolicy => "skipped",
+        crate::vdd::VddFinalizationOutcome::Fail => "failed",
+        crate::vdd::VddFinalizationOutcome::Inconclusive => "inconclusive",
+        crate::vdd::VddFinalizationOutcome::VerifierError => "verifier-error",
+        crate::vdd::VddFinalizationOutcome::Unavailable => "unavailable",
+        crate::vdd::VddFinalizationOutcome::Stale => "stale",
+        crate::vdd::VddFinalizationOutcome::Unconverged => "unconverged",
+        crate::vdd::VddFinalizationOutcome::Cancelled => "cancelled",
+        crate::vdd::VddFinalizationOutcome::FailOpen => "failed-open",
+    }
 }
 
 async fn fire_vdd_result_hooks(
@@ -2054,6 +2062,8 @@ fn vdd_result_hook_plan(result: &VddResult) -> Vec<(HookEvent, Value)> {
             events
         }
         VddResult::Blocking(blocking) => {
+            let clean_convergence = blocking.session.converged
+                && crate::vdd::blocking_session_has_clean_final_iteration(&blocking.session);
             let mut events = vec![(
                 HookEvent::PostAdversaryReview,
                 serde_json::json!({
@@ -2063,7 +2073,8 @@ fn vdd_result_hook_plan(result: &VddResult) -> Vec<(HookEvent, Value)> {
                     "total_findings": blocking.session.total_findings,
                     "genuine_findings": blocking.session.total_genuine,
                     "false_positives": blocking.session.total_false_positives,
-                    "converged": blocking.session.converged,
+                    "converged": clean_convergence,
+                    "loop_converged": blocking.session.converged,
                     "crosslink_issues": blocking.crosslink_issues.len(),
                 }),
             )];
@@ -2076,7 +2087,7 @@ fn vdd_result_hook_plan(result: &VddResult) -> Vec<(HookEvent, Value)> {
                     }),
                 ));
             }
-            if blocking.session.converged {
+            if clean_convergence {
                 events.push((
                     HookEvent::VddConverged,
                     serde_json::json!({
@@ -7080,6 +7091,7 @@ mod tests {
             )),
             static_analysis: vec![],
             tokens_used: crate::session::TokenUsage::default(),
+            provider_receipts: Vec::new(),
         });
 
         let plan = vdd_result_hook_plan(&result);
@@ -7094,15 +7106,42 @@ mod tests {
     #[test]
     fn vdd_blocking_hook_plan_reports_conflict_and_convergence() {
         let mut session = crate::vdd::review::VddSession::new(crate::config::VddMode::Blocking);
-        session.total_findings = 3;
-        session.total_genuine = 1;
-        session.total_false_positives = 2;
+        for (number, findings, genuine_count, false_positive_count) in [
+            (
+                1,
+                vec![test_vdd_finding(crate::vdd::FindingStatus::Genuine)],
+                1,
+                0,
+            ),
+            (
+                2,
+                vec![test_vdd_finding(crate::vdd::FindingStatus::FalsePositive)],
+                0,
+                1,
+            ),
+        ] {
+            session.record_iteration(crate::vdd::VddIteration {
+                number,
+                builder_response: "candidate".to_string(),
+                static_analysis: Vec::new(),
+                adversary_review: crate::vdd::AdversaryReview {
+                    iteration: number,
+                    findings,
+                    raw_response: "{}".to_string(),
+                    tokens_used: crate::session::TokenUsage::default(),
+                    timestamp: chrono::Utc::now(),
+                },
+                genuine_count,
+                false_positive_count,
+            });
+        }
         session.finalize(true, "clean pass");
 
         let result = VddResult::Blocking(crate::vdd::VddBlockingResult {
             final_response: serde_json::json!({"ok": true}),
             session,
             crosslink_issues: vec!["issue-1".to_string()],
+            provider_receipts: Vec::new(),
         });
 
         let plan = vdd_result_hook_plan(&result);
@@ -7111,6 +7150,39 @@ mod tests {
         assert_eq!(events[0], HookEvent::PostAdversaryReview);
         assert!(events.contains(&HookEvent::VddConflict));
         assert!(events.contains(&HookEvent::VddConverged));
+    }
+
+    #[test]
+    fn vdd_blocking_hook_does_not_report_dirty_statistical_convergence() {
+        let mut session = crate::vdd::review::VddSession::new(crate::config::VddMode::Blocking);
+        session.record_iteration(crate::vdd::VddIteration {
+            number: 1,
+            builder_response: "candidate".to_string(),
+            static_analysis: Vec::new(),
+            adversary_review: crate::vdd::AdversaryReview {
+                iteration: 1,
+                findings: vec![test_vdd_finding(crate::vdd::FindingStatus::Genuine)],
+                raw_response: "{}".to_string(),
+                tokens_used: crate::session::TokenUsage::default(),
+                timestamp: chrono::Utc::now(),
+            },
+            genuine_count: 1,
+            false_positive_count: 0,
+        });
+        session.finalize(true, "statistical threshold");
+        let result = VddResult::Blocking(crate::vdd::VddBlockingResult {
+            final_response: serde_json::json!({"ok": true}),
+            session,
+            crosslink_issues: Vec::new(),
+            provider_receipts: Vec::new(),
+        });
+
+        let events = vdd_result_hook_plan(&result);
+        assert_eq!(events[0].1["converged"], false);
+        assert_eq!(events[0].1["loop_converged"], true);
+        assert!(!events
+            .iter()
+            .any(|(event, _)| *event == HookEvent::VddConverged));
     }
 
     #[test]

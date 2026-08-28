@@ -327,7 +327,7 @@ fn response_is_json(response: &reqwest::Response) -> bool {
 async fn print_json_response(
     response: reqwest::Response,
     adapter: &dyn ProviderAdapter,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let body = openclaudia::provider_transport::read_json_capped::<serde_json::Value>(
         response,
         openclaudia::provider_transport::MAX_JSON_RESPONSE_BYTES,
@@ -344,11 +344,14 @@ async fn print_json_response(
     let text = adapter.extract_response_text(&body).ok_or_else(|| {
         anyhow::anyhow!("provider response did not contain printable assistant text")
     })?;
-    println!("{text}");
-    Ok(())
+    Ok(text)
 }
 
-async fn print_sse_response(response: reqwest::Response, provider: &str) -> anyhow::Result<()> {
+async fn print_sse_response(
+    response: reqwest::Response,
+    provider: &str,
+    emit_live: bool,
+) -> anyhow::Result<String> {
     let mut stream = openclaudia::provider_transport::bounded_byte_stream(
         response,
         openclaudia::provider_transport::MAX_STREAM_RESPONSE_BYTES,
@@ -356,6 +359,7 @@ async fn print_sse_response(response: reqwest::Response, provider: &str) -> anyh
     .eventsource();
     let mut state = PrintSseState::new(provider);
     let mut emitted_text = false;
+    let mut full_text = String::new();
 
     while let Some(event) = stream.next().await {
         let event = event.map_err(|err| anyhow::anyhow!("SSE stream error: {err}"))?;
@@ -368,8 +372,11 @@ async fn print_sse_response(response: reqwest::Response, provider: &str) -> anyh
         state.terminal.observe(&json).map_err(anyhow::Error::msg)?;
         if let Some(text) = extract_print_sse_text(&json, &mut state) {
             emitted_text |= !text.is_empty();
-            print!("{text}");
-            std::io::stdout().flush()?;
+            full_text.push_str(&text);
+            if emit_live {
+                print!("{text}");
+                std::io::stdout().flush()?;
+            }
         }
     }
 
@@ -397,8 +404,10 @@ async fn print_sse_response(response: reqwest::Response, provider: &str) -> anyh
         anyhow::bail!("provider stream did not contain printable assistant text");
     }
 
-    println!();
-    Ok(())
+    if emit_live {
+        println!();
+    }
+    Ok(full_text)
 }
 
 fn print_message_values(
@@ -419,7 +428,7 @@ async fn print_responses_stream(
     provider: &str,
     model: &str,
     assistant_message_ordinal: u64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let decoded = openclaudia::pipeline::decode_openai_responses_stream(
         openclaudia::pipeline::OpenAiResponsesStreamParams {
             response,
@@ -450,7 +459,31 @@ async fn print_responses_stream(
     if decoded.content.is_empty() {
         anyhow::bail!("Responses stream did not contain printable assistant text");
     }
-    println!("{}", decoded.content);
+    Ok(decoded.content)
+}
+
+async fn finalize_print_candidate(
+    config: &openclaudia::config::AppConfig,
+    run: &std::sync::Arc<openclaudia::tools::ToolRunContext>,
+    engine: Option<&openclaudia::vdd::VddEngine>,
+    request: &openclaudia::proxy::ChatCompletionRequest,
+    api_key: Option<&openclaudia::providers::ApiKey>,
+    content: String,
+) -> anyhow::Result<()> {
+    let messages = print_message_values(request)?;
+    let (content, _observation) = crate::run_vdd_review(
+        engine,
+        &config.vdd,
+        run,
+        content,
+        &messages,
+        &config.proxy.target,
+        &request.model,
+        api_key,
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
+    println!("{content}");
     Ok(())
 }
 
@@ -688,14 +721,18 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
         provider.thinking.reasoning_effort = Some(skill_effort);
     }
     let adapter = openclaudia::providers::get_adapter(&config.proxy.target)?;
-    let chat_request = build_print_chat_request_with_items(
+    let mut chat_request = build_print_chat_request_with_items(
         adapter,
         &model,
         print_turn.prompt,
         &print_run,
         print_turn.context_items,
     );
+    if config.vdd.enabled {
+        chat_request.stream = Some(false);
+    }
     enforce_print_request_policy(&config, &chat_request)?;
+    let vdd_engine = crate::init_vdd_engine_if_enabled(&config);
     let prepared = prepare_print_transport(&PreparePrintTransport {
         config: &config,
         provider: &provider,
@@ -748,8 +785,15 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
         if turn.content.trim().is_empty() {
             anyhow::bail!("Codex SDK returned no printable assistant text");
         }
-        println!("{}", turn.content);
-        return Ok(());
+        return finalize_print_candidate(
+            &config,
+            &print_run,
+            vdd_engine.as_ref(),
+            &chat_request,
+            chat_auth.api_key.as_ref(),
+            turn.content,
+        )
+        .await;
     }
 
     if let Some(sdk) = chat_auth.claude_agent_sdk.as_ref() {
@@ -781,8 +825,15 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
         if turn.content.trim().is_empty() {
             anyhow::bail!("Claude Agent SDK returned no printable assistant text");
         }
-        println!("{}", turn.content);
-        return Ok(());
+        return finalize_print_candidate(
+            &config,
+            &print_run,
+            vdd_engine.as_ref(),
+            &chat_request,
+            chat_auth.api_key.as_ref(),
+            turn.content,
+        )
+        .await;
     }
 
     let client = openclaudia::provider_transport::shared_client()
@@ -799,25 +850,45 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
         anyhow::bail!("API error {}: {diagnostic}", status.as_u16());
     }
 
-    let result = if wire_api.is_responses() {
-        print_responses_stream(
-            response,
-            &headers,
-            &config.proxy.target,
-            &model,
-            responses_assistant_ordinal
-                .ok_or_else(|| anyhow::anyhow!("Responses request ordinal is missing"))?,
+    let (result, emitted_live) = if wire_api.is_responses() {
+        (
+            print_responses_stream(
+                response,
+                &headers,
+                &config.proxy.target,
+                &model,
+                responses_assistant_ordinal
+                    .ok_or_else(|| anyhow::anyhow!("Responses request ordinal is missing"))?,
+            )
+            .await,
+            false,
         )
-        .await
     } else if response_is_json(&response) {
-        print_json_response(response, adapter).await
+        (print_json_response(response, adapter).await, false)
     } else {
-        print_sse_response(response, &config.proxy.target).await
+        let emitted_live = !config.vdd.enabled;
+        (
+            print_sse_response(response, &config.proxy.target, emitted_live).await,
+            emitted_live,
+        )
     };
     provider_budget
         .finish_unknown()
         .map_err(|error| anyhow::anyhow!("Provider budget reconciliation failed: {error}"))?;
-    result
+    let content = result?;
+    if emitted_live {
+        Ok(())
+    } else {
+        finalize_print_candidate(
+            &config,
+            &print_run,
+            vdd_engine.as_ref(),
+            &chat_request,
+            chat_auth.api_key.as_ref(),
+            content,
+        )
+        .await
+    }
     }
     .await;
 

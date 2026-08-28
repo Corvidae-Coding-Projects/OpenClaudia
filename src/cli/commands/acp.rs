@@ -96,13 +96,13 @@ pub async fn cmd_acp(
             )
         })?;
 
-    openclaudia::acp::run_acp_server(
+    Box::pin(openclaudia::acp::run_acp_server(
         config,
         model,
         api_key,
         claude_code_token,
         claude_agent_sdk,
         codex_agent_sdk,
-    )
+    ))
     .await
 }

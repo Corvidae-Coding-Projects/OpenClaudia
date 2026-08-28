@@ -107,6 +107,9 @@ type SharedAcpTaskManagers =
 pub struct AcpServer {
     /// Application config (providers, hooks, etc.)
     config: AppConfig,
+    /// Host-owned VDD engine. Required policy still fails closed when this is
+    /// absent; model output cannot construct or waive it.
+    vdd_engine: Option<crate::vdd::VddEngine>,
     /// Session manager for persistence
     session_manager: SessionManager,
     /// Hook engine — wired through every tool dispatch in
@@ -1327,9 +1330,17 @@ impl AcpServer {
         let policy_enforcer = Arc::new(crate::services::policy::PolicyEnforcer::new(
             config.policy.clone(),
         ));
+        let vdd_engine = if config.vdd.enabled {
+            let client = crate::provider_transport::shared_client()
+                .map_err(|error| format!("creating ACP VDD client failed: {error}"))?;
+            Some(crate::vdd::VddEngine::new(&config.vdd, &config, client))
+        } else {
+            None
+        };
 
         Ok(Self {
             config,
+            vdd_engine,
             session_manager: SessionManager::new(persist_dir),
             hook_engine,
             session_map: HashMap::new(),
@@ -2845,6 +2856,51 @@ impl AcpServer {
                             return "error".to_string();
                         }
                     };
+                    let user_task = self
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+                        .and_then(|message| message.get("content").and_then(Value::as_str))
+                        .unwrap_or("")
+                        .to_string();
+                    let policy = crate::vdd::VddFinalizationPolicy::from_config(&self.config.vdd);
+                    let scope = format!("acp:{acp_session_id}:{user_task}");
+                    let builder = crate::vdd::BuilderProvider::new(
+                        &self.config.proxy.target,
+                        self.api_key.as_ref(),
+                    )
+                    .with_model(&self.model);
+                    let finalization = crate::vdd::finalize_text_candidate(
+                        self.vdd_engine.as_ref(),
+                        &run,
+                        &policy,
+                        rendered_content,
+                        &scope,
+                        &user_task,
+                        builder,
+                    )
+                    .await;
+                    let (publication, vdd_observation) = finalization.into_parts();
+                    let rendered_content = match publication {
+                        crate::vdd::VddPublication::Publish(candidate) => {
+                            candidate.into_candidate()
+                        }
+                        crate::vdd::VddPublication::Withhold(withheld) => {
+                            let reason = format!(
+                                "VDD finalization withheld assistant success ({:?}): {}",
+                                withheld.outcome(),
+                                withheld.detail()
+                            );
+                            self.send_session_update(
+                                acp_session_id,
+                                "agent_message_chunk",
+                                &json!({"type": "text", "text": format!("\n{reason}")}),
+                            );
+                            self.record_failed_prompt_turn(&reason);
+                            return "error".to_string();
+                        }
+                    };
                     // No tool calls — we're done
                     if !rendered_content.is_empty() {
                         self.send_session_update(
@@ -2858,6 +2914,13 @@ impl AcpServer {
                             "role": "assistant",
                             "content": rendered_content,
                         }));
+                    }
+                    if let Some(observation) = vdd_observation {
+                        let projection = crate::context::ContextProjector::project(
+                            vec![observation],
+                            crate::context::ContextBudget::default(),
+                        );
+                        projection.append_reference_to_json_messages(&mut self.messages);
                     }
                     if let Some(state) = next_provider_native_state {
                         self.provider_native_state = Some(state);
@@ -5647,6 +5710,7 @@ memory:
         );
         let server = AcpServer {
             config: test_config(),
+            vdd_engine: None,
             session_manager: SessionManager::new(tmp.path().join("sessions")),
             hook_engine: HookEngine::new(HooksConfig::default()),
             session_map: HashMap::new(),

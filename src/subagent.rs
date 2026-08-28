@@ -502,9 +502,33 @@ pub struct BackgroundAgent {
 struct SemanticWorkerSlice {
     source: crate::coordinator::PlannerEvidenceSourceRecord,
     assignment: crate::coordinator::WorkerSliceAssignment,
+    verification: Option<BackgroundWorkerVerificationInput>,
+    promotion: SemanticWorkerPromotion,
     worktree_path: Option<PathBuf>,
     outcome: Option<crate::coordinator::worker_lifecycle::WorkerSliceOutcome>,
     checkpointed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackgroundWorkerVerificationInput {
+    pub objective: String,
+    pub acceptance_criteria: Vec<String>,
+    pub source_content: String,
+    pub worker_provider: String,
+    pub worker_endpoint: String,
+    pub worker_model: String,
+    pub policy_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SemanticWorkerPromotion {
+    Pending,
+    NotRequired,
+    Accepted,
+    Rejected {
+        outcome: crate::vdd::VddFinalizationOutcome,
+        detail: String,
+    },
 }
 
 /// Canonical child-run snapshot consumed by the rotating planner ledger.
@@ -518,6 +542,9 @@ pub(crate) struct BackgroundChildSnapshot {
     pub source: crate::coordinator::PlannerEvidenceSourceRecord,
     pub assignment: crate::coordinator::WorkerSliceAssignment,
     pub outcome: Option<crate::coordinator::worker_lifecycle::WorkerSliceOutcome>,
+    pub candidate: Option<String>,
+    pub verification: Option<BackgroundWorkerVerificationInput>,
+    pub promotion: SemanticWorkerPromotion,
 }
 
 /// Manager for background agents
@@ -862,6 +889,7 @@ impl BackgroundAgentManager {
         id: &str,
         source: crate::coordinator::PlannerEvidenceSourceRecord,
         assignment: crate::coordinator::WorkerSliceAssignment,
+        verification: Option<BackgroundWorkerVerificationInput>,
         worktree_path: Option<PathBuf>,
     ) -> Result<(), String> {
         let observed_locator = worktree_path
@@ -920,6 +948,12 @@ impl BackgroundAgentManager {
         let next = SemanticWorkerSlice {
             source,
             assignment,
+            promotion: if verification.is_some() {
+                SemanticWorkerPromotion::Pending
+            } else {
+                SemanticWorkerPromotion::NotRequired
+            },
+            verification,
             worktree_path,
             outcome: None,
             checkpointed: false,
@@ -928,6 +962,7 @@ impl BackgroundAgentManager {
             Some(existing)
                 if existing.source == next.source
                     && existing.assignment == next.assignment
+                    && existing.verification == next.verification
                     && existing.worktree_path == next.worktree_path =>
             {
                 Ok(())
@@ -1017,6 +1052,14 @@ impl BackgroundAgentManager {
                     agent.id
                 )
             })?;
+            let candidate = agent_field_guard(
+                &agent.result,
+                "child_snapshots_for_run",
+                &agent.id,
+                "result",
+            )
+            .ok_or_else(|| format!("Agent '{}' result lock poisoned", agent.id))?
+            .clone();
             snapshots.push(BackgroundChildSnapshot {
                 agent_id: agent.id.clone(),
                 task_id,
@@ -1027,6 +1070,9 @@ impl BackgroundAgentManager {
                 source: semantic_slice.source,
                 assignment: semantic_slice.assignment,
                 outcome: semantic_slice.outcome,
+                candidate,
+                verification: semantic_slice.verification,
+                promotion: semantic_slice.promotion,
             });
         }
         snapshots.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
@@ -1071,10 +1117,90 @@ impl BackgroundAgentManager {
                 return Err(format!("Agent '{}' semantic-slice lock poisoned", agent.id));
             };
             if let Some(semantic) = semantic.as_mut() {
-                semantic.checkpointed = true;
+                if semantic.promotion != SemanticWorkerPromotion::Pending {
+                    semantic.checkpointed = true;
+                }
             }
         }
         Ok(())
+    }
+
+    /// Publish the host-owned VDD disposition for one exact worker run.
+    /// Model output cannot call this path or alter the retained candidate.
+    pub(crate) fn record_semantic_finalization(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+        run_id: crate::runtime::RunId,
+        promotion: SemanticWorkerPromotion,
+    ) -> Result<(), String> {
+        if matches!(
+            promotion,
+            SemanticWorkerPromotion::Pending | SemanticWorkerPromotion::NotRequired
+        ) {
+            return Err(
+                "worker finalization must be an accepted or rejected host outcome".to_string(),
+            );
+        }
+        let agents = self
+            .agents_guard("record_semantic_finalization")
+            .ok_or_else(|| "Background agent registry is unavailable".to_string())?;
+        let agent = agents
+            .values()
+            .find(|agent| {
+                agent.owner_run == owner.run_id()
+                    && agent_field_guard(
+                        &agent.child_descriptor,
+                        "record_semantic_finalization",
+                        &agent.id,
+                        "child_descriptor",
+                    )
+                    .and_then(|descriptor| descriptor.as_ref().map(|value| value.run_id))
+                        == Some(run_id)
+            })
+            .cloned()
+            .ok_or_else(|| format!("Worker run '{run_id}' is no longer available"))?;
+        drop(agents);
+        let mut semantic_guard = agent_field_guard(
+            &agent.semantic_slice,
+            "record_semantic_finalization",
+            &agent.id,
+            "semantic_slice",
+        )
+        .ok_or_else(|| format!("Agent '{}' semantic-slice lock poisoned", agent.id))?;
+        let semantic = semantic_guard
+            .as_mut()
+            .ok_or_else(|| format!("Agent '{}' has no semantic worker slice", agent.id))?;
+        let result = match &semantic.promotion {
+            SemanticWorkerPromotion::Pending => {
+                semantic.promotion = promotion;
+                Ok(())
+            }
+            existing if existing == &promotion => Ok(()),
+            _ => Err(format!(
+                "Agent '{}' already has a different worker finalization",
+                agent.id
+            )),
+        };
+        drop(semantic_guard);
+        result
+    }
+
+    fn semantic_finalization_pending(
+        &self,
+        owner: &crate::tools::ToolRunContext,
+        id: &str,
+    ) -> bool {
+        let Some(agent) = self.get_for_run(owner, id) else {
+            return false;
+        };
+        agent_field_guard(
+            &agent.semantic_slice,
+            "semantic_finalization_pending",
+            id,
+            "semantic_slice",
+        )
+        .and_then(|semantic| semantic.as_ref().map(|slice| slice.promotion.clone()))
+            == Some(SemanticWorkerPromotion::Pending)
     }
 
     /// Mark an agent as finished with a result
@@ -1468,7 +1594,7 @@ fn semantic_record_can_be_removed(agent: &BackgroundAgent) -> bool {
     let Some(semantic) = semantic.as_ref() else {
         return true;
     };
-    if semantic.outcome.is_none() {
+    if semantic.outcome.is_none() || semantic.promotion == SemanticWorkerPromotion::Pending {
         return false;
     }
     semantic.checkpointed
@@ -2517,6 +2643,12 @@ impl DelegationTaskGuard {
     fn finish(mut self, status: crate::session::TaskUpdateStatus) -> Result<(), String> {
         self.transition(status)
     }
+
+    /// Leave the delegation durably in progress while a host-owned verifier
+    /// decides whether the worker result may be promoted.
+    fn leave_proposed(mut self) {
+        self.armed = false;
+    }
 }
 
 impl Drop for DelegationTaskGuard {
@@ -3247,6 +3379,9 @@ async fn run_subagent_core(
     let is_verifier = config.agent_type == AgentType::Verifier;
     let coordinator_slice =
         parent_mode.class == crate::modes::RuntimeModeClass::Coordinator && !is_verifier;
+    let worker_vdd_required = coordinator_slice
+        && app_config.vdd.enabled
+        && app_config.vdd.mode == crate::config::VddMode::Blocking;
     let child_registration = match parent_run.begin_child_run_registration() {
         Ok(registration) => registration,
         Err(error) => {
@@ -3601,6 +3736,7 @@ async fn run_subagent_core(
                 model_sha256,
             )
             .map_err(|error| error.to_string())?;
+            let policy_generation = model_binding.generation;
             let task_id = crate::task_graph::TaskId::parse(delegation.task_id.clone())
                 .map_err(|error| error.to_string())?;
             let source_id = crate::coordinator::PlannerSourceId::new();
@@ -3633,9 +3769,21 @@ async fn run_subagent_core(
                     .with_artifact_locator(worktree.worktree_path.to_string_lossy().into_owned())
                     .map_err(|error| error.to_string())?;
             }
-            Ok((source, assignment))
+            let verification = worker_vdd_required.then(|| BackgroundWorkerVerificationInput {
+                objective: config.task.clone(),
+                acceptance_criteria: vec![config.prompt.clone()],
+                source_content: task_content.clone(),
+                worker_provider: app_config.proxy.target.clone(),
+                worker_endpoint: app_config.active_provider().map_or_else(
+                    || "https://api.anthropic.com/v1".to_string(),
+                    |provider| provider.base_url.clone(),
+                ),
+                worker_model: model.clone(),
+                policy_generation,
+            });
+            Ok((source, assignment, verification))
         })();
-        let (source, assignment) = match semantic_binding {
+        let (source, assignment, verification) = match semantic_binding {
             Ok(binding) => binding,
             Err(error) => {
                 BACKGROUND_AGENTS.fail(parent_run, &agent_id, error.clone());
@@ -3654,6 +3802,7 @@ async fn run_subagent_core(
             &agent_id,
             source,
             assignment,
+            verification,
             worktree
                 .as_ref()
                 .map(|isolation| isolation.worktree_path.clone()),
@@ -4724,7 +4873,13 @@ async fn run_subagent_core(
         config.agent_type,
     );
 
-    if let Err(error) = delegation.finish(crate::session::TaskUpdateStatus::Completed) {
+    let delegation_completion = if worker_vdd_required {
+        delegation.leave_proposed();
+        Ok(())
+    } else {
+        delegation.finish(crate::session::TaskUpdateStatus::Completed)
+    };
+    if let Err(error) = delegation_completion {
         let message = format!(
             "Subagent returned a result, but canonical delegation completion could not be committed: {error}"
         );
@@ -4751,6 +4906,9 @@ async fn run_subagent_core(
     // non-force removal failure preserves the worktree and returns its exact
     // location to the supervisor.
     let final_worktree = worktree.and_then(|worktree| {
+        if worker_vdd_required {
+            return Some(worktree);
+        }
         if worktree.has_changes(parent_run) {
             return Some(worktree);
         }
@@ -4766,6 +4924,17 @@ async fn run_subagent_core(
             }
         }
     });
+
+    if worker_vdd_required {
+        return SubagentResult {
+            agent_id,
+            success: false,
+            output: "Worker result is proposed and awaiting host VDD finalization".to_string(),
+            turns_used: turns,
+            is_background: config.run_in_background,
+            worktree: final_worktree,
+        };
+    }
 
     SubagentResult {
         agent_id,
@@ -5953,7 +6122,9 @@ fn execute_task_tool_with_receipt<S: BuildHasher>(
             )
             .await;
 
-            if !result.success {
+            if !result.success
+                && !BACKGROUND_AGENTS.semantic_finalization_pending(&parent_run_bg, &agent_id_bg)
+            {
                 BACKGROUND_AGENTS.fail(&parent_run_bg, &agent_id_bg, result.output);
             }
         });
@@ -6087,6 +6258,15 @@ fn dispatch_subagent_sync(
             );
         }
         (message, false, effect_started)
+    } else if BACKGROUND_AGENTS.semantic_finalization_pending(parent_run, &result.agent_id) {
+        (
+            format!(
+                "Agent produced a proposed result in {} turns; host VDD finalization is pending",
+                result.turns_used
+            ),
+            false,
+            effect_started,
+        )
     } else {
         (
             format!("Agent failed: {}", result.output),
@@ -6098,6 +6278,7 @@ fn dispatch_subagent_sync(
 
 /// Execute the `AgentOutput` tool and retain whether a finished entry was
 /// consumed from the exact-run manager.
+#[allow(clippy::too_many_lines)] // Terminal output, semantic promotion, and cleanup must be observed under one registry snapshot.
 fn execute_agent_output_tool_with_receipt<S: BuildHasher>(
     owner: &crate::tools::ToolRunContext,
     args: &HashMap<String, Value, S>,
@@ -6180,6 +6361,37 @@ fn execute_agent_output_tool_with_receipt<S: BuildHasher>(
     let turns = agent.turns.load(Ordering::SeqCst);
 
     if finished {
+        let promotion = agent_field_guard(
+            &agent.semantic_slice,
+            "agent_output",
+            agent_id,
+            "semantic_slice",
+        )
+        .and_then(|semantic| semantic.as_ref().map(|slice| slice.promotion.clone()));
+        match promotion {
+            Some(SemanticWorkerPromotion::Pending) => {
+                return (
+                    format!(
+                        "Agent '{agent_id}' produced a proposed result after {turns} turns; host VDD finalization is still pending"
+                    ),
+                    false,
+                    false,
+                );
+            }
+            Some(SemanticWorkerPromotion::Rejected { outcome, detail }) => {
+                drop(agent);
+                let _ = BACKGROUND_AGENTS.remove_for_run(owner, agent_id);
+                return (
+                    format!(
+                        "Agent '{agent_id}' result was withheld by host VDD finalization ({outcome:?}): {detail}"
+                    ),
+                    true,
+                    true,
+                );
+            }
+            Some(SemanticWorkerPromotion::NotRequired | SemanticWorkerPromotion::Accepted)
+            | None => {}
+        }
         // Get the result or error
         let result = agent_field_guard(&agent.result, "agent_output", agent_id, "result")
             .and_then(|r| r.clone());

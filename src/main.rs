@@ -2635,17 +2635,19 @@ async fn resolve_chat_auth(
 /// and enable independent unit tests.
 /// Run VDD adversarial review and print findings.
 ///
-/// Extracted from `cmd_chat` (crosslink #262) — this block appears at three
-/// call sites in the function.  The caller is responsible for the `!cancelled`
-/// guard and the `vdd_engine.is_some()` check before calling.
+/// The host finalization policy is applied even when the engine is absent, so
+/// blocking mode fails closed instead of silently returning the candidate.
+#[allow(clippy::too_many_arguments)] // Legacy frontends supply the complete host-owned review boundary explicitly.
 async fn run_vdd_review(
-    engine: &vdd::VddEngine,
+    engine: Option<&vdd::VddEngine>,
+    config: &config::VddConfig,
     run_context: &std::sync::Arc<openclaudia::tools::ToolRunContext>,
-    content: &str,
-    messages: &mut Vec<serde_json::Value>,
+    content: String,
+    messages: &[serde_json::Value],
     target: &str,
+    model: &str,
     api_key: Option<&openclaudia::providers::ApiKey>,
-) {
+) -> Result<(String, Option<openclaudia::context::ContextItem>), String> {
     let user_task = messages
         .iter()
         .rev()
@@ -2653,48 +2655,44 @@ async fn run_vdd_review(
         .and_then(|m| m.get("content").and_then(|c| c.as_str()))
         .unwrap_or("");
 
-    let builder = vdd::BuilderProvider::new(target, api_key);
-    match engine
-        .review_text(run_context, content, user_task, builder)
-        .await
-    {
-        Ok(result) => {
-            if result.findings.is_empty() {
-                println!("\n\x1b[32m✓ VDD Review: No issues found\x1b[0m");
-            } else {
-                let genuine_count = result
-                    .findings
-                    .iter()
-                    .filter(|f| f.status == vdd::FindingStatus::Genuine)
-                    .count();
-                println!(
-                    "\n\x1b[33m🔍 VDD Review: {} finding(s) ({} genuine)\x1b[0m",
-                    result.findings.len(),
-                    genuine_count
-                );
-                for finding in &result.findings {
-                    let status_icon = match finding.status {
-                        vdd::FindingStatus::Genuine => "⚠",
-                        vdd::FindingStatus::FalsePositive => "✗",
-                        vdd::FindingStatus::Disputed => "?",
-                    };
-                    println!(
-                        "  {} [{}] {}",
-                        status_icon, finding.severity, finding.description
-                    );
-                }
-                if let Some(observation) = result.context_observation {
-                    let projection = openclaudia::context::ContextProjector::project(
-                        vec![observation],
-                        openclaudia::context::ContextBudget::default(),
-                    );
-                    projection.append_reference_to_json_messages(messages);
-                }
-            }
+    let builder = vdd::BuilderProvider::new(target, api_key).with_model(model);
+    let policy = vdd::VddFinalizationPolicy::from_config(config);
+    if policy.requirement() == vdd::VddFinalizationRequirement::Disabled {
+        return Ok((content, None));
+    }
+    let scope = format!(
+        "legacy:{}:{user_task}",
+        run_context.runtime().descriptor().session_id
+    );
+    let finalization = vdd::finalize_text_candidate(
+        engine,
+        run_context,
+        &policy,
+        content,
+        &scope,
+        user_task,
+        builder,
+    )
+    .await;
+    let (publication, observation) = finalization.into_parts();
+    match publication {
+        vdd::VddPublication::Publish(candidate) => {
+            let outcome = candidate.outcome();
+            println!(
+                "\n\x1b[32m✓ VDD finalization {outcome:?}: {}\x1b[0m",
+                candidate.detail()
+            );
+            Ok((candidate.into_candidate(), observation))
         }
-        Err(e) => {
-            tracing::warn!("VDD review failed: {}", e);
-            println!("\n\x1b[31m⚠ VDD review failed: {e}\x1b[0m");
+        vdd::VddPublication::Withhold(withheld) => {
+            let reason = format!(
+                "VDD finalization withheld assistant success ({:?}): {}",
+                withheld.outcome(),
+                withheld.detail()
+            );
+            tracing::warn!(reason = %reason, "VDD finalization blocked legacy response");
+            println!("\n\x1b[31m⚠ {reason}\x1b[0m");
+            Err(reason)
         }
     }
 }

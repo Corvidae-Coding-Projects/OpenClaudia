@@ -202,6 +202,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-101: Bound VDD provider transport (#1198)
+- S-100: Make VDD a blocking finalization gate (#1197)
 - S-099: Make VDD verdict parsing strict and fail closed (#1196)
 - Exercise canonical VDD through the real child harness end to end (#1186)
 - Replace yanked chacha20 dependency blocking repository policy (#1181)
