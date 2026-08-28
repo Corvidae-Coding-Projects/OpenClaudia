@@ -25892,11 +25892,12 @@
       "uuid": "b04c040e-c8a3-485c-8db2-0d25f37fc909",
       "display_id": 1193,
       "title": "Explain untracked local plugin registry",
-      "status": "open",
+      "status": "closed",
       "priority": "low",
       "created_by": "6Vw9",
       "created_at": "2026-08-28T02:44:22.598430507Z",
-      "updated_at": "2026-08-28T02:46:22.095816947Z",
+      "updated_at": "2026-08-28T02:46:26.866153308Z",
+      "closed_at": "2026-08-28T02:46:26.866147126Z",
       "labels": [
         "investigation"
       ],
@@ -47390,11 +47391,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2210,
       "timestamp": "2026-08-28T02:46:22.095816947Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2211,
+      "timestamp": "2026-08-28T02:46:26.866153308Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-28T02:46:22.095816947Z",
+    "timestamp": "2026-08-28T02:46:26.866153308Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2210
+    "agent_seq": 2211
   }
 }
