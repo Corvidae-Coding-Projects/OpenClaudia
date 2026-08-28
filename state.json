@@ -1,6 +1,6 @@
 {
   "next_display_id": 1193,
-  "next_comment_id": 1865,
+  "next_comment_id": 1866,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -13469,12 +13469,21 @@
       "parent_uuid": "5ea8af88-cc85-47d9-943c-8e2e851b5e5a",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T23:55:37.382654152Z",
-      "updated_at": "2026-08-28T01:35:29.244893993Z",
+      "updated_at": "2026-08-28T01:35:39.975800623Z",
       "closed_at": "2026-08-28T01:35:29.244892346Z",
       "labels": [
         "feature"
       ],
       "comments": {
+        "4b550159-249d-4225-a815-265e6980d300": {
+          "display_id": 1865,
+          "author": "6Vw9",
+          "content": "Closed as a duplicate of #1191. No separate implementation, code, test, or changelog entry was delivered under this duplicate record.",
+          "created_at": "2026-08-28T01:35:39.972872266Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABADLjL712KZ4ek1wPaOR+NlraD5jzOOYuQ1Gc+31Fv43fuhww1SkNt4Lnn6oPwKO6/OKq+jsyNG3h7KDma/QvSDA=="
+        },
         "e61ad93d-58ae-4e23-a69c-b85c66d55e45": {
           "display_id": 1864,
           "author": "6Vw9",
@@ -47195,11 +47204,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2193,
       "timestamp": "2026-08-28T01:35:29.244893993Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2194,
+      "timestamp": "2026-08-28T01:35:39.975800623Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-28T01:35:29.244893993Z",
+    "timestamp": "2026-08-28T01:35:39.975800623Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2193
+    "agent_seq": 2194
   }
 }
