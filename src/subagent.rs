@@ -2246,6 +2246,91 @@ pub(crate) struct CanonicalVerifierExecution {
     pub snapshot: Option<CanonicalVerifierRunSnapshot>,
 }
 
+/// Host-validated authority and limits for one durable schedule occurrence.
+///
+/// This value is created only after trusted scheduler state, approval
+/// generation, lease fencing, and expiry checks succeed. It is intentionally
+/// not serializable and cannot be constructed by a model tool call.
+#[derive(Debug, Clone)]
+pub(crate) struct ScheduledAgentRunPolicy {
+    pub run_id: crate::runtime::RunId,
+    pub task: String,
+    pub prompt: String,
+    pub model: String,
+    pub allowed_tools: Vec<String>,
+    pub max_turns: u64,
+    pub max_output_tokens: u32,
+    pub max_tool_calls: u64,
+    pub max_cost_microusd: u64,
+    pub timeout: Duration,
+    pub cancellation: crate::runtime::CancellationHandle,
+}
+
+/// Exact terminal projection returned to the durable scheduler.
+#[derive(Debug, Clone)]
+pub(crate) struct ScheduledAgentRunOutcome {
+    pub success: bool,
+    pub output: String,
+    pub turns_used: u64,
+    pub cancellation_receipt: Option<crate::runtime::CancellationReceipt>,
+}
+
+fn scheduled_agent_id(run_id: crate::runtime::RunId) -> String {
+    let compact = run_id.to_string().replace('-', "");
+    format!("cron-{compact}")
+}
+
+fn scheduled_child_cancellation_receipt(
+    owner: &crate::tools::ToolRunContext,
+    agent_id: &str,
+) -> Option<crate::runtime::CancellationReceipt> {
+    let agent = BACKGROUND_AGENTS.get_for_run(owner, agent_id)?;
+    agent_field_guard(
+        &agent.child_cancellation,
+        "scheduled_child_receipt",
+        agent_id,
+        "child_cancellation",
+    )
+    .and_then(|slot| {
+        slot.as_ref()
+            .and_then(crate::runtime::CancellationHandle::receipt)
+    })
+}
+
+fn cancel_scheduled_child(
+    owner: &crate::tools::ToolRunContext,
+    agent_id: &str,
+    reason: crate::runtime::CancellationReason,
+) {
+    if let Some(agent) = BACKGROUND_AGENTS.get_for_run(owner, agent_id) {
+        if let Some(cancellation) = agent_field_guard(
+            &agent.child_cancellation,
+            "cancel_scheduled_child",
+            agent_id,
+            "child_cancellation",
+        )
+        .and_then(|slot| slot.clone())
+        {
+            let _receipt = cancellation.cancel(reason);
+        }
+    }
+}
+
+/// Synchronously cancel and reap the child for one deterministic schedule run.
+/// This is the scheduler handle's last-resort drop path; normal shutdown waits
+/// for [`run_scheduled_agent`] to publish its terminal outcome.
+pub(crate) fn stop_scheduled_agent(
+    owner: &crate::tools::ToolRunContext,
+    run_id: crate::runtime::RunId,
+    reason: crate::runtime::CancellationReason,
+) -> Result<(), String> {
+    let agent_id = scheduled_agent_id(run_id);
+    cancel_scheduled_child(owner, &agent_id, reason);
+    BACKGROUND_AGENTS
+        .stop(owner, &agent_id, "durable scheduler handle dropped")
+        .map(|_| ())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CanonicalVerifierExecutionOutcome {
     Completed,
@@ -2276,6 +2361,31 @@ fn verifier_budget_limits(
         concurrent_calls: parent_limits.concurrent_calls.min(1),
         child_runs: 0,
         cost_microusd: parent_limits.cost_microusd.min(50_000_000),
+        trace_bytes: parent_limits.trace_bytes.min(8 * 1024 * 1024),
+    }
+}
+
+fn scheduled_budget_limits(
+    parent: &crate::tools::ToolRunContext,
+    policy: &ScheduledAgentRunPolicy,
+) -> crate::runtime::BudgetLimits {
+    let parent_limits = &parent.runtime().descriptor().budget.limits;
+    let output_tokens = u64::from(policy.max_output_tokens).saturating_mul(policy.max_turns);
+    let elapsed_millis = u64::try_from(policy.timeout.as_millis()).unwrap_or(u64::MAX);
+    crate::runtime::BudgetLimits {
+        input_tokens: parent_limits.input_tokens.min(256_000),
+        output_tokens: parent_limits.output_tokens.min(output_tokens),
+        total_tokens: parent_limits
+            .total_tokens
+            .min(256_000_u64.saturating_add(output_tokens)),
+        turns: parent_limits.turns.min(policy.max_turns),
+        provider_calls: parent_limits.provider_calls.min(policy.max_turns),
+        tool_calls: parent_limits.tool_calls.min(policy.max_tool_calls),
+        elapsed_millis: parent_limits.elapsed_millis.min(elapsed_millis),
+        retries: 0,
+        concurrent_calls: parent_limits.concurrent_calls.min(1),
+        child_runs: 0,
+        cost_microusd: parent_limits.cost_microusd.min(policy.max_cost_microusd),
         trace_bytes: parent_limits.trace_bytes.min(8 * 1024 * 1024),
     }
 }
@@ -2524,6 +2634,159 @@ pub async fn run_subagent(
     run_subagent_inner(parent_run, config, app_config, client, None, None, None).await
 }
 
+/// Execute one already-authorized durable schedule occurrence through the
+/// canonical child-agent runtime.
+///
+/// The scheduler chooses the idempotent run identity, but cannot bypass the
+/// child runtime's capability, budget, hook, guardrail, grounding, or host
+/// safety boundaries. This entry point is crate-private so persisted state is
+/// the only production authority that can construct the policy.
+#[allow(clippy::too_many_lines)] // Policy validation, canonical dispatch, cancellation, and cleanup are one lifecycle.
+pub(crate) async fn run_scheduled_agent(
+    parent_run: &Arc<crate::tools::ToolRunContext>,
+    policy: &ScheduledAgentRunPolicy,
+    app_config: &AppConfig,
+    client: &Client,
+) -> ScheduledAgentRunOutcome {
+    let agent_id = scheduled_agent_id(policy.run_id);
+    let known_tools = AgentType::GeneralPurpose
+        .allowed_tools()
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    let unique_tools = policy
+        .allowed_tools
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    let invalid_tool = policy
+        .allowed_tools
+        .iter()
+        .find(|tool| !known_tools.contains(tool.as_str()));
+    if policy.task.trim().is_empty()
+        || policy.prompt.trim().is_empty()
+        || policy.model.trim().is_empty()
+        || policy.max_turns == 0
+        || policy.max_output_tokens == 0
+        || policy.max_tool_calls == 0
+        || policy.max_cost_microusd == 0
+        || policy.timeout.is_zero()
+        || policy.allowed_tools.is_empty()
+        || unique_tools.len() != policy.allowed_tools.len()
+        || invalid_tool.is_some()
+    {
+        let detail = invalid_tool.map_or_else(
+            || "required fields, limits, and a unique non-empty tool set must be valid".to_string(),
+            |tool| format!("unsupported scheduled tool '{tool}'"),
+        );
+        return ScheduledAgentRunOutcome {
+            success: false,
+            output: format!("Scheduled child policy rejected: {detail}"),
+            turns_used: 0,
+            cancellation_receipt: None,
+        };
+    }
+
+    let config = SubagentConfig {
+        agent_type: AgentType::GeneralPurpose,
+        task: policy.task.clone(),
+        prompt: policy.prompt.clone(),
+        run_in_background: false,
+        model_override: Some(policy.model.clone()),
+        resume_agent_id: None,
+        isolation: None,
+    };
+    let scheduled = run_subagent_inner_with_policy(
+        parent_run,
+        &config,
+        app_config,
+        client,
+        None,
+        Some(&agent_id),
+        None,
+        None,
+        None,
+        None,
+        Some(policy),
+    );
+    tokio::pin!(scheduled);
+    let parent_cancellation = parent_run.runtime().cancellation();
+    let schedule_cancellation = policy.cancellation.clone();
+    let result = tokio::select! {
+        result = &mut scheduled => Some(result),
+        _receipt = tokio::time::sleep(policy.timeout) => {
+            cancel_scheduled_child(
+                parent_run,
+                &agent_id,
+                crate::runtime::CancellationReason::Deadline,
+            );
+            let _stop = BACKGROUND_AGENTS.stop(
+                parent_run,
+                &agent_id,
+                "durable schedule maximum run duration elapsed",
+            );
+            None
+        }
+        _receipt = parent_cancellation.cancelled() => {
+            cancel_scheduled_child(
+                parent_run,
+                &agent_id,
+                crate::runtime::CancellationReason::ParentTerminated,
+            );
+            let _stop = BACKGROUND_AGENTS.stop(
+                parent_run,
+                &agent_id,
+                "durable scheduler owner terminated",
+            );
+            None
+        }
+        receipt = schedule_cancellation.cancelled() => {
+            cancel_scheduled_child(parent_run, &agent_id, receipt.reason);
+            let _stop = BACKGROUND_AGENTS.stop(
+                parent_run,
+                &agent_id,
+                "durable scheduler service stopped",
+            );
+            None
+        }
+    };
+    let process_cleanup =
+        crate::tools::BACKGROUND_SHELLS.kill_for_process_owner(parent_run, &agent_id);
+    let cancellation_receipt = scheduled_child_cancellation_receipt(parent_run, &agent_id);
+    match result {
+        Some(result) if process_cleanup.starts_with("Terminated ") => ScheduledAgentRunOutcome {
+            success: false,
+            output: format!(
+                "Scheduled child attempted detached process work; owned cleanup completed: {process_cleanup}"
+            ),
+            turns_used: result.turns_used,
+            cancellation_receipt,
+        },
+        Some(result) => ScheduledAgentRunOutcome {
+            success: result.success,
+            output: result.output,
+            turns_used: result.turns_used,
+            cancellation_receipt,
+        },
+        None => ScheduledAgentRunOutcome {
+            success: false,
+            output: if parent_cancellation.is_cancelled() {
+                "Scheduled child cancelled because its scheduler owner terminated".to_string()
+            } else if schedule_cancellation.is_cancelled() {
+                "Scheduled child cancelled because its scheduler service stopped".to_string()
+            } else {
+                format!(
+                    "Scheduled child exceeded its maximum run duration of {} seconds",
+                    policy.timeout.as_secs()
+                )
+            },
+            turns_used: BACKGROUND_AGENTS
+                .get_for_run(parent_run, &agent_id)
+                .map_or(0, |agent| agent.turns.load(Ordering::SeqCst)),
+            cancellation_receipt,
+        },
+    }
+}
+
 /// Run one generation-bound plugin agent through the canonical child harness.
 ///
 /// Plugin prompts are admitted as attributed reference context, never as host
@@ -2628,6 +2891,7 @@ pub async fn run_plugin_agent(
         None,
         None,
         Some(registration),
+        None,
     )
     .await
 }
@@ -2688,6 +2952,7 @@ pub(crate) async fn run_canonical_vdd_verifier(
         None,
         Some(policy),
         Some(&review_root),
+        None,
         None,
     );
     tokio::pin!(verifier);
@@ -2827,6 +3092,7 @@ async fn run_subagent_inner(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -2843,6 +3109,7 @@ async fn run_subagent_inner_with_policy(
     verifier_policy: Option<CanonicalVerifierRunPolicy>,
     verifier_review_root: Option<&Path>,
     plugin_agent: Option<&crate::plugins::PluginAgentRegistration>,
+    scheduled_policy: Option<&ScheduledAgentRunPolicy>,
 ) -> SubagentResult {
     if config.agent_type == AgentType::Verifier
         && (verifier_policy.is_none() || verifier_review_root.is_none())
@@ -2930,6 +3197,7 @@ async fn run_subagent_inner_with_policy(
         verifier_policy,
         verifier_review_root,
         plugin_agent,
+        scheduled_policy,
     )
     .await;
 
@@ -2973,6 +3241,7 @@ async fn run_subagent_core(
     verifier_policy: Option<CanonicalVerifierRunPolicy>,
     verifier_review_root: Option<&Path>,
     plugin_agent: Option<&crate::plugins::PluginAgentRegistration>,
+    scheduled_policy: Option<&ScheduledAgentRunPolicy>,
 ) -> SubagentResult {
     let parent_mode = parent_run.runtime_mode();
     let is_verifier = config.agent_type == AgentType::Verifier;
@@ -3171,7 +3440,15 @@ async fn run_subagent_core(
             };
         }
     };
-    let workspace_access = if config.agent_type == AgentType::GeneralPurpose {
+    let scheduled_writes_workspace = scheduled_policy.is_some_and(|policy| {
+        policy
+            .allowed_tools
+            .iter()
+            .any(|tool| matches!(tool.as_str(), "bash" | "write_file" | "edit_file"))
+    });
+    let workspace_access = if scheduled_writes_workspace
+        || (scheduled_policy.is_none() && config.agent_type == AgentType::GeneralPurpose)
+    {
         crate::tools::WorkspaceAccess::ReadWrite
     } else {
         crate::tools::WorkspaceAccess::ReadOnly
@@ -3214,10 +3491,23 @@ async fn run_subagent_core(
         } else {
             parent_mode.mode.clone()
         };
-    let child_budget_limits = verifier_policy.map_or_else(
-        || parent_run.runtime().descriptor().budget.limits.clone(),
-        |policy| verifier_budget_limits(parent_run, policy),
+    let child_budget_limits = scheduled_policy.map_or_else(
+        || {
+            verifier_policy.map_or_else(
+                || parent_run.runtime().descriptor().budget.limits.clone(),
+                |policy| verifier_budget_limits(parent_run, policy),
+            )
+        },
+        |policy| scheduled_budget_limits(parent_run, policy),
     );
+    let scheduled_needs_process = scheduled_policy.is_none_or(|policy| {
+        policy.allowed_tools.iter().any(|tool| {
+            matches!(
+                tool.as_str(),
+                "bash" | "bash_output" | "kill_shell" | "kill_shells_for_agent"
+            )
+        })
+    });
     let mut child_builder = crate::tools::ToolRunContext::builder(session_id, child_root)
         .working_directory(child_cwd)
         .read_only_roots(child_read_only_roots)
@@ -3226,7 +3516,10 @@ async fn run_subagent_core(
         .executable_search_path(parent_run.executable_search_path())
         .host_home(parent_run.host_home().map(Path::to_path_buf))
         .workspace_access(workspace_access)
-        .process(parent_run.grants_resource(crate::tools::ToolResource::Process))
+        .process(
+            scheduled_needs_process
+                && parent_run.grants_resource(crate::tools::ToolResource::Process),
+        )
         .network(!is_verifier && parent_run.grants_resource(crate::tools::ToolResource::Network))
         .secrets(!is_verifier && parent_run.grants_resource(crate::tools::ToolResource::Secrets))
         .process_owner(&agent_id)
@@ -3241,6 +3534,9 @@ async fn run_subagent_core(
         .parent_budget(parent_run.budget().clone())
         .runtime_mode(child_runtime_mode)
         .behavior_scope_targets(parent_mode.scope_targets);
+    if let Some(policy) = scheduled_policy {
+        child_builder = child_builder.scheduled_run_id(policy.run_id);
+    }
     child_builder = if is_verifier {
         child_builder
             .protected_environment_grants(crate::secrets::EnvironmentGrants::new())
@@ -3265,6 +3561,22 @@ async fn run_subagent_core(
             };
         }
     };
+    if scheduled_policy.is_some_and(|policy| subagent_run.run_id() != policy.run_id) {
+        BACKGROUND_AGENTS.fail(
+            parent_run,
+            &agent_id,
+            "Scheduled child runtime identity did not match its occurrence identity".to_string(),
+        );
+        return SubagentResult {
+            agent_id,
+            success: false,
+            output: "Scheduled child runtime identity did not match its occurrence identity"
+                .to_string(),
+            turns_used: 0,
+            is_background: false,
+            worktree,
+        };
+    }
     let model = config
         .model_override
         .clone()
@@ -3443,6 +3755,19 @@ async fn run_subagent_core(
             20,
         ));
     }
+    if let Some(policy) = scheduled_policy {
+        subagent_context.push(crate::context::ContextItem::host_instruction(
+            "scheduler.capability_policy",
+            crate::context::HostInstructionSource::RuntimePolicy,
+            "host:durable-schedule-capability-profile-v1",
+            format!(
+                "This is one non-interactive durable schedule occurrence. Its canonical run id is {}. Use only the host-approved tools exposed for this run, remain within the bound budget and workspace, do not delegate or leave detached work, and return a final result before the run deadline.",
+                policy.run_id
+            ),
+            crate::context::ContextFreshness::Session,
+            20,
+        ));
+    }
     if let Some(registration) = plugin_agent {
         let metadata = &registration.metadata;
         subagent_context.push(crate::context::ContextItem::reference(
@@ -3482,6 +3807,14 @@ async fn run_subagent_core(
             })
             .collect::<std::collections::HashSet<_>>();
         allowed_tools.retain(|tool| requested.contains(tool));
+    }
+    if let Some(policy) = scheduled_policy {
+        let approved = policy
+            .allowed_tools
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::HashSet<_>>();
+        allowed_tools.retain(|tool| approved.contains(tool));
     }
 
     // Filter tool definitions to only allowed tools
@@ -3556,9 +3889,14 @@ async fn run_subagent_core(
     } else {
         crate::pipeline::WireApi::ChatCompletions
     };
-    let max_turns = verifier_policy.map_or(MAX_SUBAGENT_TURNS as u64, |policy| policy.max_turns);
-    let max_output_tokens =
-        verifier_policy.map_or(SUBAGENT_MAX_TOKENS, |policy| policy.max_output_tokens);
+    let max_turns = scheduled_policy.map_or_else(
+        || verifier_policy.map_or(MAX_SUBAGENT_TURNS as u64, |policy| policy.max_turns),
+        |policy| policy.max_turns,
+    );
+    let max_output_tokens = scheduled_policy.map_or_else(
+        || verifier_policy.map_or(SUBAGENT_MAX_TOKENS, |policy| policy.max_output_tokens),
+        |policy| policy.max_output_tokens,
+    );
 
     // Run the agent loop
     let mut final_output: String;
@@ -3567,11 +3905,16 @@ async fn run_subagent_core(
     // Library-layer permission gate — consulted by every
     // `execute_tool_with_memory` call inside this subagent's tool loop.
     // Closes crosslink #505 for the subagent path.
-    let permission_mgr = crate::permissions::PermissionManager::trusted_for_run(
-        &subagent_run,
-        app_config.permissions.enabled,
-        app_config.permissions.default_allow.clone(),
-        app_config.web_fetch.preapproved_domains.clone(),
+    let permission_mgr = scheduled_policy.map_or_else(
+        || {
+            crate::permissions::PermissionManager::trusted_for_run(
+                &subagent_run,
+                app_config.permissions.enabled,
+                app_config.permissions.default_allow.clone(),
+                app_config.web_fetch.preapproved_domains.clone(),
+            )
+        },
+        |_| crate::permissions::PermissionManager::unrestricted_for_run(&subagent_run),
     );
     let policy_enforcer = crate::services::policy::PolicyEnforcer::new(app_config.policy.clone());
 

@@ -196,7 +196,6 @@ fn previously_fail_open_tools_now_reach_an_authorization_decision() {
             json!({"name": "x", "schedule": "* * * * *", "prompt": "p"}),
         ),
         ("cron_delete", json!({"name": "x"})),
-        ("cron_list", json!({})),
         ("enter_worktree", json!({"branch": "agent/x"})),
         ("kill_shell", json!({"shell_id": "sh-1"})),
         ("kill_shells_for_agent", json!({"agent_id": "a-1"})),
@@ -790,6 +789,7 @@ fn matrix_covers_each_named_area_with_an_enforced_effect() {
     // task, cron, worktree, process, MCP, skill, tool_search, Crosslink.
     assert!(row_for("task").effect.requires_authorization());
     assert!(row_for("cron_create").effect.requires_authorization());
+    assert_eq!(row_for("cron_list").effect, ToolEffect::ReadOnly);
     assert!(row_for("enter_worktree").effect.requires_authorization());
     assert!(row_for("bash").effect.requires_authorization());
     assert!(row_for("kill_shell").effect.requires_authorization());

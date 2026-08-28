@@ -59,6 +59,7 @@ pub mod services;
 pub mod session;
 pub mod skills;
 pub mod slash_commands;
+pub(crate) mod speculation;
 pub mod state;
 pub mod subagent;
 pub mod task_graph;

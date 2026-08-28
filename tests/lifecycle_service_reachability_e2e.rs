@@ -50,7 +50,7 @@ fn every_service_has_one_unambiguous_audited_disposition() {
         ),
         (
             LifecycleServiceId::BackgroundJobs,
-            LifecycleServiceClassification::Unavailable,
+            LifecycleServiceClassification::Wired,
         ),
         (
             LifecycleServiceId::AutoCompaction,

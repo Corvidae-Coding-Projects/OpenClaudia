@@ -29,7 +29,9 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::time::Instant;
 
 use similar::TextDiff;
 
@@ -40,6 +42,47 @@ const MAX_IMAGE_PIXELS: u64 = 100_000_000;
 pub(super) const MAX_MUTATION_BYTES: usize = 10 * 1024 * 1024;
 const MAX_DIFF_LINES_PER_GENERATION: usize = 100_000;
 const MAX_RETAINED_DIFF_BYTES: usize = 64 * 1024;
+const MAX_SPECULATIVE_READ_BYTES: u64 = 256 * 1024;
+
+/// Side-effect-free final-page snapshot captured for the run-owned speculation
+/// coordinator. Construction performs only a descriptor-confined project read;
+/// the ordinary read bookkeeping is deliberately deferred until
+/// [`commit_speculative_read`] is called after normal tool admission.
+#[derive(Debug)]
+pub struct SpeculativeReadArtifact {
+    run_id: crate::runtime::RunId,
+    capability_generation: crate::runtime::CapabilityGeneration,
+    resolved: PathBuf,
+    snapshot: std::fs::Metadata,
+    capture_latency_micros: u64,
+    page: read::StableReadPage,
+}
+
+impl SpeculativeReadArtifact {
+    #[must_use]
+    pub(crate) const fn generation(&self) -> crate::runtime::ContentDigest {
+        self.page.generation
+    }
+
+    #[must_use]
+    pub(crate) const fn input_bytes(&self) -> u64 {
+        self.page.total_bytes
+    }
+
+    #[must_use]
+    pub(crate) fn output_bytes(&self) -> u64 {
+        let bytes = match &self.page.content {
+            read::StablePageContent::Text { text, .. } => text.len(),
+            read::StablePageContent::Binary(bytes) => bytes.len(),
+        };
+        u64::try_from(bytes).unwrap_or(u64::MAX)
+    }
+
+    #[must_use]
+    pub(crate) const fn capture_latency_micros(&self) -> u64 {
+        self.capture_latency_micros
+    }
+}
 
 /// Maximum number of entries in the read tracker, per session, before
 /// the oldest write is evicted from the front of the list. Per-session so
@@ -1306,6 +1349,131 @@ fn read_derived_document_typed(
         generation,
         total_bytes,
     )
+}
+
+/// Capture the complete final page of one cursor-bound text read without
+/// publishing read observations, touching the read-before-write tracker, or
+/// registering provider attachments.
+///
+/// This is intentionally narrower than ordinary `read_file`: speculation may
+/// read only an already-observed project artifact, through an opaque cursor
+/// that binds its content generation, and only when the remaining operation
+/// completes successfully inside a small fixed byte budget.
+pub fn capture_speculative_read(
+    run: &super::security::ToolRunContext,
+    args: &HashMap<String, serde_json::Value>,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+) -> Result<SpeculativeReadArtifact, String> {
+    let capture_started = Instant::now();
+    if cancelled.load(Ordering::Acquire)
+        || run.runtime().cancellation().is_cancelled()
+        || Instant::now() >= deadline
+    {
+        return Err("speculative read was cancelled before capture".to_string());
+    }
+    if !args.contains_key("cursor")
+        || args
+            .keys()
+            .any(|key| !matches!(key.as_str(), "path" | "cursor" | "limit"))
+    {
+        return Err(
+            "speculative reads require exact path/cursor arguments and optional retained limit"
+                .to_string(),
+        );
+    }
+    let path = args
+        .arg_str_strict("path")
+        .map_err(|error| error.to_string())?;
+    let resolved = resolve_path(run, path)?;
+    if !resolved.starts_with(run.project_root()) || run.is_denied_path(&resolved) {
+        return Err("speculative reads are limited to unmasked project artifacts".to_string());
+    }
+    if !matches!(
+        detect_file_type(&resolved.to_string_lossy()),
+        FileType::Text
+    ) {
+        return Err("speculative reads are limited to text artifacts".to_string());
+    }
+
+    let _workspace_operation = run
+        .begin_workspace_operation()
+        .map_err(|error| error.to_string())?;
+    let mut file = secure_fs::open_regular_read(run, &resolved)?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("Cannot inspect speculative read artifact: {error}"))?;
+    if metadata.len() > MAX_SPECULATIVE_READ_BYTES {
+        return Err(format!(
+            "speculative read input exceeds the {MAX_SPECULATIVE_READ_BYTES}-byte budget"
+        ));
+    }
+    let page = read::read_stable_page(run, &mut file, &resolved, args)
+        .map_err(|failure| failure.message)?;
+    let snapshot = file
+        .metadata()
+        .map_err(|error| format!("Cannot reinspect speculative read artifact: {error}"))?;
+    if cancelled.load(Ordering::Acquire)
+        || run.runtime().cancellation().is_cancelled()
+        || Instant::now() >= deadline
+    {
+        return Err("speculative read was cancelled before completion".to_string());
+    }
+    if page.next_cursor.is_some() || !matches!(&page.content, read::StablePageContent::Text { .. })
+    {
+        return Err("speculative read did not produce a complete text result".to_string());
+    }
+    Ok(SpeculativeReadArtifact {
+        run_id: run.run_id(),
+        capability_generation: run.generation(),
+        resolved,
+        snapshot,
+        capture_latency_micros: u64::try_from(capture_started.elapsed().as_micros())
+            .unwrap_or(u64::MAX),
+        page,
+    })
+}
+
+/// Reopen the exact confined artifact and verify that its filesystem snapshot
+/// still matches the bytes captured by speculation. The cursor already binds
+/// the full content digest; descriptor metadata validation closes the
+/// capture-to-consumption race without repeating the expensive full-file scan
+/// that speculation exists to move off the critical path.
+pub fn validate_speculative_read(
+    run: &super::security::ToolRunContext,
+    artifact: &SpeculativeReadArtifact,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+) -> Result<(), String> {
+    if artifact.run_id != run.run_id() || artifact.capability_generation != run.generation() {
+        return Err("speculative read belongs to a different run generation".to_string());
+    }
+    if cancelled.load(Ordering::Acquire)
+        || run.runtime().cancellation().is_cancelled()
+        || Instant::now() >= deadline
+    {
+        return Err("speculative read was cancelled before validation".to_string());
+    }
+    let file = secure_fs::open_regular_read(run, &artifact.resolved)?;
+    let live_snapshot = file
+        .metadata()
+        .map_err(|error| format!("Cannot validate speculative read artifact: {error}"))?;
+    if !secure_fs::same_file_snapshot(&artifact.snapshot, &live_snapshot) {
+        return Err("speculative read no longer matches the live artifact generation".to_string());
+    }
+    Ok(())
+}
+
+/// Publish the ordinary read bookkeeping only after exact call matching and
+/// live-generation validation have succeeded.
+pub fn commit_speculative_read(
+    run: &super::security::ToolRunContext,
+    artifact: SpeculativeReadArtifact,
+) -> Result<crate::tools::ToolHandlerResult, String> {
+    if artifact.run_id != run.run_id() || artifact.capability_generation != run.generation() {
+        return Err("speculative read belongs to a different run generation".to_string());
+    }
+    Ok(text_page_result(run, &artifact.resolved, artifact.page))
 }
 
 pub fn execute_read_file_typed(

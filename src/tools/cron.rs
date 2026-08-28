@@ -1,9 +1,9 @@
 //! Cron scheduling tools for recurring task execution.
 //!
-//! Manages cron-like schedules stored in a JSON file at
-//! `.openclaudia/schedules.json`. `OpenClaudia` currently stores and
-//! exposes schedule metadata; actual recurring execution is the
-//! responsibility of an external scheduler.
+//! Legacy cron-shaped metadata remains readable from
+//! `.openclaudia/schedules.json`. New model-facing schedules are authorized,
+//! persisted in trusted user state, leased, and executed through the canonical
+//! child-agent runtime owned by [`SchedulerServiceHandle`].
 //!
 //! ## Concurrency model (crosslink #403)
 //!
@@ -38,6 +38,14 @@ const TMP_SUFFIX: &str = ".tmp";
 const MAX_SCHEDULES: usize = 50;
 const LIST_PROMPT_MAX_BYTES: usize = 80;
 const LIST_PROMPT_ELLIPSIS: &str = "...";
+
+#[path = "cron_scheduler.rs"]
+mod scheduler;
+
+pub use scheduler::{
+    execute_authorized_cron_create, execute_authorized_cron_delete, execute_authorized_cron_list,
+    SchedulerServiceHandle,
+};
 
 const fn default_true() -> bool {
     true

@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- S-095: Fix proxy streaming and VDD delivery parity (#1191)
+- S-085: Implement speculation as a measured transaction (#1190)
+- S-084: Turn cron metadata into a scheduler service (#1189)
 - S-088: Run VDD as the canonical alternate-model verifier (#1157)
 - S-081: Use one real keybinding engine (#1179)
 - S-063: Activate plugin capabilities through canonical registries (#1178)

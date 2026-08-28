@@ -170,6 +170,14 @@ impl ApprovalBinding {
         binding
     }
 
+    /// Stable digest of the authenticated host actor for durable authorities
+    /// that must survive a frontend/run restart without becoming transferable
+    /// to a different OS principal.
+    #[must_use]
+    pub(crate) fn actor_id(&self) -> &str {
+        &self.actor_id
+    }
+
     fn workspace_generation(&self) -> u64 {
         if self.follows_process_cwd_generation {
             self.workspace_generation_base

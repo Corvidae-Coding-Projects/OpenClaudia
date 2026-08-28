@@ -2472,19 +2472,21 @@ impl ToolHandler for CronCreateHandler {
         &self,
         _args: &HashMap<String, Value>,
     ) -> &'static [super::security::ToolResource] {
-        REQUIRES_WRITE
+        REQUIRES_READ
     }
     fn effect_spec(&self) -> ToolEffectSpec {
-        ToolEffectSpec::effectful(ToolEffect::WorkspaceMutation, "Cron", "name")
+        ToolEffectSpec::effectful(ToolEffect::ExternalMutation, "ScheduleCreate", "name")
     }
+    #[allow(clippy::too_many_lines)] // The schedule schema is one model-visible capability contract.
     fn definition(&self) -> Value {
         json!({
             "type": "function",
             "function": {
                 "name": "cron_create",
-                "description": "Create recurring schedule metadata with a cron expression. Schedules are stored in .openclaudia/schedules.json for external schedulers; OpenClaudia does not run them automatically.",
+                "description": "Create a durable authorized agent schedule. The host persists policy and exact history, leases each UTC occurrence, and runs it through the canonical agent runtime.",
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "name": {
                             "type": "string",
@@ -2504,7 +2506,97 @@ impl ToolHandler for CronCreateHandler {
                         },
                         "durable": {
                             "type": "boolean",
-                            "description": "Whether downstream schedulers should treat this as durable schedule metadata (default: true)"
+                            "description": "Compatibility preference retained with the record; authorized schedules are always persisted durably (default: true)"
+                        },
+                        "timezone": {
+                            "type": "string",
+                            "enum": ["UTC"],
+                            "default": "UTC",
+                            "description": "Explicit timezone contract. This version supports UTC only, which has no DST transitions."
+                        },
+                        "misfire_policy": {
+                            "type": "string",
+                            "enum": ["skip", "run_once"],
+                            "default": "run_once",
+                            "description": "What to do when an occurrence is observed after its grace window"
+                        },
+                        "misfire_grace_seconds": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 86400,
+                            "default": 300
+                        },
+                        "overlap_policy": {
+                            "type": "string",
+                            "enum": ["skip", "queue_one"],
+                            "default": "skip",
+                            "description": "What to do when the prior occurrence still owns a live lease"
+                        },
+                        "max_retries": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 10,
+                            "default": 2
+                        },
+                        "retry_backoff_seconds": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 86400,
+                            "default": 60
+                        },
+                        "max_run_seconds": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 86400,
+                            "default": 900
+                        },
+                        "expires_at": {
+                            "type": "string",
+                            "description": "Optional RFC3339 instant after which no new occurrence may start"
+                        },
+                        "max_runs": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Optional maximum number of terminal occurrences"
+                        },
+                        "model": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 256,
+                            "description": "Optional exact model identity; defaults to the active provider model"
+                        },
+                        "allowed_tools": {
+                            "type": "array",
+                            "minItems": 1,
+                            "uniqueItems": true,
+                            "items": {
+                                "type": "string",
+                                "enum": ["bash", "bash_output", "kill_shell", "kill_shells_for_agent", "read_file", "write_file", "edit_file", "list_files", "web_fetch"]
+                            },
+                            "description": "Exact child capability allowlist; defaults to read_file, list_files, and web_fetch"
+                        },
+                        "max_turns": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 100,
+                            "default": 20
+                        },
+                        "max_output_tokens": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 32768,
+                            "default": 4096
+                        },
+                        "max_tool_calls": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 1000,
+                            "default": 40
+                        },
+                        "max_cost_microusd": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "default": 10_000_000
                         }
                     },
                     "required": ["name", "schedule", "prompt"]
@@ -2514,11 +2606,27 @@ impl ToolHandler for CronCreateHandler {
     }
     fn execute_legacy(
         &self,
-        _permit: &ToolDispatchPermit,
+        permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        cron::execute_cron_create(ctx.run, args)
+        let approval = match permit.require_host_approval() {
+            Ok(approval) => approval,
+            Err(error) => {
+                return (
+                    format!("Durable schedule creation requires fresh host approval: {error}"),
+                    true,
+                )
+            }
+        };
+        let Some(config) = ctx.app_config else {
+            return (
+                "Durable schedule creation requires the active application configuration"
+                    .to_string(),
+                true,
+            );
+        };
+        cron::execute_authorized_cron_create(ctx.run, args, approval, config)
     }
 }
 
@@ -2534,14 +2642,14 @@ impl ToolHandler for CronDeleteHandler {
         REQUIRES_WRITE
     }
     fn effect_spec(&self) -> ToolEffectSpec {
-        ToolEffectSpec::effectful_tool_scope(ToolEffect::WorkspaceMutation, "Cron")
+        ToolEffectSpec::effectful_tool_scope(ToolEffect::ExternalMutation, "ScheduleDelete")
     }
     fn definition(&self) -> Value {
         json!({
             "type": "function",
             "function": {
                 "name": "cron_delete",
-                "description": "Delete stored cron schedule metadata by name, list index, or legacy ID.",
+                "description": "Delete an authorized schedule, or remove legacy unapproved metadata by name, list index, or legacy ID. A running authorized occurrence must be stopped through its owning scheduler lifecycle first.",
                 "parameters": {
                     "type": "object",
                     "description": "Provide exactly one identifier: name, index, or id. Prefer name when available; use index from cron_list output or legacy id only when name is unavailable.",
@@ -2567,11 +2675,20 @@ impl ToolHandler for CronDeleteHandler {
     }
     fn execute_legacy(
         &self,
-        _permit: &ToolDispatchPermit,
+        permit: &ToolDispatchPermit,
         args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        cron::execute_cron_delete(ctx.run, args)
+        let approval = match permit.require_host_approval() {
+            Ok(approval) => approval,
+            Err(error) => {
+                return (
+                    format!("Schedule deletion requires fresh host approval: {error}"),
+                    true,
+                )
+            }
+        };
+        cron::execute_authorized_cron_delete(ctx.run, args, approval)
     }
 }
 
@@ -2584,21 +2701,17 @@ impl ToolHandler for CronListHandler {
         &self,
         _args: &HashMap<String, Value>,
     ) -> &'static [super::security::ToolResource] {
-        REQUIRES_WRITE
+        REQUIRES_READ
     }
     fn effect_spec(&self) -> ToolEffectSpec {
-        // Listing acquires an exclusive advisory lock by creating
-        // `.openclaudia/schedules.json.lock` (and its parent directory). It
-        // therefore changes durable workspace state even when no schedule
-        // file exists.
-        ToolEffectSpec::effectful_tool_scope(ToolEffect::WorkspaceMutation, "Cron")
+        ToolEffectSpec::read_only("ScheduleRead")
     }
     fn definition(&self) -> Value {
         json!({
             "type": "function",
             "function": {
                 "name": "cron_list",
-                "description": "List stored cron schedule metadata, including enabled status, cron expressions, prompts, and any recorded run counters.",
+                "description": "List durable authorized schedules, policy and status, recent exact run history, plus legacy unapproved metadata that is never executed automatically.",
                 "parameters": {
                     "type": "object",
                     "properties": {},
@@ -2613,7 +2726,7 @@ impl ToolHandler for CronListHandler {
         _args: &HashMap<String, Value>,
         ctx: &mut ToolContext<'_>,
     ) -> (String, bool) {
-        cron::execute_cron_list(ctx.run, &HashMap::new())
+        cron::execute_authorized_cron_list(ctx.run)
     }
 }
 

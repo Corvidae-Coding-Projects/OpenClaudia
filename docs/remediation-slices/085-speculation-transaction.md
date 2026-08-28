@@ -1,6 +1,6 @@
 # S-085: Implement or remove speculation by measurement
 
-Status: Planned
+Status: Complete
 Effort: Medium
 Primary findings: F-104
 Workstreams: W7
@@ -27,3 +27,51 @@ Replace speculation scaffolding with a safe artifact-bound optimization that sur
 ## Handoff
 
 Record changed artifact generations, commands/tests run, typed evidence receipts, unresolved risks, and any newly proposed slice. Completion of this slice does not imply completion of its parent workstream.
+
+## Completed implementation — 2026-08-27
+
+Speculation is now a run-owned optimization for one narrow operation: the exact
+next page of a successful partial `read_file`. A complete authoritative result
+may seed one bounded prediction whose call ID, run ID, capability generation,
+path, cursor, limit, content digest, stable file snapshot, deadline, and
+cancellation handle are fixed before capture. It receives no network, secret,
+write, process, approval, or run-independent authority.
+
+The TUI follow-up loop carries the coordinator through canonical run
+transitions and the normal tool executor admits a matching precomputed read
+through the same policy, permission, guardrail, accounting, and typed-result
+boundary as an on-demand read. Consumption reopens the exact confined file and
+compares stable metadata to reject mutation without performing a second full
+read. Mismatch, expiry, cancellation, incomplete/error results, or stale run
+generation joins and discards the artifact.
+
+A bounded measurement window records correctness, hits, waste, critical-path
+latency, and byte-cost against the demand baseline. Speculation remains enabled
+only after sufficient exact hits, zero correctness loss, bounded waste, lower
+critical-path latency, and no greater I/O cost. The skeptical parent review
+repaired the worker version's second full demand read, which had made every hit
+self-defeating and forced admission to disable.
+
+## Evidence
+
+- Deterministic speculation tests passed 8/8: trusted prediction shape,
+  rejection of error/non-read seeds, exact argument matching, successful
+  canonical commit and admission, mutation invalidation, measurement gates,
+  disable behavior, and bounded history.
+- The all-feature library, pipeline, file, executor, and TUI integration tests
+  passed under the complete serialized Rust 1.98.0 suite.
+- `cargo +1.98.0 clippy --locked --all-targets --all-features -- -D warnings`
+  passed with zero diagnostics.
+- `cargo +1.98.0 test --quiet --locked --all-targets --all-features --
+  --test-threads=1` passed every non-ignored target.
+
+## Residual boundaries
+
+- The predictor deliberately handles only final-page continuation reads. New
+  operation classes require their own evidence that they are deterministic,
+  effect-free, and measurably better than demand execution.
+- Metrics are run-local and conservative; a fresh run earns admission again
+  rather than inheriting an unverifiable historical win.
+- S-100 retains canonical finalization authority. No alternate-model VDD pass
+  receipt is represented here.
+- Completion applies only to S-085; parent issue #1071 remains open.

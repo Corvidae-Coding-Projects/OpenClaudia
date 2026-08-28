@@ -23,7 +23,7 @@ provider; the audit records the exact gaps.
   MiniMax, Ollama, and OpenAI-compatible endpoints.
 - A full-screen TUI, legacy line REPL, one-shot print path, HTTP proxy, ACP
   server, and loop mode. These currently duplicate orchestration behavior.
-- File, process, web, LSP, task, worktree, scheduling-metadata, MCP-resource,
+- File, process, web, LSP, task, worktree, durable-scheduling, MCP-resource,
   skill, and subagent surfaces. Several are partial or do not yet pass through
   one canonical capability boundary.
 - Sessions, transcripts, compaction, memory, hooks, plugins, guardrails,
@@ -31,7 +31,7 @@ provider; the audit records the exact gaps.
   remediation plan; current implementations must not be treated as complete.
 - **Git Worktrees** — Create, list, and safely remove isolated git worktrees without mutating the process CWD. Current cleanup/transaction/capability gaps are documented in the audit.
 - **Thinking Mode** — Extended reasoning for Anthropic, OpenAI GPT-5/o1/o3/o4, Gemini 3.x/2.5, DeepSeek V4, Qwen QwQ, Z.AI/GLM, and MiniMax-M3. This describes adapter configuration branches, not uniform preservation or privacy of native reasoning state.
-- **Cron Scheduling** — Create, list, and delete cron schedule metadata for external schedulers. OpenClaudia does not currently execute those schedules.
+- **Cron Scheduling** — Create, list, execute, and delete durable UTC schedules with explicit approval, bounded child-agent capabilities, retries, overlap policy, cancellation, and run history. The full-screen TUI owns the scheduler lifecycle; legacy metadata remains visible but inert until recreated with fresh authorization.
 - **Web Search** — Free DuckDuckGo/Bing browser scraping is available through
   the explicit `browser` build feature. It remains opt-in while its documented
   egress/isolation gaps are remediated; default builds expose direct
@@ -114,9 +114,9 @@ owned by the audit and remediation slices.
 | `enter_worktree` | Create an isolated Git worktree record |
 | `exit_worktree` | Preview and transactionally stage, commit, merge, discard, or remove an isolated worktree |
 | `list_worktrees` | List tracked worktrees |
-| `cron_create` | Create recurring cron metadata for an external scheduler |
-| `cron_delete` | Delete schedule metadata |
-| `cron_list` | List schedule metadata |
+| `cron_create` | Create a durable authorized agent schedule |
+| `cron_delete` | Delete an authorized schedule or inert legacy metadata |
+| `cron_list` | List authorized schedules, policy, and run history |
 | `list_mcp_resources` | List resources from connected MCP servers |
 | `read_mcp_resource` | Read a named MCP resource |
 

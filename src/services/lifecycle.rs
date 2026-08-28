@@ -205,11 +205,14 @@ const CATALOG: &[LifecycleServiceRegistration] = &[
         "No declared production flag exists; arbitrary OPENCLAUDIA_FEATURE_* names are rejected.",
         Some("S-014/S-047"),
     ),
-    LifecycleServiceRegistration::classified(
+    LifecycleServiceRegistration::wired(
         LifecycleServiceId::BackgroundJobs,
-        LifecycleServiceClassification::Unavailable,
-        "The synchronous scheduler lacks ownership, durable leases, cancellation, and safe job semantics.",
-        Some("S-055/S-061/S-062/S-084"),
+        LifecyclePath::new(
+            "tools::SchedulerServiceHandle::start/tui::App::rebind_scheduler_service",
+            "tools::cron::scheduler::SchedulerService durable claim and canonical child dispatch",
+            "tools::SchedulerServiceHandle::shutdown/drop",
+        ),
+        "The TUI owns one durable, fenced scheduler per active run generation and awaits canonical child shutdown.",
     ),
     LifecycleServiceRegistration::wired(
         LifecycleServiceId::AutoCompaction,

@@ -951,6 +951,8 @@ pub struct App {
     /// silent unless they explicitly provide a sink.
     analytics_subscriber: Option<crate::services::analytics::StateAnalyticsSubscriber>,
     service_registry: crate::services::ServiceRegistry,
+    /// Sole durable scheduler owner for the currently active run generation.
+    scheduler_service: Option<crate::tools::SchedulerServiceHandle>,
     /// Active permission prompt (if any). Tool execution blocks until resolved.
     pending_permission: Option<PendingPermission>,
     /// Active `ask_user_question` modal (if any). The pipeline's
@@ -1103,6 +1105,7 @@ impl App {
             transcript_subscriber,
             analytics_subscriber: None,
             service_registry: crate::services::ServiceRegistry::analytics_disabled(),
+            scheduler_service: None,
             pending_permission: None,
             pending_user_question: None,
             pending_plan_approval: None,
@@ -1223,6 +1226,7 @@ impl App {
         self.pending_key_events.clear();
     }
 
+    #[allow(clippy::too_many_lines)] // Session replacement is one atomic frontend transition.
     fn apply_loaded_session(&mut self, loaded: &Session) -> bool {
         let current_run = match self.run_context.as_ref() {
             Ok(run) => std::sync::Arc::clone(run),
@@ -1272,6 +1276,7 @@ impl App {
         // Flush the old snapshot before replacement. Subscribers stay attached
         // because `apply_loaded` replaces the shared store in place.
         self.transcript_subscriber.flush_now();
+        self.stop_scheduler_service();
         crate::tools::retire_run(&current_run);
         self.chat_session.apply_loaded(loaded);
         self.chat_session.set_permission_bypass(permission_bypass);
@@ -1284,6 +1289,13 @@ impl App {
         self.rebind_mcp_runtime(&next_run);
         self.mode = tui_mode_for_agent(loaded.agent_mode());
         self.refresh_app_config_target();
+        if let Err(error) = self.rebind_scheduler_service(&next_run) {
+            self.messages.add(DisplayMessage::error(format!(
+                "Loaded session scheduler could not start: {error}"
+            )));
+            self.should_quit = true;
+            return false;
+        }
         let _ = self.chat_session.refresh_estimated_tokens();
         let transcript_cwd = self.run_context.as_ref().map_or_else(
             |_| {
@@ -1379,10 +1391,34 @@ impl App {
         }));
     }
 
+    fn stop_scheduler_service(&mut self) {
+        drop(self.scheduler_service.take());
+    }
+
+    fn rebind_scheduler_service(
+        &mut self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
+    ) -> Result<(), String> {
+        if self.runtime_handle.is_none() {
+            return Ok(());
+        }
+        self.stop_scheduler_service();
+        let config = self.app_config.clone().ok_or_else(|| {
+            "Durable scheduler requires the active application configuration".to_string()
+        })?;
+        self.scheduler_service = Some(crate::tools::SchedulerServiceHandle::start(
+            std::sync::Arc::clone(run),
+            config,
+            self.api_client.client.clone(),
+        )?);
+        Ok(())
+    }
+
     fn apply_workspace_run_transition(
         &mut self,
         run: &std::sync::Arc<crate::tools::ToolRunContext>,
     ) {
+        self.stop_scheduler_service();
         // The pipeline has already published this generation, which makes the
         // previous run stale. Rebind the application first so a task-store
         // failure cannot accidentally route later operations through it.
@@ -1409,6 +1445,12 @@ impl App {
         self.rebind_permission_manager(run);
         self.refresh_prompt_context_for_run();
         self.rebind_mcp_runtime(run);
+        if let Err(error) = self.rebind_scheduler_service(run) {
+            self.messages.add(DisplayMessage::error(format!(
+                "Workspace changed, but its durable scheduler could not start: {error}"
+            )));
+            self.should_quit = true;
+        }
         self.persist_session();
     }
 
@@ -1730,6 +1772,7 @@ impl App {
             }
         }
 
+        self.stop_scheduler_service();
         crate::tools::retire_run(&current_run);
         self.run_context = Ok(std::sync::Arc::clone(&next_run));
         self.chat_session
@@ -1737,6 +1780,13 @@ impl App {
         self.provider = provider;
         self.model = model;
         self.refresh_app_config_target();
+        if let Err(error) = self.rebind_scheduler_service(&next_run) {
+            self.messages.add(DisplayMessage::error(format!(
+                "Provider scheduler could not start: {error}"
+            )));
+            self.should_quit = true;
+            return;
+        }
         self.rebind_permission_manager(&next_run);
 
         self.set_api_config(
@@ -1790,6 +1840,7 @@ impl App {
     /// # Errors
     ///
     /// Returns an error if terminal initialization or rendering fails.
+    #[allow(clippy::too_many_lines)] // Terminal, hooks, scheduler, and MCP share one ordered lifecycle boundary.
     pub async fn run(&mut self) -> io::Result<()> {
         // Capture the tokio runtime handle (must be called inside an async context).
         self.runtime_handle = tokio::runtime::Handle::try_current().ok();
@@ -1822,6 +1873,18 @@ impl App {
                 )));
             }
         }
+
+        let scheduler_run = self
+            .run_context
+            .as_ref()
+            .map(std::sync::Arc::clone)
+            .map_err(|error| {
+                io::Error::other(format!("Durable scheduler run is unavailable: {error}"))
+            })?;
+        self.rebind_scheduler_service(&scheduler_run)
+            .map_err(|error| {
+                io::Error::other(format!("Durable scheduler startup failed: {error}"))
+            })?;
 
         let outcome: io::Result<()> = async {
             enable_raw_mode()?;
@@ -1912,7 +1975,17 @@ impl App {
         // when both the run loop and cleanup fail.
         let terminal_cleanup = disable_raw_mode()
             .and_then(|()| execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen));
-        let outcome = outcome.and(terminal_cleanup);
+        let mut outcome = outcome.and(terminal_cleanup);
+
+        if let Some(scheduler) = self.scheduler_service.take() {
+            if let Err(error) = scheduler.shutdown().await {
+                outcome = outcome.and_then(|()| {
+                    Err(io::Error::other(format!(
+                        "Durable scheduler shutdown failed: {error}"
+                    )))
+                });
+            }
+        }
 
         // Fire SessionEnd hooks. Best-effort: the app is already exiting
         // so we can't recover from a failure, and we must not spam the
@@ -5149,6 +5222,7 @@ struct AgenticCtx<'a> {
     hook_engine: Option<std::sync::Arc<crate::hooks::HookEngine>>,
     policy_enforcer: std::sync::Arc<crate::services::policy::PolicyEnforcer>,
     task_mgr: std::sync::Arc<std::sync::Mutex<crate::session::TaskManager>>,
+    speculation: std::sync::Arc<crate::speculation::SpeculationCoordinator>,
     mcp_manager: Option<&'a std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
     session_id: &'a str,
     task_obs: Option<crate::ledger::ObsId>,
@@ -5752,6 +5826,7 @@ async fn run_agentic_loop(
     let mut run_context = std::sync::Arc::clone(ctx.run_context);
     let mut permission_mgr = ctx.permission_mgr.clone();
     let mut task_mgr = std::sync::Arc::clone(&ctx.task_mgr);
+    let mut speculation = std::sync::Arc::clone(&ctx.speculation);
     let mut mcp_manager = ctx.mcp_manager;
     let mut task_obs = ctx.task_obs;
     loop {
@@ -5830,29 +5905,32 @@ async fn run_agentic_loop(
                     return Err(error);
                 }
             };
-        match crate::pipeline::run_turn(crate::pipeline::RunTurnParams {
-            run_context: std::sync::Arc::clone(&run_context),
-            client: ctx.client,
-            endpoint: ctx.endpoint,
-            headers: ctx.headers,
-            claude_agent_sdk: ctx.claude_agent_sdk,
-            codex_agent_sdk: ctx.codex_agent_sdk,
-            effort_level: ctx.effort_level,
-            request_body: &body,
-            provider: ctx.provider,
-            model_identity: ctx.model,
-            provider_native_state: provider_native_state.as_ref(),
-            assistant_message_ordinal,
-            memory_db: ctx.memory_db.clone(),
-            app_config: ctx.app_config.clone(),
-            permission_mgr: permission_mgr.clone(),
-            transient_allowed_tool_rules: ctx.transient_allowed_tool_rules,
-            hook_engine: ctx.hook_engine.clone(),
-            policy_enforcer: Some(std::sync::Arc::clone(&ctx.policy_enforcer)),
-            task_mgr: std::sync::Arc::clone(&task_mgr),
-            session_id: Some(ctx.session_id.to_string()),
-            tx: ctx.tx.clone(),
-        })
+        match crate::pipeline::run_turn_with_speculation(
+            crate::pipeline::RunTurnParams {
+                run_context: std::sync::Arc::clone(&run_context),
+                client: ctx.client,
+                endpoint: ctx.endpoint,
+                headers: ctx.headers,
+                claude_agent_sdk: ctx.claude_agent_sdk,
+                codex_agent_sdk: ctx.codex_agent_sdk,
+                effort_level: ctx.effort_level,
+                request_body: &body,
+                provider: ctx.provider,
+                model_identity: ctx.model,
+                provider_native_state: provider_native_state.as_ref(),
+                assistant_message_ordinal,
+                memory_db: ctx.memory_db.clone(),
+                app_config: ctx.app_config.clone(),
+                permission_mgr: permission_mgr.clone(),
+                transient_allowed_tool_rules: ctx.transient_allowed_tool_rules,
+                hook_engine: ctx.hook_engine.clone(),
+                policy_enforcer: Some(std::sync::Arc::clone(&ctx.policy_enforcer)),
+                task_mgr: std::sync::Arc::clone(&task_mgr),
+                session_id: Some(ctx.session_id.to_string()),
+                tx: ctx.tx.clone(),
+            },
+            Some(std::sync::Arc::clone(&speculation)),
+        )
         .await
         {
             Ok(mut followup) => {
@@ -5898,6 +5976,7 @@ async fn run_agentic_loop(
                     run_context = bindings.run_context;
                     permission_mgr = bindings.permission_mgr;
                     task_mgr = bindings.task_mgr;
+                    speculation = bindings.speculation;
                 }
                 if followup.needs_followup {
                     let asst = crate::pipeline::build_assistant_message_with_tools(
@@ -6354,6 +6433,9 @@ async fn handle_followup_turn(
             run_context: std::sync::Arc::clone(ctx.run_context),
             permission_mgr: ctx.permission_mgr.clone(),
             task_mgr: std::sync::Arc::clone(&ctx.task_mgr),
+            speculation: std::sync::Arc::new(crate::speculation::SpeculationCoordinator::for_run(
+                ctx.run_context,
+            )),
         }
     });
     let initial_run_changed =
@@ -6408,6 +6490,7 @@ async fn handle_followup_turn(
         hook_engine: ctx.hook_engine.clone(),
         policy_enforcer: std::sync::Arc::clone(&ctx.policy_enforcer),
         task_mgr: initial_bindings.task_mgr,
+        speculation: initial_bindings.speculation,
         mcp_manager: followup_mcp_manager,
         session_id: ctx.session_id,
         task_obs: followup_task_obs,

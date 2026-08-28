@@ -193,6 +193,7 @@ enum EnvironmentGrantSource {
 }
 
 pub struct ToolRunContextBuilder {
+    run_id: Option<RunId>,
     session_id: SessionId,
     evidence_session_key: Option<String>,
     project_root: PathBuf,
@@ -236,6 +237,7 @@ impl ToolRunContextBuilder {
     fn new(session_id: SessionId, project_root: PathBuf) -> Self {
         let process_owner = session_id.as_str().to_string();
         Self {
+            run_id: None,
             session_id,
             evidence_session_key: None,
             working_directory: project_root.clone(),
@@ -469,6 +471,17 @@ impl ToolRunContextBuilder {
         self
     }
 
+    /// Bind a host-derived identity to a non-interactive canonical run.
+    ///
+    /// This is crate-private because model- or project-controlled callers must
+    /// never choose run identities. Durable schedulers use it to derive the
+    /// same idempotency key for one exact schedule occurrence after restart.
+    #[must_use]
+    pub(crate) const fn scheduled_run_id(mut self, run_id: RunId) -> Self {
+        self.run_id = Some(run_id);
+        self
+    }
+
     /// Bind explicit immutable limits to this run generation.
     #[must_use]
     pub const fn budget_limits(mut self, limits: BudgetLimits) -> Self {
@@ -657,6 +670,7 @@ impl ToolRunContext {
     #[allow(clippy::too_many_lines)] // Capability validation and descriptor binding are one transaction.
     fn new(builder: ToolRunContextBuilder) -> Result<Self, String> {
         let ToolRunContextBuilder {
+            run_id,
             session_id,
             evidence_session_key,
             project_root,
@@ -901,7 +915,7 @@ impl ToolRunContext {
         let generation = next_capability_generation()?;
         let workspace_generation = WorkspaceGeneration::new(generation.get())
             .ok_or_else(|| "workspace generation must be non-zero".to_string())?;
-        let run_id = RunId::new();
+        let run_id = run_id.unwrap_or_else(RunId::new);
         let mut grants = BTreeSet::from([
             CapabilityKind::ContextAssembly,
             CapabilityKind::Provider,

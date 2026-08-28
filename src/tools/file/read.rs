@@ -22,7 +22,7 @@ const MAX_PAGED_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 
 const READ_SCAN_BUFFER_BYTES: usize = 64 * 1024;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(super) enum StablePageContent {
     Text {
         text: String,
@@ -34,7 +34,7 @@ pub(super) enum StablePageContent {
     Binary(Vec<u8>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(super) struct StableReadPage {
     pub generation: crate::runtime::ContentDigest,
     pub total_bytes: u64,

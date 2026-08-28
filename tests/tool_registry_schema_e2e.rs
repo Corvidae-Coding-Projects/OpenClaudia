@@ -820,7 +820,7 @@ fn file_tool_path_descriptions_match_relative_path_support() {
 }
 
 #[test]
-fn cron_create_description_does_not_claim_openclaudia_runs_schedules() {
+fn cron_create_description_advertises_the_durable_runtime_boundary() {
     let def = registry()
         .get("cron_create")
         .expect("cron_create registered")
@@ -830,16 +830,12 @@ fn cron_create_description_does_not_claim_openclaudia_runs_schedules() {
         .and_then(Value::as_str)
         .expect("cron_create description");
     assert!(
-        desc.contains("external schedulers"),
-        "cron_create must describe the actual execution boundary; got {desc:?}"
+        desc.contains("durable authorized agent schedule"),
+        "cron_create must describe durable authorization; got {desc:?}"
     );
     assert!(
-        !desc.contains("executed by loop mode"),
-        "cron_create must not advertise automatic loop-mode execution; got {desc:?}"
-    );
-    assert!(
-        !desc.contains("OpenClaudia runs"),
-        "cron_create must not imply OpenClaudia executes schedules automatically; got {desc:?}"
+        desc.contains("canonical agent runtime"),
+        "cron_create must identify its production execution boundary; got {desc:?}"
     );
 }
 
@@ -854,12 +850,8 @@ fn cron_delete_schema_matches_identifier_contract() {
         .and_then(Value::as_str)
         .expect("cron_delete description");
     assert!(
-        desc.contains("stored cron schedule metadata"),
-        "cron_delete must describe deletion as metadata removal; got {desc:?}"
-    );
-    assert!(
-        !desc.contains("scheduled task"),
-        "cron_delete must not imply OpenClaudia owns task execution; got {desc:?}"
+        desc.contains("authorized schedule") && desc.contains("legacy unapproved metadata"),
+        "cron_delete must distinguish authorized schedules from inert legacy metadata; got {desc:?}"
     );
 
     let params = def
@@ -902,7 +894,7 @@ fn cron_delete_schema_matches_identifier_contract() {
 }
 
 #[test]
-fn cron_list_schema_describes_stored_metadata_not_runner() {
+fn cron_list_schema_describes_authorized_runtime_state_and_legacy_metadata() {
     let def = registry()
         .get("cron_list")
         .expect("cron_list registered")
@@ -912,11 +904,12 @@ fn cron_list_schema_describes_stored_metadata_not_runner() {
         .and_then(Value::as_str)
         .expect("cron_list description");
     assert!(
-        desc.contains("stored cron schedule metadata"),
-        "cron_list must describe stored metadata; got {desc:?}"
+        desc.contains("durable authorized schedules") && desc.contains("recent exact run history"),
+        "cron_list must describe durable runtime state and history; got {desc:?}"
     );
     assert!(
-        !desc.contains("scheduled tasks"),
-        "cron_list must not imply OpenClaudia owns task execution; got {desc:?}"
+        desc.contains("legacy unapproved metadata")
+            && desc.contains("never executed automatically"),
+        "cron_list must keep legacy records explicitly inert; got {desc:?}"
     );
 }

@@ -1,698 +1,922 @@
-//! Speculation engine — crosslink #166.
+//! Run-owned, artifact-bound speculative reads.
 //!
-//! Provides a framework for **speculative execution**: pre-running likely tool
-//! calls before the model finishes its turn so results are available without
-//! blocking the user interaction loop.
+//! The only production prediction supported here is the final page of a
+//! `read_file` continuation already returned by the harness. The opaque cursor
+//! binds the content generation and exact line limit; the coordinator adds the
+//! exact path and immutable run generations. Capture uses the descriptor-pinned
+//! project filesystem capability but publishes no read observation, approval,
+//! tracker entry, attachment, network access, process, secret, or write.
 //!
-//! # Architecture (phased rollout)
-//!
-//! - **Phase 1 (this commit)**: trait surface + `NoOpSpeculationEngine` +
-//!   integration hook in `pipeline::run_turn`. Nothing executes speculatively
-//!   yet; the hook is a zero-cost no-op. Tests validate the contract.
-//! - **Phase 2** (tracked in follow-up issue): `OverlaySpeculationEngine` —
-//!   an in-memory snapshot of the relevant FS paths ("overlay") pre-populated
-//!   before the model turn starts; speculative tool calls write into the
-//!   overlay rather than the real FS. Requires the overlay-filesystem
-//!   subsystem and a prediction heuristic.
-//! - **Phase 3**: acceptance workflow — when the model's actual tool call
-//!   matches the prediction, promote the overlay result without re-running
-//!   the tool. When it doesn't match, discard the overlay silently.
-//!
-//! # Design invariants
-//!
-//! 1. The `SpeculationEngine` trait is `Send + Sync + 'static` so engines can
-//!    live in an `Arc` shared across async task boundaries.
-//! 2. `predict` is **pure** (no side-effects on call); side-effects happen only
-//!    inside `submit_result` (recording hit/miss metrics) and the engine's
-//!    internal async worker.
-//! 3. A prediction is identified by a `PredictionId` newtype — opaque to
-//!    callers, avoids stringly-typed IDs.
-//! 4. `SpeculationHint` carries the minimum information the engine needs:
-//!    the last N model messages plus the pending tool-call list (may be empty
-//!    on the first message of a turn).
-//! 5. The no-op implementation satisfies the full trait contract: every method
-//!    is a constant-time no-op that returns the neutral value for its type.
+//! A prediction is started before the next provider turn completes. The later
+//! tool call still traverses normal policy, hook, and permission admission.
+//! Only then may an exact tool/argument/run/generation match join the owned
+//! worker, revalidate the live descriptor snapshot, and commit the
+//! complete successful receipt. Every other outcome cancels, joins, and drops
+//! the disposable snapshot.
 
-use serde::{Deserialize, Serialize};
-use std::fmt;
-use std::sync::Arc;
+use crate::runtime::{
+    BudgetAmounts, BudgetGeneration, BudgetReservation, CapabilityGeneration, ContentDigest, RunId,
+    StateGeneration, WorkspaceGeneration,
+};
+use crate::tools::effect::ToolEffect;
+use crate::tools::{ToolCall, ToolResult};
+use serde_json::{Map, Value};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
-// ─── Newtype identifiers ─────────────────────────────────────────────────────
+const SPECULATIVE_TOOL: &str = "read_file";
+const MAX_ARGUMENT_BYTES: usize = 4 * 1024;
+const MAX_INPUT_BYTES: u64 = 256 * 1024;
+const MAX_RESULT_BYTES: u64 = 96 * 1024;
+const MAX_MEASUREMENT_SAMPLES: usize = 16;
+const MIN_ADMISSION_SAMPLES: usize = 4;
+const CONFIDENCE_SCALE: u16 = 10_000;
+const PREDICTION_CONFIDENCE: u16 = 9_000;
+const MIN_CONFIDENCE: u16 = 8_000;
+const OPERATION_DEADLINE: Duration = Duration::from_millis(1_500);
+const RESULT_DEADLINE: Duration = Duration::from_secs(60);
 
-/// Opaque identifier for a single speculation prediction.
-///
-/// The engine assigns these; callers carry them through to `submit_result`
-/// so the engine can record hit/miss statistics without exposing its internal
-/// accounting.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct PredictionId(String);
-
-impl PredictionId {
-    /// Create from a raw string (engine-internal use only).
-    #[must_use]
-    pub fn new(raw: impl Into<String>) -> Self {
-        Self(raw.into())
-    }
-
-    /// Borrow the underlying string for logging.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunBinding {
+    run_id: RunId,
+    workspace: WorkspaceGeneration,
+    capability: CapabilityGeneration,
+    budget: BudgetGeneration,
+    state: StateGeneration,
+    provider: ContentDigest,
+    host_safety_policy: u32,
+    runtime_mode: u64,
 }
 
-impl fmt::Display for PredictionId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-// ─── Input: what the engine sees ─────────────────────────────────────────────
-
-/// A summary of one recent message, carrying only what the engine needs to
-/// decide what to speculate about.
-///
-/// Full message bodies can be large; `SpeculationHint` intentionally avoids
-/// including the raw `serde_json::Value` to keep `predict` allocations small.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MessageSummary {
-    /// "user" | "assistant" | "tool"
-    pub role: String,
-    /// First 256 bytes of the text content (enough for pattern-matching).
-    pub content_prefix: String,
-    /// Tool name if this is a tool-result message; `None` otherwise.
-    pub tool_name: Option<String>,
-}
-
-/// Context passed to [`SpeculationEngine::predict`] at the start of a model turn.
-///
-/// The engine reads this to decide which (if any) tool call is worth
-/// pre-running speculatively before the model responds.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpeculationHint {
-    /// The last few turns of conversation (most-recent last).
-    ///
-    /// Capped at [`SpeculationConfig::context_depth`] entries to bound the
-    /// cost of cloning into the engine.
-    pub recent_messages: Vec<MessageSummary>,
-
-    /// Tool calls already queued in the current partial response (may be
-    /// empty at the start of a fresh turn).
-    pub pending_tool_names: Vec<String>,
-}
-
-// ─── Output: what the engine predicts ────────────────────────────────────────
-
-/// A single speculative prediction: the engine believes the model will call
-/// `tool_name` with `predicted_args` in the next turn.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpeculationPrediction {
-    /// Opaque identifier assigned by the engine.
-    pub id: PredictionId,
-    /// Tool the engine expects the model to call.
-    pub tool_name: String,
-    /// Best-guess JSON arguments (may be partial or approximate).
-    pub predicted_args: serde_json::Value,
-    /// Engine's confidence score in [0.0, 1.0].
-    ///
-    /// Callers may use this to decide whether to actually pre-run the
-    /// tool (Phase 2+). A score below a configured threshold should skip
-    /// speculative execution even if a prediction exists.
-    pub confidence: f32,
-}
-
-// ─── Feedback: what actually happened ────────────────────────────────────────
-
-/// Whether the model's actual tool call matched the prediction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PredictionOutcome {
-    /// Tool name and args matched closely enough to reuse the result.
-    Hit,
-    /// Tool name matched but args diverged — result discarded.
-    PartialMiss,
-    /// Tool name did not match — prediction was wrong.
-    Miss,
-    /// No tool call was made (model replied without calling a tool).
-    NoToolCall,
-}
-
-/// Outcome of one model turn, fed back to the engine via
-/// [`SpeculationEngine::submit_result`] for learning/statistics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActualOutcome {
-    /// Which prediction this feedback is for.
-    pub prediction_id: PredictionId,
-    /// How closely the prediction matched reality.
-    pub outcome: PredictionOutcome,
-    /// The tool name the model actually called (or `None` if no tool call).
-    pub actual_tool_name: Option<String>,
-}
-
-// ─── Configuration ────────────────────────────────────────────────────────────
-
-/// Run-time configuration for the speculation engine.
-///
-/// Passed to the engine factory so the engine can tune its behaviour without
-/// needing to reach into the global `AppConfig`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpeculationConfig {
-    /// Whether the engine is allowed to actually pre-run tools.
-    ///
-    /// `false` makes every engine behave like `NoOpSpeculationEngine`
-    /// regardless of which implementation is in use.
-    pub enabled: bool,
-
-    /// Minimum confidence before a prediction is acted on (Phase 2+).
-    ///
-    /// Range [0.0, 1.0]. The default (0.7) means the engine must be at least
-    /// 70% confident before it starts a speculative execution.
-    pub confidence_threshold: f32,
-
-    /// How many recent messages to include in each `SpeculationHint`.
-    ///
-    /// Larger values give the engine more context but cost more cloning work.
-    pub context_depth: usize,
-
-    /// Maximum number of concurrent speculative executions.
-    ///
-    /// Phase 2+ honours this limit. Phase 1 (no-op) ignores it.
-    pub max_concurrent: usize,
-}
-
-impl Default for SpeculationConfig {
-    fn default() -> Self {
+impl RunBinding {
+    fn from_run(run: &crate::tools::ToolRunContext) -> Self {
+        let descriptor = run.runtime().descriptor();
         Self {
-            enabled: false, // disabled by default until Phase 2 lands
-            confidence_threshold: 0.70,
-            context_depth: 6,
-            max_concurrent: 2,
+            run_id: descriptor.run_id,
+            workspace: descriptor.workspace.generation,
+            capability: descriptor.capabilities.generation,
+            budget: descriptor.budget.generation,
+            state: descriptor.initial_state.generation,
+            provider: ContentDigest::sha256(run.provider_id().as_bytes()),
+            host_safety_policy: crate::tools::HOST_SAFETY_POLICY_GENERATION,
+            runtime_mode: run.runtime_mode().generation,
+        }
+    }
+
+    fn matches(self, run: &crate::tools::ToolRunContext) -> bool {
+        self == Self::from_run(run)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadPrediction {
+    id: u64,
+    binding: RunBinding,
+    arguments: Value,
+    input_generation: ContentDigest,
+    confidence: u16,
+}
+
+impl ReadPrediction {
+    fn matches(&self, run: &crate::tools::ToolRunContext, tool_call: &ToolCall) -> bool {
+        self.binding.matches(run)
+            && tool_call.function.name == SPECULATIVE_TOOL
+            && tool_call.function.arguments.len() <= MAX_ARGUMENT_BYTES
+            && serde_json::from_str::<Value>(&tool_call.function.arguments)
+                .is_ok_and(|arguments| arguments == self.arguments)
+    }
+
+    fn argument_map(&self) -> Option<HashMap<String, Value>> {
+        self.arguments
+            .as_object()
+            .map(|arguments| arguments.clone().into_iter().collect())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionDecision {
+    /// A bounded trial is still gathering comparisons against demand reads.
+    Evaluating,
+    /// Every deterministic admission threshold has been met.
+    Enabled,
+    /// Speculation did not beat the demand baseline and is disabled for the run.
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EvaluationSample {
+    correct: bool,
+    hit: bool,
+    wasted: bool,
+    baseline_latency_micros: u64,
+    speculative_latency_micros: u64,
+    baseline_cost_units: u64,
+    speculative_cost_units: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpeculationMetrics {
+    pub(crate) samples: usize,
+    pub(crate) correct: usize,
+    pub(crate) hits: usize,
+    pub(crate) wasted: usize,
+    pub(crate) baseline_latency_micros: u64,
+    pub(crate) speculative_latency_micros: u64,
+    pub(crate) baseline_cost_units: u64,
+    pub(crate) speculative_cost_units: u64,
+}
+
+#[derive(Debug, Default)]
+struct EvaluationWindow {
+    samples: VecDeque<EvaluationSample>,
+}
+
+impl EvaluationWindow {
+    fn record(&mut self, sample: EvaluationSample) {
+        if self.samples.len() == MAX_MEASUREMENT_SAMPLES {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(sample);
+    }
+
+    fn metrics(&self) -> SpeculationMetrics {
+        self.samples
+            .iter()
+            .fold(SpeculationMetrics::default(), |mut metrics, sample| {
+                metrics.samples = metrics.samples.saturating_add(1);
+                metrics.correct = metrics.correct.saturating_add(usize::from(sample.correct));
+                metrics.hits = metrics.hits.saturating_add(usize::from(sample.hit));
+                metrics.wasted = metrics.wasted.saturating_add(usize::from(sample.wasted));
+                metrics.baseline_latency_micros = metrics
+                    .baseline_latency_micros
+                    .saturating_add(sample.baseline_latency_micros);
+                metrics.speculative_latency_micros = metrics
+                    .speculative_latency_micros
+                    .saturating_add(sample.speculative_latency_micros);
+                metrics.baseline_cost_units = metrics
+                    .baseline_cost_units
+                    .saturating_add(sample.baseline_cost_units);
+                metrics.speculative_cost_units = metrics
+                    .speculative_cost_units
+                    .saturating_add(sample.speculative_cost_units);
+                metrics
+            })
+    }
+
+    fn decision(&self) -> AdmissionDecision {
+        let metrics = self.metrics();
+        if metrics.samples < MIN_ADMISSION_SAMPLES {
+            return AdmissionDecision::Evaluating;
+        }
+        let all_correct = metrics.correct == metrics.samples;
+        let hit_threshold = metrics.hits.saturating_mul(usize::from(CONFIDENCE_SCALE))
+            >= metrics
+                .samples
+                .saturating_mul(usize::from(PREDICTION_CONFIDENCE));
+        let waste_threshold =
+            metrics.wasted.saturating_mul(100) <= metrics.samples.saturating_mul(25);
+        let latency_better = metrics.speculative_latency_micros < metrics.baseline_latency_micros;
+        let cost_not_worse = metrics.speculative_cost_units <= metrics.baseline_cost_units;
+        if all_correct && hit_threshold && waste_threshold && latency_better && cost_not_worse {
+            AdmissionDecision::Enabled
+        } else {
+            AdmissionDecision::Disabled
         }
     }
 }
 
-// ─── Engine trait ─────────────────────────────────────────────────────────────
-
-/// Core contract for a speculation engine.
+/// Exact run-owned coordinator for one bounded speculative-read experiment.
 ///
-/// Implementors examine `SpeculationHint` data and optionally pre-run
-/// tool calls in a sandboxed overlay. All methods must be callable from
-/// an async context (the integration hook in `pipeline::run_turn` is async).
-///
-/// # Thread safety
-///
-/// The bound `Send + Sync + 'static` is required so an engine can live
-/// behind `Arc<dyn SpeculationEngine>` and be shared across the TUI event
-/// loop and the pipeline worker tasks.
-pub trait SpeculationEngine: Send + Sync + 'static {
-    /// Examine the current conversation hint and optionally predict the
-    /// next tool call.
-    ///
-    /// Returning `None` means the engine declines to speculate for this
-    /// turn (e.g., low confidence, disabled, or the hint doesn't match
-    /// any known pattern).
-    ///
-    /// This call must be **fast** (≪ 1 ms) — it runs on the hot path
-    /// of every model turn. Expensive work (I/O, HTTP) belongs in the
-    /// engine's background worker, not here.
-    fn predict(&self, hint: &SpeculationHint) -> Option<SpeculationPrediction>;
-
-    /// Record the actual outcome of a turn so the engine can update its
-    /// internal hit/miss statistics.
-    ///
-    /// Called once per turn, regardless of whether `predict` returned `Some`.
-    /// When `predict` returned `None`, pass a synthetic `ActualOutcome` with
-    /// `outcome = PredictionOutcome::NoToolCall` and `prediction_id` set to
-    /// any sentinel (the engine must handle this gracefully).
-    fn submit_result(&self, outcome: &ActualOutcome);
-
-    /// Returns `true` if the engine has at least one speculative execution
-    /// in flight.
-    ///
-    /// The pipeline integration hook polls this after the model responds
-    /// to decide whether to wait for the overlay result (Phase 2+) or
-    /// proceed immediately.
-    fn has_pending(&self) -> bool;
-
-    /// Human-readable name for this engine (used in tracing / diagnostics).
-    fn name(&self) -> &'static str;
-
-    /// Current hit rate over all recorded turns, in [0.0, 1.0].
-    ///
-    /// Returns `None` if no turns have been recorded yet.
-    ///
-    /// Primarily for metrics / TUI display; not on the hot path.
-    fn hit_rate(&self) -> Option<f32>;
+/// The coordinator is carried through immediate TUI follow-up turns alongside
+/// the same `ToolRunContext`. A workspace transition creates a new coordinator;
+/// no worker or prediction crosses that generation boundary.
+pub struct SpeculationCoordinator {
+    binding: RunBinding,
+    next_prediction_id: AtomicU64,
+    pending: Mutex<Option<ReadPrediction>>,
+    measurements: Arc<Mutex<EvaluationWindow>>,
+    in_flight: Arc<AtomicBool>,
 }
 
-// ─── No-op implementation ─────────────────────────────────────────────────────
-
-/// A speculation engine that does nothing.
-///
-/// Every method is a constant-time no-op returning the neutral value for
-/// its type. Used as the default when `SpeculationConfig::enabled` is
-/// `false`, or as the Phase 1 default until a real engine lands.
-///
-/// # Why not just `Option<Arc<dyn SpeculationEngine>>`?
-///
-/// Having a concrete type that satisfies the trait means the pipeline
-/// integration code is always the same shape — no `if let Some(engine)` at
-/// the call site, no dead-code branches to test separately.
-#[derive(Debug, Default)]
-pub struct NoOpSpeculationEngine;
-
-impl SpeculationEngine for NoOpSpeculationEngine {
-    fn predict(&self, _hint: &SpeculationHint) -> Option<SpeculationPrediction> {
-        None
-    }
-
-    fn submit_result(&self, _outcome: &ActualOutcome) {
-        // nothing to record
-    }
-
-    fn has_pending(&self) -> bool {
-        false
-    }
-
-    fn name(&self) -> &'static str {
-        "no-op"
-    }
-
-    fn hit_rate(&self) -> Option<f32> {
-        None
+impl std::fmt::Debug for SpeculationCoordinator {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SpeculationCoordinator")
+            .field("binding", &self.binding)
+            .field("decision", &self.admission_decision())
+            .field("metrics", &self.metrics())
+            .field("in_flight", &self.in_flight.load(Ordering::Acquire))
+            .finish_non_exhaustive()
     }
 }
 
-// ─── Factory ─────────────────────────────────────────────────────────────────
+impl SpeculationCoordinator {
+    #[must_use]
+    pub(crate) fn for_run(run: &crate::tools::ToolRunContext) -> Self {
+        Self {
+            binding: RunBinding::from_run(run),
+            next_prediction_id: AtomicU64::new(1),
+            pending: Mutex::new(None),
+            measurements: Arc::new(Mutex::new(EvaluationWindow::default())),
+            in_flight: Arc::new(AtomicBool::new(false)),
+        }
+    }
 
-/// Build the active `SpeculationEngine` from a `SpeculationConfig`.
-///
-/// Phase 1 always returns `NoOpSpeculationEngine` wrapped in an `Arc`.
-/// Phase 2+ will pattern-match on `cfg` to select the `OverlaySpeculationEngine`
-/// when `cfg.enabled` is `true`.
-#[must_use]
-pub fn build_engine(cfg: &SpeculationConfig) -> Arc<dyn SpeculationEngine> {
-    if cfg.enabled {
-        tracing::warn!(
-            "SpeculationEngine: enabled=true but OverlaySpeculationEngine is not yet \
-             implemented (Phase 2, crosslink #166 follow-up). Falling back to no-op."
+    #[must_use]
+    pub(crate) fn is_bound_to(&self, run: &crate::tools::ToolRunContext) -> bool {
+        self.binding.matches(run)
+    }
+
+    /// Retain one next-page prediction from a trusted typed `read_file`
+    /// result. Only partial results with an opaque continuation and immutable
+    /// artifact generation can seed work; errors, complete reads, and every
+    /// other tool clear the pending candidate.
+    pub(crate) fn observe_result(&self, tool_call: &ToolCall, result: &ToolResult) {
+        let prediction_id = self.next_prediction_id.fetch_add(1, Ordering::Relaxed);
+        let prediction = prediction_from_result(self.binding, prediction_id, tool_call, result);
+        let mut pending = lock_or_recover(&self.pending);
+        if pending.as_ref().is_some_and(|current| {
+            prediction.as_ref().is_some_and(|next| {
+                current.arguments == next.arguments
+                    && current.input_generation == next.input_generation
+            })
+        }) {
+            return;
+        }
+        *pending = prediction;
+    }
+
+    /// Start the retained prediction before provider completion. The caller
+    /// owns the returned handle and must either consume it after normal tool
+    /// admission or discard it; `Drop` is a cancellation-and-join backstop.
+    #[must_use]
+    #[allow(clippy::too_many_lines)] // Admission, reservation, and worker ownership are one transaction.
+    pub(crate) fn start(
+        &self,
+        run: &Arc<crate::tools::ToolRunContext>,
+    ) -> Option<SpeculationHandle> {
+        if !self.is_bound_to(run)
+            || run.runtime().cancellation().is_cancelled()
+            || self.admission_decision() == AdmissionDecision::Disabled
+            || self
+                .in_flight
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return None;
+        }
+        let prediction = lock_or_recover(&self.pending).take();
+        let Some(prediction) = prediction else {
+            self.in_flight.store(false, Ordering::Release);
+            return None;
+        };
+        if prediction.confidence < MIN_CONFIDENCE
+            || prediction.confidence > CONFIDENCE_SCALE
+            || serde_json::to_vec(&prediction.arguments)
+                .map_or(true, |bytes| bytes.len() > MAX_ARGUMENT_BYTES)
+        {
+            self.in_flight.store(false, Ordering::Release);
+            return None;
+        }
+        let Ok(effect) = crate::tools::host_safety::HostSafetyPolicy::enforce(
+            SPECULATIVE_TOOL,
+            &prediction.arguments,
+        ) else {
+            self.in_flight.store(false, Ordering::Release);
+            return None;
+        };
+        if effect.effect != ToolEffect::ReadOnly {
+            self.in_flight.store(false, Ordering::Release);
+            return None;
+        }
+        if run
+            .admit_runtime_mode_resolved(SPECULATIVE_TOOL, &effect, &prediction.arguments)
+            .is_err()
+            || run
+                .tool_catalog()
+                .admit_tool_call(run, SPECULATIVE_TOOL)
+                .is_err()
+        {
+            self.in_flight.store(false, Ordering::Release);
+            return None;
+        }
+        let Some(arguments) = prediction.argument_map() else {
+            self.in_flight.store(false, Ordering::Release);
+            return None;
+        };
+        let budget_reservation = match run.budget().reserve(BudgetAmounts {
+            concurrent_calls: 1,
+            ..BudgetAmounts::default()
+        }) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                self.in_flight.store(false, Ordering::Release);
+                tracing::debug!(%error, "run budget denied speculative read");
+                return None;
+            }
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let started = Instant::now();
+        let deadline = started + RESULT_DEADLINE;
+        let worker_deadline = started + OPERATION_DEADLINE;
+        let worker_run = Arc::clone(run);
+        let worker = match std::thread::Builder::new()
+            .name(format!("speculative-read-{}", prediction.id))
+            .spawn(move || {
+                if worker_run.runtime().cancellation().is_cancelled() {
+                    return Err("owning run was cancelled before speculative capture".to_string());
+                }
+                let artifact = crate::tools::file::capture_speculative_read(
+                    &worker_run,
+                    &arguments,
+                    &worker_cancelled,
+                    worker_deadline,
+                )?;
+                if artifact.input_bytes() > MAX_INPUT_BYTES
+                    || artifact.output_bytes() > MAX_RESULT_BYTES
+                {
+                    return Err("speculative read exceeded its reserved byte budget".to_string());
+                }
+                Ok(artifact)
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.in_flight.store(false, Ordering::Release);
+                tracing::debug!(%error, "could not start bounded speculative read worker");
+                return None;
+            }
+        };
+        Some(SpeculationHandle {
+            prediction,
+            started,
+            deadline,
+            cancelled,
+            worker: Some(worker),
+            budget_reservation: Some(budget_reservation),
+            measurements: Arc::clone(&self.measurements),
+            in_flight: Arc::clone(&self.in_flight),
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn admission_decision(&self) -> AdmissionDecision {
+        lock_or_recover(&self.measurements).decision()
+    }
+
+    #[must_use]
+    pub(crate) fn metrics(&self) -> SpeculationMetrics {
+        lock_or_recover(&self.measurements).metrics()
+    }
+}
+
+/// Owned result handle for one bounded prediction. It is intentionally not
+/// cloneable: exactly one caller decides reuse or discard and observes the
+/// worker's terminal result.
+pub struct SpeculationHandle {
+    prediction: ReadPrediction,
+    started: Instant,
+    deadline: Instant,
+    cancelled: Arc<AtomicBool>,
+    worker: Option<JoinHandle<Result<crate::tools::file::SpeculativeReadArtifact, String>>>,
+    budget_reservation: Option<BudgetReservation>,
+    measurements: Arc<Mutex<EvaluationWindow>>,
+    in_flight: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for SpeculationHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SpeculationHandle")
+            .field("prediction_id", &self.prediction.id)
+            .field("binding", &self.prediction.binding)
+            .field("input_generation", &self.prediction.input_generation)
+            .field("deadline", &self.deadline)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SpeculationHandle {
+    #[must_use]
+    pub(crate) fn matches(&self, run: &crate::tools::ToolRunContext, tool_call: &ToolCall) -> bool {
+        self.prediction.matches(run, tool_call)
+    }
+
+    /// Join, validate, and commit a matching prediction after the actual tool
+    /// call has passed ordinary admission. `None` directs the caller to the
+    /// demand path.
+    pub(crate) fn consume(
+        mut self,
+        run: &crate::tools::ToolRunContext,
+        tool_call: &ToolCall,
+    ) -> Option<crate::tools::file::SpeculativeReadArtifact> {
+        if !self.matches(run, tool_call) {
+            self.discard_inner("actual tool call did not exactly match prediction");
+            return None;
+        }
+        let consume_started = Instant::now();
+        let joined = self.join_worker();
+        let speculative_latency = micros(consume_started.elapsed());
+        let mut sample = EvaluationSample {
+            correct: true,
+            hit: false,
+            wasted: true,
+            baseline_latency_micros: 0,
+            speculative_latency_micros: speculative_latency,
+            baseline_cost_units: 0,
+            speculative_cost_units: 0,
+        };
+        let artifact = match joined {
+            Ok(artifact)
+                if Instant::now() < self.deadline
+                    && artifact.generation() == self.prediction.input_generation =>
+            {
+                artifact
+            }
+            Ok(artifact) => {
+                sample.correct = artifact.generation() == self.prediction.input_generation;
+                sample.speculative_cost_units = artifact.input_bytes().saturating_mul(2);
+                self.record(sample);
+                return None;
+            }
+            Err(error) => {
+                tracing::debug!(prediction_id = self.prediction.id, %error, "speculative read discarded");
+                self.record(sample);
+                return None;
+            }
+        };
+        sample.speculative_cost_units = artifact.input_bytes().saturating_mul(2);
+        sample.baseline_latency_micros = artifact.capture_latency_micros();
+        sample.baseline_cost_units = artifact.input_bytes().saturating_mul(2);
+        match crate::tools::file::validate_speculative_read(
+            run,
+            &artifact,
+            &self.cancelled,
+            self.deadline,
+        ) {
+            Ok(()) => {
+                sample.correct = true;
+                sample.hit = true;
+                sample.wasted = false;
+                sample.speculative_latency_micros = micros(consume_started.elapsed());
+                self.record(sample);
+                Some(artifact)
+            }
+            Err(error) => {
+                sample.correct = false;
+                sample.speculative_latency_micros = micros(consume_started.elapsed());
+                tracing::debug!(prediction_id = self.prediction.id, %error, "speculative read failed live-generation validation");
+                self.record(sample);
+                None
+            }
+        }
+    }
+
+    /// Cancel and synchronously join an unused prediction. The worker is
+    /// bounded to one small local project read, so this cannot leave a detached
+    /// task behind the owning run.
+    pub(crate) fn discard(mut self, reason: &'static str) {
+        self.discard_inner(reason);
+    }
+
+    fn discard_inner(&mut self, reason: &'static str) {
+        self.cancelled.store(true, Ordering::Release);
+        let cost = self
+            .join_worker()
+            .ok()
+            .map_or(0, |artifact| artifact.input_bytes().saturating_mul(2));
+        tracing::debug!(
+            prediction_id = self.prediction.id,
+            reason,
+            "speculative read cancelled and joined"
+        );
+        self.record(EvaluationSample {
+            correct: true,
+            hit: false,
+            wasted: true,
+            baseline_latency_micros: 0,
+            speculative_latency_micros: micros(self.started.elapsed()),
+            baseline_cost_units: 0,
+            speculative_cost_units: cost,
+        });
+    }
+
+    fn join_worker(&mut self) -> Result<crate::tools::file::SpeculativeReadArtifact, String> {
+        let worker = self
+            .worker
+            .take()
+            .ok_or_else(|| "speculative read worker was already observed".to_string())?;
+        let result = worker
+            .join()
+            .map_err(|_| "speculative read worker panicked".to_string())?;
+        if let Some(reservation) = self.budget_reservation.take() {
+            reservation
+                .commit()
+                .map_err(|error| format!("speculative read budget settlement failed: {error}"))?;
+        }
+        result
+    }
+
+    fn record(&self, sample: EvaluationSample) {
+        let mut measurements = lock_or_recover(&self.measurements);
+        measurements.record(sample);
+        let metrics = measurements.metrics();
+        let decision = measurements.decision();
+        drop(measurements);
+        tracing::debug!(
+            prediction_id = self.prediction.id,
+            samples = metrics.samples,
+            correct = metrics.correct,
+            hits = metrics.hits,
+            wasted = metrics.wasted,
+            baseline_latency_micros = metrics.baseline_latency_micros,
+            speculative_latency_micros = metrics.speculative_latency_micros,
+            baseline_cost_units = metrics.baseline_cost_units,
+            speculative_cost_units = metrics.speculative_cost_units,
+            admission = ?decision,
+            "recorded bounded speculation comparison"
         );
     }
-    Arc::new(NoOpSpeculationEngine)
 }
 
-// ─── Pipeline integration hook ────────────────────────────────────────────────
-
-/// Build a `SpeculationHint` from a slice of raw OpenAI-format messages.
-///
-/// This is a pure function so it can be unit-tested without a live engine.
-/// Only the last `depth` messages are included; each is summarised to avoid
-/// cloning large `Value` trees.
-#[must_use]
-pub fn build_hint_from_messages(messages: &[serde_json::Value], depth: usize) -> SpeculationHint {
-    let start = messages.len().saturating_sub(depth);
-    let recent_messages = messages[start..]
-        .iter()
-        .map(|m| {
-            let role = m
-                .get("role")
-                .and_then(|r| r.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-
-            let content_prefix = m
-                .get("content")
-                .and_then(|c| c.as_str())
-                .map(|s| {
-                    // Cap at 256 bytes on a char boundary to avoid slicing mid-char.
-                    let end = s
-                        .char_indices()
-                        .map(|(i, _)| i)
-                        .take_while(|&i| i < 256)
-                        .last()
-                        .map_or(0, |i| {
-                            // advance past the last char
-                            let ch = s[i..].chars().next().map_or(0, char::len_utf8);
-                            i + ch
-                        });
-                    s[..end].to_string()
-                })
-                .unwrap_or_default();
-
-            let tool_name = m
-                .get("tool_calls")
-                .and_then(|tc| tc.get(0))
-                .and_then(|tc| tc.get("function"))
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-                .map(str::to_string);
-
-            MessageSummary {
-                role,
-                content_prefix,
-                tool_name,
-            }
-        })
-        .collect();
-
-    SpeculationHint {
-        recent_messages,
-        pending_tool_names: Vec::new(),
-    }
-}
-
-/// Integration hook: run after a model turn completes.
-///
-/// In Phase 1 this is a fast no-op (the `NoOpSpeculationEngine` returns
-/// `None` from `predict` immediately). In Phase 2+ the engine will use
-/// the hint to decide whether to pre-run the next predicted tool call.
-///
-/// Called by `pipeline::run_turn` at the end of every turn, before the
-/// `TurnResult` is returned to the caller.
-pub fn after_turn(
-    engine: &dyn SpeculationEngine,
-    messages: &[serde_json::Value],
-    tool_names_called: &[String],
-    config: &SpeculationConfig,
-) {
-    if !config.enabled {
-        return;
-    }
-
-    let hint = build_hint_from_messages(messages, config.context_depth);
-    let prediction = engine.predict(&hint);
-
-    // Record outcome for the previous turn.
-    // When no prediction was made, record a no-call sentinel.
-    let prediction_id = prediction
-        .as_ref()
-        .map_or_else(|| PredictionId::new("__no_prediction__"), |p| p.id.clone());
-
-    let outcome_kind = if tool_names_called.is_empty() {
-        PredictionOutcome::NoToolCall
-    } else if let Some(pred) = &prediction {
-        if tool_names_called.contains(&pred.tool_name) {
-            PredictionOutcome::Hit
-        } else {
-            PredictionOutcome::Miss
+impl Drop for SpeculationHandle {
+    fn drop(&mut self) {
+        if self.worker.is_some() {
+            self.discard_inner("owned speculation handle dropped before reuse");
         }
-    } else {
-        PredictionOutcome::NoToolCall
-    };
-
-    engine.submit_result(&ActualOutcome {
-        prediction_id,
-        outcome: outcome_kind,
-        actual_tool_name: tool_names_called.first().cloned(),
-    });
+        self.in_flight.store(false, Ordering::Release);
+    }
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
+fn prediction_from_result(
+    binding: RunBinding,
+    id: u64,
+    tool_call: &ToolCall,
+    result: &ToolResult,
+) -> Option<ReadPrediction> {
+    if tool_call.function.name != SPECULATIVE_TOOL
+        || result.handler() != SPECULATIVE_TOOL
+        || result.is_error()
+        || !result.is_partial()
+    {
+        return None;
+    }
+    let arguments = serde_json::from_str::<Value>(&tool_call.function.arguments)
+        .ok()?
+        .as_object()?
+        .clone();
+    let path = arguments.get("path")?.as_str()?.to_string();
+    let structured = result.structured()?;
+    if structured.get("kind").and_then(Value::as_str) != Some("text")
+        || structured.get("sensitivity").and_then(Value::as_str) != Some("workspace")
+    {
+        return None;
+    }
+    let cursor = structured
+        .get("continuation")?
+        .get("cursor")?
+        .as_str()?
+        .to_string();
+    let input_generation = structured
+        .get("artifact")?
+        .get("generation")?
+        .as_str()?
+        .parse()
+        .ok()?;
+    let mut next = Map::new();
+    next.insert("path".to_string(), Value::String(path));
+    next.insert("cursor".to_string(), Value::String(cursor));
+    if let Some(limit) = arguments.get("limit") {
+        if limit.as_u64().is_none_or(|limit| limit == 0) {
+            return None;
+        }
+        next.insert("limit".to_string(), limit.clone());
+    }
+    let arguments = Value::Object(next);
+    if serde_json::to_vec(&arguments).is_ok_and(|encoded| encoded.len() <= MAX_ARGUMENT_BYTES) {
+        Some(ReadPrediction {
+            id,
+            binding,
+            arguments,
+            input_generation,
+            confidence: PREDICTION_CONFIDENCE,
+        })
+    } else {
+        None
+    }
+}
+
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|error| {
+        tracing::error!("speculation state lock poisoned; recovering inner state");
+        error.into_inner()
+    })
+}
+
+fn micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::{
+        FunctionCall, ToolFailure, ToolFailureCode, ToolHandlerResult, ToolRetryability,
+    };
     use serde_json::json;
 
-    // ── NoOpSpeculationEngine contract ────────────────────────────────────────
+    fn binding() -> RunBinding {
+        RunBinding {
+            run_id: RunId::new(),
+            workspace: WorkspaceGeneration::new(1).expect("workspace generation"),
+            capability: CapabilityGeneration::new(2).expect("capability generation"),
+            budget: BudgetGeneration::new(3).expect("budget generation"),
+            state: StateGeneration::new(4).expect("state generation"),
+            provider: ContentDigest::sha256(b"test-provider"),
+            host_safety_policy: crate::tools::HOST_SAFETY_POLICY_GENERATION,
+            runtime_mode: 1,
+        }
+    }
+
+    fn call(arguments: &Value) -> ToolCall {
+        ToolCall {
+            id: "call-1".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: SPECULATIVE_TOOL.to_string(),
+                arguments: serde_json::to_string(&arguments).expect("arguments encode"),
+            },
+        }
+    }
+
+    fn partial_read_result(call: &ToolCall) -> ToolResult {
+        ToolResult::bind(
+            call,
+            SPECULATIVE_TOOL,
+            ToolHandlerResult::partial_truncated_structured(
+                "page",
+                json!({
+                    "kind": "text",
+                    "sensitivity": "workspace",
+                    "artifact": {
+                        "generation": ContentDigest::sha256(b"artifact"),
+                        "byte_len": 100,
+                    },
+                    "continuation": {"cursor": "opaque-cursor"},
+                    "partial": true,
+                    "eof": false,
+                }),
+                50,
+                Some(json!({"cursor": "opaque-cursor"})),
+            ),
+        )
+    }
 
     #[test]
-    fn noop_predict_always_returns_none() {
-        let engine = NoOpSpeculationEngine;
-        let hint = SpeculationHint {
-            recent_messages: vec![MessageSummary {
-                role: "user".into(),
-                content_prefix: "read this file".into(),
-                tool_name: None,
-            }],
-            pending_tool_names: vec!["read_file".into()],
-        };
-        assert!(
-            engine.predict(&hint).is_none(),
-            "NoOp engine must never predict a tool call"
+    fn trusted_partial_read_predicts_exact_cursor_call() {
+        let call = call(&json!({"path": "src/lib.rs", "limit": 20}));
+        let result = partial_read_result(&call);
+        let prediction = prediction_from_result(binding(), 7, &call, &result)
+            .expect("trusted continuation predicts final page");
+
+        assert_eq!(prediction.id, 7);
+        assert_eq!(prediction.arguments["path"], "src/lib.rs");
+        assert_eq!(prediction.arguments["cursor"], "opaque-cursor");
+        assert_eq!(prediction.arguments["limit"], 20);
+        assert_eq!(
+            prediction.input_generation,
+            ContentDigest::sha256(b"artifact")
         );
     }
 
     #[test]
-    fn noop_has_pending_always_false() {
-        let engine = NoOpSpeculationEngine;
-        assert!(
-            !engine.has_pending(),
-            "NoOp engine must never report pending speculations"
+    fn complete_error_and_non_read_results_cannot_seed_predictions() {
+        let read = call(&json!({"path": "src/lib.rs"}));
+        let complete = ToolResult::bind(
+            &read,
+            SPECULATIVE_TOOL,
+            ToolHandlerResult::success_text("complete"),
+        );
+        assert!(prediction_from_result(binding(), 1, &read, &complete).is_none());
+
+        let error = ToolResult::bind(
+            &read,
+            SPECULATIVE_TOOL,
+            ToolHandlerResult::error(ToolFailure::new(
+                ToolFailureCode::External,
+                "failed".to_string(),
+                ToolRetryability::Safe,
+            )),
+        );
+        assert!(prediction_from_result(binding(), 2, &read, &error).is_none());
+
+        let mut other = read;
+        other.function.name = "grep".to_string();
+        let result = partial_read_result(&other);
+        assert!(prediction_from_result(binding(), 3, &other, &result).is_none());
+    }
+
+    #[test]
+    fn exact_arguments_do_not_accept_a_near_match() {
+        let read = call(&json!({"path": "src/lib.rs"}));
+        let result = partial_read_result(&read);
+        let prediction = prediction_from_result(binding(), 1, &read, &result).expect("prediction");
+        assert_eq!(
+            prediction.arguments,
+            json!({"path": "src/lib.rs", "cursor": "opaque-cursor"})
+        );
+        assert_ne!(
+            prediction.arguments,
+            json!({"path": "src/lib.rs", "cursor": "other-cursor"})
         );
     }
 
     #[test]
-    fn noop_hit_rate_returns_none() {
-        let engine = NoOpSpeculationEngine;
-        assert!(
-            engine.hit_rate().is_none(),
-            "NoOp engine has no statistics to report"
+    fn exact_cursor_receipt_commits_and_enables_when_it_moves_latency_off_path() {
+        let workspace = tempfile::tempdir().expect("speculation workspace");
+        std::fs::write(workspace.path().join("source.txt"), "one\ntwo\n")
+            .expect("write source fixture");
+        let run = crate::tools::security::test_run_context_for(workspace.path());
+        let first_call = call(&json!({"path": "source.txt", "limit": 1}));
+        let first_args = HashMap::from([
+            ("path".to_string(), json!("source.txt")),
+            ("limit".to_string(), json!(1)),
+        ]);
+        let first_result = ToolResult::bind(
+            &first_call,
+            SPECULATIVE_TOOL,
+            crate::tools::file::execute_read_file_typed(&run, &first_args),
         );
+        assert!(first_result.is_partial());
+        let cursor = first_result.structured().expect("typed first page")["continuation"]["cursor"]
+            .as_str()
+            .expect("continuation cursor")
+            .to_string();
+        let continuation = call(&json!({
+            "path": "source.txt",
+            "cursor": cursor,
+            "limit": 1,
+        }));
+        let coordinator = SpeculationCoordinator::for_run(&run);
+        let permissions = crate::permissions::PermissionManager::unrestricted_for_run(&run);
+
+        for _ in 0..MIN_ADMISSION_SAMPLES {
+            coordinator.observe_result(&first_call, &first_result);
+            let handle = coordinator
+                .start(&run)
+                .expect("evaluation prediction starts");
+            assert!(handle.matches(&run, &continuation));
+            let committed = crate::services::tool_executor::ToolExecutor::execute_precomputed_read(
+                crate::services::tool_executor::PrecomputedReadRequest {
+                    run_context: &run,
+                    tool_call: &continuation,
+                    handle,
+                    memory_db: None,
+                    app_config: None,
+                    permission_mgr: &permissions,
+                    authorization: None,
+                    session_id: Some(run.session_id()),
+                    policy_enforcer: None,
+                },
+            );
+            assert!(!committed.is_partial());
+            assert_eq!(
+                committed.structured().expect("typed final page")["eof"],
+                true
+            );
+        }
+
+        let metrics = coordinator.metrics();
+        assert_eq!(metrics.samples, MIN_ADMISSION_SAMPLES);
+        assert_eq!(metrics.correct, MIN_ADMISSION_SAMPLES);
+        assert_eq!(metrics.hits, MIN_ADMISSION_SAMPLES);
+        assert_eq!(metrics.wasted, 0);
+        assert_eq!(metrics.speculative_cost_units, metrics.baseline_cost_units);
+        assert!(metrics.speculative_latency_micros < metrics.baseline_latency_micros);
+        assert_eq!(coordinator.admission_decision(), AdmissionDecision::Enabled);
+        crate::tools::retire_run(&run);
     }
 
     #[test]
-    fn noop_submit_result_does_not_panic() {
-        let engine = NoOpSpeculationEngine;
-        // Should complete without panicking for all outcome variants.
-        for outcome in &[
-            PredictionOutcome::Hit,
-            PredictionOutcome::PartialMiss,
-            PredictionOutcome::Miss,
-            PredictionOutcome::NoToolCall,
-        ] {
-            engine.submit_result(&ActualOutcome {
-                prediction_id: PredictionId::new("test-id"),
-                outcome: *outcome,
-                actual_tool_name: Some("bash".into()),
+    fn changed_artifact_is_rejected_without_a_second_full_read() {
+        let workspace = tempfile::tempdir().expect("speculation workspace");
+        let path = workspace.path().join("source.txt");
+        std::fs::write(&path, "one\ntwo\n").expect("write source fixture");
+        let run = crate::tools::security::test_run_context_for(workspace.path());
+        let first_call = call(&json!({"path": "source.txt", "limit": 1}));
+        let first_args = HashMap::from([
+            ("path".to_string(), json!("source.txt")),
+            ("limit".to_string(), json!(1)),
+        ]);
+        let first_result = ToolResult::bind(
+            &first_call,
+            SPECULATIVE_TOOL,
+            crate::tools::file::execute_read_file_typed(&run, &first_args),
+        );
+        let cursor = first_result.structured().expect("typed first page")["continuation"]["cursor"]
+            .as_str()
+            .expect("continuation cursor")
+            .to_string();
+        let continuation_args = HashMap::from([
+            ("path".to_string(), json!("source.txt")),
+            ("cursor".to_string(), json!(cursor)),
+            ("limit".to_string(), json!(1)),
+        ]);
+        let cancelled = AtomicBool::new(false);
+        let artifact = crate::tools::file::capture_speculative_read(
+            &run,
+            &continuation_args,
+            &cancelled,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect("capture speculative continuation");
+
+        std::fs::write(&path, "one\ntwo changed\n").expect("mutate source fixture");
+        let error = crate::tools::file::validate_speculative_read(
+            &run,
+            &artifact,
+            &cancelled,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect_err("changed artifact must invalidate speculation");
+        assert!(error.contains("no longer matches"));
+        crate::tools::retire_run(&run);
+    }
+
+    #[test]
+    fn admission_requires_correct_hits_with_lower_latency_and_cost() {
+        let mut window = EvaluationWindow::default();
+        for _ in 0..MIN_ADMISSION_SAMPLES {
+            window.record(EvaluationSample {
+                correct: true,
+                hit: true,
+                wasted: false,
+                baseline_latency_micros: 100,
+                speculative_latency_micros: 20,
+                baseline_cost_units: 100,
+                speculative_cost_units: 40,
             });
+        }
+        assert_eq!(window.decision(), AdmissionDecision::Enabled);
+    }
+
+    #[test]
+    fn admission_disables_on_wrong_result_waste_or_non_improvement() {
+        let failing_samples = [
+            EvaluationSample {
+                correct: false,
+                hit: true,
+                wasted: false,
+                baseline_latency_micros: 100,
+                speculative_latency_micros: 20,
+                baseline_cost_units: 100,
+                speculative_cost_units: 40,
+            },
+            EvaluationSample {
+                correct: true,
+                hit: false,
+                wasted: true,
+                baseline_latency_micros: 100,
+                speculative_latency_micros: 20,
+                baseline_cost_units: 100,
+                speculative_cost_units: 40,
+            },
+            EvaluationSample {
+                correct: true,
+                hit: true,
+                wasted: false,
+                baseline_latency_micros: 100,
+                speculative_latency_micros: 100,
+                baseline_cost_units: 100,
+                speculative_cost_units: 100,
+            },
+        ];
+        for failing in failing_samples {
+            let mut window = EvaluationWindow::default();
+            for _ in 0..MIN_ADMISSION_SAMPLES {
+                window.record(failing);
+            }
+            assert_eq!(window.decision(), AdmissionDecision::Disabled);
         }
     }
 
     #[test]
-    fn noop_name_is_static_str() {
-        let engine = NoOpSpeculationEngine;
-        assert_eq!(engine.name(), "no-op");
-    }
-
-    // ── build_engine factory ──────────────────────────────────────────────────
-
-    #[test]
-    fn build_engine_disabled_returns_noop() {
-        let cfg = SpeculationConfig {
-            enabled: false,
-            ..Default::default()
-        };
-        let engine = build_engine(&cfg);
-        // The no-op engine predicts nothing even when enabled is false.
-        let hint = SpeculationHint {
-            recent_messages: vec![],
-            pending_tool_names: vec![],
-        };
-        assert!(engine.predict(&hint).is_none());
-    }
-
-    #[test]
-    fn build_engine_enabled_falls_back_to_noop_in_phase1() {
-        // Phase 1: enabled=true still returns a no-op because the overlay
-        // engine is not yet implemented.
-        let cfg = SpeculationConfig {
-            enabled: true,
-            ..Default::default()
-        };
-        let engine = build_engine(&cfg);
-        assert!(!engine.has_pending(), "Phase 1 engine must have no pending");
-    }
-
-    // ── SpeculationConfig defaults ────────────────────────────────────────────
-
-    #[test]
-    fn config_default_is_disabled() {
-        let cfg = SpeculationConfig::default();
-        assert!(!cfg.enabled, "Speculation must be disabled by default");
-    }
-
-    #[test]
-    fn config_default_confidence_threshold_is_reasonable() {
-        let cfg = SpeculationConfig::default();
-        assert!(
-            (0.0..=1.0).contains(&cfg.confidence_threshold),
-            "confidence_threshold must be in [0.0, 1.0]"
-        );
-        assert!(
-            cfg.confidence_threshold >= 0.5,
-            "default threshold should be at least 0.5 to avoid noisy speculation"
-        );
-    }
-
-    #[test]
-    fn config_default_context_depth_nonzero() {
-        let cfg = SpeculationConfig::default();
-        assert!(cfg.context_depth > 0, "context_depth must be > 0");
-    }
-
-    // ── build_hint_from_messages ──────────────────────────────────────────────
-
-    #[test]
-    fn hint_depth_caps_message_count() {
-        let messages: Vec<serde_json::Value> = (0..20)
-            .map(|i| json!({ "role": "user", "content": format!("msg {i}") }))
-            .collect();
-        let hint = build_hint_from_messages(&messages, 6);
-        assert_eq!(
-            hint.recent_messages.len(),
-            6,
-            "hint must contain exactly `depth` messages"
-        );
-    }
-
-    #[test]
-    fn hint_fewer_messages_than_depth() {
-        let messages = vec![
-            json!({ "role": "user", "content": "hello" }),
-            json!({ "role": "assistant", "content": "hi" }),
-        ];
-        let hint = build_hint_from_messages(&messages, 6);
-        assert_eq!(
-            hint.recent_messages.len(),
-            2,
-            "hint must not fabricate messages when fewer than depth exist"
-        );
-    }
-
-    #[test]
-    fn hint_content_prefix_caps_at_256_bytes() {
-        // 300 ASCII 'x' characters — should be trimmed to 256.
-        let long_str = "x".repeat(300);
-        let messages = vec![json!({ "role": "user", "content": long_str })];
-        let hint = build_hint_from_messages(&messages, 4);
-        let prefix = &hint.recent_messages[0].content_prefix;
-        assert!(
-            prefix.len() <= 256,
-            "content_prefix must be at most 256 bytes, got {}",
-            prefix.len()
-        );
-        // Must still be non-empty
-        assert!(
-            !prefix.is_empty(),
-            "non-empty content must produce non-empty prefix"
-        );
-    }
-
-    #[test]
-    fn hint_empty_messages_produces_empty_hint() {
-        let hint = build_hint_from_messages(&[], 6);
-        assert!(hint.recent_messages.is_empty());
-        assert!(hint.pending_tool_names.is_empty());
-    }
-
-    #[test]
-    fn hint_tool_name_extracted_from_tool_calls() {
-        let messages = vec![json!({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": { "name": "read_file", "arguments": "{}" }
-                }
-            ]
-        })];
-        let hint = build_hint_from_messages(&messages, 4);
-        assert_eq!(
-            hint.recent_messages[0].tool_name.as_deref(),
-            Some("read_file"),
-            "tool_name must be extracted from tool_calls[0].function.name"
-        );
-    }
-
-    #[test]
-    fn hint_role_preserved() {
-        let messages = vec![
-            json!({ "role": "system", "content": "You are helpful." }),
-            json!({ "role": "user", "content": "do something" }),
-            json!({ "role": "assistant", "content": "ok" }),
-        ];
-        let hint = build_hint_from_messages(&messages, 10);
-        let roles: Vec<&str> = hint
-            .recent_messages
-            .iter()
-            .map(|m| m.role.as_str())
-            .collect();
-        assert_eq!(roles, vec!["system", "user", "assistant"]);
-    }
-
-    // ── after_turn hook ───────────────────────────────────────────────────────
-
-    #[test]
-    fn after_turn_disabled_is_noop() {
-        // When enabled=false, after_turn returns immediately without calling
-        // predict or submit_result. Verified indirectly: the no-op engine is
-        // stateless so there's nothing to assert, but it must not panic.
-        let engine = NoOpSpeculationEngine;
-        let cfg = SpeculationConfig {
-            enabled: false,
-            ..Default::default()
-        };
-        let messages = vec![json!({ "role": "user", "content": "test" })];
-        after_turn(&engine, &messages, &[], &cfg);
-    }
-
-    #[test]
-    fn after_turn_enabled_with_no_tool_calls() {
-        let engine = NoOpSpeculationEngine;
-        let cfg = SpeculationConfig {
-            enabled: true,
-            ..Default::default()
-        };
-        let messages = vec![json!({ "role": "user", "content": "test" })];
-        // Should complete without panic even when tool_names_called is empty.
-        after_turn(&engine, &messages, &[], &cfg);
-    }
-
-    #[test]
-    fn after_turn_enabled_with_tool_calls() {
-        let engine = NoOpSpeculationEngine;
-        let cfg = SpeculationConfig {
-            enabled: true,
-            ..Default::default()
-        };
-        let messages = vec![json!({ "role": "user", "content": "list files" })];
-        let tool_names = vec!["list_files".to_string()];
-        after_turn(&engine, &messages, &tool_names, &cfg);
-    }
-
-    // ── PredictionId ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn prediction_id_display_matches_inner() {
-        let id = PredictionId::new("abc-123");
-        assert_eq!(id.to_string(), "abc-123");
-        assert_eq!(id.as_str(), "abc-123");
-    }
-
-    #[test]
-    fn prediction_id_equality() {
-        let a = PredictionId::new("x");
-        let b = PredictionId::new("x");
-        let c = PredictionId::new("y");
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-    }
-
-    // ── Trait object safety ───────────────────────────────────────────────────
-
-    #[test]
-    fn engine_is_object_safe_via_arc() {
-        // If this compiles, the trait is object-safe and Arc-compatible.
-        let engine: Arc<dyn SpeculationEngine> = Arc::new(NoOpSpeculationEngine);
-        assert_eq!(engine.name(), "no-op");
-        assert!(!engine.has_pending());
-    }
-
-    #[test]
-    fn engine_arc_send_sync() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<Arc<dyn SpeculationEngine>>();
+    fn measurement_window_stays_bounded() {
+        let mut window = EvaluationWindow::default();
+        for _ in 0..(MAX_MEASUREMENT_SAMPLES + 5) {
+            window.record(EvaluationSample {
+                correct: true,
+                hit: true,
+                wasted: false,
+                baseline_latency_micros: 2,
+                speculative_latency_micros: 1,
+                baseline_cost_units: 2,
+                speculative_cost_units: 1,
+            });
+        }
+        assert_eq!(window.metrics().samples, MAX_MEASUREMENT_SAMPLES);
     }
 }

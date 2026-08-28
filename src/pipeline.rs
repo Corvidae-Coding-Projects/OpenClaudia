@@ -470,6 +470,7 @@ pub(crate) struct TurnExecutionBindings {
     pub(crate) run_context: Arc<tools::ToolRunContext>,
     pub(crate) permission_mgr: Option<Arc<PermissionManager>>,
     pub(crate) task_mgr: Arc<Mutex<crate::session::TaskManager>>,
+    pub(crate) speculation: Arc<crate::speculation::SpeculationCoordinator>,
 }
 
 impl std::fmt::Debug for TurnExecutionBindings {
@@ -479,6 +480,7 @@ impl std::fmt::Debug for TurnExecutionBindings {
             .field("run_id", &self.run_context.run_id())
             .field("generation", &self.run_context.generation())
             .field("has_permission_manager", &self.permission_mgr.is_some())
+            .field("speculation", &self.speculation)
             .finish_non_exhaustive()
     }
 }
@@ -1969,6 +1971,17 @@ fn trace_run_turn_request(endpoint: &str, request_body: &Value) {
 /// Returns `Err` if the HTTP request itself fails (network error, etc.).
 #[allow(clippy::too_many_lines)] // One provider turn owns reservation, transport, response handling, and settlement.
 pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
+    run_turn_with_speculation(p, None).await
+}
+
+/// TUI follow-up entry point that carries the exact run-owned speculation
+/// coordinator without exposing internal optimization state in the public
+/// `RunTurnParams` compatibility surface.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn run_turn_with_speculation(
+    p: RunTurnParams<'_>,
+    speculation: Option<Arc<crate::speculation::SpeculationCoordinator>>,
+) -> Result<TurnResult, String> {
     let RunTurnParams {
         run_context,
         client,
@@ -2005,6 +2018,14 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
     )
     .map_err(|error| format!("Run budget denied provider call: {error}"))?;
     trace_run_turn_request(endpoint, &request_body);
+    let speculation = speculation
+        .filter(|coordinator| coordinator.is_bound_to(&run_context))
+        .unwrap_or_else(|| {
+            Arc::new(crate::speculation::SpeculationCoordinator::for_run(
+                &run_context,
+            ))
+        });
+    let speculative_read = speculation.start(&run_context);
 
     if let Some(sdk) = codex_agent_sdk {
         let sdk_turn = match sdk.complete_turn(&request_body, effort_level).await {
@@ -2033,6 +2054,8 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
         ensure_provider_turn_succeeded(terminal_outcome, sdk_turn.tool_calls.len())?;
         let tool_batch = execute_tool_calls_for_tui(
             run_context,
+            speculation,
+            speculative_read,
             &sdk_turn.tool_calls,
             memory_db,
             app_config,
@@ -2089,6 +2112,8 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
         ensure_provider_turn_succeeded(terminal_outcome, sdk_turn.tool_calls.len())?;
         let tool_batch = execute_tool_calls_for_tui(
             run_context,
+            speculation,
+            speculative_read,
             &sdk_turn.tool_calls,
             memory_db,
             app_config,
@@ -2133,6 +2158,8 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
     ) {
         handle_provider_native_json_response(
             run_context,
+            speculation,
+            speculative_read,
             response,
             provider,
             provider_native_state,
@@ -2153,6 +2180,8 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
     } else if request_body.get("input").is_some() && request_body.get("messages").is_none() {
         stream_responses_sse_response(SseStreamParams {
             run_context,
+            speculation,
+            speculative_read,
             response,
             headers,
             provider,
@@ -2173,6 +2202,8 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
     } else {
         stream_sse_response(SseStreamParams {
             run_context,
+            speculation,
+            speculative_read,
             response,
             headers,
             provider,
@@ -2509,6 +2540,8 @@ pub fn decode_provider_native_json_turn(
 #[allow(clippy::too_many_arguments)]
 async fn handle_provider_native_json_response(
     run_context: Arc<tools::ToolRunContext>,
+    speculation: Arc<crate::speculation::SpeculationCoordinator>,
+    speculative_read: Option<crate::speculation::SpeculationHandle>,
     response: reqwest::Response,
     provider: &str,
     previous_state: Option<&crate::runtime::ProviderNativeState>,
@@ -2571,6 +2604,8 @@ async fn handle_provider_native_json_response(
     // Execute tool calls if any
     let tool_batch = execute_tool_calls_for_tui(
         run_context,
+        speculation,
+        speculative_read,
         &tool_calls,
         memory_db,
         app_config,
@@ -2677,6 +2712,8 @@ fn handle_sse_timeout(
 /// [`RunTurnParams`] pattern.
 struct SseStreamParams<'a> {
     run_context: Arc<tools::ToolRunContext>,
+    speculation: Arc<crate::speculation::SpeculationCoordinator>,
+    speculative_read: Option<crate::speculation::SpeculationHandle>,
     response: reqwest::Response,
     headers: &'a crate::secrets::SensitiveHeaders,
     provider: &'a str,
@@ -2700,6 +2737,8 @@ struct SseStreamParams<'a> {
 async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, String> {
     let SseStreamParams {
         run_context,
+        speculation,
+        speculative_read,
         response,
         headers,
         provider,
@@ -2790,6 +2829,8 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
 
     finalize_sse_stream(SseFinalize {
         run_context,
+        speculation,
+        speculative_read,
         provider,
         model_identity,
         full_content,
@@ -2859,6 +2900,8 @@ fn dispatch_sse_action(action: SseAction, ctx: SseActionDispatch<'_>) -> Result<
 /// accumulators and the per-turn channels in a single move.
 struct SseFinalize<'a> {
     run_context: Arc<tools::ToolRunContext>,
+    speculation: Arc<crate::speculation::SpeculationCoordinator>,
+    speculative_read: Option<crate::speculation::SpeculationHandle>,
     provider: &'a str,
     model_identity: &'a str,
     full_content: String,
@@ -2899,6 +2942,8 @@ async fn finalize_sse_stream(f: SseFinalize<'_>) -> Result<TurnResult, String> {
     // Execute tool calls if any
     let tool_batch = execute_tool_calls_for_tui(
         f.run_context,
+        f.speculation,
+        f.speculative_read,
         &tool_calls,
         f.memory_db,
         f.app_config,
@@ -3589,6 +3634,8 @@ pub async fn decode_openai_responses_stream(
 async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, String> {
     let SseStreamParams {
         run_context,
+        speculation,
+        speculative_read,
         response,
         headers,
         provider,
@@ -3659,6 +3706,8 @@ async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnRes
 
     let tool_batch = execute_tool_calls_for_tui(
         run_context,
+        speculation,
+        speculative_read,
         &tool_calls,
         memory_db,
         app_config,
@@ -4031,6 +4080,7 @@ struct ToolPermissionDispatch {
 struct SingleToolExecution<'a> {
     run_context: Arc<tools::ToolRunContext>,
     tool_call: &'a ToolCall,
+    precomputed_read: Option<crate::speculation::SpeculationHandle>,
     memory_db: Option<Arc<MemoryDb>>,
     app_config: Option<Arc<AppConfig>>,
     permission: ToolPermissionDispatch,
@@ -4048,10 +4098,12 @@ const fn tool_result_completed_successfully(result: &tools::ToolResult) -> bool 
 /// Execute one tool call through its canonical sync or async dispatcher, fire
 /// the matching post-tool hook, and retain the typed provider result.
 /// Returns `None` when the event channel is broken (caller should `break`).
+#[allow(clippy::too_many_lines)] // One tool call owns UX events, admission, execution, and cancellation.
 async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<tools::ToolResult> {
     let SingleToolExecution {
         run_context,
         tool_call,
+        precomputed_read,
         memory_db,
         app_config,
         permission,
@@ -4085,6 +4137,21 @@ async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<tools::ToolRe
         let run_context_for_blocking = Arc::clone(&run_context);
         let uses_task_graph = tools::uses_canonical_task_graph(tool_name);
         tokio::task::spawn_blocking(move || {
+            if let Some(handle) = precomputed_read {
+                return crate::services::tool_executor::ToolExecutor::execute_precomputed_read(
+                    crate::services::tool_executor::PrecomputedReadRequest {
+                        run_context: &run_context_for_blocking,
+                        tool_call: &tool_call_clone,
+                        handle,
+                        memory_db: memory_db.as_deref(),
+                        app_config: app_config.as_deref(),
+                        permission_mgr: perm_mgr.as_ref(),
+                        authorization: permission.authorization,
+                        session_id: session_for_blocking.as_deref(),
+                        policy_enforcer: policy_enforcer.as_deref(),
+                    },
+                );
+            }
             let execute = |task_mgr: Option<&mut crate::session::TaskManager>| {
                 crate::services::tool_executor::ToolExecutor::execute(
                     crate::services::tool_executor::ToolExecutorRequest {
@@ -4411,6 +4478,8 @@ fn record_quality_gate_verification(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn execute_tool_calls_for_tui(
     mut run_context: Arc<tools::ToolRunContext>,
+    mut speculation: Arc<crate::speculation::SpeculationCoordinator>,
+    mut speculative_read: Option<crate::speculation::SpeculationHandle>,
     tool_calls: &[ToolCall],
     memory_db: Option<Arc<MemoryDb>>,
     app_config: Option<Arc<AppConfig>>,
@@ -4425,6 +4494,9 @@ async fn execute_tool_calls_for_tui(
 ) -> ToolCallBatch {
     // Session-level "always allow/deny" cache (lives for this agentic loop)
     if tool_calls.is_empty() {
+        if let Some(handle) = speculative_read.take() {
+            handle.discard("provider turn made no tool call");
+        }
         return ToolCallBatch {
             results: Vec::new(),
             has_tools: false,
@@ -4432,11 +4504,15 @@ async fn execute_tool_calls_for_tui(
                 run_context,
                 permission_mgr,
                 task_mgr,
+                speculation,
             },
         };
     }
 
     let Some(mut permission_mgr) = permission_mgr else {
+        if let Some(handle) = speculative_read.take() {
+            handle.discard("execution frontend has no permission manager");
+        }
         let mut results = Vec::with_capacity(tool_calls.len());
         for tool_call in tool_calls {
             let result = tools::ToolResult::failure(
@@ -4465,6 +4541,7 @@ async fn execute_tool_calls_for_tui(
                 run_context,
                 permission_mgr: None,
                 task_mgr,
+                speculation,
             },
         };
     };
@@ -4472,6 +4549,14 @@ async fn execute_tool_calls_for_tui(
     let mut results = Vec::new();
 
     for tool_call in tool_calls {
+        if speculative_read
+            .as_ref()
+            .is_some_and(|handle| !handle.matches(&run_context, tool_call))
+        {
+            if let Some(handle) = speculative_read.take() {
+                handle.discard("next actual tool call did not exactly match prediction");
+            }
+        }
         let tool_name = &tool_call.function.name;
         let tool_args = match parse_tool_arguments_for_tui(tool_name, &tool_call.function.arguments)
         {
@@ -4511,6 +4596,9 @@ async fn execute_tool_calls_for_tui(
             session_id,
             tool_name,
         ) {
+            if let Some(handle) = speculative_read.take() {
+                handle.discard("predicted call was denied by enterprise policy");
+            }
             let result_json = policy_denied_tool_result(
                 &run_context,
                 tool_name,
@@ -4534,6 +4622,9 @@ async fn execute_tool_calls_for_tui(
             )
             .await
             {
+                if let Some(handle) = speculative_read.take() {
+                    handle.discard("predicted call was denied by a pre-tool hook");
+                }
                 send_event_or_break!(
                     tx,
                     AppEvent::ToolDone {
@@ -4571,11 +4662,19 @@ async fn execute_tool_calls_for_tui(
         {
             PermissionOutcome::Allowed { authorization } => authorization,
             PermissionOutcome::DeniedWithResult(result_json) => {
+                if let Some(handle) = speculative_read.take() {
+                    handle.discard("predicted call was denied by permission policy");
+                }
                 observe_tool_result_json(&run_context, session_id, tool_name, &result_json);
                 results.push(result_json);
                 continue;
             }
-            PermissionOutcome::ChannelBroken => break,
+            PermissionOutcome::ChannelBroken => {
+                if let Some(handle) = speculative_read.take() {
+                    handle.discard("permission channel closed before predicted call admission");
+                }
+                break;
+            }
         };
 
         let args_desc = describe_tool_call(tool_name, &tool_args);
@@ -4590,9 +4689,30 @@ async fn execute_tool_calls_for_tui(
             }
         );
 
+        let precomputed_read = if speculative_read
+            .as_ref()
+            .is_some_and(|handle| handle.matches(&run_context, tool_call))
+        {
+            if run_context
+                .tool_catalog()
+                .admit_tool_call(&run_context, tool_name)
+                .is_ok()
+            {
+                speculative_read.take()
+            } else {
+                if let Some(handle) = speculative_read.take() {
+                    handle.discard("predicted call was denied by the published tool catalog");
+                }
+                None
+            }
+        } else {
+            None
+        };
+
         let tool_result = execute_single_tool(SingleToolExecution {
             run_context: Arc::clone(&run_context),
             tool_call,
+            precomputed_read,
             memory_db: memory_db.clone(),
             app_config: app_config.clone(),
             permission: ToolPermissionDispatch {
@@ -4667,6 +4787,9 @@ async fn execute_tool_calls_for_tui(
                             }
                             permission_mgr = Arc::new(permission_mgr.rebind_for_run(&next_run));
                             run_context = next_run;
+                            speculation = Arc::new(
+                                crate::speculation::SpeculationCoordinator::for_run(&run_context),
+                            );
                             if tx
                                 .send(AppEvent::WorkspaceTransition {
                                     run_context: Arc::clone(&run_context),
@@ -4685,6 +4808,7 @@ async fn execute_tool_calls_for_tui(
                         }
                     }
                 }
+                speculation.observe_result(tool_call, &result);
                 observe_tool_result(&run_context, session_id, &result);
                 results.push(result.openai_message());
                 if let Some(context) = approved_plan_context {
@@ -4692,6 +4816,10 @@ async fn execute_tool_calls_for_tui(
                 }
             }
         }
+    }
+
+    if let Some(handle) = speculative_read.take() {
+        handle.discard("provider tool calls did not consume the exact prediction");
     }
 
     if let Some(finding) =
@@ -4707,6 +4835,7 @@ async fn execute_tool_calls_for_tui(
             run_context,
             permission_mgr: Some(permission_mgr),
             task_mgr,
+            speculation,
         },
     }
 }
@@ -4983,6 +5112,12 @@ mod tests {
         Arc::clone(tools::security::test_run_context())
     }
 
+    fn test_speculation(
+        run: &Arc<tools::ToolRunContext>,
+    ) -> Arc<crate::speculation::SpeculationCoordinator> {
+        Arc::new(crate::speculation::SpeculationCoordinator::for_run(run))
+    }
+
     #[tokio::test]
     async fn tui_plan_follow_up_uses_typed_host_reply_and_returns_approved_context() {
         let tool_call = ToolCall {
@@ -5212,6 +5347,7 @@ memory:
         let result = execute_single_tool(SingleToolExecution {
             run_context: Arc::clone(&run),
             tool_call: &call,
+            precomputed_read: None,
             memory_db: Some(memory),
             app_config: Some(Arc::new(config)),
             permission: ToolPermissionDispatch {
@@ -5366,11 +5502,15 @@ memory:
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
         let permission_mgr = Some(Arc::new(PermissionManager::unrestricted()));
+        let run_context = test_run();
+        let speculation = test_speculation(&run_context);
 
         let ToolCallBatch {
             results, has_tools, ..
         } = execute_tool_calls_for_tui(
-            test_run(),
+            run_context,
+            speculation,
+            None,
             &[tool_call],
             None,
             None,
@@ -5489,6 +5629,8 @@ memory:
 
         let batch = execute_tool_calls_for_tui(
             Arc::clone(&source),
+            test_speculation(&source),
+            None,
             &[tool_call],
             None,
             None,
@@ -5553,8 +5695,12 @@ memory:
             let mgr = Arc::clone(&mgr);
             async move {
                 let tool_calls = vec![tool_call];
+                let run_context = test_run();
+                let speculation = test_speculation(&run_context);
                 execute_tool_calls_for_tui(
-                    test_run(),
+                    run_context,
+                    speculation,
+                    None,
                     &tool_calls,
                     None,
                     None,
@@ -5644,6 +5790,8 @@ memory:
             results, has_tools, ..
         } = execute_tool_calls_for_tui(
             Arc::clone(&run_context),
+            test_speculation(&run_context),
+            None,
             &[tool_call],
             None,
             None,
@@ -5721,11 +5869,15 @@ memory:
         };
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
+        let run_context = test_run();
+        let speculation = test_speculation(&run_context);
 
         let ToolCallBatch {
             results, has_tools, ..
         } = execute_tool_calls_for_tui(
-            test_run(),
+            run_context,
+            speculation,
+            None,
             &[tool_call],
             None,
             None,
@@ -5821,11 +5973,15 @@ memory:
         };
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
+        let run_context = test_run();
+        let speculation = test_speculation(&run_context);
 
         let ToolCallBatch {
             results, has_tools, ..
         } = execute_tool_calls_for_tui(
-            test_run(),
+            run_context,
+            speculation,
+            None,
             &[tool_call],
             None,
             None,
@@ -5896,6 +6052,8 @@ memory:
             results, has_tools, ..
         } = execute_tool_calls_for_tui(
             Arc::clone(&run_context),
+            test_speculation(&run_context),
+            None,
             &[tool_call],
             None,
             None,

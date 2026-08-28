@@ -49,6 +49,7 @@ mod continuation;
 mod cron;
 pub mod crosslink;
 pub mod effect;
+pub(crate) use cron::SchedulerServiceHandle;
 /// Re-export the cron command entry points so the E2E test suite
 /// (`tests/cron_e2e.rs`) can drive create/list/delete + the
 /// validator perimeter directly. Internal call sites continue to

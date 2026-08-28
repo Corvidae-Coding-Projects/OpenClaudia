@@ -65,6 +65,21 @@ pub struct ToolExecutorRequest<'a> {
     pub policy_enforcer: Option<&'a PolicyEnforcer>,
 }
 
+/// Inputs for admitting an owned speculative read through the same policy,
+/// authorization, accounting, and typed-result boundary as an ordinary local
+/// tool invocation before its receipt may be joined and validated.
+pub(crate) struct PrecomputedReadRequest<'a> {
+    pub(crate) run_context: &'a std::sync::Arc<tools::ToolRunContext>,
+    pub(crate) tool_call: &'a ToolCall,
+    pub(crate) handle: crate::speculation::SpeculationHandle,
+    pub(crate) memory_db: Option<&'a MemoryDb>,
+    pub(crate) app_config: Option<&'a AppConfig>,
+    pub(crate) permission_mgr: &'a PermissionManager,
+    pub(crate) authorization: Option<ExecutionPermit>,
+    pub(crate) session_id: Option<&'a str>,
+    pub(crate) policy_enforcer: Option<&'a PolicyEnforcer>,
+}
+
 /// Shared local tool executor.
 pub struct ToolExecutor;
 
@@ -387,6 +402,195 @@ impl ToolExecutor {
                 record_quality_gate_report(run_context, session_id, &report);
                 result = attach_quality_gate_report(result, &report);
             }
+        }
+        result
+    }
+
+    /// Admit, validate, and conditionally commit a `read_file` snapshot without
+    /// repeating its render, while preserving every ordinary dispatch gate and
+    /// accounting effect. Invalid receipts fall back to the demand handler.
+    #[must_use]
+    #[allow(clippy::too_many_lines)] // Mirrors the canonical admission transaction before receipt reuse.
+    pub(crate) fn execute_precomputed_read(request: PrecomputedReadRequest<'_>) -> ToolResult {
+        let PrecomputedReadRequest {
+            run_context,
+            tool_call,
+            handle,
+            memory_db,
+            app_config,
+            permission_mgr,
+            authorization,
+            session_id,
+            policy_enforcer,
+        } = request;
+        let session_id = session_id.or_else(|| Some(run_context.session_id()));
+        let _workspace_operation = match run_context.begin_workspace_operation() {
+            Ok(guard) => guard,
+            Err(error) => {
+                return ToolResult::failure(
+                    tool_call,
+                    ToolFailureCode::Unavailable,
+                    format!("Workspace generation is unavailable: {error}"),
+                    ToolRetryability::Safe,
+                );
+            }
+        };
+        if tool_call.function.name != "read_file" {
+            return ToolResult::failure(
+                tool_call,
+                ToolFailureCode::Internal,
+                "A speculative read receipt cannot execute another tool".to_string(),
+                ToolRetryability::Never,
+            );
+        }
+        if let Err(reason) = run_context
+            .tool_catalog()
+            .admit_tool_call(run_context, &tool_call.function.name)
+        {
+            return ToolResult::failure(
+                tool_call,
+                ToolFailureCode::Unavailable,
+                reason,
+                ToolRetryability::Safe,
+            );
+        }
+        let arguments =
+            match Self::parse_arguments(&tool_call.function.name, &tool_call.function.arguments) {
+                Ok(arguments) => arguments,
+                Err(reason) => {
+                    return ToolResult::failure(
+                        tool_call,
+                        ToolFailureCode::InvalidArguments,
+                        reason,
+                        ToolRetryability::Never,
+                    );
+                }
+            };
+        let resolved = match tools::host_safety::HostSafetyPolicy::enforce(
+            &tool_call.function.name,
+            &arguments,
+        ) {
+            Ok(resolved) if resolved.effect == tools::effect::ToolEffect::ReadOnly => resolved,
+            Ok(_) => {
+                return ToolResult::failure(
+                    tool_call,
+                    ToolFailureCode::PolicyDenied,
+                    "Speculation requires an explicitly classified read-only invocation"
+                        .to_string(),
+                    ToolRetryability::Never,
+                );
+            }
+            Err(reason) => {
+                return ToolResult::failure(
+                    tool_call,
+                    ToolFailureCode::PolicyDenied,
+                    format!("Blocked by non-bypassable host safety: {reason}"),
+                    ToolRetryability::Never,
+                );
+            }
+        };
+        if let Err(reason) =
+            run_context.admit_runtime_mode_resolved(&tool_call.function.name, &resolved, &arguments)
+        {
+            return ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PolicyDenied,
+                reason,
+                ToolRetryability::Never,
+            );
+        }
+        let tool_policy = ToolExecutionPolicy::new(policy_enforcer, session_id);
+        if let Err(error) = tool_policy.check_tool(&tool_call.function.name) {
+            return ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PolicyDenied,
+                format!("Blocked by policy: {error}"),
+                ToolRetryability::Never,
+            );
+        }
+        let authorization = match authorization {
+            Some(permit) => permit,
+            None => match permission_mgr.authorize_tool_call(tool_call, session_id) {
+                AuthorizationResult::Allowed(permit) => permit,
+                AuthorizationResult::Denied(reason) => {
+                    return ToolResult::failure(
+                        tool_call,
+                        ToolFailureCode::PermissionDenied,
+                        format!("Permission denied: {reason}"),
+                        ToolRetryability::Never,
+                    );
+                }
+                AuthorizationResult::NeedsPrompt { tool, target } => {
+                    return ToolResult::failure(
+                        tool_call,
+                        ToolFailureCode::PermissionDenied,
+                        format!(
+                            "Permission denied: no interactive prompt is available for {tool} on '{target}'"
+                        ),
+                        ToolRetryability::Never,
+                    );
+                }
+            },
+        };
+        let consumed_authorization =
+            match permission_mgr.consume_execution_permit(&authorization, tool_call, session_id) {
+                Ok(consumed) => consumed,
+                Err(reason) => {
+                    return ToolResult::failure(
+                        tool_call,
+                        ToolFailureCode::PermissionDenied,
+                        format!("Permission denied: execution permit rejected: {reason}"),
+                        ToolRetryability::Never,
+                    );
+                }
+            };
+        if let Err(error) = tool_policy.check_and_record_tool(&tool_call.function.name) {
+            return ToolResult::failure(
+                tool_call,
+                ToolFailureCode::PolicyDenied,
+                format!("Blocked by policy: {error}"),
+                ToolRetryability::Never,
+            );
+        }
+        let budget_reservation = match run_context.budget().reserve(BudgetAmounts {
+            tool_calls: 1,
+            concurrent_calls: 1,
+            ..BudgetAmounts::default()
+        }) {
+            Ok(reservation) => reservation,
+            Err(error) => return budget_denied_tool_result(tool_call, &error),
+        };
+        let _ledger_guard = crate::grounded_loop::install_active_project_ledger_for_session(
+            run_context,
+            run_context.evidence_session_key(),
+        );
+        let result = handle.consume(run_context, tool_call).map_or_else(
+            || {
+                tools::execute_tool_after_authorization(
+                    run_context,
+                    tool_call,
+                    memory_db,
+                    app_config,
+                    None,
+                    Some(&consumed_authorization),
+                )
+            },
+            |artifact| {
+                let handler_result =
+                    match tools::file::commit_speculative_read(run_context, artifact) {
+                        Ok(result) => result,
+                        Err(error) => tools::ToolHandlerResult::error(tools::ToolFailure::new(
+                            ToolFailureCode::Conflict,
+                            error,
+                            ToolRetryability::Safe,
+                        )),
+                    };
+                let result = ToolResult::bind(tool_call, "read_file", handler_result);
+                tools::attach_automatic_learning(run_context, memory_db, app_config, None, result)
+            },
+        );
+        if let Err(error) = budget_reservation.commit() {
+            return budget_accounting_failure(tool_call, &error);
         }
         result
     }

@@ -1,6 +1,6 @@
 //! End-to-end tests for explicit analytics composition and preserved background
-//! job mechanics. The lifecycle catalog must keep the jobs unavailable until a
-//! safe scheduler owns them.
+//! job mechanics. The lifecycle catalog must expose the durable scheduler only
+//! after a production composition root owns its startup and shutdown.
 //!
 //! Sprint 77 of the verification effort. Sprint 47 covered
 //! `LspServerManager`, sprint 46 covered `JobScheduler` ticks
@@ -148,21 +148,24 @@ fn analytics_arc_outlives_the_registry_via_shared_ownership() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section B — unavailable job classification
+// Section B — scheduler lifecycle classification
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn background_jobs_are_not_misreported_as_active() {
+fn durable_background_scheduler_has_an_owned_lifecycle_path() {
     let registration = lifecycle_service_catalog()
         .iter()
         .find(|registration| registration.id() == LifecycleServiceId::BackgroundJobs)
         .expect("background catalog row");
     assert_eq!(
         registration.classification(),
-        LifecycleServiceClassification::Unavailable
+        LifecycleServiceClassification::Wired
     );
-    assert!(registration.path().is_none());
-    assert!(registration.follow_up().is_some());
+    let path = registration.path().expect("wired scheduler lifecycle path");
+    assert!(path.construct().contains("SchedulerServiceHandle::start"));
+    assert!(path.consume().contains("canonical child dispatch"));
+    assert!(path.shutdown().contains("SchedulerServiceHandle::shutdown"));
+    assert!(registration.follow_up().is_none());
 }
 
 // ───────────────────────────────────────────────────────────────────────────

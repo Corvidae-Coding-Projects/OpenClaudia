@@ -11,20 +11,73 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
+use openclaudia::permissions::{ApprovalProvenance, PermissionManager};
+use openclaudia::services::tool_executor::{ToolExecutor, ToolExecutorRequest};
 use openclaudia::tools::registry::registry;
+use openclaudia::tools::{FunctionCall, ToolCall, ToolRunContext};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::ops::Deref;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tempfile::TempDir;
 
 mod support;
 
-fn run_in_tempdir<R>(f: impl FnOnce(&std::path::Path) -> R) -> R {
-    let tmp = TempDir::new().expect("tempdir");
-    f(tmp.path())
+struct CronHarness {
+    root: TempDir,
+    run: Arc<ToolRunContext>,
+    config: openclaudia::config::AppConfig,
 }
 
-fn dispatch(root: &std::path::Path, name: &str, args: &HashMap<String, Value>) -> (String, bool) {
-    support::legacy(&support::dispatch_tool_result_in(root, name, args))
+impl Deref for CronHarness {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &Self::Target {
+        self.root.path()
+    }
+}
+
+fn run_in_tempdir<R>(f: impl FnOnce(&CronHarness) -> R) -> R {
+    let root = TempDir::new().expect("tempdir");
+    let run = support::test_run_context(root.path());
+    let config = serde_yaml::from_str(
+        "proxy:\n  port: 8080\n  host: 127.0.0.1\n  target: anthropic\nproviders:\n  anthropic:\n    base_url: https://api.anthropic.com\n    model: claude-test\n",
+    )
+    .expect("minimal scheduler config");
+    f(&CronHarness { root, run, config })
+}
+
+fn dispatch(harness: &CronHarness, name: &str, args: &HashMap<String, Value>) -> (String, bool) {
+    static CALL_ID: AtomicU64 = AtomicU64::new(1);
+    let tool_call = ToolCall {
+        id: format!("test-{name}-{}", CALL_ID.fetch_add(1, Ordering::Relaxed)),
+        call_type: "function".to_string(),
+        function: FunctionCall {
+            name: name.to_string(),
+            arguments: serde_json::to_string(args).expect("JSON values must serialize"),
+        },
+    };
+    let permissions = PermissionManager::unrestricted_for_run(&harness.run);
+    let authorization = permissions
+        .approve_tool_call_once(
+            &tool_call,
+            Some(harness.run.session_id()),
+            ApprovalProvenance::InteractiveUser,
+        )
+        .ok();
+    let result = ToolExecutor::execute(ToolExecutorRequest {
+        run_context: &harness.run,
+        tool_call: &tool_call,
+        memory_db: None,
+        app_config: Some(&harness.config),
+        task_mgr: None,
+        permission_mgr: &permissions,
+        authorization,
+        session_id: Some(harness.run.session_id()),
+        policy_enforcer: None,
+    });
+    support::legacy(&result)
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -209,6 +262,11 @@ fn cron_list_on_empty_store_returns_non_error_message() {
         assert!(
             msg.to_lowercase().contains("no") || msg.contains('0') || msg.contains("empty"),
             "MUST surface empty-store message; got {msg:?}"
+        );
+        assert!(
+            !root.join(".openclaudia/schedules.json").exists()
+                && !root.join(".openclaudia/schedules.json.lock").exists(),
+            "read-only cron_list MUST NOT materialize legacy schedule or lock files"
         );
     });
 }

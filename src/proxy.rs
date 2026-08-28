@@ -11,12 +11,19 @@ use axum::{
     routing::{any, get, post},
     Json, Router,
 };
+use bytes::Bytes;
+use futures::{Stream, StreamExt as _};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::{
-    atomic::{AtomicU32, Ordering},
-    Arc,
+use std::{
+    collections::VecDeque,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -248,6 +255,23 @@ enum ProxyRouteKind {
     AnthropicMessages,
     OpenAiResponses,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyDeliveryMode {
+    Buffered,
+    LiveStream,
+    BufferedVddReview,
+}
+
+impl ProxyDeliveryMode {
+    const fn is_live(self) -> bool {
+        matches!(self, Self::LiveStream)
+    }
+}
+
+const DELIVERY_MODE_HEADER: &str = "x-openclaudia-delivery-mode";
+const VDD_MODE_HEADER: &str = "x-openclaudia-vdd-mode";
+const VDD_OUTCOME_HEADER: &str = "x-openclaudia-vdd-outcome";
 
 impl ProxyRouteKind {
     const fn as_str(self) -> &'static str {
@@ -1723,16 +1747,80 @@ async fn record_turn_estimate(
 /// Bounded read closes crosslink #352: `max_response_bytes` (default
 /// 50 MiB) caps the buffered body; over-limit and other read errors are typed
 /// finalization failures and can never become an empty successful response.
+fn annotate_vdd_response(
+    response: &mut Response,
+    mode: &crate::config::VddMode,
+    outcome: &'static str,
+) {
+    let mode = match mode {
+        crate::config::VddMode::Blocking => "blocking",
+        crate::config::VddMode::Advisory => "advisory",
+    };
+    response
+        .headers_mut()
+        .insert(VDD_MODE_HEADER, HeaderValue::from_static(mode));
+    response
+        .headers_mut()
+        .insert(VDD_OUTCOME_HEADER, HeaderValue::from_static(outcome));
+}
+
+fn blocking_vdd_failure_response(
+    mut parts: axum::http::response::Parts,
+    status: StatusCode,
+    outcome: &'static str,
+    message: &str,
+) -> Result<Response, ProxyError> {
+    parts.status = status;
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.remove(header::TRANSFER_ENCODING);
+    parts.headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    let body = serde_json::to_vec(&serde_json::json!({
+        "error": {
+            "message": message,
+            "type": "vdd_blocking_failure"
+        }
+    }))
+    .map_err(ProxyError::JsonError)?;
+    let mut response = Response::from_parts(parts, Body::from(body));
+    annotate_vdd_response(&mut response, &crate::config::VddMode::Blocking, outcome);
+    Ok(response)
+}
+
 #[allow(clippy::too_many_lines)] // Keep one auditable response-body/VDD/reassembly transaction.
 async fn apply_vdd_review(
     response_value: Response,
     state: &ProxyState,
     request: &ChatCompletionRequest,
+    route: ProxyRouteKind,
     provider_name: &str,
     api_key: Option<&ApiKey>,
+    exact_candidate: Option<Value>,
 ) -> Result<Response, ProxyError> {
     let Some(vdd_engine) = &state.vdd_engine else {
-        return Ok(response_value);
+        if !state.config.vdd.enabled {
+            return Ok(response_value);
+        }
+        let (parts, body) = response_value.into_parts();
+        return match state.config.vdd.mode {
+            crate::config::VddMode::Advisory => {
+                let mut response = Response::from_parts(parts, body);
+                annotate_vdd_response(
+                    &mut response,
+                    &crate::config::VddMode::Advisory,
+                    "unavailable",
+                );
+                Ok(response)
+            }
+            crate::config::VddMode::Blocking => blocking_vdd_failure_response(
+                parts,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "Blocking VDD review is configured but the verifier is unavailable",
+            ),
+        };
     };
 
     let (parts, body) = response_value.into_parts();
@@ -1746,9 +1834,24 @@ async fn apply_vdd_review(
         }
     };
 
-    // Parse the body as JSON. Non-JSON bodies are passed through verbatim.
-    let Ok(response_json) = serde_json::from_slice::<Value>(&response_bytes) else {
-        return Ok(Response::from_parts(parts, Body::from(response_bytes)));
+    // A successful provider candidate must be structured before it can be
+    // bound to review. Advisory mode may fail open, but blocking mode never
+    // labels an unreviewable body as successful.
+    let response_json = exact_candidate.or_else(|| serde_json::from_slice(&response_bytes).ok());
+    let Some(response_json) = response_json else {
+        return match state.config.vdd.mode {
+            crate::config::VddMode::Advisory => {
+                let mut response = Response::from_parts(parts, Body::from(response_bytes));
+                annotate_vdd_response(&mut response, &crate::config::VddMode::Advisory, "degraded");
+                Ok(response)
+            }
+            crate::config::VddMode::Blocking => blocking_vdd_failure_response(
+                parts,
+                StatusCode::BAD_GATEWAY,
+                "failed",
+                "Blocking VDD review could not parse the provider candidate",
+            ),
+        };
     };
 
     fire_vdd_hook_event(
@@ -1799,51 +1902,110 @@ async fn apply_vdd_review(
         }
     }
 
-    // Decide which bytes to ship back. Only `Blocking` produces new bytes;
-    // every other path reuses the original response body.
-    let body_bytes: Vec<u8> = match vdd_result {
-        Ok(VddResult::Advisory(advisory)) => {
-            let genuine = advisory
-                .findings
-                .iter()
-                .filter(|f| f.status == crate::vdd::FindingStatus::Genuine)
-                .count();
-            if let Some(observation) = advisory.context_observation {
-                let mut sm = state.session_manager.write().await;
-                sm.store_vdd_observation(observation);
+    // Decide which bytes to ship back. Only a converged blocking review may
+    // replace the candidate. Advisory failures remain explicit fail-open
+    // delivery; blocking skips, failures, and unconverged sessions are typed
+    // non-success responses and never expose the unreviewed candidate.
+    let (body_bytes, mode, outcome): (Vec<u8>, crate::config::VddMode, &'static str) =
+        match vdd_result {
+            Ok(VddResult::Advisory(advisory)) => {
+                let genuine = advisory
+                    .findings
+                    .iter()
+                    .filter(|f| f.status == crate::vdd::FindingStatus::Genuine)
+                    .count();
+                if let Some(observation) = advisory.context_observation {
+                    let mut sm = state.session_manager.write().await;
+                    sm.store_vdd_observation(observation);
+                }
+                info!(
+                    total = advisory.findings.len(),
+                    genuine = genuine,
+                    "VDD advisory review complete"
+                );
+                let outcome = if genuine == 0 {
+                    "advisory"
+                } else {
+                    "advisory-findings"
+                };
+                (
+                    response_bytes.to_vec(),
+                    crate::config::VddMode::Advisory,
+                    outcome,
+                )
             }
-            info!(
-                total = advisory.findings.len(),
-                genuine = genuine,
-                "VDD advisory review complete"
-            );
-            response_bytes.to_vec()
-        }
-        Ok(VddResult::Blocking(blocking)) => {
-            info!(
-                iterations = blocking.session.iterations.len(),
-                genuine = blocking.session.total_genuine,
-                converged = blocking.session.converged,
-                crosslink_issues = blocking.crosslink_issues.len(),
-                "VDD blocking loop complete"
-            );
-            serde_json::to_vec(&blocking.final_response).map_err(|error| {
-                ProxyError::FinalizationFailed(format!(
-                    "failed to serialize blocking VDD response: {error}"
-                ))
-            })?
-        }
-        Ok(VddResult::Skipped(reason)) => {
-            debug!(reason = %reason, "VDD skipped");
-            response_bytes.to_vec()
-        }
-        Err(e) => {
-            warn!(error = %e, "VDD error (non-blocking, returning original response)");
-            response_bytes.to_vec()
-        }
-    };
+            Ok(VddResult::Blocking(blocking)) => {
+                info!(
+                    iterations = blocking.session.iterations.len(),
+                    genuine = blocking.session.total_genuine,
+                    converged = blocking.session.converged,
+                    crosslink_issues = blocking.crosslink_issues.len(),
+                    "VDD blocking loop complete"
+                );
+                if !blocking.session.converged {
+                    return blocking_vdd_failure_response(
+                        parts,
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "failed",
+                        "Blocking VDD review did not converge",
+                    );
+                }
+                let final_response = if route == ProxyRouteKind::ChatCompletions {
+                    get_adapter(provider_name)
+                    .map_err(|error| ProxyError::FinalizationFailed(error.to_string()))?
+                    .transform_response(blocking.final_response, false)
+                    .map_err(|error| {
+                        ProxyError::FinalizationFailed(format!(
+                            "failed to translate blocking VDD response to the client protocol: {error}"
+                        ))
+                    })?
+                } else {
+                    blocking.final_response
+                };
+                let body = serde_json::to_vec(&final_response).map_err(|error| {
+                    ProxyError::FinalizationFailed(format!(
+                        "failed to serialize blocking VDD response: {error}"
+                    ))
+                })?;
+                (body, crate::config::VddMode::Blocking, "passed")
+            }
+            Ok(VddResult::Skipped(reason)) => {
+                debug!(reason = %reason, "VDD skipped");
+                if state.config.vdd.mode == crate::config::VddMode::Blocking {
+                    return blocking_vdd_failure_response(
+                        parts,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "unavailable",
+                        "Blocking VDD review was unavailable for this candidate",
+                    );
+                }
+                (
+                    response_bytes.to_vec(),
+                    crate::config::VddMode::Advisory,
+                    "unavailable",
+                )
+            }
+            Err(e) => {
+                warn!(error = %e, "VDD review failed");
+                if state.config.vdd.mode == crate::config::VddMode::Blocking {
+                    return blocking_vdd_failure_response(
+                        parts,
+                        StatusCode::BAD_GATEWAY,
+                        "failed",
+                        "Blocking VDD review failed",
+                    );
+                }
+                (
+                    response_bytes.to_vec(),
+                    crate::config::VddMode::Advisory,
+                    "failed-open",
+                )
+            }
+        };
 
-    Ok(Response::from_parts(parts, Body::from(body_bytes)))
+    let mut response = Response::from_parts(parts, Body::from(body_bytes));
+    annotate_vdd_response(&mut response, &mode, outcome);
+    Ok(response)
 }
 
 async fn fire_vdd_result_hooks(
@@ -2134,6 +2296,31 @@ async fn bump_session_request_count(state: &ProxyState) {
     }
 }
 
+/// Select the client delivery contract before the provider request is built.
+///
+/// A configured VDD review needs the complete, exact provider candidate. A
+/// client that asked for streaming is therefore switched to an explicitly
+/// buffered response before dispatch instead of receiving a completed body
+/// replayed as if it were a live stream. The response is annotated during
+/// finalization with both the delivery mode and the review outcome.
+fn select_proxy_delivery_mode(
+    state: &ProxyState,
+    normalized: &mut NormalizedProxyRequest,
+) -> ProxyDeliveryMode {
+    if normalized.canonical.stream != Some(true) {
+        return ProxyDeliveryMode::Buffered;
+    }
+    if !state.config.vdd.enabled {
+        return ProxyDeliveryMode::LiveStream;
+    }
+
+    normalized.canonical.stream = Some(false);
+    if let Some(wire) = normalized.wire.as_object_mut() {
+        wire.insert("stream".to_string(), Value::Bool(false));
+    }
+    ProxyDeliveryMode::BufferedVddReview
+}
+
 /// For OpenAI-compatible streaming requests, inject `stream_options` so the
 /// upstream includes a final usage event we can attribute to the session.
 ///
@@ -2206,11 +2393,18 @@ async fn transform_and_forward(
     })?;
     trace.record(ProxyLifecycleStage::ProviderBudgetReserved)?;
 
+    let endpoint = if is_stream {
+        adapter
+            .stream_endpoint(&request.model)
+            .unwrap_or_else(|| adapter.chat_endpoint(&request.model))
+    } else {
+        adapter.chat_endpoint(&request.model)
+    };
     let upstream = forward_to_provider_raw_reqwest(
         &state.client,
         provider,
         provider_name,
-        &adapter.chat_endpoint(&request.model),
+        &endpoint,
         &transformed_request,
         is_stream,
         adapter_headers(adapter, api_key),
@@ -2254,14 +2448,17 @@ async fn record_actual_usage_for_session(state: &ProxyState, usage: TokenUsage) 
     }
 }
 
+#[allow(clippy::too_many_arguments)] // One finalization transaction owns policy, budget, evidence, and delivery.
 async fn finalize_canonical_proxy_response(
     state: &ProxyState,
     normalized: &NormalizedProxyRequest,
     provider_name: &str,
     api_key: Option<&ApiKey>,
     converted: (Response, Option<TokenUsage>),
+    exact_review_candidate: Option<Value>,
     provider_budget: crate::provider_budget::ProviderBudgetReservation,
     mut trace: ProxyLifecycleTrace,
+    delivery_mode: ProxyDeliveryMode,
 ) -> Result<Response, ProxyError> {
     let (response, usage) = converted;
     match usage.as_ref() {
@@ -2277,21 +2474,32 @@ async fn finalize_canonical_proxy_response(
         }
     }
 
-    let response = if normalized.canonical.stream == Some(true) || !response.status().is_success() {
-        response
-    } else {
-        apply_vdd_review(
-            response,
-            state,
-            &normalized.canonical,
-            provider_name,
-            api_key,
-        )
-        .await?
-    };
+    let mut response =
+        if normalized.canonical.stream == Some(true) || !response.status().is_success() {
+            response
+        } else {
+            apply_vdd_review(
+                response,
+                state,
+                &normalized.canonical,
+                normalized.route,
+                provider_name,
+                api_key,
+                exact_review_candidate,
+            )
+            .await?
+        };
+    if delivery_mode == ProxyDeliveryMode::BufferedVddReview {
+        response.headers_mut().insert(
+            DELIVERY_MODE_HEADER,
+            HeaderValue::from_static("buffered-vdd-review"),
+        );
+    }
     trace.record(ProxyLifecycleStage::EvidencePolicyApplied)?;
 
-    complete_loop_iteration(state).await;
+    if response.status().is_success() {
+        complete_loop_iteration(state).await;
+    }
     trace.record(ProxyLifecycleStage::Finalized)?;
     trace.record(ProxyLifecycleStage::DeliveryReady)?;
     trace.finish()?;
@@ -2407,8 +2615,9 @@ async fn proxy_chat_completions(
         state.config.proxy.max_response_bytes,
     )
     .await?;
-    let (normalized, provider_name, mut trace) =
+    let (mut normalized, provider_name, mut trace) =
         prepare_canonical_proxy_request(&state, normalized).await?;
+    let delivery_mode = select_proxy_delivery_mode(&state, &mut normalized);
 
     info!(
         model = %normalized.canonical.model,
@@ -2417,7 +2626,7 @@ async fn proxy_chat_completions(
     );
 
     let (provider, api_key) = resolve_provider_credentials(&state, &headers, &provider_name)?;
-    let is_stream = normalized.canonical.stream.unwrap_or(false);
+    let is_stream = delivery_mode.is_live();
     let (raw_response, provider_budget) = transform_and_forward(
         &state,
         provider,
@@ -2428,16 +2637,26 @@ async fn proxy_chat_completions(
         &mut trace,
     )
     .await?;
+    if delivery_mode.is_live() && raw_response.response.status().is_success() {
+        return live_stream_response(
+            &state,
+            &normalized,
+            &provider_name,
+            raw_response,
+            provider_budget,
+            trace,
+        );
+    }
 
     // Post-response: non-streaming chat completions must be normalized back
     // into OpenAI shape after the provider-native request/response roundtrip.
     let max_bytes = state.config.proxy.max_response_bytes;
-    let (response, usage) = if is_stream {
-        (convert_response(raw_response, max_bytes).await?, None)
+    let (response, usage, exact_candidate) = if is_stream {
+        (convert_response(raw_response, max_bytes).await?, None, None)
     } else {
-        let (response_value, usage) =
+        let (response_value, usage, exact_candidate) =
             convert_response_with_usage(raw_response, max_bytes, &provider_name).await?;
-        (response_value, usage)
+        (response_value, usage, exact_candidate)
     };
     finalize_canonical_proxy_response(
         &state,
@@ -2445,8 +2664,10 @@ async fn proxy_chat_completions(
         &provider_name,
         api_key.as_ref(),
         (response, usage),
+        exact_candidate,
         provider_budget,
         trace,
+        delivery_mode,
     )
     .await
 }
@@ -2600,8 +2821,9 @@ async fn proxy_completions(
     .await?;
     let (mut normalized, provider_name, mut trace) =
         prepare_canonical_proxy_request(&state, normalized).await?;
+    let delivery_mode = select_proxy_delivery_mode(&state, &mut normalized);
     let (provider, api_key) = resolve_provider_credentials(&state, &headers, &provider_name)?;
-    let is_stream = normalized.canonical.stream.unwrap_or(false);
+    let is_stream = delivery_mode.is_live();
     let max_bytes = state.config.proxy.max_response_bytes;
     let provider_budget = crate::provider_budget::reserve_provider_call(
         &state.run_context,
@@ -2625,6 +2847,16 @@ async fn proxy_completions(
     )
     .await?;
     trace.record(ProxyLifecycleStage::ProviderDispatched)?;
+    if delivery_mode.is_live() && raw.response.status().is_success() {
+        return live_stream_response(
+            &state,
+            &normalized,
+            &provider_name,
+            raw,
+            provider_budget,
+            trace,
+        );
+    }
 
     let (response, usage) = if is_stream {
         (convert_response(raw, max_bytes).await?, None)
@@ -2637,8 +2869,10 @@ async fn proxy_completions(
         &provider_name,
         api_key.as_ref(),
         (response, usage),
+        None,
         provider_budget,
         trace,
+        delivery_mode,
     )
     .await
 }
@@ -2802,6 +3036,7 @@ async fn proxy_anthropic_messages(
     .await?;
     let (mut normalized, provider_name, mut trace) =
         prepare_canonical_proxy_request(&state, normalized).await?;
+    let delivery_mode = select_proxy_delivery_mode(&state, &mut normalized);
     let provider = state
         .config
         .get_provider(&provider_name)
@@ -2835,7 +3070,17 @@ async fn proxy_anthropic_messages(
         }
     }?;
     trace.record(ProxyLifecycleStage::ProviderDispatched)?;
-    let is_stream = normalized.canonical.stream.unwrap_or(false);
+    let is_stream = delivery_mode.is_live();
+    if is_stream && raw.response.status().is_success() {
+        return live_stream_response(
+            &state,
+            &normalized,
+            &provider_name,
+            raw,
+            provider_budget,
+            trace,
+        );
+    }
     let (response, usage) = if is_stream {
         (convert_response(raw, max_bytes).await?, None)
     } else {
@@ -2851,8 +3096,10 @@ async fn proxy_anthropic_messages(
         &provider_name,
         api_key,
         (response, usage),
+        None,
         provider_budget,
         trace,
+        delivery_mode,
     )
     .await
 }
@@ -2884,6 +3131,7 @@ async fn proxy_passthrough(
     .await?;
     let (mut normalized, provider_name, mut trace) =
         prepare_canonical_proxy_request(&state, normalized).await?;
+    let delivery_mode = select_proxy_delivery_mode(&state, &mut normalized);
     let (provider, api_key) = resolve_provider_credentials(&state, &headers, &provider_name)?;
 
     let url = format!(
@@ -2941,7 +3189,17 @@ async fn proxy_passthrough(
         response,
         request_headers: provider_headers,
     };
-    let is_stream = normalized.canonical.stream.unwrap_or(false);
+    let is_stream = delivery_mode.is_live();
+    if is_stream && raw.response.status().is_success() {
+        return live_stream_response(
+            &state,
+            &normalized,
+            &provider_name,
+            raw,
+            provider_budget,
+            trace,
+        );
+    }
     let (response, usage) = if is_stream {
         (
             convert_response(raw, state.config.proxy.max_response_bytes).await?,
@@ -2961,8 +3219,10 @@ async fn proxy_passthrough(
         &provider_name,
         api_key.as_ref(),
         (response, usage),
+        None,
         provider_budget,
         trace,
+        delivery_mode,
     )
     .await
 }
@@ -3070,7 +3330,7 @@ async fn convert_response_with_usage(
     upstream: UpstreamResponse,
     max_bytes: usize,
     provider_name: &str,
-) -> Result<(Response, Option<TokenUsage>), ProxyError> {
+) -> Result<(Response, Option<TokenUsage>, Option<Value>), ProxyError> {
     let UpstreamResponse {
         response,
         request_headers,
@@ -3102,7 +3362,7 @@ async fn convert_response_with_usage(
         let response = builder
             .body(Body::from(diagnostic))
             .map_err(|e| ProxyError::InvalidBody(format!("Failed to build response body: {e}")))?;
-        return Ok((response, None));
+        return Ok((response, None, None));
     }
 
     let raw_json = serde_json::from_slice::<Value>(&body).map_err(|e| {
@@ -3110,6 +3370,7 @@ async fn convert_response_with_usage(
     })?;
     let adapter = get_adapter(provider_name).map_err(|e| ProxyError::InvalidBody(e.to_string()))?;
     let raw_usage = adapter.extract_token_usage(&raw_json);
+    let exact_candidate = raw_json.clone();
     let transformed_json = adapter
         .transform_response(raw_json, false)
         .map_err(|e| ProxyError::InvalidBody(format!("Provider response transform failed: {e}")))?;
@@ -3127,7 +3388,7 @@ async fn convert_response_with_usage(
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
         .map_err(|e| ProxyError::InvalidBody(format!("Failed to build response body: {e}")))?;
-    Ok((response, usage))
+    Ok((response, usage, Some(exact_candidate)))
 }
 
 /// Extract token usage from a provider's JSON response
@@ -3266,6 +3527,1037 @@ pub const SSE_STREAM_TIMEOUT_SECS: u64 = 300;
 /// without newlines. When exceeded, the accumulator is dropped and a
 /// warning is logged. See crosslink #695.
 pub const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+
+type UpstreamByteStream =
+    Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
+
+#[derive(Debug)]
+struct SseFrame {
+    event: Option<String>,
+    data: String,
+}
+
+#[derive(Default)]
+struct SseDecoder {
+    buffer: Vec<u8>,
+}
+
+impl SseDecoder {
+    fn push(&mut self, chunk: &Bytes) -> Result<(), String> {
+        if self.buffer.len().saturating_add(chunk.len()) > MAX_SSE_LINE_BYTES {
+            return Err(format!(
+                "upstream SSE frame exceeded {MAX_SSE_LINE_BYTES} bytes"
+            ));
+        }
+        self.buffer.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Result<Option<SseFrame>, String> {
+        let Some((boundary, delimiter_len)) = sse_frame_boundary(&self.buffer) else {
+            return Ok(None);
+        };
+        if boundary > MAX_SSE_LINE_BYTES {
+            return Err(format!(
+                "upstream SSE frame exceeded {MAX_SSE_LINE_BYTES} bytes"
+            ));
+        }
+        let frame = self.buffer.drain(..boundary).collect::<Vec<_>>();
+        self.buffer.drain(..delimiter_len);
+        let frame = std::str::from_utf8(&frame)
+            .map_err(|error| format!("upstream SSE frame was not UTF-8: {error}"))?;
+        let mut event = None;
+        let mut data = Vec::new();
+        for raw_line in frame.lines() {
+            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+            if line.starts_with(':') || line.is_empty() {
+                continue;
+            }
+            if let Some(value) = line.strip_prefix("event:") {
+                event = Some(value.trim_start().to_string());
+            } else if let Some(value) = line.strip_prefix("data:") {
+                data.push(value.strip_prefix(' ').unwrap_or(value));
+            }
+        }
+        Ok(Some(SseFrame {
+            event,
+            data: data.join("\n"),
+        }))
+    }
+
+    const fn has_pending_bytes(&self) -> bool {
+        !self.buffer.is_empty()
+    }
+}
+
+fn sse_frame_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf = buffer.windows(2).position(|window| window == b"\n\n");
+    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+    match (lf, crlf) {
+        (Some(lf), Some(crlf)) if lf <= crlf => Some((lf, 2)),
+        (Some(_) | None, Some(crlf)) => Some((crlf, 4)),
+        (Some(lf), None) => Some((lf, 2)),
+        (None, None) => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderStreamProtocol {
+    OpenAi,
+    Anthropic,
+    Google,
+    OpenAiResponses,
+}
+
+impl ProviderStreamProtocol {
+    const fn for_request(route: ProxyRouteKind, provider_name: &str) -> Self {
+        match route {
+            ProxyRouteKind::AnthropicMessages => Self::Anthropic,
+            ProxyRouteKind::OpenAiResponses => Self::OpenAiResponses,
+            ProxyRouteKind::ChatCompletions if provider_name.eq_ignore_ascii_case("anthropic") => {
+                Self::Anthropic
+            }
+            ProxyRouteKind::ChatCompletions if provider_name.eq_ignore_ascii_case("google") => {
+                Self::Google
+            }
+            ProxyRouteKind::ChatCompletions | ProxyRouteKind::LegacyCompletions => Self::OpenAi,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct StreamTerminal {
+    frame: Bytes,
+    success: bool,
+}
+
+#[derive(Debug, Default)]
+struct StreamTranslation {
+    frames: VecDeque<Bytes>,
+    terminal: Option<StreamTerminal>,
+}
+
+struct ProxyStreamTranslator {
+    route: ProxyRouteKind,
+    provider: ProviderStreamProtocol,
+    model: String,
+    response_id: String,
+    created: i64,
+    finish_seen: bool,
+    usage: TokenUsage,
+    usage_seen: bool,
+}
+
+impl ProxyStreamTranslator {
+    fn new(route: ProxyRouteKind, provider_name: &str, model: &str) -> Self {
+        Self {
+            route,
+            provider: ProviderStreamProtocol::for_request(route, provider_name),
+            model: model.to_string(),
+            response_id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+            created: chrono::Utc::now().timestamp(),
+            finish_seen: false,
+            usage: TokenUsage::default(),
+            usage_seen: false,
+        }
+    }
+
+    fn translate(&mut self, frame: &SseFrame) -> Result<StreamTranslation, String> {
+        if frame.data.is_empty() {
+            return Ok(StreamTranslation::default());
+        }
+        if frame.data == "[DONE]" {
+            return self.finish_openai_stream();
+        }
+        let event = serde_json::from_str::<Value>(&frame.data)
+            .map_err(|error| format!("upstream SSE data was not valid JSON: {error}"))?;
+        match self.provider {
+            ProviderStreamProtocol::OpenAi => self.translate_openai(&event),
+            ProviderStreamProtocol::Anthropic => {
+                if self.route == ProxyRouteKind::AnthropicMessages {
+                    self.validate_native_anthropic(frame.event.as_deref(), &event)
+                } else {
+                    self.translate_anthropic(&event)
+                }
+            }
+            ProviderStreamProtocol::Google => self.translate_google(&event),
+            ProviderStreamProtocol::OpenAiResponses => {
+                self.validate_openai_responses(frame.event.as_deref(), &event)
+            }
+        }
+    }
+
+    fn finish_eof(&self) -> Result<StreamTranslation, String> {
+        match self.provider {
+            ProviderStreamProtocol::Google if self.finish_seen => Ok(StreamTranslation {
+                frames: VecDeque::new(),
+                terminal: Some(StreamTerminal {
+                    frame: openai_done_frame(),
+                    success: true,
+                }),
+            }),
+            ProviderStreamProtocol::Google => {
+                Err("Google stream ended before a terminal finishReason".to_string())
+            }
+            ProviderStreamProtocol::OpenAi => {
+                Err("OpenAI stream ended before the [DONE] terminal event".to_string())
+            }
+            ProviderStreamProtocol::Anthropic => {
+                Err("Anthropic stream ended before message_stop".to_string())
+            }
+            ProviderStreamProtocol::OpenAiResponses => {
+                Err("Responses stream ended before a terminal response event".to_string())
+            }
+        }
+    }
+
+    fn usage(&self) -> Option<TokenUsage> {
+        self.usage_seen.then_some(self.usage.clone())
+    }
+
+    fn merge_usage(&mut self, usage: &TokenUsage) {
+        self.usage.input_tokens = self.usage.input_tokens.max(usage.input_tokens);
+        self.usage.output_tokens = self.usage.output_tokens.max(usage.output_tokens);
+        self.usage.cache_read_tokens = self.usage.cache_read_tokens.max(usage.cache_read_tokens);
+        self.usage.cache_write_tokens = self.usage.cache_write_tokens.max(usage.cache_write_tokens);
+        self.usage_seen = true;
+    }
+
+    fn finish_openai_stream(&self) -> Result<StreamTranslation, String> {
+        if self.provider != ProviderStreamProtocol::OpenAi {
+            return Err("foreign [DONE] marker in provider stream".to_string());
+        }
+        if !self.finish_seen {
+            return Err("OpenAI stream reached [DONE] without a finish reason".to_string());
+        }
+        Ok(StreamTranslation {
+            frames: VecDeque::new(),
+            terminal: Some(StreamTerminal {
+                frame: openai_done_frame(),
+                success: true,
+            }),
+        })
+    }
+
+    fn translate_openai(&mut self, event: &Value) -> Result<StreamTranslation, String> {
+        if event.get("error").is_some() {
+            return Ok(StreamTranslation {
+                frames: VecDeque::new(),
+                terminal: Some(StreamTerminal {
+                    frame: protocol_json_frame(self.route, event)?,
+                    success: false,
+                }),
+            });
+        }
+        if let Some(usage) = extract_usage_from_sse_event(event) {
+            self.merge_usage(&usage);
+        }
+        let choices = event.get("choices").and_then(Value::as_array);
+        if choices.is_none() && event.get("usage").is_none() {
+            return Err("OpenAI stream event had neither choices nor usage".to_string());
+        }
+        if let Some(choices) = choices {
+            for choice in choices {
+                if self.route == ProxyRouteKind::LegacyCompletions
+                    && choice.get("text").is_none()
+                    && choice.get("finish_reason").is_none_or(Value::is_null)
+                {
+                    return Err(
+                        "legacy completion stream received a chat-shaped choice".to_string()
+                    );
+                }
+                if self.route == ProxyRouteKind::ChatCompletions
+                    && choice.get("delta").is_none()
+                    && choice.get("finish_reason").is_none_or(Value::is_null)
+                {
+                    return Err("chat completion stream received a non-chat choice".to_string());
+                }
+                if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                    validate_openai_finish_reason(reason)?;
+                    self.finish_seen = true;
+                }
+            }
+        }
+        let mut frames = VecDeque::new();
+        frames.push_back(protocol_json_frame(self.route, event)?);
+        Ok(StreamTranslation {
+            frames,
+            terminal: None,
+        })
+    }
+
+    fn validate_native_anthropic(
+        &mut self,
+        declared_event: Option<&str>,
+        event: &Value,
+    ) -> Result<StreamTranslation, String> {
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Anthropic stream event omitted type".to_string())?;
+        if declared_event.is_some_and(|declared| declared != event_type) {
+            return Err("Anthropic SSE event name did not match its JSON type".to_string());
+        }
+        if let Some(usage) = extract_usage_from_sse_event(event) {
+            self.merge_usage(&usage);
+        }
+        if event_type == "message_delta" {
+            let reason = event
+                .pointer("/delta/stop_reason")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Anthropic message_delta omitted stop_reason".to_string())?;
+            map_anthropic_finish_reason(reason)?;
+            self.finish_seen = true;
+        }
+        if event_type == "message_stop" {
+            if !self.finish_seen {
+                return Err("Anthropic message_stop arrived without a stop reason".to_string());
+            }
+            return Ok(StreamTranslation {
+                frames: VecDeque::new(),
+                terminal: Some(StreamTerminal {
+                    frame: named_json_frame(event_type, event)?,
+                    success: true,
+                }),
+            });
+        }
+        if event_type == "error" {
+            return Ok(StreamTranslation {
+                frames: VecDeque::new(),
+                terminal: Some(StreamTerminal {
+                    frame: named_json_frame(event_type, event)?,
+                    success: false,
+                }),
+            });
+        }
+        let mut frames = VecDeque::new();
+        frames.push_back(named_json_frame(event_type, event)?);
+        Ok(StreamTranslation {
+            frames,
+            terminal: None,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)] // One provider event state machine preserves ordered protocol semantics.
+    fn translate_anthropic(&mut self, event: &Value) -> Result<StreamTranslation, String> {
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Anthropic stream event omitted type".to_string())?;
+        if let Some(usage) = extract_usage_from_sse_event(event) {
+            self.merge_usage(&usage);
+        }
+        let mut frames = VecDeque::new();
+        match event_type {
+            "message_start" => {
+                if let Some(id) = event.pointer("/message/id").and_then(Value::as_str) {
+                    self.response_id = id.to_string();
+                }
+                if let Some(model) = event.pointer("/message/model").and_then(Value::as_str) {
+                    self.model = model.to_string();
+                }
+                frames.push_back(openai_chat_chunk_frame(
+                    &self.response_id,
+                    &self.model,
+                    self.created,
+                    &serde_json::json!({"role": "assistant", "content": ""}),
+                    None,
+                )?);
+            }
+            "content_block_start" => {
+                let block = event.get("content_block").ok_or_else(|| {
+                    "Anthropic content_block_start omitted content_block".to_string()
+                })?;
+                match block.get("type").and_then(Value::as_str) {
+                    Some("tool_use") => {
+                        let id = block
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty())
+                            .ok_or_else(|| "Anthropic tool_use block omitted id".to_string())?;
+                        let name = block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .filter(|name| !name.is_empty())
+                            .ok_or_else(|| "Anthropic tool_use block omitted name".to_string())?;
+                        let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
+                        frames.push_back(openai_chat_chunk_frame(
+                            &self.response_id,
+                            &self.model,
+                            self.created,
+                            &serde_json::json!({
+                                "tool_calls": [{
+                                    "index": index,
+                                    "id": id,
+                                    "type": "function",
+                                    "function": {"name": name, "arguments": ""}
+                                }]
+                            }),
+                            None,
+                        )?);
+                    }
+                    Some("refusal") => {
+                        let refusal = block.get("text").and_then(Value::as_str).unwrap_or("");
+                        frames.push_back(openai_chat_chunk_frame(
+                            &self.response_id,
+                            &self.model,
+                            self.created,
+                            &serde_json::json!({"refusal": refusal}),
+                            None,
+                        )?);
+                    }
+                    Some("text" | "thinking" | "redacted_thinking") => {}
+                    Some(other) => {
+                        return Err(format!("unsupported Anthropic content block type {other}"));
+                    }
+                    None => return Err("Anthropic content block omitted type".to_string()),
+                }
+            }
+            "content_block_delta" => {
+                let delta = event
+                    .get("delta")
+                    .ok_or_else(|| "Anthropic content_block_delta omitted delta".to_string())?;
+                match delta.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        let text = delta
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| "Anthropic text_delta omitted text".to_string())?;
+                        frames.push_back(openai_chat_chunk_frame(
+                            &self.response_id,
+                            &self.model,
+                            self.created,
+                            &serde_json::json!({"content": text}),
+                            None,
+                        )?);
+                    }
+                    Some("input_json_delta") => {
+                        let arguments = delta
+                            .get("partial_json")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                "Anthropic input_json_delta omitted partial_json".to_string()
+                            })?;
+                        let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
+                        frames.push_back(openai_chat_chunk_frame(
+                            &self.response_id,
+                            &self.model,
+                            self.created,
+                            &serde_json::json!({
+                                "tool_calls": [{
+                                    "index": index,
+                                    "function": {"arguments": arguments}
+                                }]
+                            }),
+                            None,
+                        )?);
+                    }
+                    Some("thinking_delta" | "signature_delta") => {}
+                    Some(other) => {
+                        return Err(format!("unsupported Anthropic delta type {other}"));
+                    }
+                    None => return Err("Anthropic delta omitted type".to_string()),
+                }
+            }
+            "message_delta" => {
+                let reason = event
+                    .pointer("/delta/stop_reason")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "Anthropic message_delta omitted stop_reason".to_string())?;
+                let finish = map_anthropic_finish_reason(reason)?;
+                self.finish_seen = true;
+                frames.push_back(openai_chat_chunk_frame(
+                    &self.response_id,
+                    &self.model,
+                    self.created,
+                    &serde_json::json!({}),
+                    Some(finish),
+                )?);
+            }
+            "message_stop" => {
+                if !self.finish_seen {
+                    return Err("Anthropic message_stop arrived without a stop reason".to_string());
+                }
+                return Ok(StreamTranslation {
+                    frames,
+                    terminal: Some(StreamTerminal {
+                        frame: openai_done_frame(),
+                        success: true,
+                    }),
+                });
+            }
+            "error" => {
+                return Ok(StreamTranslation {
+                    frames,
+                    terminal: Some(StreamTerminal {
+                        frame: protocol_error_frame(self.route, "upstream_error"),
+                        success: false,
+                    }),
+                });
+            }
+            "content_block_stop" | "ping" => {}
+            other => return Err(format!("unsupported Anthropic stream event {other}")),
+        }
+        Ok(StreamTranslation {
+            frames,
+            terminal: None,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)] // One provider event state machine preserves ordered protocol semantics.
+    fn translate_google(&mut self, event: &Value) -> Result<StreamTranslation, String> {
+        if event.get("error").is_some() {
+            return Ok(StreamTranslation {
+                frames: VecDeque::new(),
+                terminal: Some(StreamTerminal {
+                    frame: protocol_error_frame(self.route, "upstream_error"),
+                    success: false,
+                }),
+            });
+        }
+        if let Some(usage) = google_stream_usage(event) {
+            self.merge_usage(&usage);
+        }
+        let mut frames = VecDeque::new();
+        let Some(candidate) = event.pointer("/candidates/0") else {
+            if let Some(reason) = event
+                .pointer("/promptFeedback/blockReason")
+                .and_then(Value::as_str)
+            {
+                self.finish_seen = true;
+                frames.push_back(openai_chat_chunk_frame(
+                    &self.response_id,
+                    &self.model,
+                    self.created,
+                    &serde_json::json!({"refusal": format!("Google blocked the response: {reason}")}),
+                    Some("content_filter"),
+                )?);
+                return Ok(StreamTranslation {
+                    frames,
+                    terminal: None,
+                });
+            }
+            return Ok(StreamTranslation {
+                frames,
+                terminal: None,
+            });
+        };
+
+        let mut delta = serde_json::Map::new();
+        if let Some(parts) = candidate
+            .pointer("/content/parts")
+            .and_then(Value::as_array)
+        {
+            let mut text = String::new();
+            let mut tool_calls = Vec::new();
+            for (index, part) in parts.iter().enumerate() {
+                if let Some(fragment) = part.get("text").and_then(Value::as_str) {
+                    if part.get("thought").and_then(Value::as_bool) != Some(true) {
+                        text.push_str(fragment);
+                    }
+                    continue;
+                }
+                if let Some(call) = part.get("functionCall") {
+                    let name = call
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.is_empty())
+                        .ok_or_else(|| "Google functionCall omitted name".to_string())?;
+                    let arguments = call
+                        .get("args")
+                        .filter(|args| args.is_object())
+                        .ok_or_else(|| "Google functionCall omitted object args".to_string())?;
+                    let id = call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map_or_else(
+                            || format!("call_gemini_0_{index}"),
+                            std::string::ToString::to_string,
+                        );
+                    let arguments = serde_json::to_string(arguments)
+                        .map_err(|error| format!("Google tool arguments were invalid: {error}"))?;
+                    tool_calls.push(serde_json::json!({
+                        "index": index,
+                        "id": id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments}
+                    }));
+                    continue;
+                }
+                return Err("Google stream contained an unsupported content part".to_string());
+            }
+            if !text.is_empty() {
+                delta.insert("content".to_string(), Value::String(text));
+            }
+            if !tool_calls.is_empty() {
+                delta.insert("tool_calls".to_string(), Value::Array(tool_calls));
+            }
+        }
+        let finish_reason = candidate
+            .get("finishReason")
+            .and_then(Value::as_str)
+            .map(map_google_finish_reason)
+            .transpose()?;
+        if let Some(reason) = finish_reason {
+            self.finish_seen = true;
+            if reason == "content_filter" && delta.is_empty() {
+                delta.insert(
+                    "refusal".to_string(),
+                    Value::String("Google safety policy blocked the response".to_string()),
+                );
+            }
+        }
+        if !delta.is_empty() || finish_reason.is_some() {
+            frames.push_back(openai_chat_chunk_frame(
+                &self.response_id,
+                &self.model,
+                self.created,
+                &Value::Object(delta),
+                finish_reason,
+            )?);
+        }
+        Ok(StreamTranslation {
+            frames,
+            terminal: None,
+        })
+    }
+
+    fn validate_openai_responses(
+        &mut self,
+        declared_event: Option<&str>,
+        event: &Value,
+    ) -> Result<StreamTranslation, String> {
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Responses stream event omitted type".to_string())?;
+        if declared_event.is_some_and(|declared| declared != event_type) {
+            return Err("Responses SSE event name did not match its JSON type".to_string());
+        }
+        if !event_type.starts_with("response.") && event_type != "error" {
+            return Err(format!("foreign event {event_type} on Responses stream"));
+        }
+        if let Some(response) = event.get("response") {
+            let usage = extract_usage_from_response(response);
+            if usage.total() > 0 {
+                self.merge_usage(&usage);
+            }
+        }
+        let terminal = match event_type {
+            "response.completed" => Some(true),
+            "response.failed" | "response.incomplete" | "error" => Some(false),
+            _ => None,
+        };
+        if let Some(success) = terminal {
+            return Ok(StreamTranslation {
+                frames: VecDeque::new(),
+                terminal: Some(StreamTerminal {
+                    frame: named_json_frame(event_type, event)?,
+                    success,
+                }),
+            });
+        }
+        let mut frames = VecDeque::new();
+        frames.push_back(named_json_frame(event_type, event)?);
+        Ok(StreamTranslation {
+            frames,
+            terminal: None,
+        })
+    }
+}
+
+fn validate_openai_finish_reason(reason: &str) -> Result<(), String> {
+    if matches!(
+        reason,
+        "stop" | "length" | "tool_calls" | "content_filter" | "function_call" | "refusal"
+    ) {
+        Ok(())
+    } else {
+        Err(format!("unsupported OpenAI finish reason {reason}"))
+    }
+}
+
+fn map_anthropic_finish_reason(reason: &str) -> Result<&'static str, String> {
+    match reason {
+        "end_turn" | "stop_sequence" => Ok("stop"),
+        "max_tokens" => Ok("length"),
+        "tool_use" | "pause_turn" => Ok("tool_calls"),
+        "refusal" => Ok("content_filter"),
+        other => Err(format!("unsupported Anthropic stop reason {other}")),
+    }
+}
+
+fn map_google_finish_reason(reason: &str) -> Result<&'static str, String> {
+    match reason {
+        "STOP" => Ok("stop"),
+        "MAX_TOKENS" => Ok("length"),
+        "SAFETY"
+        | "RECITATION"
+        | "BLOCKLIST"
+        | "PROHIBITED_CONTENT"
+        | "SPII"
+        | "IMAGE_SAFETY"
+        | "IMAGE_PROHIBITED_CONTENT"
+        | "NO_IMAGE" => Ok("content_filter"),
+        "MALFORMED_FUNCTION_CALL" | "UNEXPECTED_TOOL_CALL" => {
+            Err(format!("Google reported terminal tool failure {reason}"))
+        }
+        other => Err(format!("unsupported Google finish reason {other}")),
+    }
+}
+
+fn google_stream_usage(event: &Value) -> Option<TokenUsage> {
+    let usage = event.get("usageMetadata")?;
+    Some(TokenUsage {
+        input_tokens: usage
+            .get("promptTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        output_tokens: usage
+            .get("candidatesTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        cache_read_tokens: usage
+            .get("cachedContentTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        cache_write_tokens: 0,
+    })
+}
+
+fn openai_chat_chunk_frame(
+    id: &str,
+    model: &str,
+    created: i64,
+    delta: &Value,
+    finish_reason: Option<&str>,
+) -> Result<Bytes, String> {
+    data_json_frame(&serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish_reason
+        }]
+    }))
+}
+
+fn protocol_json_frame(route: ProxyRouteKind, event: &Value) -> Result<Bytes, String> {
+    match route {
+        ProxyRouteKind::OpenAiResponses => {
+            let event_type = event
+                .get("type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Responses stream event omitted type".to_string())?;
+            named_json_frame(event_type, event)
+        }
+        ProxyRouteKind::ChatCompletions
+        | ProxyRouteKind::LegacyCompletions
+        | ProxyRouteKind::AnthropicMessages => data_json_frame(event),
+    }
+}
+
+fn data_json_frame(event: &Value) -> Result<Bytes, String> {
+    let json = serde_json::to_vec(event)
+        .map_err(|error| format!("could not serialize translated SSE event: {error}"))?;
+    let mut frame = Vec::with_capacity(json.len().saturating_add(8));
+    frame.extend_from_slice(b"data: ");
+    frame.extend_from_slice(&json);
+    frame.extend_from_slice(b"\n\n");
+    Ok(Bytes::from(frame))
+}
+
+fn named_json_frame(event_type: &str, event: &Value) -> Result<Bytes, String> {
+    let json = serde_json::to_vec(event)
+        .map_err(|error| format!("could not serialize translated SSE event: {error}"))?;
+    let mut frame = Vec::with_capacity(
+        event_type
+            .len()
+            .saturating_add(json.len())
+            .saturating_add(16),
+    );
+    frame.extend_from_slice(b"event: ");
+    frame.extend_from_slice(event_type.as_bytes());
+    frame.extend_from_slice(b"\ndata: ");
+    frame.extend_from_slice(&json);
+    frame.extend_from_slice(b"\n\n");
+    Ok(Bytes::from(frame))
+}
+
+const fn openai_done_frame() -> Bytes {
+    Bytes::from_static(b"data: [DONE]\n\n")
+}
+
+fn protocol_error_frame(route: ProxyRouteKind, error_type: &str) -> Bytes {
+    let message = "The upstream provider stream failed before a valid terminal event";
+    let event = match route {
+        ProxyRouteKind::AnthropicMessages => serde_json::json!({
+            "type": "error",
+            "error": {"type": error_type, "message": message}
+        }),
+        ProxyRouteKind::OpenAiResponses => serde_json::json!({
+            "type": "error",
+            "code": error_type,
+            "message": message
+        }),
+        ProxyRouteKind::ChatCompletions | ProxyRouteKind::LegacyCompletions => {
+            serde_json::json!({
+                "error": {"type": error_type, "message": message}
+            })
+        }
+    };
+    let serialized = match route {
+        ProxyRouteKind::AnthropicMessages | ProxyRouteKind::OpenAiResponses => {
+            named_json_frame("error", &event)
+        }
+        ProxyRouteKind::ChatCompletions | ProxyRouteKind::LegacyCompletions => {
+            data_json_frame(&event)
+        }
+    };
+    serialized.unwrap_or_else(|error| {
+        warn!(error = %error, "Failed to serialize provider stream error event");
+        match route {
+            ProxyRouteKind::AnthropicMessages => Bytes::from_static(
+                b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"serialization_error\",\"message\":\"The proxy could not serialize the upstream stream failure\"}}\n\n",
+            ),
+            ProxyRouteKind::OpenAiResponses => Bytes::from_static(
+                b"event: error\ndata: {\"type\":\"error\",\"code\":\"serialization_error\",\"message\":\"The proxy could not serialize the upstream stream failure\"}\n\n",
+            ),
+            ProxyRouteKind::ChatCompletions | ProxyRouteKind::LegacyCompletions => {
+                Bytes::from_static(
+                    b"data: {\"error\":{\"type\":\"serialization_error\",\"message\":\"The proxy could not serialize the upstream stream failure\"}}\n\n",
+                )
+            }
+        }
+    })
+}
+
+struct ProxyStreamState {
+    upstream: UpstreamByteStream,
+    decoder: SseDecoder,
+    translator: ProxyStreamTranslator,
+    pending: VecDeque<Bytes>,
+    terminal: Option<StreamTerminal>,
+    state: ProxyState,
+    provider_budget: Option<crate::provider_budget::ProviderBudgetReservation>,
+    trace: Option<ProxyLifecycleTrace>,
+    received_bytes: usize,
+    max_response_bytes: usize,
+    done: bool,
+}
+
+impl ProxyStreamState {
+    async fn next_output(&mut self) -> Option<Bytes> {
+        loop {
+            if let Some(frame) = self.pending.pop_front() {
+                return Some(frame);
+            }
+            if let Some(terminal) = self.terminal.take() {
+                let settlement = if terminal.success {
+                    self.settle_success().await
+                } else {
+                    self.settle_failure();
+                    Ok(())
+                };
+                self.done = true;
+                return Some(match settlement {
+                    Ok(()) => terminal.frame,
+                    Err(error) => {
+                        warn!(error = %error, "Streaming finalization failed");
+                        protocol_error_frame(self.translator.route, "finalization_error")
+                    }
+                });
+            }
+            if self.done {
+                return None;
+            }
+            match self.decoder.pop() {
+                Ok(Some(frame)) => match self.translator.translate(&frame) {
+                    Ok(translation) => {
+                        self.pending.extend(translation.frames);
+                        self.terminal = translation.terminal;
+                        continue;
+                    }
+                    Err(error) => return Some(self.fail(&error)),
+                },
+                Err(error) => return Some(self.fail(&error)),
+                Ok(None) => {}
+            }
+
+            let next = tokio::time::timeout(
+                Duration::from_secs(SSE_STREAM_TIMEOUT_SECS),
+                self.upstream.next(),
+            )
+            .await;
+            match next {
+                Err(_) => {
+                    return Some(self.fail("upstream SSE stream timed out while idle"));
+                }
+                Ok(Some(Err(error))) => {
+                    return Some(self.fail(&format!("upstream SSE transport failed: {error}")));
+                }
+                Ok(Some(Ok(chunk))) => {
+                    let Some(total) = self.received_bytes.checked_add(chunk.len()) else {
+                        return Some(self.fail("upstream SSE byte count overflowed"));
+                    };
+                    if total > self.max_response_bytes {
+                        return Some(self.fail(&format!(
+                            "upstream SSE stream exceeded {} bytes",
+                            self.max_response_bytes
+                        )));
+                    }
+                    self.received_bytes = total;
+                    if let Err(error) = self.decoder.push(&chunk) {
+                        return Some(self.fail(&error));
+                    }
+                }
+                Ok(None) => {
+                    if self.decoder.has_pending_bytes() {
+                        return Some(
+                            self.fail("upstream SSE stream ended with an incomplete frame"),
+                        );
+                    }
+                    match self.translator.finish_eof() {
+                        Ok(translation) => {
+                            self.pending.extend(translation.frames);
+                            self.terminal = translation.terminal;
+                        }
+                        Err(error) => return Some(self.fail(&error)),
+                    }
+                }
+            }
+        }
+    }
+
+    fn fail(&mut self, error: &str) -> Bytes {
+        warn!(error = %error, "Provider stream failed before terminal delivery");
+        self.settle_failure();
+        self.done = true;
+        protocol_error_frame(self.translator.route, "upstream_stream_error")
+    }
+
+    fn settle_failure(&mut self) {
+        if let Some(provider_budget) = self.provider_budget.take() {
+            if let Err(error) = provider_budget.finish_unknown() {
+                warn!(error = %error, "Failed to settle interrupted provider stream budget");
+            }
+        }
+        self.trace.take();
+    }
+
+    async fn settle_success(&mut self) -> Result<(), String> {
+        let usage = self.translator.usage();
+        let provider_budget = self
+            .provider_budget
+            .take()
+            .ok_or_else(|| "stream lost its provider budget reservation".to_string())?;
+        match usage.as_ref() {
+            Some(usage) => provider_budget.reconcile(usage),
+            None => provider_budget.finish_unknown(),
+        }
+        .map_err(|error| format!("provider budget reconciliation failed: {error}"))?;
+        if self.state.config.session.token_tracking.enabled {
+            if let Some(usage) = usage {
+                record_actual_usage_for_session(&self.state, usage).await;
+            }
+        }
+        let mut trace = self
+            .trace
+            .take()
+            .ok_or_else(|| "stream lost its lifecycle trace".to_string())?;
+        trace
+            .record(ProxyLifecycleStage::EvidencePolicyApplied)
+            .map_err(|error| error.to_string())?;
+        complete_loop_iteration(&self.state).await;
+        trace
+            .record(ProxyLifecycleStage::Finalized)
+            .map_err(|error| error.to_string())?;
+        trace
+            .record(ProxyLifecycleStage::DeliveryReady)
+            .map_err(|error| error.to_string())?;
+        trace.finish().map_err(|error| error.to_string())
+    }
+}
+
+impl Drop for ProxyStreamState {
+    fn drop(&mut self) {
+        if !self.done {
+            // Dropping the Axum response body is the client-disconnect path.
+            // Dropping the reqwest byte stream cancels upstream transport;
+            // settle the matching budget and lifecycle ownership as unknown so
+            // neither remains live after delivery disappears.
+            self.settle_failure();
+            self.done = true;
+        }
+    }
+}
+
+fn live_stream_response(
+    state: &ProxyState,
+    normalized: &NormalizedProxyRequest,
+    provider_name: &str,
+    upstream: UpstreamResponse,
+    provider_budget: crate::provider_budget::ProviderBudgetReservation,
+    trace: ProxyLifecycleTrace,
+) -> Result<Response, ProxyError> {
+    let UpstreamResponse {
+        response,
+        request_headers: _,
+    } = upstream;
+    let status = StatusCode::from_u16(response.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    if !status.is_success() {
+        return Err(ProxyError::FinalizationFailed(format!(
+            "live stream conversion received non-success status {status}"
+        )));
+    }
+    let mut builder = Response::builder().status(status);
+    for (key, value) in response.headers() {
+        if key != header::TRANSFER_ENCODING
+            && key != header::CONTENT_LENGTH
+            && key != header::CONTENT_TYPE
+        {
+            if let Ok(value) = HeaderValue::from_bytes(value.as_bytes()) {
+                builder = builder.header(key.as_str(), value);
+            }
+        }
+    }
+    let stream_state = ProxyStreamState {
+        upstream: Box::pin(response.bytes_stream()),
+        decoder: SseDecoder::default(),
+        translator: ProxyStreamTranslator::new(
+            normalized.route,
+            provider_name,
+            &normalized.canonical.model,
+        ),
+        pending: VecDeque::new(),
+        terminal: None,
+        state: state.clone(),
+        provider_budget: Some(provider_budget),
+        trace: Some(trace),
+        received_bytes: 0,
+        max_response_bytes: state.config.proxy.max_response_bytes,
+        done: false,
+    };
+    let stream = futures::stream::unfold(stream_state, |mut state| async move {
+        state
+            .next_output()
+            .await
+            .map(|frame| (Ok::<Bytes, std::io::Error>(frame), state))
+    });
+    builder
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(DELIVERY_MODE_HEADER, "live")
+        .body(Body::from_stream(stream))
+        .map_err(|error| {
+            ProxyError::FinalizationFailed(format!("failed to build live stream response: {error}"))
+        })
+}
 
 /// Forward request to upstream provider.
 ///
@@ -4742,7 +6034,7 @@ mod tests {
         )
         .await;
 
-        let (response, usage) = convert_response_with_usage(
+        let (response, usage, candidate) = convert_response_with_usage(
             UpstreamResponse {
                 response: upstream,
                 request_headers: seeded_request_headers(SECRET),
@@ -4755,6 +6047,7 @@ mod tests {
         let body = response_text(response).await;
 
         assert!(usage.is_none());
+        assert!(candidate.is_none());
         assert!(
             !body.contains(SECRET),
             "proxy leaked request secret: {body}"
@@ -4782,7 +6075,7 @@ mod tests {
         });
         let upstream = upstream_response(StatusCode::OK, "application/json", raw.to_string()).await;
 
-        let (response, usage) = convert_response_with_usage(
+        let (response, usage, candidate) = convert_response_with_usage(
             UpstreamResponse {
                 response: upstream,
                 request_headers: crate::secrets::SensitiveHeaders::new(),
@@ -4795,6 +6088,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let usage = usage.expect("raw Anthropic usage should be preserved");
+        assert_eq!(candidate.as_ref(), Some(&raw));
         assert_eq!(usage.input_tokens, 12);
         assert_eq!(usage.output_tokens, 5);
         assert_eq!(usage.cache_read_tokens, 3);
@@ -5219,6 +6513,376 @@ mod tests {
             extract_usage_from_sse_event(&event).is_none(),
             "all-zero usage must return None"
         );
+    }
+
+    fn translated_frame_json(frame: &Bytes) -> Value {
+        let text = std::str::from_utf8(frame).expect("translated frame must be UTF-8");
+        let data = text
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("translated frame must contain data");
+        serde_json::from_str(data).expect("translated data must be JSON")
+    }
+
+    fn json_sse_frame(event: &Value) -> SseFrame {
+        SseFrame {
+            event: None,
+            data: serde_json::to_string(&event).expect("fixture JSON"),
+        }
+    }
+
+    #[test]
+    fn openai_stream_preserves_tool_refusal_length_and_usage() {
+        let mut translator =
+            ProxyStreamTranslator::new(ProxyRouteKind::ChatCompletions, "openai", "gpt-test");
+        let event = serde_json::json!({
+            "id": "chatcmpl-upstream",
+            "object": "chat.completion.chunk",
+            "model": "gpt-test",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "refusal": "policy refusal",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{\"q\":\"x\"}"}
+                    }]
+                },
+                "finish_reason": "length"
+            }],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 7}
+        });
+        let translated = translator
+            .translate(&json_sse_frame(&event))
+            .expect("translate OpenAI event");
+        assert_eq!(translated.frames.len(), 1);
+        assert_eq!(translated_frame_json(&translated.frames[0]), event);
+        let usage = translator.usage().expect("usage receipt");
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 7);
+
+        let terminal = translator
+            .translate(&SseFrame {
+                event: None,
+                data: "[DONE]".to_string(),
+            })
+            .expect("terminal marker")
+            .terminal
+            .expect("terminal delivery");
+        assert!(terminal.success);
+        assert_eq!(terminal.frame, openai_done_frame());
+    }
+
+    #[test]
+    fn anthropic_stream_translates_text_tool_length_refusal_and_usage() {
+        let mut translator =
+            ProxyStreamTranslator::new(ProxyRouteKind::ChatCompletions, "anthropic", "claude-test");
+        let fixtures = [
+            serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_1",
+                    "model": "claude-test",
+                    "usage": {"input_tokens": 13}
+                }
+            }),
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "tool_use", "id": "toolu_1", "name": "lookup"}
+            }),
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"q\":\"x\"}"}
+            }),
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {"type": "refusal", "text": "cannot comply"}
+            }),
+            serde_json::json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "max_tokens"},
+                "usage": {"output_tokens": 5}
+            }),
+        ];
+        let mut output = Vec::new();
+        for fixture in fixtures {
+            let translated = translator
+                .translate(&json_sse_frame(&fixture))
+                .expect("translate Anthropic event");
+            output.extend(translated.frames);
+        }
+        let rendered = output
+            .iter()
+            .map(|frame| std::str::from_utf8(frame).expect("UTF-8"))
+            .collect::<String>();
+        assert!(rendered.contains("tool_calls"));
+        assert!(rendered.contains("toolu_1"));
+        assert!(!rendered.contains("partial_json"));
+        assert!(rendered.contains("cannot comply"));
+        assert!(rendered.contains("\"finish_reason\":\"length\""));
+        let usage = translator.usage().expect("Anthropic usage");
+        assert_eq!(usage.input_tokens, 13);
+        assert_eq!(usage.output_tokens, 5);
+
+        let terminal = translator
+            .translate(&json_sse_frame(
+                &serde_json::json!({"type": "message_stop"}),
+            ))
+            .expect("message_stop")
+            .terminal
+            .expect("terminal");
+        assert!(terminal.success);
+    }
+
+    #[test]
+    fn google_stream_translates_tool_refusal_finish_and_usage() {
+        let mut translator =
+            ProxyStreamTranslator::new(ProxyRouteKind::ChatCompletions, "google", "gemini-test");
+        let translated = translator
+            .translate(&json_sse_frame(&serde_json::json!({
+                "candidates": [{
+                    "content": {"parts": [{
+                        "functionCall": {
+                            "id": "call_google_1",
+                            "name": "lookup",
+                            "args": {"q": "x"}
+                        }
+                    }]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {"promptTokenCount": 17, "candidatesTokenCount": 3}
+            })))
+            .expect("translate Google tool event");
+        let tool = translated_frame_json(&translated.frames[0]);
+        assert_eq!(
+            tool["choices"][0]["delta"]["tool_calls"][0]["id"],
+            "call_google_1"
+        );
+        assert_eq!(tool["choices"][0]["finish_reason"], "stop");
+        let usage = translator.usage().expect("Google usage");
+        assert_eq!(usage.input_tokens, 17);
+        assert_eq!(usage.output_tokens, 3);
+        assert!(
+            translator
+                .finish_eof()
+                .expect("Google EOF")
+                .terminal
+                .expect("terminal")
+                .success
+        );
+
+        let mut refusal =
+            ProxyStreamTranslator::new(ProxyRouteKind::ChatCompletions, "google", "gemini-test");
+        let blocked = refusal
+            .translate(&json_sse_frame(&serde_json::json!({
+                "promptFeedback": {"blockReason": "SAFETY"}
+            })))
+            .expect("translate Google refusal");
+        let blocked = translated_frame_json(&blocked.frames[0]);
+        assert_eq!(blocked["choices"][0]["finish_reason"], "content_filter");
+        assert!(blocked["choices"][0]["delta"]["refusal"]
+            .as_str()
+            .is_some_and(|message| message.contains("SAFETY")));
+    }
+
+    #[test]
+    fn provider_errors_and_missing_terminals_never_become_stream_success() {
+        let mut anthropic =
+            ProxyStreamTranslator::new(ProxyRouteKind::ChatCompletions, "anthropic", "claude-test");
+        let error = anthropic
+            .translate(&json_sse_frame(&serde_json::json!({
+                "type": "error",
+                "error": {"type": "overloaded_error", "message": "busy"}
+            })))
+            .expect("translate provider error")
+            .terminal
+            .expect("error terminal");
+        assert!(!error.success);
+        assert!(std::str::from_utf8(&error.frame)
+            .expect("UTF-8")
+            .contains("upstream_error"));
+
+        let mut openai =
+            ProxyStreamTranslator::new(ProxyRouteKind::ChatCompletions, "openai", "gpt-test");
+        let error = openai
+            .translate(&SseFrame {
+                event: None,
+                data: "[DONE]".to_string(),
+            })
+            .expect_err("DONE without finish reason must fail");
+        assert!(error.contains("finish reason"));
+    }
+
+    #[test]
+    fn native_anthropic_and_responses_streams_validate_declared_protocol() {
+        let mut anthropic = ProxyStreamTranslator::new(
+            ProxyRouteKind::AnthropicMessages,
+            "anthropic",
+            "claude-test",
+        );
+        let event = serde_json::json!({
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 2}}
+        });
+        let translated = anthropic
+            .translate(&SseFrame {
+                event: Some("message_start".to_string()),
+                data: serde_json::to_string(&event).expect("fixture"),
+            })
+            .expect("native Anthropic event");
+        assert!(std::str::from_utf8(&translated.frames[0])
+            .expect("UTF-8")
+            .starts_with("event: message_start\n"));
+
+        let mut responses =
+            ProxyStreamTranslator::new(ProxyRouteKind::OpenAiResponses, "openai", "gpt-test");
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "response": {"usage": {"input_tokens": 5, "output_tokens": 4}}
+        });
+        let terminal = responses
+            .translate(&SseFrame {
+                event: Some("response.completed".to_string()),
+                data: serde_json::to_string(&completed).expect("fixture"),
+            })
+            .expect("Responses terminal")
+            .terminal
+            .expect("terminal");
+        assert!(terminal.success);
+        assert_eq!(responses.usage().expect("usage").output_tokens, 4);
+
+        let foreign = responses
+            .translate(&json_sse_frame(
+                &serde_json::json!({"type": "message_start"}),
+            ))
+            .expect_err("foreign Anthropic event must be rejected");
+        assert!(foreign.contains("foreign event"));
+    }
+
+    #[test]
+    fn sse_decoder_is_fragment_safe_and_bounded() {
+        let mut decoder = SseDecoder::default();
+        decoder
+            .push(&Bytes::from_static(b"event: message\ndata: {\"type\":"))
+            .expect("partial frame");
+        assert!(decoder.pop().expect("decode partial").is_none());
+        decoder
+            .push(&Bytes::from_static(b"\"ping\"}\n\n"))
+            .expect("complete frame");
+        let frame = decoder.pop().expect("decode").expect("frame");
+        assert_eq!(frame.event.as_deref(), Some("message"));
+        assert_eq!(frame.data, "{\"type\":\"ping\"}");
+
+        let mut oversized = SseDecoder::default();
+        let bytes = Bytes::from(vec![b'x'; MAX_SSE_LINE_BYTES + 1]);
+        assert!(oversized.push(&bytes).is_err());
+    }
+
+    struct PollObservedStream {
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+        yielded: bool,
+    }
+
+    impl Stream for PollObservedStream {
+        type Item = Result<Bytes, reqwest::Error>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            if self.yielded {
+                std::task::Poll::Pending
+            } else {
+                self.yielded = true;
+                std::task::Poll::Ready(Some(Ok(Bytes::from_static(
+                    b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+                ))))
+            }
+        }
+    }
+
+    impl Drop for PollObservedStream {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn live_stream_is_pull_driven_and_drop_cancels_upstream_owner() {
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let upstream: UpstreamByteStream = Box::pin(PollObservedStream {
+            polls: Arc::clone(&polls),
+            dropped: Arc::clone(&dropped),
+            yielded: false,
+        });
+        let mut request = serde_json::json!({"max_tokens": 1});
+        let provider_budget = crate::provider_budget::reserve_provider_call(
+            test_run(),
+            "anthropic",
+            "claude-test",
+            &mut request,
+            1,
+        )
+        .expect("reserve test provider call");
+        let state = test_proxy_state(minimal_config("anthropic"));
+        let mut stream = ProxyStreamState {
+            upstream,
+            decoder: SseDecoder::default(),
+            translator: ProxyStreamTranslator::new(
+                ProxyRouteKind::ChatCompletions,
+                "anthropic",
+                "claude-test",
+            ),
+            pending: VecDeque::new(),
+            terminal: None,
+            state,
+            provider_budget: Some(provider_budget),
+            trace: None,
+            received_bytes: 0,
+            max_response_bytes: 1024,
+            done: false,
+        };
+        let first = stream.next_output().await.expect("first translated frame");
+        assert!(std::str::from_utf8(&first)
+            .expect("UTF-8")
+            .contains("hello"));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        tokio::task::yield_now().await;
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        drop(stream);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn configured_vdd_switches_requested_stream_to_honest_buffered_delivery() {
+        let mut config = minimal_config("anthropic");
+        config.vdd.enabled = true;
+        config.vdd.mode = crate::config::VddMode::Blocking;
+        let state = test_proxy_state(config);
+        let mut normalized = normalize_proxy_request(
+            ProxyRouteKind::AnthropicMessages,
+            serde_json::json!({
+                "model": "claude-test",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 16,
+                "stream": true
+            }),
+        )
+        .expect("normalize");
+        assert_eq!(
+            select_proxy_delivery_mode(&state, &mut normalized),
+            ProxyDeliveryMode::BufferedVddReview
+        );
+        assert_eq!(normalized.canonical.stream, Some(false));
+        assert_eq!(normalized.wire["stream"], false);
     }
 
     /// Spec - `SSE_STREAM_TIMEOUT_SECS` constant is 5 minutes.

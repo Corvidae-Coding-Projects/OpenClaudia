@@ -143,7 +143,7 @@ fn canonical_permission_tool(tool: &str) -> Option<&'static str> {
 fn requires_fresh_host_approval(canonical_tool: &str) -> bool {
     matches!(
         canonical_tool,
-        "MemoryReview" | "MemoryExport" | "MemoryImport"
+        "MemoryReview" | "MemoryExport" | "MemoryImport" | "ScheduleCreate" | "ScheduleDelete"
     )
 }
 
