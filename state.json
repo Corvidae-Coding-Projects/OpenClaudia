@@ -25892,7 +25892,10 @@
       "priority": "low",
       "created_by": "6Vw9",
       "created_at": "2026-08-28T02:44:22.598430507Z",
-      "updated_at": "2026-08-28T02:44:22.598430507Z"
+      "updated_at": "2026-08-28T02:44:27.095323422Z",
+      "labels": [
+        "investigation"
+      ]
     },
     "b04d2823-3401-4393-accf-f2d833fa9ffe": {
       "uuid": "b04d2823-3401-4393-accf-f2d833fa9ffe",
@@ -47340,11 +47343,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2206,
       "timestamp": "2026-08-28T02:44:22.598430507Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2207,
+      "timestamp": "2026-08-28T02:44:27.095323422Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-28T02:44:22.598430507Z",
+    "timestamp": "2026-08-28T02:44:27.095323422Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2206
+    "agent_seq": 2207
   }
 }
