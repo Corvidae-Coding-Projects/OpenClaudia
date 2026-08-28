@@ -51,6 +51,7 @@ __pycache__/
 .openclaudia/reality-ledgers/
 .openclaudia/schedules.json.lock
 .openclaudia/sandbox-transactions/
+.openclaudia/plugins/installed_plugins.json
 .openclaudia/plugins/transactions.lock
 .openclaudia/plugins/.transactions/
 .openclaudia/plugins/.generations/
