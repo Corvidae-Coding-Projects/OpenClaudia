@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1202,
+  "next_display_id": 1203,
   "next_comment_id": 1907,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -618,6 +618,7 @@
     "8de5caaf-be57-4083-bc07-c9f33e5e7759": 580,
     "8e03afe6-d146-43e7-84bc-4084c696a4dc": 1115,
     "8e058e60-5ec5-4756-9c54-0d1e156de3a6": 1157,
+    "8e3dee0f-7704-46cc-bf0d-473f4890158b": 1202,
     "8e4a5961-7f8d-4650-81ff-7ea7d29be200": 384,
     "8ea62b4d-468c-4d61-bf8f-b69d261b2756": 26,
     "8ecebe13-cf84-408b-b5c1-f803b0b77dc4": 291,
@@ -21498,6 +21499,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA+rPY9CF5P946r/72VFyJbLR9tvkXd2hEv7ZotUxn4pZnyFDbjlYjR5lPoDk1WC1MAI8Ka6BfTgCYcI6LVCR1Aw=="
         }
       }
+    },
+    "8e3dee0f-7704-46cc-bf0d-473f4890158b": {
+      "uuid": "8e3dee0f-7704-46cc-bf0d-473f4890158b",
+      "display_id": 1202,
+      "title": "Reconcile stale remediation slice status documents",
+      "description": "The live remediation index has eight numbered slice files still marked Status: Planned although their delivery issues are closed and implementation evidence exists: S-033, S-034, S-035, S-059, S-062, S-086, S-100, and S-101. Reconcile each document from its exact commit, Crosslink result comments, and runner evidence. Do not mark any unverified claim complete, do not hand-edit generated changelog output, and keep implementation changes out of this documentation-only issue. Acceptance: the slice documents accurately distinguish implemented, independently verified, VDD-pending, and complete states, and the aggregate remaining-slice count is reproducible.",
+      "status": "open",
+      "priority": "medium",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-28T15:47:09.132646546Z",
+      "updated_at": "2026-08-28T15:47:09.132646546Z"
     },
     "8e4a5961-7f8d-4650-81ff-7ea7d29be200": {
       "uuid": "8e4a5961-7f8d-4650-81ff-7ea7d29be200",
@@ -48231,11 +48244,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2288,
       "timestamp": "2026-08-28T15:45:16.248693054Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2289,
+      "timestamp": "2026-08-28T15:47:09.132646546Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-28T15:45:16.248693054Z",
+    "timestamp": "2026-08-28T15:47:09.132646546Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2288
+    "agent_seq": 2289
   }
 }
