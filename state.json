@@ -14854,11 +14854,12 @@
       "display_id": 1196,
       "title": "S-099: Make VDD verdict parsing strict and fail closed",
       "description": "Complete remediation slice S-099 under parent #1071: finish the versioned canonical VDD verdict schema, stable finding identities, bounded normalized paths and ranges, duplicate and contradiction rejection, and deterministic parser/triage tests without expanding into S-100/S-101/S-102.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-28T07:47:31.467293979Z",
-      "updated_at": "2026-08-28T08:34:18.919372342Z",
+      "updated_at": "2026-08-28T08:34:23.312515372Z",
+      "closed_at": "2026-08-28T08:34:23.312513818Z",
       "labels": [
         "remediation"
       ],
@@ -47638,11 +47639,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2234,
       "timestamp": "2026-08-28T08:34:18.919372342Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2235,
+      "timestamp": "2026-08-28T08:34:23.312515372Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-28T08:34:18.919372342Z",
+    "timestamp": "2026-08-28T08:34:23.312515372Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2234
+    "agent_seq": 2235
   }
 }
