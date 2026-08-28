@@ -27692,11 +27692,12 @@
       "uuid": "bbea3388-35cc-4114-98fd-3de446b17dad",
       "display_id": 1197,
       "title": "S-100: Make VDD a blocking finalization gate",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-28T09:27:29.083178666Z",
-      "updated_at": "2026-08-28T11:11:29.678636298Z",
+      "updated_at": "2026-08-28T11:11:34.195022652Z",
+      "closed_at": "2026-08-28T11:11:34.195016848Z",
       "labels": [
         "remediation"
       ],
@@ -47898,11 +47899,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2256,
       "timestamp": "2026-08-28T11:11:29.678636298Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2257,
+      "timestamp": "2026-08-28T11:11:34.195022652Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-28T11:11:29.678636298Z",
+    "timestamp": "2026-08-28T11:11:34.195022652Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2256
+    "agent_seq": 2257
   }
 }
