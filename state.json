@@ -1,6 +1,6 @@
 {
   "next_display_id": 1193,
-  "next_comment_id": 1867,
+  "next_comment_id": 1868,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -35427,10 +35427,21 @@
       "parent_uuid": "5ea8af88-cc85-47d9-943c-8e2e851b5e5a",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T23:55:14.145458322Z",
-      "updated_at": "2026-08-27T23:55:19.073238463Z",
+      "updated_at": "2026-08-28T01:36:10.660276963Z",
       "labels": [
         "feature"
-      ]
+      ],
+      "comments": {
+        "316511b9-9c90-4bd1-ba40-61a429fbb433": {
+          "display_id": 1867,
+          "author": "6Vw9",
+          "content": "Delivered S-085 as a run-owned measured speculation transaction limited to exact next-page read_file captures. Artifacts bind run and capability generation, exact arguments, content digest, stable file snapshot, deadline and cancellation; matching consumption re-enters the canonical executor and rejects mutation without a second full read. Bounded metrics retain the optimization only for correct low-waste hits with lower critical-path latency and no greater I/O cost. Parent review repaired the worker path that had self-disabled every hit. Evidence: speculation 8/8, strict Rust 1.98 Clippy green, and the complete serialized all-target/all-feature suite green.",
+          "created_at": "2026-08-28T01:36:10.657697978Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAA0xj9DhkmXd9nomBHZyTGVhT1DBc2Mnmihxe7+vS0QmqR6xcg3S1MhGqBKLFz3tuYWQ5HEj0h4Ri6FzHAgQ/Ag=="
+        }
+      }
     },
     "fe21a89e-76fb-452e-9aad-bb250d045362": {
       "uuid": "fe21a89e-76fb-452e-9aad-bb250d045362",
@@ -47231,11 +47242,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2196,
       "timestamp": "2026-08-28T01:36:00.121306241Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2197,
+      "timestamp": "2026-08-28T01:36:10.660276963Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-28T01:36:00.121306241Z",
+    "timestamp": "2026-08-28T01:36:10.660276963Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2196
+    "agent_seq": 2197
   }
 }
