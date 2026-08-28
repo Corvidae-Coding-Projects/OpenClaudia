@@ -1,6 +1,6 @@
 {
   "next_display_id": 1200,
-  "next_comment_id": 1901,
+  "next_comment_id": 1902,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9223,7 +9223,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-28T11:44:45.921120190Z",
-      "updated_at": "2026-08-28T11:51:43.382477900Z",
+      "updated_at": "2026-08-28T12:48:44.966938939Z",
       "labels": [
         "remediation"
       ],
@@ -9245,6 +9245,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAat9FU8GfFbKwCo/yFHTa3IJ9296WTrAOQCrL+kySwartX3OMwxIWCqEeFRAMabIU4jCkNyWr8H46YfvufPVbAQ=="
+        },
+        "e5273795-8923-4570-9915-bafa492f9397": {
+          "display_id": 1901,
+          "author": "6Vw9",
+          "content": "Architecture review checkpoint: host finalization now commits a versioned redacted per-run ledger before issue projection; Crosslink mutations use scoped deterministic markers, one SQLite transaction per action, monotonic reconciliation receipts, bounded CAS/retry recovery, and exact artifact citations. Required-mode stale/cancelled/inconclusive outcomes cannot open issues; clean later evidence can resolve them. Default workspace-relative storage was corrected to the masked host-control capability and safely tightens legacy directory permissions. Focused Rust 1.98 evidence/config tests and strict all-feature Clippy are green; full repository gates remain.",
+          "created_at": "2026-08-28T12:48:44.961862232Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA3ZqZnaobEU6dNuoCZn/fQgZVSEK4ep/g97KJRNhUbjM3ikP62U6CW24x+OHi5ftwjv3C8LLNo6KvQMHw4tQAAg=="
         }
       }
     },
@@ -48066,11 +48075,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2273,
       "timestamp": "2026-08-28T11:51:43.382477900Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2274,
+      "timestamp": "2026-08-28T12:48:44.966938939Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-28T11:51:43.382477900Z",
+    "timestamp": "2026-08-28T12:48:44.966938939Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2273
+    "agent_seq": 2274
   }
 }
