@@ -29,7 +29,7 @@ const MAX_FAIL_OPEN_REASON_BYTES: usize = 4 * 1024;
 const MAX_CANDIDATE_GENERATION_BYTES: usize = 4 * 1024;
 
 /// Whether review is disabled, advisory, or required before success.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VddFinalizationRequirement {
     Disabled,
@@ -109,6 +109,43 @@ impl VddFinalizationPolicy {
     #[must_use]
     pub const fn requirement(&self) -> VddFinalizationRequirement {
         self.requirement
+    }
+
+    fn evidence_digest(&self, config: &VddConfig) -> ContentDigest {
+        let failure_policy = match &self.failure_policy {
+            VddFailurePolicy::Withhold => serde_json::json!({"kind": "withhold"}),
+            VddFailurePolicy::HostSelectedFailOpen { reason } => serde_json::json!({
+                "kind": "host_selected_fail_open",
+                "reason_sha256": ContentDigest::sha256(reason.as_bytes()),
+            }),
+        };
+        let static_commands = config
+            .static_analysis
+            .commands
+            .iter()
+            .map(|command| ContentDigest::sha256(command.as_bytes()))
+            .collect::<Vec<_>>();
+        let seed = serde_json::json!({
+            "schema": 1,
+            "requirement": self.requirement,
+            "failure_policy": failure_policy,
+            "mode": config.mode,
+            "adversary_provider": config.adversary.provider,
+            "adversary_model": config.adversary.model,
+            "temperature_bits": config.adversary.temperature.to_bits(),
+            "max_tokens": config.adversary.max_tokens,
+            "request_timeout_seconds": config.adversary.request_timeout_seconds,
+            "max_iterations": config.thresholds.max_iterations,
+            "min_iterations": config.thresholds.min_iterations,
+            "false_positive_rate_bits": config.thresholds.false_positive_rate.to_bits(),
+            "static_analysis_enabled": config.static_analysis.enabled,
+            "static_analysis_auto_detect": config.static_analysis.auto_detect,
+            "static_commands": static_commands,
+            "static_timeout_seconds": config.static_analysis.timeout_seconds,
+            "promote_verified_findings": config.tracking.promote_verified_findings,
+            "retention_days": config.tracking.retention_days,
+        });
+        ContentDigest::sha256(serde_json::to_vec(&seed).unwrap_or_default())
     }
 }
 
@@ -476,14 +513,33 @@ pub async fn finalize_text_candidate(
         };
     }
     if run.runtime().cancellation().is_cancelled() {
-        return VddResponseFinalization {
-            publication: non_pass(
+        let evidence_binding = binding.clone();
+        let publication = non_pass(
+            policy,
+            content,
+            binding,
+            VddNonPassOutcome::Cancelled,
+            "candidate finalization was cancelled before VDD review".to_string(),
+        );
+        let publication = if let Some(engine) = engine {
+            persist_legacy_publication(
+                run,
+                engine.config(),
                 policy,
-                content,
-                binding,
-                VddNonPassOutcome::Cancelled,
-                "candidate finalization was cancelled before VDD review".to_string(),
-            ),
+                scope,
+                &evidence_binding,
+                None,
+                &[],
+                &[],
+                &[],
+                publication,
+            )
+            .await
+        } else {
+            publication
+        };
+        return VddResponseFinalization {
+            publication,
             context_observation: None,
             provider_receipts: Vec::new(),
         };
@@ -506,21 +562,43 @@ pub async fn finalize_text_candidate(
         VddFinalizationRequirement::Advisory => {
             let review = engine.review_text(run, &content, user_task, builder).await;
             if run.runtime().cancellation().is_cancelled() {
+                let provider_receipts = review
+                    .as_ref()
+                    .map_or(&[][..], |review| review.provider_receipts.as_slice());
+                let evidence_binding = binding.clone();
+                let publication = non_pass(
+                    policy,
+                    content,
+                    binding,
+                    VddNonPassOutcome::Cancelled,
+                    "candidate finalization was cancelled during VDD review".to_string(),
+                );
+                let publication = persist_legacy_publication(
+                    run,
+                    engine.config(),
+                    policy,
+                    scope,
+                    &evidence_binding,
+                    None,
+                    &[],
+                    &[],
+                    provider_receipts,
+                    publication,
+                )
+                .await;
+                let provider_receipts = review
+                    .map(|review| review.provider_receipts)
+                    .unwrap_or_default();
                 return VddResponseFinalization {
-                    publication: non_pass(
-                        policy,
-                        content,
-                        binding,
-                        VddNonPassOutcome::Cancelled,
-                        "candidate finalization was cancelled during VDD review".to_string(),
-                    ),
+                    publication,
                     context_observation: None,
-                    provider_receipts: Vec::new(),
+                    provider_receipts,
                 };
             }
             match review {
                 Ok(review) => {
                     let context_observation = review.context_observation;
+                    let evidence_binding = binding.clone();
                     let publication = finalize_advisory_review(
                         policy,
                         content,
@@ -528,23 +606,53 @@ pub async fn finalize_text_candidate(
                         &review.findings,
                         &review.static_analysis,
                     );
+                    let publication = persist_legacy_publication(
+                        run,
+                        engine.config(),
+                        policy,
+                        scope,
+                        &evidence_binding,
+                        None,
+                        &review.findings,
+                        &review.static_analysis,
+                        &review.provider_receipts,
+                        publication,
+                    )
+                    .await;
                     VddResponseFinalization {
                         publication,
                         context_observation,
                         provider_receipts: review.provider_receipts,
                     }
                 }
-                Err(error) => VddResponseFinalization {
-                    publication: non_pass(
+                Err(error) => {
+                    let evidence_binding = binding.clone();
+                    let publication = non_pass(
                         policy,
                         content,
                         binding,
                         classify_legacy_error(&error),
                         error.to_string(),
-                    ),
-                    context_observation: None,
-                    provider_receipts: Vec::new(),
-                },
+                    );
+                    let publication = persist_legacy_publication(
+                        run,
+                        engine.config(),
+                        policy,
+                        scope,
+                        &evidence_binding,
+                        None,
+                        &[],
+                        &[],
+                        &[],
+                        publication,
+                    )
+                    .await;
+                    VddResponseFinalization {
+                        publication,
+                        context_observation: None,
+                        provider_receipts: Vec::new(),
+                    }
+                }
             }
         }
         VddFinalizationRequirement::Required => {
@@ -552,40 +660,88 @@ pub async fn finalize_text_candidate(
                 .review_text_blocking(run, &content, user_task, builder)
                 .await;
             if run.runtime().cancellation().is_cancelled() {
+                let provider_receipts = review
+                    .as_ref()
+                    .map_or(&[][..], |review| review.provider_receipts.as_slice());
+                let evidence_binding = binding.clone();
+                let publication = non_pass(
+                    policy,
+                    content,
+                    binding,
+                    VddNonPassOutcome::Cancelled,
+                    "candidate finalization was cancelled during blocking VDD review".to_string(),
+                );
+                let publication = persist_legacy_publication(
+                    run,
+                    engine.config(),
+                    policy,
+                    scope,
+                    &evidence_binding,
+                    None,
+                    &[],
+                    &[],
+                    provider_receipts,
+                    publication,
+                )
+                .await;
+                let provider_receipts = review
+                    .map(|review| review.provider_receipts)
+                    .unwrap_or_default();
                 return VddResponseFinalization {
-                    publication: non_pass(
-                        policy,
-                        content,
-                        binding,
-                        VddNonPassOutcome::Cancelled,
-                        "candidate finalization was cancelled during blocking VDD review"
-                            .to_string(),
-                    ),
+                    publication,
                     context_observation: None,
-                    provider_receipts: Vec::new(),
+                    provider_receipts,
                 };
             }
             match review {
-                Ok(review) => finalize_blocking_text_review(run, policy, scope, content, review),
-                Err(error) => VddResponseFinalization {
-                    publication: non_pass(
+                Ok(review) => {
+                    finalize_blocking_text_review(
+                        engine.config(),
+                        run,
+                        policy,
+                        scope,
+                        content,
+                        review,
+                    )
+                    .await
+                }
+                Err(error) => {
+                    let evidence_binding = binding.clone();
+                    let publication = non_pass(
                         policy,
                         content,
                         binding,
                         classify_legacy_error(&error),
                         error.to_string(),
-                    ),
-                    context_observation: None,
-                    provider_receipts: Vec::new(),
-                },
+                    );
+                    let publication = persist_legacy_publication(
+                        run,
+                        engine.config(),
+                        policy,
+                        scope,
+                        &evidence_binding,
+                        None,
+                        &[],
+                        &[],
+                        &[],
+                        publication,
+                    )
+                    .await;
+                    VddResponseFinalization {
+                        publication,
+                        context_observation: None,
+                        provider_receipts: Vec::new(),
+                    }
+                }
             }
         }
         VddFinalizationRequirement::Disabled => unreachable!("disabled policy returned above"),
     }
 }
 
-fn finalize_blocking_text_review(
-    run: &ToolRunContext,
+async fn finalize_blocking_text_review(
+    config: &VddConfig,
+    run: &Arc<ToolRunContext>,
     policy: &VddFinalizationPolicy,
     scope: &str,
     fallback_candidate: String,
@@ -611,6 +767,7 @@ fn finalize_blocking_text_review(
             };
         }
     };
+    let evidence_binding = binding.clone();
     let publication = if !session.converged {
         non_pass(
             policy,
@@ -619,6 +776,7 @@ fn finalize_blocking_text_review(
             VddNonPassOutcome::Unconverged,
             session
                 .termination_reason
+                .clone()
                 .unwrap_or_else(|| "blocking VDD review ended without convergence".to_string()),
         )
     } else if !blocking_session_has_clean_final_iteration(&session) {
@@ -637,10 +795,90 @@ fn finalize_blocking_text_review(
             "blocking VDD review converged on a clean final iteration".to_string(),
         )
     };
+    let publication = persist_legacy_publication(
+        run,
+        config,
+        policy,
+        scope,
+        &evidence_binding,
+        Some(&session),
+        &[],
+        &[],
+        &provider_receipts,
+        publication,
+    )
+    .await;
     VddResponseFinalization {
         publication,
         context_observation: None,
         provider_receipts,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_legacy_publication<T>(
+    run: &Arc<ToolRunContext>,
+    config: &VddConfig,
+    policy: &VddFinalizationPolicy,
+    scope: &str,
+    binding: &VddCandidateBinding,
+    session: Option<&super::VddSession>,
+    advisory_findings: &[super::Finding],
+    advisory_static: &[super::StaticAnalysisResult],
+    provider_receipts: &[super::VddProviderCallReceipt],
+    publication: VddPublication<T>,
+) -> VddPublication<T> {
+    let outcome = publication.outcome();
+    match super::sink::persist_legacy_finalization(
+        run,
+        config,
+        policy.requirement,
+        policy.evidence_digest(config),
+        scope,
+        binding,
+        outcome,
+        session,
+        advisory_findings,
+        advisory_static,
+        provider_receipts,
+    )
+    .await
+    {
+        Ok(Some(receipt)) => {
+            tracing::info!(
+                attempt_id = %receipt.attempt_id,
+                ledger_revision = receipt.ledger_revision,
+                crosslink_issues = receipt.issue_ids.len(),
+                "VDD finalization evidence committed"
+            );
+            publication
+        }
+        Ok(None) => publication,
+        Err(error) => {
+            tracing::error!(error = %error, "VDD finalization evidence was not committed");
+            evidence_failure_publication(policy, publication, &error.to_string())
+        }
+    }
+}
+
+fn evidence_failure_publication<T>(
+    policy: &VddFinalizationPolicy,
+    publication: VddPublication<T>,
+    error: &str,
+) -> VddPublication<T> {
+    match publication {
+        VddPublication::Publish(candidate)
+            if policy.requirement == VddFinalizationRequirement::Required =>
+        {
+            non_pass(
+                policy,
+                candidate.candidate,
+                candidate.binding,
+                VddNonPassOutcome::VerifierError,
+                format!("required VDD evidence persistence failed: {error}"),
+            )
+        }
+        other => other,
     }
 }
 
@@ -661,8 +899,9 @@ pub fn blocking_session_has_clean_final_iteration(session: &super::VddSession) -
 /// This compatibility adapter lets buffered frontends retain their transport
 /// flow while sharing the same publication semantics.
 #[allow(clippy::too_many_lines)] // Every legacy result arm consumes the candidate into one publication decision.
-pub fn finalize_review_result(
-    run: &ToolRunContext,
+pub async fn finalize_review_result(
+    run: &Arc<ToolRunContext>,
+    config: &VddConfig,
     policy: &VddFinalizationPolicy,
     original_candidate: Vec<u8>,
     scope: &str,
@@ -695,14 +934,29 @@ pub fn finalize_review_result(
         };
     }
     if run.runtime().cancellation().is_cancelled() {
+        let evidence_binding = binding.clone();
+        let publication = non_pass(
+            policy,
+            original_candidate,
+            binding,
+            VddNonPassOutcome::Cancelled,
+            "candidate finalization was cancelled".to_string(),
+        );
+        let publication = persist_legacy_publication(
+            run,
+            config,
+            policy,
+            scope,
+            &evidence_binding,
+            None,
+            &[],
+            &[],
+            &[],
+            publication,
+        )
+        .await;
         return VddResponseFinalization {
-            publication: non_pass(
-                policy,
-                original_candidate,
-                binding,
-                VddNonPassOutcome::Cancelled,
-                "candidate finalization was cancelled".to_string(),
-            ),
+            publication,
             context_observation: None,
             provider_receipts: Vec::new(),
         };
@@ -712,6 +966,7 @@ pub fn finalize_review_result(
         Ok(VddResult::Advisory(review)) => {
             let context_observation = review.context_observation;
             let provider_receipts = review.provider_receipts;
+            let evidence_binding = binding.clone();
             let publication = finalize_advisory_review(
                 policy,
                 original_candidate,
@@ -719,6 +974,19 @@ pub fn finalize_review_result(
                 &review.findings,
                 &review.static_analysis,
             );
+            let publication = persist_legacy_publication(
+                run,
+                config,
+                policy,
+                scope,
+                &evidence_binding,
+                None,
+                &review.findings,
+                &review.static_analysis,
+                &provider_receipts,
+                publication,
+            )
+            .await;
             VddResponseFinalization {
                 publication,
                 context_observation,
@@ -727,86 +995,139 @@ pub fn finalize_review_result(
         }
         Ok(VddResult::Blocking(blocking)) => {
             let provider_receipts = blocking.provider_receipts;
-            if !blocking.session.converged {
-                return VddResponseFinalization {
-                    publication: non_pass(
+            let (publication, evidence_binding) = if !blocking.session.converged {
+                (
+                    non_pass(
                         policy,
                         original_candidate,
-                        binding,
+                        binding.clone(),
                         VddNonPassOutcome::Unconverged,
-                        blocking.session.termination_reason.unwrap_or_else(|| {
-                            "blocking VDD review ended without convergence".to_string()
-                        }),
+                        blocking
+                            .session
+                            .termination_reason
+                            .clone()
+                            .unwrap_or_else(|| {
+                                "blocking VDD review ended without convergence".to_string()
+                            }),
                     ),
-                    context_observation: None,
-                    provider_receipts,
-                };
-            }
-            if !blocking_session_has_clean_final_iteration(&blocking.session) {
-                return VddResponseFinalization {
-                    publication: non_pass(
+                    binding,
+                )
+            } else if !blocking_session_has_clean_final_iteration(&blocking.session) {
+                (
+                    non_pass(
                         policy,
                         original_candidate,
-                        binding,
+                        binding.clone(),
                         VddNonPassOutcome::Fail,
                         "blocking VDD convergence lacked a clean final evidence iteration"
                             .to_string(),
                     ),
-                    context_observation: None,
-                    provider_receipts,
-                };
-            }
-            match serde_json::to_vec(&blocking.final_response) {
-                Ok(candidate) => {
-                    let reviewed_binding =
-                        VddCandidateBinding::for_response(run, scope, &candidate)
-                            .unwrap_or_else(|_| binding.clone());
-                    VddResponseFinalization {
-                        publication: publish(
-                            candidate,
+                    binding,
+                )
+            } else {
+                match serde_json::to_vec(&blocking.final_response) {
+                    Ok(candidate) => {
+                        let reviewed_binding =
+                            VddCandidateBinding::for_response(run, scope, &candidate)
+                                .unwrap_or_else(|_| binding.clone());
+                        (
+                            publish(
+                                candidate,
+                                reviewed_binding.clone(),
+                                VddFinalizationOutcome::Pass,
+                                "blocking VDD review converged on a clean final iteration"
+                                    .to_string(),
+                            ),
                             reviewed_binding,
-                            VddFinalizationOutcome::Pass,
-                            "blocking VDD review converged on a clean final iteration".to_string(),
-                        ),
-                        context_observation: None,
-                        provider_receipts,
+                        )
                     }
-                }
-                Err(error) => VddResponseFinalization {
-                    publication: non_pass(
-                        policy,
-                        original_candidate,
+                    Err(error) => (
+                        non_pass(
+                            policy,
+                            original_candidate,
+                            binding.clone(),
+                            VddNonPassOutcome::VerifierError,
+                            format!("reviewed response could not be serialized: {error}"),
+                        ),
                         binding,
-                        VddNonPassOutcome::VerifierError,
-                        format!("reviewed response could not be serialized: {error}"),
                     ),
-                    context_observation: None,
-                    provider_receipts,
-                },
+                }
+            };
+            let publication = persist_legacy_publication(
+                run,
+                config,
+                policy,
+                scope,
+                &evidence_binding,
+                Some(&blocking.session),
+                &[],
+                &[],
+                &provider_receipts,
+                publication,
+            )
+            .await;
+            VddResponseFinalization {
+                publication,
+                context_observation: None,
+                provider_receipts,
             }
         }
-        Ok(VddResult::Skipped(reason)) => VddResponseFinalization {
-            publication: non_pass(
+        Ok(VddResult::Skipped(reason)) => {
+            let evidence_binding = binding.clone();
+            let publication = non_pass(
                 policy,
                 original_candidate,
                 binding,
                 VddNonPassOutcome::Unavailable,
                 reason,
-            ),
-            context_observation: None,
-            provider_receipts: Vec::new(),
-        },
-        Err(error) => VddResponseFinalization {
-            publication: non_pass(
+            );
+            let publication = persist_legacy_publication(
+                run,
+                config,
+                policy,
+                scope,
+                &evidence_binding,
+                None,
+                &[],
+                &[],
+                &[],
+                publication,
+            )
+            .await;
+            VddResponseFinalization {
+                publication,
+                context_observation: None,
+                provider_receipts: Vec::new(),
+            }
+        }
+        Err(error) => {
+            let evidence_binding = binding.clone();
+            let publication = non_pass(
                 policy,
                 original_candidate,
                 binding,
                 classify_legacy_error(&error),
                 error.to_string(),
-            ),
-            context_observation: None,
-            provider_receipts: Vec::new(),
-        },
+            );
+            let publication = persist_legacy_publication(
+                run,
+                config,
+                policy,
+                scope,
+                &evidence_binding,
+                None,
+                &[],
+                &[],
+                &[],
+                publication,
+            )
+            .await;
+            VddResponseFinalization {
+                publication,
+                context_observation: None,
+                provider_receipts: Vec::new(),
+            }
+        }
     }
 }
 
@@ -900,16 +1221,25 @@ pub async fn finalize_worker_candidate_with_receipt(
         }
     };
     if run.runtime().cancellation().is_cancelled() {
-        return worker_finalization(
-            non_pass(
-                policy,
-                candidate,
-                binding,
-                VddNonPassOutcome::Cancelled,
-                "worker finalization was cancelled during VDD review".to_string(),
-            ),
-            Some(receipt_json),
+        let evidence_binding = binding.clone();
+        let publication = non_pass(
+            policy,
+            candidate,
+            binding,
+            VddNonPassOutcome::Cancelled,
+            "worker finalization was cancelled during VDD review".to_string(),
         );
+        return worker_finalization_with_evidence(
+            engine,
+            run,
+            policy,
+            request,
+            &receipt,
+            receipt_json,
+            &evidence_binding,
+            publication,
+        )
+        .await;
     }
     let live_generation = request
         .worker_result()
@@ -924,23 +1254,84 @@ pub async fn finalize_worker_candidate_with_receipt(
     let live_generation = match live_generation {
         Ok(generation) => generation,
         Err(detail) => {
-            return worker_finalization(
-                non_pass(
-                    policy,
-                    candidate,
-                    binding,
-                    VddNonPassOutcome::Unavailable,
-                    detail,
-                ),
-                Some(receipt_json),
+            let evidence_binding = binding.clone();
+            let publication = non_pass(
+                policy,
+                candidate,
+                binding,
+                VddNonPassOutcome::Unavailable,
+                detail,
             );
+            return worker_finalization_with_evidence(
+                engine,
+                run,
+                policy,
+                request,
+                &receipt,
+                receipt_json,
+                &evidence_binding,
+                publication,
+            )
+            .await;
         }
     };
+    let evidence_binding = binding.clone();
     let publication =
         match classify_canonical_receipt(request, &binding, &live_generation, &receipt) {
             Ok(detail) => publish(candidate, binding, VddFinalizationOutcome::Pass, detail),
             Err((outcome, detail)) => non_pass(policy, candidate, binding, outcome, detail),
         };
+    worker_finalization_with_evidence(
+        engine,
+        run,
+        policy,
+        request,
+        &receipt,
+        receipt_json,
+        &evidence_binding,
+        publication,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn worker_finalization_with_evidence<T>(
+    engine: &VddEngine,
+    run: &Arc<ToolRunContext>,
+    policy: &VddFinalizationPolicy,
+    request: &CanonicalVddRequest,
+    receipt: &CanonicalVddReceipt,
+    receipt_json: serde_json::Value,
+    evidence_binding: &VddCandidateBinding,
+    publication: VddPublication<T>,
+) -> VddWorkerFinalization<T> {
+    let publication = match super::sink::persist_worker_finalization(
+        run,
+        engine.config(),
+        policy.requirement,
+        policy.evidence_digest(engine.config()),
+        request,
+        evidence_binding,
+        publication.outcome(),
+        receipt,
+    )
+    .await
+    {
+        Ok(Some(evidence)) => {
+            tracing::info!(
+                attempt_id = %evidence.attempt_id,
+                ledger_revision = evidence.ledger_revision,
+                crosslink_issues = evidence.issue_ids.len(),
+                "canonical VDD evidence committed"
+            );
+            publication
+        }
+        Ok(None) => publication,
+        Err(error) => {
+            tracing::error!(error = %error, "canonical VDD evidence was not committed");
+            evidence_failure_publication(policy, publication, &error.to_string())
+        }
+    };
     worker_finalization(publication, Some(receipt_json))
 }
 
@@ -1465,11 +1856,17 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn blocking_text_publication_binds_and_returns_the_reviewed_revision() {
+    #[tokio::test]
+    async fn blocking_text_publication_binds_and_returns_the_reviewed_revision() {
         let directory = tempfile::tempdir().expect("run directory");
         let run = crate::tools::security::test_run_context_for(directory.path());
+        let config = VddConfig {
+            enabled: true,
+            mode: VddMode::Blocking,
+            ..VddConfig::default()
+        };
         let result = finalize_blocking_text_review(
+            &config,
             &run,
             &VddFinalizationPolicy::required(),
             "test-scope",
@@ -1480,7 +1877,8 @@ mod tests {
                 crosslink_issues: Vec::new(),
                 provider_receipts: Vec::new(),
             },
-        );
+        )
+        .await;
         let VddPublication::Publish(published) = result.publication else {
             panic!("clean blocking result must publish");
         };
@@ -1490,6 +1888,18 @@ mod tests {
             ContentDigest::sha256(b"reviewed candidate")
         );
         assert_eq!(published.outcome(), VddFinalizationOutcome::Pass);
+        let evidence =
+            super::super::VddEvidenceStore::open_for_run(&run, &config).expect("evidence store");
+        let attempt_ids = evidence.attempt_ids().expect("attempt identities");
+        assert_eq!(attempt_ids.len(), 1);
+        let attempt = evidence
+            .export_attempt(&attempt_ids[0])
+            .expect("persisted finalization");
+        assert_eq!(attempt.outcome, VddFinalizationOutcome::Pass);
+        assert_eq!(
+            attempt.candidate.digest(),
+            ContentDigest::sha256(b"reviewed candidate")
+        );
     }
 
     #[test]

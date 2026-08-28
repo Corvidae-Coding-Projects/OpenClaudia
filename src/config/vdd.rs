@@ -10,6 +10,7 @@ const MAX_VDD_REVIEW_TIMEOUT_SECONDS: u64 = 10 * 60;
 const MAX_VDD_STATIC_COMMANDS: usize = 16;
 const MAX_VDD_STATIC_COMMAND_BYTES: usize = 4 * 1024;
 const MAX_VDD_STATIC_TIMEOUT_SECONDS: u64 = 10 * 60;
+const MAX_VDD_EVIDENCE_RETENTION_DAYS: u64 = 10 * 365;
 
 /// VDD operating mode
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -201,17 +202,27 @@ impl VddStaticAnalysis {
     pub(crate) const MAX_COMMANDS: usize = MAX_VDD_STATIC_COMMANDS;
 }
 
-/// VDD session persistence and logging
+/// VDD evidence persistence, issue projection, and diagnostic logging.
 #[derive(Debug, Deserialize, Clone)]
 pub struct VddTracking {
-    /// Persist VDD session data to disk
+    /// Persist redacted, resumable VDD evidence to disk.
     #[serde(default = "default_true")]
     pub persist: bool,
-    /// Directory for VDD session data
+    /// Directory for the descriptor-safe evidence ledger.
     #[serde(default = "default_vdd_path")]
     pub path: PathBuf,
-    /// Log a bounded adversary response preview (verbose)
+    /// Project checked unresolved findings into Crosslink issues.
+    ///
+    /// This is host configuration, never a model-selected action. Promotion
+    /// requires persistence so retries can reconcile partial external state.
     #[serde(default = "default_true")]
+    pub promote_verified_findings: bool,
+    /// Days before retained prose is redacted while bindings and status
+    /// history remain as tombstone evidence.
+    #[serde(default = "default_evidence_retention_days")]
+    pub retention_days: u64,
+    /// Log a bounded adversary response preview (verbose and sensitive).
+    #[serde(default)]
     pub log_adversary_responses: bool,
 }
 
@@ -219,12 +230,18 @@ fn default_vdd_path() -> PathBuf {
     PathBuf::from(".openclaudia/vdd")
 }
 
+const fn default_evidence_retention_days() -> u64 {
+    30
+}
+
 impl Default for VddTracking {
     fn default() -> Self {
         Self {
             persist: true,
             path: default_vdd_path(),
-            log_adversary_responses: true,
+            promote_verified_findings: true,
+            retention_days: default_evidence_retention_days(),
+            log_adversary_responses: false,
         }
     }
 }
@@ -267,6 +284,21 @@ impl VddConfig {
     }
 
     fn validate_non_provider_settings(&self) -> Result<(), String> {
+        if self.tracking.persist && self.tracking.path.as_os_str().is_empty() {
+            return Err("VDD evidence persistence path cannot be empty".to_string());
+        }
+        if self.tracking.promote_verified_findings && !self.tracking.persist {
+            return Err(
+                "VDD Crosslink promotion requires evidence persistence for retry-safe reconciliation"
+                    .to_string(),
+            );
+        }
+        if self.tracking.retention_days > MAX_VDD_EVIDENCE_RETENTION_DAYS {
+            return Err(format!(
+                "VDD evidence retention cannot exceed {MAX_VDD_EVIDENCE_RETENTION_DAYS} days, got {}",
+                self.tracking.retention_days
+            ));
+        }
         if !self.thresholds.false_positive_rate.is_finite()
             || self.thresholds.false_positive_rate < 0.0
             || self.thresholds.false_positive_rate > 1.0
@@ -397,6 +429,8 @@ mod tests {
             "tracking": {
                 "persist": true,
                 "path": "/custom/vdd",
+                "promote_verified_findings": false,
+                "retention_days": 90,
                 "log_adversary_responses": false
             }
         }"#;
@@ -413,6 +447,8 @@ mod tests {
         assert_eq!(config.thresholds.min_iterations, 3);
         assert_eq!(config.static_analysis.commands.len(), 2);
         assert_eq!(config.static_analysis.timeout_seconds, 180);
+        assert!(!config.tracking.promote_verified_findings);
+        assert_eq!(config.tracking.retention_days, 90);
         assert!(!config.tracking.log_adversary_responses);
     }
 
@@ -477,6 +513,19 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate("anthropic").is_ok());
+    }
+
+    #[test]
+    fn test_vdd_validate_rejects_empty_evidence_path() {
+        let mut config = VddConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        config.tracking.path = PathBuf::new();
+        assert!(config
+            .validate("anthropic")
+            .expect_err("empty evidence root must fail")
+            .contains("cannot be empty"));
     }
 
     #[test]

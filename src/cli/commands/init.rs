@@ -221,7 +221,9 @@ session:
 #   tracking:
 #     persist: true
 #     path: .openclaudia/vdd
-#     log_adversary_responses: true
+#     promote_verified_findings: true  # checked unresolved findings only
+#     retention_days: 30               # prose redacts; bindings/history remain
+#     log_adversary_responses: false   # sensitive; opt in only for debugging
 
 # Guardrails - Constrain agent behavior and monitor changes
 # guardrails:

@@ -20,7 +20,6 @@ use crate::vdd::finding::{Finding, FindingStatus};
 use crate::vdd::helpers::{extract_user_task, findings_context_observation};
 use crate::vdd::prompts::{build_adversary_request, build_revision_request};
 use crate::vdd::review::{AdversaryReview, VddIteration, VddSession};
-use crate::vdd::sink::{create_crosslink_issues, persist_session};
 use crate::vdd::static_analysis::{run_shell_command, StaticAnalysisResult};
 use crate::vdd::transport::{send_to_adversary, send_to_builder, VddProviderAuth, VddReviewBudget};
 use crate::vdd::triage::{
@@ -109,6 +108,10 @@ struct BlockingLoopOutput {
 }
 
 impl VddEngine {
+    pub(crate) const fn config(&self) -> &VddConfig {
+        &self.config
+    }
+
     #[must_use]
     pub fn new(config: &VddConfig, app_config: &AppConfig, client: Client) -> Self {
         Self {
@@ -567,13 +570,14 @@ impl VddEngine {
         }
 
         self.finalize_unconverged_session(&mut session);
-        let crosslink_issues = self.create_issues_and_persist(run, &session).await;
 
         Ok(BlockingLoopOutput {
             final_text: current_builder_text,
             final_response: current_builder_response,
             session,
-            crosslink_issues,
+            // Issue projection is intentionally deferred until host-owned
+            // finalization has bound the exact candidate and terminal verdict.
+            crosslink_issues: Vec::new(),
             provider_receipts: budget.provider_receipts(),
         })
     }
@@ -777,43 +781,6 @@ impl VddEngine {
         session.record_iteration(vdd_iteration);
 
         Ok((genuine_count, fp_count, findings))
-    }
-
-    /// Create Chainlink issues for the session's genuine findings and
-    /// persist the session if configured. Extracted from
-    /// [`Self::blocking_loop`] purely to keep that function under the
-    /// project's 100-line limit; behaviour is unchanged.
-    async fn create_issues_and_persist(
-        &self,
-        run: &std::sync::Arc<crate::tools::ToolRunContext>,
-        session: &VddSession,
-    ) -> Vec<String> {
-        let all_genuine: Vec<&Finding> = session
-            .iterations
-            .iter()
-            .flat_map(|i| &i.adversary_review.findings)
-            .filter(|f| f.status == FindingStatus::Genuine)
-            .collect();
-
-        let crosslink_issues = if all_genuine.is_empty() {
-            Vec::new()
-        } else {
-            match create_crosslink_issues(run, &all_genuine).await {
-                Ok(ids) => ids,
-                Err(e) => {
-                    warn!("VDD: Crosslink issue creation failed: {}", e);
-                    Vec::new()
-                }
-            }
-        };
-
-        if self.config.tracking.persist {
-            if let Err(e) = persist_session(&self.config.tracking.path, session) {
-                warn!("VDD: Session persistence failed: {}", e);
-            }
-        }
-
-        crosslink_issues
     }
 
     /// Run configured static analysis commands.

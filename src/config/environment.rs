@@ -243,6 +243,8 @@ enum ConfigField {
     VddStaticAnalysisTimeoutSeconds,
     VddTrackingPersist,
     VddTrackingPath,
+    VddTrackingPromoteVerifiedFindings,
+    VddTrackingRetentionDays,
     VddTrackingLogAdversaryResponses,
     GuardrailsBlastRadiusEnabled,
     GuardrailsBlastRadiusMode,
@@ -589,6 +591,24 @@ const APP_FIELDS: &[FieldDefinition] = &[
         "OPENCLAUDIA_VDD_TRACKING_LOG_ADVERSARY_RESPONSES",
         Boolean,
         Sensitive,
+        true
+    ),
+    field!(
+        ConfigField::VddTrackingPromoteVerifiedFindings,
+        "vdd.tracking.promote_verified_findings",
+        "OPENCLAUDIA_VDD__TRACKING__PROMOTE_VERIFIED_FINDINGS",
+        "OPENCLAUDIA_VDD_TRACKING_PROMOTE_VERIFIED_FINDINGS",
+        Boolean,
+        Public,
+        true
+    ),
+    field!(
+        ConfigField::VddTrackingRetentionDays,
+        "vdd.tracking.retention_days",
+        "OPENCLAUDIA_VDD__TRACKING__RETENTION_DAYS",
+        "OPENCLAUDIA_VDD_TRACKING_RETENTION_DAYS",
+        U64,
+        Public,
         true
     ),
     field!(
@@ -1837,6 +1857,12 @@ fn apply_value(
         }
         ConfigField::VddTrackingPersist => config.vdd.tracking.persist = expect_value!(Boolean),
         ConfigField::VddTrackingPath => config.vdd.tracking.path = expect_value!(String).into(),
+        ConfigField::VddTrackingPromoteVerifiedFindings => {
+            config.vdd.tracking.promote_verified_findings = expect_value!(Boolean);
+        }
+        ConfigField::VddTrackingRetentionDays => {
+            config.vdd.tracking.retention_days = expect_value!(U64);
+        }
         ConfigField::VddTrackingLogAdversaryResponses => {
             config.vdd.tracking.log_adversary_responses = expect_value!(Boolean);
         }
@@ -2503,6 +2529,7 @@ mod tests {
             | ConfigField::SessionTokenTrackingMaxOutputTokens
             | ConfigField::VddAdversaryMaxTokens
             | ConfigField::VddThresholdsMaxIterations
+            | ConfigField::VddTrackingRetentionDays
             | ConfigField::GuardrailsDiffMonitorMaxLinesChanged
             | ConfigField::GuardrailsDiffMonitorMaxFilesChanged
             | ConfigField::Provider {
@@ -2529,6 +2556,7 @@ mod tests {
             | ConfigField::VddStaticAnalysisEnabled
             | ConfigField::VddStaticAnalysisAutoDetect
             | ConfigField::VddTrackingPersist
+            | ConfigField::VddTrackingPromoteVerifiedFindings
             | ConfigField::VddTrackingLogAdversaryResponses
             | ConfigField::PermissionsEnabled
             | ConfigField::Provider {
@@ -2654,6 +2682,12 @@ mod tests {
                     config.vdd.tracking.path,
                     std::path::Path::new("typed-env-value")
                 );
+            }
+            ConfigField::VddTrackingPromoteVerifiedFindings => {
+                assert!(!config.vdd.tracking.promote_verified_findings);
+            }
+            ConfigField::VddTrackingRetentionDays => {
+                assert_eq!(config.vdd.tracking.retention_days, 7);
             }
             ConfigField::VddTrackingLogAdversaryResponses => {
                 assert!(!config.vdd.tracking.log_adversary_responses);

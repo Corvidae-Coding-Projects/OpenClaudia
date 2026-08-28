@@ -1911,11 +1911,13 @@ async fn apply_vdd_review(
     );
     let finalization = crate::vdd::finalize_review_result(
         &state.run_context,
+        &state.config.vdd,
         &policy,
         response_bytes.to_vec(),
         &scope,
         vdd_result,
-    );
+    )
+    .await;
     let (publication, observation, provider_receipts) = finalization.into_parts_with_receipts();
     if let Some(observation) = observation {
         state

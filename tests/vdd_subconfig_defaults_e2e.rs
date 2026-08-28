@@ -168,9 +168,16 @@ fn vdd_tracking_default_path_is_openclaudia_vdd() {
 }
 
 #[test]
-fn vdd_tracking_default_log_adversary_responses_is_true() {
+fn vdd_tracking_default_log_adversary_responses_is_false() {
     let cfg = VddTracking::default();
-    assert!(cfg.log_adversary_responses);
+    assert!(!cfg.log_adversary_responses);
+}
+
+#[test]
+fn vdd_tracking_defaults_to_retry_safe_verified_finding_projection() {
+    let cfg = VddTracking::default();
+    assert!(cfg.promote_verified_findings);
+    assert_eq!(cfg.retention_days, 30);
 }
 
 #[test]
@@ -193,6 +200,11 @@ fn vdd_tracking_clone_preserves_all_fields() {
     let cloned = original.clone();
     assert_eq!(cloned.persist, original.persist);
     assert_eq!(cloned.path, original.path);
+    assert_eq!(
+        cloned.promote_verified_findings,
+        original.promote_verified_findings
+    );
+    assert_eq!(cloned.retention_days, original.retention_days);
     assert_eq!(
         cloned.log_adversary_responses,
         original.log_adversary_responses

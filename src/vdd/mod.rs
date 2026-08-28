@@ -17,7 +17,7 @@
 //! - [`transport`] — HTTP plumbing to adversary + builder providers
 //! - [`prompts`] — system prompts and request-template builders
 //! - [`triage`] — three-layer finding triage (duplicate, pattern, AI verification)
-//! - [`sink`] — crosslink issue creation + on-disk session persistence
+//! - [`sink`] — redacted transactional evidence + Crosslink reconciliation
 //! - [`helpers`] — small utilities (truncation, task extraction, advisory formatting)
 //! - [`error`] — `VddError` and result enums
 //! - [`finding`], [`review`], [`parsing`], [`static_analysis`], [`confabulation`] —
@@ -64,6 +64,11 @@ pub use finalization::{
 pub use finding::{Finding, FindingStatus, Severity};
 pub use helpers::findings_context_observation;
 pub use review::{AdversaryReview, VddIteration, VddSession};
+pub use sink::{
+    VddDeterministicEvidence, VddEvidenceAttempt, VddEvidenceCitation, VddEvidenceError,
+    VddEvidenceLedger, VddEvidenceReceipt, VddEvidenceSensitivity, VddEvidenceStore,
+    VddFindingEvent, VddFindingEvidence, VddFindingState, VddModelEvidence,
+};
 pub use static_analysis::StaticAnalysisResult;
 pub use transport::VddProviderAuth;
 

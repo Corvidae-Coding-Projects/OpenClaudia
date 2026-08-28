@@ -3170,6 +3170,7 @@ mod vdd_tests {
                 },
                 tracking: VddTracking {
                     persist: false,
+                    promote_verified_findings: false,
                     log_adversary_responses: true,
                     ..Default::default()
                 },

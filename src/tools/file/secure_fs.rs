@@ -195,6 +195,47 @@ pub(super) fn create_host_control_directories(
     create_parent_directories(context, &synthetic_leaf, CapabilityDomain::HostControl)
 }
 
+/// Create or open one host-control directory through the pinned project
+/// capability, then make the exact directory owner-private.
+#[cfg(unix)]
+pub fn prepare_private_host_control_directory(
+    context: &ToolRunContext,
+    path: &Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    create_host_control_directories(context, path)?;
+    let directory = open_beneath(
+        context,
+        path,
+        true,
+        libc_flags::O_RDONLY | libc_flags::O_DIRECTORY,
+        0,
+        CapabilityDomain::HostControl,
+    )?;
+    require_directory(&directory, path)?;
+    let metadata = directory
+        .metadata()
+        .map_err(|error| format!("Failed to inspect '{}': {error}", path.display()))?;
+    // SAFETY: `geteuid` has no preconditions and retains no pointer.
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_uid {
+        return Err(format!(
+            "Host-control directory '{}' is not owned by the current user",
+            path.display()
+        ));
+    }
+    directory
+        .set_permissions(std::fs::Permissions::from_mode(0o700))
+        .map_err(|error| {
+            format!(
+                "Failed to make host-control directory '{}' private: {error}",
+                path.display()
+            )
+        })?;
+    Ok(())
+}
+
 /// A directory pinned to the kernel object reached through a capability root.
 pub(super) struct SecureDirectory {
     context: Arc<ToolRunContext>,

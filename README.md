@@ -237,6 +237,8 @@ environment.
 | `proxy.port` | `OPENCLAUDIA_PROXY__PORT` | unsigned 16-bit integer / public |
 | `session.timeout_minutes` | `OPENCLAUDIA_SESSION__TIMEOUT_MINUTES` | unsigned integer / public |
 | `session.persist_path` | `OPENCLAUDIA_SESSION__PERSIST_PATH` | non-empty path string / sensitive |
+| `vdd.tracking.promote_verified_findings` | `OPENCLAUDIA_VDD__TRACKING__PROMOTE_VERIFIED_FINDINGS` | `true` or `false` / external-mutation policy |
+| `vdd.tracking.retention_days` | `OPENCLAUDIA_VDD__TRACKING__RETENTION_DAYS` | bounded unsigned integer / public |
 | `vdd.tracking.log_adversary_responses` | `OPENCLAUDIA_VDD__TRACKING__LOG_ADVERSARY_RESPONSES` | `true` or `false` / sensitive |
 | `providers.openai-compatible.base_url` | `OPENCLAUDIA_PROVIDERS__OPENAI_COMPATIBLE__BASE_URL` | non-empty URL string / sensitive |
 | `providers.openai-compatible.api_key` | `OPENCLAUDIA_PROVIDERS__OPENAI_COMPATIBLE__API_KEY` | validated API key / secret |
