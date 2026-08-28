@@ -1,6 +1,6 @@
 {
   "next_display_id": 1199,
-  "next_comment_id": 1893,
+  "next_comment_id": 1894,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -27696,7 +27696,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-28T09:27:29.083178666Z",
-      "updated_at": "2026-08-28T09:31:16.163339940Z",
+      "updated_at": "2026-08-28T11:11:29.678636298Z",
       "labels": [
         "remediation"
       ],
@@ -27724,6 +27724,15 @@
           "driver_key_fingerprint": "SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAo8QGkcnEq3kzVC+D1yVwaSgmFy+HpeHTqRWeVGcCzHPr/TB+5KXl4L8vmtBzcpDtdOaPB2WNGO+G+ebAxuilCg=="
+        },
+        "ad2d4aa6-3268-4bf2-a5e6-6e037ab385a1": {
+          "display_id": 1893,
+          "author": "6Vw9",
+          "content": "Implemented the host-owned blocking VDD finalization gate. Required text, proxy, TUI, ACP, print, and worker publication now withhold non-passing, stale, unavailable, cancelled, or unconverged candidates; exact candidate generation/digest and canonical worker receipts are bound before promotion. Parent review corrected dirty statistical convergence, live TUI leakage, prior-candidate omission during revision, and background proposal promotion. Verification: Rust 1.98 fmt/check/strict Clippy green; focused VDD tests green; complete locked all-target/all-feature suite green (3051 library tests plus all integrations/examples); repository policy and cargo-deny green.",
+          "created_at": "2026-08-28T11:11:29.667123019Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAAnMMrSikl7jcak1KscT2vCHcuu0PceRSAoTnqSihHbTwZTTNYxxSQyvO299JrdIP5+ZSHAy5WlUsXjsf/+0jBQ=="
         },
         "d9ea4589-0cbc-4d5f-b475-994a9517ba90": {
           "display_id": 1890,
@@ -47884,11 +47893,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2255,
       "timestamp": "2026-08-28T09:31:16.163339940Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2256,
+      "timestamp": "2026-08-28T11:11:29.678636298Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-28T09:31:16.163339940Z",
+    "timestamp": "2026-08-28T11:11:29.678636298Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2255
+    "agent_seq": 2256
   }
 }
