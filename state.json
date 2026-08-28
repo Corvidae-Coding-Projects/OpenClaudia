@@ -1,6 +1,6 @@
 {
   "next_display_id": 1194,
-  "next_comment_id": 1873,
+  "next_comment_id": 1874,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -25896,7 +25896,7 @@
       "priority": "low",
       "created_by": "6Vw9",
       "created_at": "2026-08-28T02:44:22.598430507Z",
-      "updated_at": "2026-08-28T02:44:50.603787279Z",
+      "updated_at": "2026-08-28T02:46:22.095816947Z",
       "labels": [
         "investigation"
       ],
@@ -25912,6 +25912,15 @@
           "driver_key_fingerprint": "SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAo8QGkcnEq3kzVC+D1yVwaSgmFy+HpeHTqRWeVGcCzHPr/TB+5KXl4L8vmtBzcpDtdOaPB2WNGO+G+ebAxuilCg=="
+        },
+        "f331d25c-d9c7-41c3-9ee6-dd9b6372a117": {
+          "display_id": 1873,
+          "author": "6Vw9",
+          "content": "Confirmed .openclaudia/plugins/installed_plugins.json is 35-byte mode-0600 runtime state with schema version 2, zero plugins, and no disabled entries. It has never been tracked and no .gitignore rule covers it. The application treats a missing registry as empty; the file is rewritten atomically once it exists. Excluding it from bb4cedbc was deliberate because it contains no project capability and registry entries can contain machine-local absolute paths/timestamps. Prior wording 'intentionally excluded local registry' meant excluded from staging, not ignored by Git.",
+          "created_at": "2026-08-28T02:46:22.093446461Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAr5Am6ZkiehhmTMLRni8A8U/A31Au0t4ueBWBZklNZM/TQU7QDT2saZLR7gQgAnOiv/e7I86vLZMaXmjPau+BAg=="
         }
       }
     },
@@ -47376,11 +47385,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2209,
       "timestamp": "2026-08-28T02:44:50.603787279Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2210,
+      "timestamp": "2026-08-28T02:46:22.095816947Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-28T02:44:50.603787279Z",
+    "timestamp": "2026-08-28T02:46:22.095816947Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2209
+    "agent_seq": 2210
   }
 }
