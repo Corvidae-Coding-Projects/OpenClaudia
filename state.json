@@ -1,6 +1,6 @@
 {
   "next_display_id": 1193,
-  "next_comment_id": 1871,
+  "next_comment_id": 1872,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -14025,7 +14025,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T23:53:50.698988492Z",
-      "updated_at": "2026-08-28T01:38:06.867984856Z",
+      "updated_at": "2026-08-28T02:01:35.806359794Z",
       "labels": [
         "remediation"
       ],
@@ -14065,6 +14065,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAq2TnEUzKu98iALcNB566BRl2AVRxO4QCDuwjUBosYu7e/03vEPpxl8Q5C0yJqVTT7oF84BN6dZv1dpqYykXsAA=="
+        },
+        "ed8be3aa-6118-48cd-8387-a9535c5ea4f1": {
+          "display_id": 1871,
+          "author": "6Vw9",
+          "content": "Exact-head publication verified: draft PR #66 head bb4cedbc2bce6467b7a672e0a35d51a4019ff55f, GitHub Actions run 33133473037. All five jobs are green: repository-policy, Rust 1.98 MSRV including fuzz workspace, Linux format/check/strict Clippy/full serialized all-target all-feature suite/hermetic fuzz/two sandbox E2Es, Windows fail-closed contracts, and macOS fail-closed contracts. Wave-four coordination is complete.",
+          "created_at": "2026-08-28T02:01:35.803666549Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAGCf9hJd+T0q6K08nd0CRYY+R2Beml4MUnGt27LNd4NQMfUN91IuwHW0vx11kjBf9n4QXIkPKVW825Ad5Am6VAQ=="
         },
         "f933b041-d0ca-4f01-a253-2cc7847f7a1a": {
           "display_id": 1862,
@@ -47303,11 +47312,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2202,
       "timestamp": "2026-08-28T01:38:06.867984856Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2203,
+      "timestamp": "2026-08-28T02:01:35.806359794Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-28T01:38:06.867984856Z",
+    "timestamp": "2026-08-28T02:01:35.806359794Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2202
+    "agent_seq": 2203
   }
 }
