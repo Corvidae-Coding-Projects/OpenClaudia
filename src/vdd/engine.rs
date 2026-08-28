@@ -21,7 +21,9 @@ use crate::vdd::review::{AdversaryReview, VddIteration, VddSession};
 use crate::vdd::sink::{create_crosslink_issues, persist_session};
 use crate::vdd::static_analysis::{run_shell_command, StaticAnalysisResult};
 use crate::vdd::transport::{send_to_adversary, send_to_builder, VddProviderAuth};
-use crate::vdd::triage::{parse_findings, triage_findings, TriageContext};
+use crate::vdd::triage::{
+    parse_findings_detailed, triage_findings, ParseFindingsOutcome, TriageContext,
+};
 
 /// The core VDD engine that orchestrates adversarial review loops.
 pub struct VddEngine {
@@ -212,7 +214,7 @@ impl VddEngine {
         .await?;
 
         // Parse and triage findings (AI verifier uses builder's provider)
-        let mut findings = parse_findings(&adversary_text, 1);
+        let mut findings = parse_terminal_findings(&adversary_text, 1)?;
         let triage_ctx = TriageContext {
             run,
             client: &self.client,
@@ -605,7 +607,7 @@ impl VddEngine {
         .await?;
 
         // Step 2: Parse and triage findings (including AI verification)
-        let mut findings = parse_findings(&adversary_text, ctx.iteration);
+        let mut findings = parse_terminal_findings(&adversary_text, ctx.iteration)?;
         let triage_ctx = TriageContext {
             run: ctx.run,
             client: &self.client,
@@ -737,6 +739,22 @@ impl VddEngine {
     }
 }
 
+fn parse_terminal_findings(response: &str, iteration: u32) -> Result<Vec<Finding>, VddError> {
+    match parse_findings_detailed(response, iteration) {
+        ParseFindingsOutcome::NoFindings => Ok(Vec::new()),
+        ParseFindingsOutcome::Findings(findings) if findings.is_empty() => {
+            Err(VddError::ParseError(
+                "empty findings require an explicit NO_FINDINGS terminal assessment".to_string(),
+            ))
+        }
+        ParseFindingsOutcome::Findings(findings) => Ok(findings),
+        ParseFindingsOutcome::ParseError { kind } => Err(VddError::ParseError(format!(
+            "adversary returned {} instead of a terminal findings report",
+            kind.as_str()
+        ))),
+    }
+}
+
 /// Append false-positive identities from this iteration to the running
 /// list used by the next iteration's duplicate-detection layer.
 ///
@@ -756,6 +774,41 @@ mod tests {
     use super::*;
     use crate::providers::get_adapter;
     use serde_json::json;
+
+    #[test]
+    fn terminal_finding_parser_accepts_only_explicit_consistent_outcomes() {
+        let clean = r#"{"findings": [], "assessment": "NO_FINDINGS"}"#;
+        assert!(parse_terminal_findings(clean, 1)
+            .expect("explicit clean report")
+            .is_empty());
+
+        let defect = r#"{
+            "findings": [{"severity": "HIGH", "description": "reachable defect"}],
+            "assessment": "FINDINGS_PRESENT"
+        }"#;
+        assert_eq!(
+            parse_terminal_findings(defect, 1)
+                .expect("explicit defect report")
+                .len(),
+            1
+        );
+
+        for invalid in [
+            "",
+            "not json",
+            r#"{"findings": []}"#,
+            r#"{"findings": [], "assessment": "FINDINGS_PRESENT"}"#,
+            r#"{"findings": [{"description": "hidden defect"}], "assessment": "NO_FINDINGS"}"#,
+        ] {
+            assert!(
+                matches!(
+                    parse_terminal_findings(invalid, 1),
+                    Err(VddError::ParseError(_))
+                ),
+                "invalid terminal response was accepted: {invalid}"
+            );
+        }
+    }
 
     // ── Crosslink #483 + #487 ───────────────────────────────────────────────
     //

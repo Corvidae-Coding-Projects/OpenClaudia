@@ -42,8 +42,8 @@ pub(crate) use canonical::validate_canonical_verifier_model_output;
 pub use canonical::{
     CanonicalAcceptanceCriterion, CanonicalCriterionOutcome, CanonicalCriterionReport,
     CanonicalDeterministicReceipt, CanonicalFindingSeverity, CanonicalModelVerdict,
-    CanonicalSourceSnapshot, CanonicalVddPreflightError, CanonicalVddReceipt, CanonicalVddRequest,
-    CanonicalVddRequestParts, CanonicalVddTerminalReason, CanonicalVddVerdict,
+    CanonicalSourceRange, CanonicalSourceSnapshot, CanonicalVddPreflightError, CanonicalVddReceipt,
+    CanonicalVddRequest, CanonicalVddRequestParts, CanonicalVddTerminalReason, CanonicalVddVerdict,
     CanonicalVerifierFinding, CanonicalVerifierReport, DeterministicCheckOutcome, VddModelIdentity,
     VddPromotionAuthority,
 };

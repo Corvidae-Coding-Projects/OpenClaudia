@@ -1,15 +1,13 @@
 //! Response parsing utilities for VDD adversary output.
 //!
-//! Handles extraction of JSON from the adversary text (raw JSON, markdown
-//! code blocks, natural-language assessments) and severity parsing.
+//! Handles extraction of JSON from adversary text (raw JSON or Markdown code
+//! blocks) and severity parsing. Natural-language clean inference is rejected.
 //!
 //! Response-text and token-usage extraction used to live here as free
 //! functions but duplicated logic already owned by the
 //! [`crate::providers::ProviderAdapter`] trait — see crosslink #479. The
 //! free functions are gone; call `adapter.extract_response_text(..)` /
 //! `adapter.extract_token_usage(..)` instead.
-
-use super::review::AdversaryResponse;
 
 // ==========================================================================
 // JSON Extraction
@@ -90,26 +88,6 @@ pub(crate) fn extract_json_from_response(text: &str) -> Option<String> {
         .or_else(|| extract_after_fence_skip_lang(text))
         .or_else(|| extract_balanced_braces_after(text, r#"{"findings""#))
         .or_else(|| extract_first_to_last_brace(text))
-}
-
-/// Try to construct a valid `AdversaryResponse` from partial/malformed JSON
-pub(crate) fn try_parse_relaxed(text: &str) -> Option<AdversaryResponse> {
-    // Check for "NO_FINDINGS" or "no findings" anywhere in response
-    let lower = text.to_lowercase();
-    if lower.contains("no_findings")
-        || lower.contains("no findings")
-        || lower.contains("no issues")
-        || lower.contains("no vulnerabilities")
-        || lower.contains("code looks correct")
-        || lower.contains("looks good")
-    {
-        return Some(AdversaryResponse {
-            findings: Some(vec![]),
-            assessment: Some("NO_FINDINGS".to_string()),
-        });
-    }
-
-    None
 }
 
 // ==========================================================================

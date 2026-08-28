@@ -18,7 +18,7 @@ use crate::vdd::confabulation::{
 use crate::vdd::error::VddError;
 use crate::vdd::finding::{Finding, FindingStatus};
 use crate::vdd::helpers::truncate_output;
-use crate::vdd::parsing::{extract_json_from_response, parse_severity, try_parse_relaxed};
+use crate::vdd::parsing::{extract_json_from_response, parse_severity};
 use crate::vdd::prompts::VERIFIER_SYSTEM_PROMPT;
 use crate::vdd::review::AdversaryResponse;
 use crate::vdd::transport::send_to_builder_for_verification;
@@ -37,9 +37,9 @@ use crate::vdd::transport::send_to_builder_for_verification;
 pub enum ParseFindingsOutcome {
     /// JSON parsed and the adversary explicitly reported `NO_FINDINGS`.
     NoFindings,
-    /// JSON parsed and produced zero or more findings.
+    /// JSON parsed and explicitly reported one or more findings.
     Findings(Vec<Finding>),
-    /// We could not parse the response as JSON (or relaxed-text). The
+    /// We could not parse the response as a terminal JSON report. The
     /// raw response is intentionally NOT carried in the variant — the
     /// caller has already been logged a truncated preview by the parser
     /// and we don't want a giant unparseable blob travelling through
@@ -54,8 +54,7 @@ pub enum ParseFindingsOutcome {
 /// migration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseErrorKind {
-    /// The response was not JSON in any of the three forms (raw, fenced
-    /// code block, or relaxed natural-language).
+    /// The response was not JSON in either accepted form (raw or fenced).
     NotJson,
     /// The response was syntactically JSON but did not match the expected
     /// adversary-response schema.
@@ -81,19 +80,42 @@ fn validate_adversary_response_shape(value: &Value) -> Result<(), ParseErrorKind
         return Err(ParseErrorKind::InvalidSchema);
     };
 
-    if let Some(findings) = obj.get("findings") {
-        if !findings.is_array() {
+    // Preserve the public discriminator before evaluating the rest of the
+    // object: absence of the mandatory findings field is more specific than
+    // any unknown sibling key.
+    let findings = obj
+        .get("findings")
+        .ok_or(ParseErrorKind::MissingFindingsField)?
+        .as_array()
+        .ok_or(ParseErrorKind::InvalidSchema)?;
+    if obj
+        .keys()
+        .any(|key| !matches!(key.as_str(), "findings" | "assessment"))
+    {
+        return Err(ParseErrorKind::InvalidSchema);
+    }
+    for finding in findings {
+        let Some(finding) = finding.as_object() else {
+            return Err(ParseErrorKind::InvalidSchema);
+        };
+        if finding.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "severity" | "cwe" | "description" | "file" | "lines" | "reasoning"
+            )
+        }) {
             return Err(ParseErrorKind::InvalidSchema);
         }
     }
+    let assessment = obj
+        .get("assessment")
+        .and_then(Value::as_str)
+        .ok_or(ParseErrorKind::InvalidSchema)?;
 
-    if let Some(assessment) = obj.get("assessment") {
-        if !assessment.is_string() {
-            return Err(ParseErrorKind::InvalidSchema);
-        }
+    match (assessment, findings.is_empty()) {
+        ("NO_FINDINGS", true) | ("FINDINGS_PRESENT", false) => Ok(()),
+        _ => Err(ParseErrorKind::InvalidSchema),
     }
-
-    Ok(())
 }
 
 fn parse_adversary_response_json(candidate: &str) -> Result<AdversaryResponse, ParseErrorKind> {
@@ -105,90 +127,54 @@ fn parse_adversary_response_json(candidate: &str) -> Result<AdversaryResponse, P
 /// Parse adversary response text into a discriminated outcome.
 ///
 /// Use this when the caller wants to distinguish "adversary said no findings"
-/// from "we couldn't read what the adversary said". Engine code path uses
-/// [`parse_findings`] for the legacy `Vec<Finding>` shape.
+/// from "we couldn't read what the adversary said". Live engine paths use
+/// this discriminated result so malformed output cannot become a clean pass.
 pub fn parse_findings_detailed(adversary_response: &str, iteration: u32) -> ParseFindingsOutcome {
-    // Try to parse as JSON first
-    let mut invalid_schema = false;
     let parsed = match parse_adversary_response_json(adversary_response) {
-        Ok(response) => Some(response),
-        Err(ParseErrorKind::InvalidSchema) => {
-            invalid_schema = true;
-            None
-        }
-        Err(ParseErrorKind::NotJson | ParseErrorKind::MissingFindingsField) => None,
-    }
-    .or_else(|| {
-        // Try to extract JSON from markdown code blocks
-        extract_json_from_response(adversary_response).and_then(|json| {
-            match parse_adversary_response_json(&json) {
-                Ok(response) => Some(response),
-                Err(ParseErrorKind::InvalidSchema) => {
-                    invalid_schema = true;
-                    None
-                }
-                Err(ParseErrorKind::NotJson | ParseErrorKind::MissingFindingsField) => None,
-            }
-        })
-    })
-    .or_else(|| {
-        // Try relaxed parsing for natural language responses
-        if invalid_schema {
-            None
-        } else {
-            try_parse_relaxed(adversary_response)
-        }
-    });
+        Ok(response) => Ok(response),
+        Err(ParseErrorKind::NotJson) => extract_json_from_response(adversary_response)
+            .ok_or(ParseErrorKind::NotJson)
+            .and_then(|json| parse_adversary_response_json(&json)),
+        Err(kind) => Err(kind),
+    };
 
-    if invalid_schema && parsed.is_none() {
+    let response = match parsed {
+        Ok(response) => response,
+        Err(kind) => {
+            warn!(
+                outcome = "parse_error",
+                kind = kind.as_str(),
+                "VDD: Adversary response does not match the terminal findings schema"
+            );
+            info!(
+                kind = kind.as_str(),
+                "VDD: Unparseable response preview: {}",
+                truncate_output(adversary_response, 500)
+            );
+            return ParseFindingsOutcome::ParseError { kind };
+        }
+    };
+
+    let (Some(raw_findings), Some(assessment)) = (response.findings, response.assessment) else {
         warn!(
             outcome = "parse_error",
             kind = ParseErrorKind::InvalidSchema.as_str(),
-            "VDD: Adversary response JSON does not match expected schema"
+            "VDD: Validated adversary response lost a required terminal field"
         );
         return ParseFindingsOutcome::ParseError {
             kind: ParseErrorKind::InvalidSchema,
         };
-    }
-
-    let raw_findings = if let Some(response) = parsed {
-        if response.assessment.as_deref() == Some("NO_FINDINGS") {
-            info!(
-                outcome = "no_findings",
-                "VDD: Adversary reported no findings"
-            );
-            return ParseFindingsOutcome::NoFindings;
-        }
-        if let Some(findings) = response.findings {
-            findings
-        } else {
-            warn!(
-                outcome = "parse_error",
-                kind = ParseErrorKind::MissingFindingsField.as_str(),
-                "VDD: Adversary response parsed but has no 'findings' field"
-            );
-            return ParseFindingsOutcome::ParseError {
-                kind: ParseErrorKind::MissingFindingsField,
-            };
-        }
-    } else {
-        warn!(
-            outcome = "parse_error",
-            kind = ParseErrorKind::NotJson.as_str(),
-            "VDD: Could not parse adversary response as JSON (not raw JSON, not fenced, not relaxed text)"
-        );
-        info!(
-            kind = ParseErrorKind::NotJson.as_str(),
-            "VDD: Unparseable response preview: {}",
-            truncate_output(adversary_response, 500)
-        );
-        return ParseFindingsOutcome::ParseError {
-            kind: ParseErrorKind::NotJson,
-        };
     };
 
-    let findings = build_findings_from_raw(raw_findings, iteration);
-    ParseFindingsOutcome::Findings(findings)
+    if assessment == "NO_FINDINGS" {
+        info!(
+            outcome = "no_findings",
+            "VDD: Adversary reported no findings"
+        );
+        ParseFindingsOutcome::NoFindings
+    } else {
+        ParseFindingsOutcome::Findings(build_findings_from_raw(raw_findings, iteration))
+    }
 }
 
 /// Parse adversary response text into structured findings (legacy shape).
@@ -349,11 +335,14 @@ pub struct TriageContext<'a> {
 /// hallucinates, asking the same model to verify would produce the
 /// same hallucination.
 pub async fn triage_findings(findings: &mut [Finding], ctx: &TriageContext<'_>) {
+    // Historical duplicate and prose-pattern signals are useful review hints,
+    // but neither is evidence that a finding is false. Keep them observable
+    // without granting them status-transition authority.
     apply_duplicate_layer(findings, ctx.previous_fps);
     apply_pattern_layer(findings);
 
     // Layer 3: AI-powered verification — expensive but catches novel confabulations.
-    // Only verify findings that survived layers 1 and 2.
+    // Hints never remove findings from this evidence-backed verification set.
     let surviving_genuine: Vec<&Finding> = findings
         .iter()
         .filter(|f| f.status == FindingStatus::Genuine)
@@ -366,27 +355,29 @@ pub async fn triage_findings(findings: &mut [Finding], ctx: &TriageContext<'_>) 
     match verify_findings(ctx, &surviving_genuine).await {
         Ok(verdicts) => apply_verdicts(findings, &verdicts),
         Err(e) => {
-            // Tell the user verification couldn't run — they're operating
-            // with weaker confabulation detection (pattern-matching only).
+            // Verification is optional triage assistance. If it cannot run,
+            // preserve the conservative Genuine status for every finding.
             eprintln!("\x1b[33m⚠ VDD verification agent failed: {e}\x1b[0m");
             eprintln!(
-                "\x1b[33m  Triage is using pattern-matching only — novel confabulations may not be caught.\x1b[0m"
+                "\x1b[33m  Findings remain genuine; duplicate and pattern signals are hints only.\x1b[0m"
             );
             warn!("VDD verifier request failed: {e}");
         }
     }
 }
 
-/// Layer 1: mark findings whose `(file_path, severity, cwe, line_range)`
-/// tuple matches a previously confirmed false positive.
+/// Layer 1: surface findings whose `(file_path, severity, cwe, line_range)`
+/// tuple resembles a previously confirmed false positive.
 ///
 /// Crosslink #349: this replaces the prior Jaccard-on-whitespace similarity
-/// with a deterministic tuple-hash dedup. Re-reported FPs (which by
-/// definition cite the same code at the same severity) collapse cleanly;
+/// with a deterministic tuple-hash hint. Possible re-reports that cite the
+/// same code at the same severity are surfaced for the verifier;
 /// findings whose only signal is a free-text description fall through to a
 /// weaker description-prefix signature (with a warn log) so we still
-/// dedupe obvious re-reports without depending on word-overlap heuristics.
-fn apply_duplicate_layer(findings: &mut [Finding], previous_fps: &[FindingIdentity]) {
+/// identify obvious re-reports without depending on word-overlap heuristics.
+/// A match is only a hint: tuple and prefix signatures cannot prove that two
+/// findings have the same cause, so this layer never changes finding status.
+fn apply_duplicate_layer(findings: &[Finding], previous_fps: &[FindingIdentity]) {
     if previous_fps.is_empty() {
         return;
     }
@@ -403,7 +394,7 @@ fn apply_duplicate_layer(findings: &mut [Finding], previous_fps: &[FindingIdenti
         }
     }
 
-    for finding in findings.iter_mut() {
+    for finding in findings {
         let id = FindingIdentity::from_finding(finding);
         if id.is_weak() {
             // Weak finding — both cwe and line_range absent. Fall back to
@@ -418,21 +409,31 @@ fn apply_duplicate_layer(findings: &mut [Finding], previous_fps: &[FindingIdenti
                  upstream."
             );
             if weak_seen.contains(&weak_finding_signature(finding)) {
-                finding.status = FindingStatus::FalsePositive;
+                warn!(
+                    finding_id = %finding.id,
+                    "VDD dedup hint: possible weak re-report; retaining finding as genuine pending evidence-backed verification"
+                );
             }
         } else if strong_seen.contains(&finding_signature(finding)) {
-            finding.status = FindingStatus::FalsePositive;
+            warn!(
+                finding_id = %finding.id,
+                "VDD dedup hint: possible tuple re-report; retaining finding as genuine pending evidence-backed verification"
+            );
         }
     }
 }
 
-/// Layer 2: mark findings that match hardcoded false-positive patterns.
-fn apply_pattern_layer(findings: &mut [Finding]) {
-    for finding in findings.iter_mut() {
+/// Layer 2: surface findings that match historical false-positive patterns.
+/// Prose matching is not evidence and therefore cannot demote a finding.
+fn apply_pattern_layer(findings: &[Finding]) {
+    for finding in findings {
         if finding.status == FindingStatus::Genuine {
             let desc = &finding.description.to_lowercase();
             if is_common_false_positive(desc, &finding.adversary_reasoning.to_lowercase()) {
-                finding.status = FindingStatus::FalsePositive;
+                warn!(
+                    finding_id = %finding.id,
+                    "VDD pattern hint: finding resembles a historical false positive; retaining it as genuine pending evidence-backed verification"
+                );
             }
         }
     }
@@ -442,7 +443,7 @@ fn apply_pattern_layer(findings: &mut [Finding]) {
 fn apply_verdicts(findings: &mut [Finding], verdicts: &HashMap<String, String>) {
     for finding in findings.iter_mut() {
         if finding.status != FindingStatus::Genuine {
-            continue; // Already classified by layers 1-2
+            continue; // Preserve any host-owned status set before this pass.
         }
         if let Some(verdict) = verdicts.get(&finding.id) {
             if verdict == "confabulated" {
@@ -483,12 +484,11 @@ async fn verify_findings(
     let (code_view, code_truncated) =
         build_verification_code_view(ctx.builder_code, findings, 12_000);
     if code_truncated {
-        tracing::warn!(
-            findings = findings.len(),
-            max_chars = 12_000,
-            "VDD verification code view was truncated; findings whose cited lines \
-             fell outside the view will be kept as Genuine (fail-safe per #498c)."
-        );
+        return Err(VddError::ParseError(
+            "verification code view is truncated or contains an invalid cited range; \
+             findings remain genuine"
+                .to_string(),
+        ));
     }
     let mut user_content =
         format!("## Code Under Review\n```\n{code_view}\n```\n\n## Adversary Findings to Verify\n");
@@ -652,19 +652,32 @@ fn build_verification_code_view(
         return (builder_code.to_string(), false);
     }
 
-    // Collect line ranges from findings that have them. Lines are
-    // 1-indexed in the finding; convert to 0-indexed for slicing.
-    let ranges: Vec<(usize, usize)> = findings
-        .iter()
-        .filter_map(|f| f.line_range)
-        .map(|(start, end)| {
-            let zero_indexed_start = start.saturating_sub(1);
-            (
-                zero_indexed_start.saturating_sub(CONTEXT_LINES),
-                end.saturating_add(CONTEXT_LINES),
-            )
-        })
-        .collect();
+    let lines: Vec<&str> = builder_code.lines().collect();
+
+    // Collect only ordered, one-indexed ranges fully inside the supplied
+    // code. A model-supplied invalid range makes the view incomplete; the
+    // caller then keeps every affected finding genuine instead of asking the
+    // verifier to classify against missing evidence.
+    let mut invalid_range = false;
+    let mut ranges = Vec::new();
+    for finding in findings {
+        let Some((start, end)) = finding.line_range else {
+            continue;
+        };
+        if start == 0 || end < start || start > lines.len() || end > lines.len() {
+            invalid_range = true;
+            continue;
+        }
+        let zero_indexed_start = start - 1;
+        ranges.push((
+            zero_indexed_start.saturating_sub(CONTEXT_LINES),
+            end.saturating_add(CONTEXT_LINES).min(lines.len()),
+        ));
+    }
+
+    if invalid_range {
+        return (truncate_output(builder_code, max_chars), true);
+    }
 
     if ranges.is_empty() {
         // No line info — fall back to raw truncation.
@@ -685,15 +698,13 @@ fn build_verification_code_view(
         merged.push((start, end));
     }
 
-    let lines: Vec<&str> = builder_code.lines().collect();
     let mut out = String::new();
     let mut any_truncated = false;
     for (i, (start, end)) in merged.iter().enumerate() {
         if i > 0 {
             out.push_str("\n...\n");
         }
-        let end = (*end).min(lines.len());
-        for (rel, line) in lines[*start..end].iter().enumerate() {
+        for (rel, line) in lines[*start..*end].iter().enumerate() {
             let line_num = *start + rel + 1;
             if out.len() + line.len() + 16 > max_chars {
                 out.push_str("\n... [window truncated]");
@@ -791,6 +802,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn detailed_parser_rejects_partial_contradictory_and_prose_clean_outputs() {
+        for invalid in [
+            r#"{"findings": []}"#,
+            r#"{"findings": [], "assessment": "FINDINGS_PRESENT"}"#,
+            r#"{"findings": [], "assessment": "NO_FINDINGS", "truncated": true}"#,
+            r#"{"findings": [{"description": "reachable defect"}], "assessment": "NO_FINDINGS"}"#,
+            "The code looks good and has no issues.",
+            "",
+        ] {
+            assert!(
+                matches!(
+                    parse_findings_detailed(invalid, 1),
+                    ParseFindingsOutcome::ParseError { .. }
+                ),
+                "accepted non-terminal adversary output: {invalid:?}"
+            );
+        }
+    }
+
     /// Regression test for crosslink #478: `parse_findings` used `Uuid::new_v4`
     /// per finding, which made finding ids non-deterministic and broke
     /// `HashMap`-keyed verdict lookup in tests. The replacement derives the id
@@ -822,12 +853,9 @@ mod tests {
         assert_ne!(a[0].id, c[0].id);
     }
 
-    /// Test that Layer 1 (duplicate detection) catches re-reported findings
-    /// before the AI verification layer is reached. The AI layer requires
-    /// an API call, but duplicates are caught cheaply via tuple-hash dedup
-    /// (see crosslink #349).
+    /// Tuple matches are review hints, not authority to demote a finding.
     #[tokio::test]
-    async fn test_triage_marks_duplicate_as_fp() {
+    async fn test_triage_keeps_tuple_duplicate_genuine_without_verification() {
         let config = VddConfig::default();
         let app_config = test_app_config();
         let client = Client::new();
@@ -844,8 +872,8 @@ mod tests {
             iteration: 2,
         }];
 
-        // Previously confirmed FP at the same tuple — synonym-worded
-        // description should still collapse to a duplicate.
+        // Previously confirmed FP at the same tuple. Synonym-worded causes
+        // may still be distinct, so this remains only a review hint.
         let previous_fps = vec![FindingIdentity {
             file_path: Some("src/db.rs".to_string()),
             severity: Severity::High,
@@ -865,7 +893,7 @@ mod tests {
             builder_auth: None,
         };
         triage_findings(&mut findings, &ctx).await;
-        assert_eq!(findings[0].status, FindingStatus::FalsePositive);
+        assert_eq!(findings[0].status, FindingStatus::Genuine);
     }
 
     /// Two findings with the same (file, severity) but different CWE must
@@ -1012,11 +1040,9 @@ mod tests {
         );
     }
 
-    /// Weak fallback: when both cwe and `line_range` are absent, dedup falls
-    /// back to (file, severity, description-prefix) — same tuple should
-    /// still collapse.
+    /// A weak description-prefix match is also only a review hint.
     #[tokio::test]
-    async fn test_triage_weak_fallback_collapses_obvious_reissue() {
+    async fn test_triage_weak_fallback_keeps_reissue_genuine() {
         let config = VddConfig::default();
         let app_config = test_app_config();
         let client = Client::new();
@@ -1052,12 +1078,12 @@ mod tests {
             builder_auth: None,
         };
         triage_findings(&mut findings, &ctx).await;
-        assert_eq!(findings[0].status, FindingStatus::FalsePositive);
+        assert_eq!(findings[0].status, FindingStatus::Genuine);
     }
 
-    /// Test that Layer 2 (pattern matching) catches common Rust FPs.
+    /// Historical prose patterns are hints, not proof of a false positive.
     #[tokio::test]
-    async fn test_triage_marks_common_pattern_as_fp() {
+    async fn test_triage_keeps_common_pattern_genuine_without_verification() {
         let config = VddConfig::default();
         let app_config = test_app_config();
         let client = Client::new();
@@ -1075,7 +1101,7 @@ mod tests {
             iteration: 1,
         }];
 
-        // Layer 2 catches this common Rust pattern before AI verification
+        // The historical pattern is visible to triage but cannot demote it.
         let ctx = TriageContext {
             run: crate::tools::security::test_run_context(),
             client: &client,
@@ -1088,7 +1114,7 @@ mod tests {
             builder_auth: None,
         };
         triage_findings(&mut findings, &ctx).await;
-        assert_eq!(findings[0].status, FindingStatus::FalsePositive);
+        assert_eq!(findings[0].status, FindingStatus::Genuine);
     }
 
     /// Test that findings surviving layers 1-2 remain Genuine when
@@ -1214,5 +1240,26 @@ mod tests {
         let (view, truncated) = build_verification_code_view(&code, &findings, 1000);
         assert!(truncated);
         assert!(view.contains("truncated"));
+    }
+
+    #[test]
+    fn code_view_rejects_hostile_ranges_without_panicking() {
+        let code: String = (1..=200).fold(String::new(), |mut output, line| {
+            let _ = writeln!(output, "line {line}");
+            output
+        });
+
+        for (start, end) in [
+            (0, 1),
+            (80, 40),
+            (201, 201),
+            (1, 201),
+            (usize::MAX, usize::MAX),
+        ] {
+            let finding = finding_with_lines("hostile", start, end);
+            let findings = vec![&finding];
+            let (_, incomplete) = build_verification_code_view(&code, &findings, 500);
+            assert!(incomplete, "accepted hostile range {start}-{end}");
+        }
     }
 }

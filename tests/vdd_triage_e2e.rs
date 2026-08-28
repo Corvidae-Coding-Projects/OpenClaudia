@@ -68,7 +68,7 @@ fn parse_error_kind_labels_match_documented_strings() {
 
 #[test]
 fn no_findings_assessment_yields_no_findings_variant() {
-    let json = r#"{"assessment": "NO_FINDINGS"}"#;
+    let json = r#"{"findings": [], "assessment": "NO_FINDINGS"}"#;
     let outcome = parse_findings_detailed(json, 1);
     assert!(
         matches!(outcome, ParseFindingsOutcome::NoFindings),
@@ -81,7 +81,7 @@ fn fenced_json_block_with_no_findings_assessment_parsed() {
     let response = r#"
 Here is my review:
 ```json
-{"assessment": "NO_FINDINGS"}
+{"findings": [], "assessment": "NO_FINDINGS"}
 ```
 That's all.
     "#;
@@ -116,7 +116,8 @@ fn raw_findings_array_parses_into_typed_findings() {
                 "description": "minor style issue",
                 "reasoning": "cosmetic only"
             }
-        ]
+        ],
+        "assessment": "FINDINGS_PRESENT"
     }"#;
     let outcome = parse_findings_detailed(json, 3);
     let ParseFindingsOutcome::Findings(findings) = outcome else {
@@ -136,7 +137,8 @@ fn raw_finding_with_single_line_yields_line_range_of_that_line() {
     let json = r#"{
         "findings": [
             {"severity": "MEDIUM", "description": "x", "file": "f.rs", "lines": [10], "reasoning": "r"}
-        ]
+        ],
+        "assessment": "FINDINGS_PRESENT"
     }"#;
     let ParseFindingsOutcome::Findings(findings) = parse_findings_detailed(json, 1) else {
         panic!("expected Findings");
@@ -153,7 +155,8 @@ fn findings_have_distinct_ids_within_one_iteration() {
             {"severity": "HIGH", "description": "a", "reasoning": "r1"},
             {"severity": "HIGH", "description": "b", "reasoning": "r2"},
             {"severity": "HIGH", "description": "c", "reasoning": "r3"}
-        ]
+        ],
+        "assessment": "FINDINGS_PRESENT"
     }"#;
     let ParseFindingsOutcome::Findings(findings) = parse_findings_detailed(json, 1) else {
         panic!("expected Findings");
@@ -252,7 +255,7 @@ fn empty_response_string_yields_not_json_parse_error() {
 
 #[test]
 fn legacy_parse_findings_returns_empty_vec_for_no_findings() {
-    let json = r#"{"assessment": "NO_FINDINGS"}"#;
+    let json = r#"{"findings": [], "assessment": "NO_FINDINGS"}"#;
     let findings = parse_findings(json, 1);
     assert!(
         findings.is_empty(),
@@ -271,7 +274,7 @@ fn legacy_parse_findings_returns_empty_vec_for_parse_error() {
 
 #[test]
 fn legacy_parse_findings_returns_typed_findings_for_valid_input() {
-    let json = r#"{"findings": [{"severity": "MEDIUM", "description": "x", "reasoning": "r"}]}"#;
+    let json = r#"{"findings": [{"severity": "MEDIUM", "description": "x", "reasoning": "r"}], "assessment": "FINDINGS_PRESENT"}"#;
     let findings = parse_findings(json, 7);
     assert_eq!(findings.len(), 1);
     assert_eq!(findings[0].severity, Severity::Medium);
