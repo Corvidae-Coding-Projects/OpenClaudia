@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1198,
+  "next_display_id": 1199,
   "next_comment_id": 1889,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -260,6 +260,7 @@
     "3b7d7fde-61eb-4a04-8188-15bc8375eace": 1097,
     "3b829f02-7116-4a6d-8e25-0ee0625f8b26": 554,
     "3c303dc7-f87a-49a9-b45d-87f2132da140": 487,
+    "3c4a52e5-3980-4622-944b-7d7869ebc137": 1198,
     "3c788b33-8135-40ac-81e8-dcaa055cc672": 134,
     "3c7a7927-5a52-4234-8940-a20ff90918d9": 328,
     "3c7e57f0-1831-4f9a-b1d5-f0014c88b5f7": 1179,
@@ -8207,6 +8208,18 @@
         "qa-review-2026-04",
         "qa-seam-vdd"
       ]
+    },
+    "3c4a52e5-3980-4622-944b-7d7869ebc137": {
+      "uuid": "3c4a52e5-3980-4622-944b-7d7869ebc137",
+      "display_id": 1198,
+      "title": "S-101: Bound VDD provider transport",
+      "description": "Implement remediation slice S-101 from docs/remediation-slices/101-vdd-bounded-provider-transport.md. Production-wire deterministic transport bounds, cancellation, output limits, and actionable provider failures without removing intended VDD functionality. Parallel-ready with S-100; integrated verification belongs to the parent agent.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-28T09:28:00.605093005Z",
+      "updated_at": "2026-08-28T09:28:00.605093005Z"
     },
     "3c788b33-8135-40ac-81e8-dcaa055cc672": {
       "uuid": "3c788b33-8135-40ac-81e8-dcaa055cc672",
@@ -47788,11 +47801,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2248,
       "timestamp": "2026-08-28T09:27:49.960486482Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2249,
+      "timestamp": "2026-08-28T09:28:00.605093005Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-28T09:27:49.960486482Z",
+    "timestamp": "2026-08-28T09:28:00.605093005Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2248
+    "agent_seq": 2249
   }
 }
