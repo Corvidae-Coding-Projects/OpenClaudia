@@ -35422,12 +35422,13 @@
       "display_id": 1190,
       "title": "S-085: Implement speculation as a measured transaction",
       "description": "Production-wire safe artifact-bound speculation only for deterministic idempotent read-only snapshot operations, with exact-match reuse, owned cancellation/join, bounded budgets, and measurement against baseline. Worker is code-only; parent owns all execution and verification.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "5ea8af88-cc85-47d9-943c-8e2e851b5e5a",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T23:55:14.145458322Z",
-      "updated_at": "2026-08-28T01:36:10.660276963Z",
+      "updated_at": "2026-08-28T01:36:20.017085322Z",
+      "closed_at": "2026-08-28T01:36:20.017083668Z",
       "labels": [
         "feature"
       ],
@@ -47247,11 +47248,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2197,
       "timestamp": "2026-08-28T01:36:10.660276963Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2198,
+      "timestamp": "2026-08-28T01:36:20.017085322Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-28T01:36:10.660276963Z",
+    "timestamp": "2026-08-28T01:36:20.017085322Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2197
+    "agent_seq": 2198
   }
 }
