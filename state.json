@@ -1,6 +1,6 @@
 {
   "next_display_id": 1193,
-  "next_comment_id": 1870,
+  "next_comment_id": 1871,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -14025,7 +14025,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-27T23:53:50.698988492Z",
-      "updated_at": "2026-08-28T01:37:56.175929441Z",
+      "updated_at": "2026-08-28T01:38:06.867984856Z",
       "labels": [
         "remediation"
       ],
@@ -14038,6 +14038,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAKllDzVehdbsQWVW3aJDsFIUrbB6JF8SAAwQR+H0KweFhLsFmw4EVH8ZZB782AdXSCC3elu/jY8TOaXh+3lGYDg=="
+        },
+        "22905e6c-9d47-40de-aa50-17ca9c4d0576": {
+          "display_id": 1870,
+          "author": "6Vw9",
+          "content": "Committed bb4cedbc feat(agent): complete scheduler speculation and proxy delivery. Delivered and closed S-084 #1189, S-085 #1190, and S-095 #1191; duplicate #1192 closed without changelog. Parent review fixed scheduler lifecycle/concurrency/approval validation, speculation self-disabling double reads, stream disconnect settlement, and stale feature-state tests. Verification: Rust 1.98.0 format and diff checks green; strict all-target/all-feature Clippy green; scheduler 7/7, speculation 8/8, proxy 63/63, cron dispatch 21/21; complete serialized all-target/all-feature suite green.",
+          "created_at": "2026-08-28T01:38:06.865391603Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA3terKj78op7EG6Tg9xs0UXAx519plueWHRNKscH1HlVezTD3QTufcV11w+BBAipb97cNemo48OlykuGfHyoVCg=="
         },
         "52e328f3-668c-4b26-8c89-15a731fa99a6": {
           "display_id": 1863,
@@ -47289,11 +47298,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2201,
       "timestamp": "2026-08-28T01:37:56.175929441Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2202,
+      "timestamp": "2026-08-28T01:38:06.867984856Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-28T01:37:56.175929441Z",
+    "timestamp": "2026-08-28T01:38:06.867984856Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2201
+    "agent_seq": 2202
   }
 }
