@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1193,
+  "next_display_id": 1194,
   "next_comment_id": 1872,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -770,6 +770,7 @@
     "af46c0de-6bc2-443d-87b0-90465c94fd33": 416,
     "af481bd6-81aa-4baf-abb9-97a71af85f02": 618,
     "b008e498-0c2b-4ac6-9e18-faad43bd98a2": 1133,
+    "b04c040e-c8a3-485c-8db2-0d25f37fc909": 1193,
     "b04d2823-3401-4393-accf-f2d833fa9ffe": 503,
     "b0ac9d41-3bff-45e5-b29f-e0cb29d0ef27": 22,
     "b0cb96f2-951a-44b4-b8d3-a84db6619496": 226,
@@ -25883,6 +25884,16 @@
         }
       }
     },
+    "b04c040e-c8a3-485c-8db2-0d25f37fc909": {
+      "uuid": "b04c040e-c8a3-485c-8db2-0d25f37fc909",
+      "display_id": 1193,
+      "title": "Explain untracked local plugin registry",
+      "status": "open",
+      "priority": "low",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-28T02:44:22.598430507Z",
+      "updated_at": "2026-08-28T02:44:22.598430507Z"
+    },
     "b04d2823-3401-4393-accf-f2d833fa9ffe": {
       "uuid": "b04d2823-3401-4393-accf-f2d833fa9ffe",
       "display_id": 503,
@@ -47324,11 +47335,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2205,
       "timestamp": "2026-08-28T02:01:45.393242032Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2206,
+      "timestamp": "2026-08-28T02:44:22.598430507Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-28T02:01:45.393242032Z",
+    "timestamp": "2026-08-28T02:44:22.598430507Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2205
+    "agent_seq": 2206
   }
 }
