@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1200,
+  "next_display_id": 1201,
   "next_comment_id": 1902,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -973,6 +973,7 @@
     "dfa4f899-0a14-4d29-9e5a-5bb1d6c1e206": 955,
     "e073174d-d851-44e8-a8e8-84eea134c4a6": 1092,
     "e0f2c5e6-9871-4d93-81e6-06e757e91e47": 928,
+    "e11700fc-2ae6-4a5f-a290-1ddafa9e85c9": 1200,
     "e16ad946-4814-40cc-a467-d9916f4b56e9": 790,
     "e1a798cc-e476-4a18-a5fa-e9bd236415a3": 986,
     "e1b8ef4e-4979-461c-940d-472e372de917": 475,
@@ -31835,6 +31836,18 @@
         }
       }
     },
+    "e11700fc-2ae6-4a5f-a290-1ddafa9e85c9": {
+      "uuid": "e11700fc-2ae6-4a5f-a290-1ddafa9e85c9",
+      "display_id": 1200,
+      "title": "Migrate or retire legacy raw VDD session artifacts",
+      "description": "New S-102 ledgers are typed and redacted, but installations upgraded from the pre-S-102 implementation may still contain legacy .openclaudia/vdd/vdd-session-*.json raw session dumps. Design an explicit, capability-safe migration or user-approved retirement path that inventories those artifacts, preserves required provenance, never follows symlinks, and does not silently delete user data. Acceptance: upgrade behavior and rollback are documented and tested; legacy raw bodies no longer remain indefinitely after an intentional migration.",
+      "status": "open",
+      "priority": "medium",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-28T13:09:27.577108087Z",
+      "updated_at": "2026-08-28T13:09:27.577108087Z"
+    },
     "e16ad946-4814-40cc-a467-d9916f4b56e9": {
       "uuid": "e16ad946-4814-40cc-a467-d9916f4b56e9",
       "display_id": 790,
@@ -48080,11 +48093,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2274,
       "timestamp": "2026-08-28T12:48:44.966938939Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2275,
+      "timestamp": "2026-08-28T13:09:27.577108087Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-28T12:48:44.966938939Z",
+    "timestamp": "2026-08-28T13:09:27.577108087Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2274
+    "agent_seq": 2275
   }
 }
