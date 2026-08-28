@@ -1,6 +1,6 @@
 {
   "next_display_id": 1200,
-  "next_comment_id": 1899,
+  "next_comment_id": 1900,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9223,10 +9223,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-28T11:44:45.921120190Z",
-      "updated_at": "2026-08-28T11:44:50.454532659Z",
+      "updated_at": "2026-08-28T11:45:00.920666073Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "de8c1d0e-3a3f-4e52-b35d-beadb62f20ee": {
+          "display_id": 1899,
+          "author": "6Vw9",
+          "content": "[action] Beginning S-102 preflight: map current VDD finalization receipts, planner checkpoints, issue reconciliation, retention, redaction, and recovery before editing",
+          "created_at": "2026-08-28T11:45:00.918126660Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAat9FU8GfFbKwCo/yFHTa3IJ9296WTrAOQCrL+kySwartX3OMwxIWCqEeFRAMabIU4jCkNyWr8H46YfvufPVbAQ=="
+        }
+      }
     },
     "45f3bb9f-e9b5-4936-a055-38e0107a505f": {
       "uuid": "45f3bb9f-e9b5-4936-a055-38e0107a505f",
@@ -48036,11 +48047,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2271,
       "timestamp": "2026-08-28T11:44:55.831318515Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2272,
+      "timestamp": "2026-08-28T11:45:00.920666073Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-28T11:44:55.831318515Z",
+    "timestamp": "2026-08-28T11:45:00.920666073Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2271
+    "agent_seq": 2272
   }
 }
