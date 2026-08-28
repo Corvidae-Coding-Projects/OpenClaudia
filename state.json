@@ -1,6 +1,6 @@
 {
   "next_display_id": 1195,
-  "next_comment_id": 1874,
+  "next_comment_id": 1875,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -12493,10 +12493,21 @@
       "priority": "low",
       "created_by": "6Vw9",
       "created_at": "2026-08-28T02:47:56.121810439Z",
-      "updated_at": "2026-08-28T02:48:00.511645011Z",
+      "updated_at": "2026-08-28T02:49:22.994021355Z",
       "labels": [
         "maintenance"
-      ]
+      ],
+      "comments": {
+        "24667aee-be94-49af-94c3-954646ead1df": {
+          "display_id": 1874,
+          "author": "6Vw9",
+          "content": "Add the exact project-local installed_plugins.json path to the existing machine-runtime ignore block, remove the current empty generated file, verify the rule does not hide the tracked example plugin, then commit and publish the one-line cleanup.",
+          "created_at": "2026-08-28T02:49:22.991305745Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA/bUWRhdtKnGQKuHbbK22Rs/LiEg7zZgLtqpXbGA4yXr+9/bKVK3wgDX0CnjQ3kk1syToZyUcTF27JmkMYDhXAA=="
+        }
+      }
     },
     "56a3ea1f-0717-4d9f-985d-cb90fe6a2a47": {
       "uuid": "56a3ea1f-0717-4d9f-985d-cb90fe6a2a47",
@@ -47430,11 +47441,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2215,
       "timestamp": "2026-08-28T02:48:05.900083734Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2216,
+      "timestamp": "2026-08-28T02:49:22.994021355Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-28T02:48:05.900083734Z",
+    "timestamp": "2026-08-28T02:49:22.994021355Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2215
+    "agent_seq": 2216
   }
 }
