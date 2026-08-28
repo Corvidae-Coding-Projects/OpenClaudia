@@ -1,6 +1,6 @@
 {
   "next_display_id": 1197,
-  "next_comment_id": 1880,
+  "next_comment_id": 1881,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -14858,7 +14858,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-28T07:47:31.467293979Z",
-      "updated_at": "2026-08-28T07:48:29.671863701Z",
+      "updated_at": "2026-08-28T08:10:00.756473896Z",
       "labels": [
         "remediation"
       ],
@@ -14874,6 +14874,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA1DAfh5/Tn5v7Npy38mnqTuLBTRJX7kbTynRL9rKHFlnl3i345wHJgMhDrfLIslWfl8YUCGd8TFx6AKwwEKKSBQ=="
+        },
+        "a88def71-a468-4b3b-8762-e82621cbae2c": {
+          "display_id": 1880,
+          "author": "6Vw9",
+          "content": "Parent full-diff review found one inherited F-134 defect still live: apply_duplicate_layer and apply_pattern_layer automatically set findings FalsePositive from tuple/prefix matching or hard-coded prose patterns before evidence-backed verification. This can collapse distinct causes or hide genuine defects. Root-cause repair: retain these signals only as operator/verifier hints and leave finding status Genuine; malformed/unavailable verifier paths already fail conservative. No expansion into S-100/S-101/S-102.",
+          "created_at": "2026-08-28T08:10:00.753633913Z",
+          "kind": "finding",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAcPp4HRRFf/o4Vyb+SjOJJov8xzVnBoBAp0Sb5dunh4sAmXwG5AClOpsRQpaJmgIIv8PuUqR0/92ravHl6IFGBQ=="
         }
       }
     },
@@ -47610,11 +47619,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2232,
       "timestamp": "2026-08-28T07:48:29.671863701Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2233,
+      "timestamp": "2026-08-28T08:10:00.756473896Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-28T07:48:29.671863701Z",
+    "timestamp": "2026-08-28T08:10:00.756473896Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2232
+    "agent_seq": 2233
   }
 }
