@@ -1,6 +1,6 @@
 {
   "next_display_id": 1199,
-  "next_comment_id": 1894,
+  "next_comment_id": 1895,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -8219,11 +8219,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-28T09:28:00.605093005Z",
-      "updated_at": "2026-08-28T09:29:37.111175077Z",
+      "updated_at": "2026-08-28T11:11:49.612768934Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "ec2ca41b-2e88-4b00-b960-bbb0197a7082": {
+          "display_id": 1894,
+          "author": "6Vw9",
+          "content": "Implemented bounded VDD provider transport with one aggregate review budget across calls, bytes/tokens/cost/time/concurrency/storage; strict terminal/model/usage validation; bounded analyzer supervision; deterministic cancellation and child reaping for both Codex and Claude SDK subprocesses; strict one-verdict-per-finding JSON parsing; and typed provider receipts. Parent review corrected an impossible per-call reservation, permissive prose-wrapped JSON, placeholder model routing, and cancellation tests that did not spawn real children. Verification: Rust 1.98 fmt/check/strict Clippy green; transport and real mid-process cancellation tests green; complete locked all-target/all-feature suite green; all fuzz and dependency-policy gates green.",
+          "created_at": "2026-08-28T11:11:49.610272250Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAqBQZmE/yyf327rXD7xX5K+aBPN/Vk2HNevUBJXPLgwcPsuGRcobYlc8tG4xJOAFR8g9GtjgKY+eNnb6gQ7cKDg=="
+        },
         "f98c5bba-b892-49c7-b558-8a6a81cb8714": {
           "display_id": 1891,
           "author": "6Vw9",
@@ -47914,11 +47923,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2259,
       "timestamp": "2026-08-28T11:11:44.529408693Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2260,
+      "timestamp": "2026-08-28T11:11:49.612768934Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-28T11:11:44.529408693Z",
+    "timestamp": "2026-08-28T11:11:49.612768934Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2259
+    "agent_seq": 2260
   }
 }
