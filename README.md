@@ -447,40 +447,40 @@ are not emitted.
 
 ## Slash Commands (Default TUI)
 
-The default TUI and legacy REPL have different registries. The audit treats
-this as architectural drift to repair, not intentional proof of completeness.
+The default TUI and legacy REPL use one typed registry for parsing, help,
+completion, effect classification, capability checks, and dispatch admission.
+The table below is checked against that runtime registry.
 
 | Command | Current surface |
 |---|---|
-| `/help`, `?` | Open help overlay |
-| `/clear` | Clear the visible transcript |
-| `/exit`, `/quit` | Exit the TUI |
+| `/help, ?` | Show the TUI help overlay |
+| `/new, /clear` | Clear the visible transcript and start a new conversation |
+| `/exit, /quit` | Exit the TUI |
+| `/model [list\|name], /models` | Show, list, or switch models |
+| `/copy` | Copy last assistant response to clipboard |
 | `/status` | Show model, provider, effort, and token estimate |
-| `/provider [name]` | Show or switch provider |
-| `/model` | Show the current model and provider |
-| `/model list`, `/models` | List fallback models |
-| `/model <name>` | Switch to a different model |
+| `/plan` | Toggle between Build and Plan modes |
 | `/mode` | Toggle between Build and Plan modes |
+| `/keybindings, /keys, /bindings` | Show effective keyboard shortcuts |
 | `/effort [low\|medium\|high\|max\|xhigh\|auto]` | Set or cycle effort level |
-| `/sessions`, `/list` | List saved sessions |
-| `/resume`, `/continue` | Open the session picker |
-| `/load <id>` | Resume a saved session by ID prefix |
-| `/continue <id>` | Resume a saved session by ID prefix |
-| `/rename <title>` | Rename the current session |
-| `/export` | Export the current conversation to Markdown |
+| `/provider [name]` | Show or switch provider |
+| `/sessions, /list` | List saved sessions |
+| `/resume, /continue, /load <id>` | Open the session picker or resume by ID |
+| `/export` | Export the current conversation to markdown |
 | `/undo` | Undo the last message exchange |
 | `/redo` | Redo the last undone message exchange |
 | `/rewind [N]` | Show turns or rewind the last N turns |
-| `/cost` | Show the session cost estimate |
+| `/rename <title>` | Rename the current session |
+| `/init` | Initialize project config if absent |
+| `/review` | Show a truncated git diff for review |
+| `/doctor` | Run inline diagnostics |
+| `/cost` | Show session cost estimate |
 | `/context` | Show context usage breakdown |
 | `/files [dir]` | List files in the current or given directory |
-| `/diff` | Show the Git diff summary |
-| `/review` | Show a truncated Git diff for review |
-| `/doctor` | Run inline diagnostics |
-| `/init` | Initialize project configuration if absent; no repository instructions are generated |
-| `/skill`, `/skills` | Inspect or invoke discovered skills |
-| `/skill <name>` | Invoke a skill as the next prompt |
-| `/<skill-name>` | Invoke a skill by name |
+| `/diff` | Show git diff summary |
+| `/skill [name], /skills` | List or invoke a trusted skill |
+| `/<plugin>:<command> [args]` | Run a namespaced plugin command, skill, or agent |
+| `/<skill-name> [args]` | Invoke a trusted skill by name |
 
 ## Keyboard Shortcuts (Default TUI)
 

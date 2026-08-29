@@ -586,36 +586,6 @@ fn planner_checkpoint_included(blocks: &prompt::SystemPromptBlocks) -> bool {
     })
 }
 
-fn effectful_slash_operation(input: &str) -> Option<&'static str> {
-    let command_line = input.trim().strip_prefix('/')?;
-    let mut parts = command_line.split_whitespace();
-    let command = parts.next()?.to_ascii_lowercase();
-    if command.contains(':') {
-        return Some("plugin command");
-    }
-    match command.as_str() {
-        "export" => Some("export conversation"),
-        "editor" | "edit" | "e" => Some("external editor"),
-        "copy" | "yank" | "y" => Some("system clipboard write"),
-        "init" => Some("initialize project"),
-        "review" => Some("review Git changes"),
-        "mcp" => Some("MCP management"),
-        "plugin" | "plugins" => Some("plugin management"),
-        "commit" | "commit-push-pr" => Some("Git mutation"),
-        "login" => Some("credential login"),
-        "add-dir" => Some("session scope change"),
-        "branch" => Some("conversation branch write"),
-        "memory" | "mem"
-            if parts
-                .next()
-                .is_some_and(|subcommand| subcommand.eq_ignore_ascii_case("reset")) =>
-        {
-            Some("technical-memory reset")
-        }
-        _ => None,
-    }
-}
-
 impl ChatRepl {
     fn apply_workspace_transition_from_result(
         &mut self,
@@ -1241,15 +1211,6 @@ impl ChatRepl {
         input: &mut String,
         memory_db: Option<&memory::MemoryDb>,
     ) -> SlashOutcome {
-        if let Some(operation) = effectful_slash_operation(input) {
-            if let Err(error) = self
-                .run_context
-                .admit_runtime_mode_direct_operation(operation)
-            {
-                eprintln!("{error}");
-                return SlashOutcome::Continue;
-            }
-        }
         let doctor_runtime = input.trim().eq_ignore_ascii_case("/doctor").then(|| {
             let manager = openclaudia::mcp::registered_manager(&self.run_context);
             let mut snapshot = openclaudia::doctor::DoctorRuntimeSnapshot::from_run_with_mcp(
@@ -4529,7 +4490,26 @@ impl ChatRepl {
         let Some(action_result) = action else {
             return false;
         };
-        match action_result {
+        let command = match &action_result {
+            SlashCommandResult::Exit => "/exit",
+            SlashCommandResult::ToggleMode => "/mode",
+            SlashCommandResult::Status => "/status",
+            SlashCommandResult::Export => "/export",
+            _ => return false,
+        };
+        let registry = openclaudia::command_registry::registry();
+        let proposal = match registry.parse(
+            command,
+            openclaudia::command_registry::CommandFrontend::LegacyCli,
+        ) {
+            Ok(proposal) => proposal,
+            Err(error) => {
+                eprintln!("Deferred command rejected: {error}");
+                return false;
+            }
+        };
+        let run = std::sync::Arc::clone(&self.run_context);
+        match registry.execute(&proposal, Some(&run), |_| match action_result {
             SlashCommandResult::Exit => {
                 if let Err(e) = self.rl.save_history(&self.history_path) {
                     tracing::warn!("Failed to save history: {}", e);
@@ -4559,6 +4539,12 @@ impl ChatRepl {
                 false
             }
             _ => false,
+        }) {
+            Ok(exit) => exit,
+            Err(error) => {
+                eprintln!("Deferred command rejected: {error}");
+                false
+            }
         }
     }
 }
@@ -4952,31 +4938,55 @@ mod tests {
     }
 
     #[test]
-    fn restricted_modes_identify_effectful_local_shortcuts_before_dispatch() {
+    fn canonical_registry_classifies_local_shortcuts_before_dispatch() {
+        let registry = openclaudia::command_registry::registry();
         for input in [
             "/export",
             "/editor",
             "/init",
-            "/review",
-            "/mcp help",
-            "/plugin list",
+            "/plugin install demo",
             "/commit",
             "/commit-push-pr",
-            "/login",
             "/add-dir ../other",
             "/branch checkpoint",
             "/memory reset confirm",
             "/example-plugin:command",
         ] {
+            let proposal = registry
+                .parse(
+                    input,
+                    openclaudia::command_registry::CommandFrontend::LegacyCli,
+                )
+                .expect("classified command parses");
             assert!(
-                effectful_slash_operation(input).is_some(),
-                "effectful shortcut must be mode-gated: {input}"
+                registry
+                    .resolved_effect(&proposal)
+                    .expect("canonical effect")
+                    .requires_authorization(),
+                "effectful shortcut must require authorization: {input}"
             );
         }
-        for input in ["/status", "/doctor", "/find mode", "/memory list", "/skill"] {
+        for input in [
+            "/status",
+            "/doctor",
+            "/review",
+            "/mcp help",
+            "/login",
+            "/find mode",
+            "/memory list",
+            "/skill",
+        ] {
+            let proposal = registry
+                .parse(
+                    input,
+                    openclaudia::command_registry::CommandFrontend::LegacyCli,
+                )
+                .expect("classified command parses");
             assert_eq!(
-                effectful_slash_operation(input),
-                None,
+                registry
+                    .resolved_effect(&proposal)
+                    .expect("canonical effect"),
+                openclaudia::tools::effect::ToolEffect::ReadOnly,
                 "observational shortcut should remain available: {input}"
             );
         }

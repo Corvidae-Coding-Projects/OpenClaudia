@@ -3572,7 +3572,7 @@ mod tests {
             state.permissions.bypass_mode = true;
             state.permissions.trust_accepted = true;
             state.permissions.persistence_disabled = true;
-            state.transcript.watermark = 17;
+            state.transcript.watermark = 1;
             state.transcript.transcript_cwd = PathBuf::from("/tmp/transcript-root");
             state.ide.active_file = Some("/tmp/project/src/lib.rs".to_string());
             state.ide.selection = Some(openclaudia::state::IdeSelection {
@@ -3627,7 +3627,7 @@ mod tests {
             !state.permissions.persistence_disabled,
             "conversation documents must not restore invocation-local persistence policy"
         );
-        assert_eq!(state.transcript.watermark, 17);
+        assert_eq!(state.transcript.watermark, 1);
         assert_eq!(
             state.transcript.transcript_cwd,
             PathBuf::from("/tmp/transcript-root")

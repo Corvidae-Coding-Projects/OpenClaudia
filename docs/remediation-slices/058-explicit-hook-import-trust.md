@@ -1,6 +1,6 @@
 # S-058: Require explicit trust for hook imports
 
-Status: Planned
+Status: Implemented; artifact-bound VDD pending S-088
 Effort: Medium
 Primary findings: F-086
 Workstreams: W25
@@ -27,3 +27,29 @@ Stop ambient Claude/user/project settings from granting executable or instructio
 ## Handoff
 
 Record changed artifact generations, commands/tests run, typed evidence receipts, unresolved risks, and any newly proposed slice. Completion of this slice does not imply completion of its parent workstream.
+
+## Delivered — 2026-08-29
+
+- User, project, and local Claude hook files are discovered as inert proposals.
+  Ordinary unrelated Claude settings remain compatible, while the imported hook
+  subtree is parsed strictly and malformed sibling sources disable activation
+  atomically.
+- Host-owned approval receipts live outside the repository and bind workspace,
+  source scope/path/owner/digest, events, effects, capabilities, output contract,
+  executable path/digest/owner, exact argv, and every referenced file. Any
+  mutation requires explicit reapproval.
+- Approval never widens managed host policy. Repository-resident, ambiguous,
+  tampered, oversized, linked, foreign-owner, or explicitly denied proposals
+  remain inert and produce review diagnostics through `openclaudia hooks status`.
+
+## Verification evidence
+
+- Rust 1.98 formatting, locked all-target checking, and strict locked
+  all-feature/all-target Clippy with `-D warnings` passed.
+- Repository hook-import E2E passed 19/19 and Claude compatibility hook E2E
+  passed 18/18, serialized. Coverage includes approval, source mutation,
+  workspace binding, user-global imports, malformed siblings, forged receipts,
+  pinned executables, host denial precedence, and unrelated settings.
+
+No VDD receipt is claimed here. S-088 remains the independent artifact-bound
+verification boundary.

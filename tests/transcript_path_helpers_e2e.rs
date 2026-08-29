@@ -14,13 +14,48 @@
 #![allow(clippy::unwrap_used)]
 
 use openclaudia::transcript::{
-    append_entry, claude_config_home_dir, entries_after_last_boundary, envelope_for,
-    load_transcript, project_dir_for, projects_dir, sanitize_path, transcript_path,
+    append_entry, entries_after_last_boundary, envelope_for, load_transcript,
+    openclaudia_transcript_home_dir, project_dir_for, projects_dir, sanitize_path, transcript_path,
     SerializedMessage,
 };
 use serde_json::json;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use tempfile::TempDir;
+
+struct TranscriptHomeGuard {
+    _lock: MutexGuard<'static, ()>,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl TranscriptHomeGuard {
+    fn set(path: &Path) -> Self {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let lock = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var_os("OPENCLAUDIA_TRANSCRIPT_HOME_DIR");
+        unsafe {
+            std::env::set_var("OPENCLAUDIA_TRANSCRIPT_HOME_DIR", path);
+        }
+        Self {
+            _lock: lock,
+            previous,
+        }
+    }
+}
+
+impl Drop for TranscriptHomeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.previous {
+                Some(previous) => std::env::set_var("OPENCLAUDIA_TRANSCRIPT_HOME_DIR", previous),
+                None => std::env::remove_var("OPENCLAUDIA_TRANSCRIPT_HOME_DIR"),
+            }
+        }
+    }
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // Section A — sanitize_path
@@ -97,12 +132,12 @@ fn sanitize_path_handles_empty_input() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn projects_dir_lives_under_claude_config_home() {
+fn projects_dir_lives_under_openclaudia_transcript_home() {
     let projects = projects_dir();
-    let home = claude_config_home_dir();
+    let home = openclaudia_transcript_home_dir();
     assert!(
         projects.starts_with(&home),
-        "projects_dir MUST live under claude_config_home_dir; got {projects:?} not under {home:?}"
+        "projects_dir MUST live under the OpenClaudia transcript home; got {projects:?} not under {home:?}"
     );
     assert!(
         projects.ends_with("projects"),
@@ -179,10 +214,8 @@ fn envelope_for_version_field_is_populated() {
 #[test]
 fn append_entry_creates_jsonl_file_and_load_round_trips() {
     let dir = TempDir::new().expect("tempdir");
-    // To use append_entry against the tempdir as cwd we need
-    // a wrapper since transcript_path uses claude_config_home_dir
-    // — instead, drive the round-trip via load_transcript on
-    // a custom path we write directly.
+    let _home = TranscriptHomeGuard::set(dir.path());
+    // Redirect owned transcript storage into this fixture.
     let session = "session-test";
     let cwd = dir.path();
 
@@ -202,6 +235,7 @@ fn append_entry_creates_jsonl_file_and_load_round_trips() {
 #[test]
 fn append_entry_preserves_message_payload_byte_exact() {
     let dir = TempDir::new().expect("tempdir");
+    let _home = TranscriptHomeGuard::set(dir.path());
     let cwd = dir.path();
     let session = "payload-test";
     let payload = json!({
@@ -222,6 +256,7 @@ fn append_entry_preserves_message_payload_byte_exact() {
 #[test]
 fn load_transcript_skips_unparseable_lines_without_failing() {
     let dir = TempDir::new().expect("tempdir");
+    let _home = TranscriptHomeGuard::set(dir.path());
     let session = "mixed";
     let path = transcript_path(dir.path(), session);
     std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir parent");
@@ -257,6 +292,7 @@ fn load_transcript_on_missing_file_returns_empty_vec() {
 fn append_entry_creates_file_with_mode_0o600_on_unix() {
     use std::os::unix::fs::PermissionsExt;
     let dir = TempDir::new().expect("tempdir");
+    let _home = TranscriptHomeGuard::set(dir.path());
     let cwd = dir.path();
     let session = "perm-test";
     let env = envelope_for("user", cwd, session, None);
@@ -278,6 +314,7 @@ fn append_entry_creates_file_with_mode_0o600_on_unix() {
 fn append_entry_creates_project_dir_with_mode_0o700_on_unix() {
     use std::os::unix::fs::PermissionsExt;
     let dir = TempDir::new().expect("tempdir");
+    let _home = TranscriptHomeGuard::set(dir.path());
     let cwd = dir.path();
     let session = "dir-perm-test";
     let env = envelope_for("user", cwd, session, None);

@@ -202,6 +202,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-075: Create one typed command registry (#1206)
+- S-058: Require explicit trust for hook imports (#1205)
+- S-038: Repair session schema migration and ownership (#1204)
 - S-037: Make session mutation and finalization atomic (#1203)
 - S-102: Persist VDD evidence and issues transactionally (#1199)
 - S-101: Bound VDD provider transport (#1198)

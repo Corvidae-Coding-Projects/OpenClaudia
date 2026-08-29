@@ -325,20 +325,18 @@ mod tests {
     }
 
     #[test]
-    fn read_chat_session_file_reports_invalid_stored_id() {
+    fn read_chat_session_file_rejects_invalid_stored_id_during_decode() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("invalid-id.json");
         let session = test_session();
-        session.update_state(|state, _| {
-            state.identity.session_id =
-                openclaudia::state::SessionId::from_raw_unchecked("../outside");
-        });
-        fs::write(&path, serde_json::to_string(&session).unwrap()).unwrap();
+        let mut invalid = serde_json::to_value(&session).expect("serialize valid fixture");
+        invalid["session_state"]["identity"]["session_id"] = serde_json::json!("../outside");
+        fs::write(&path, serde_json::to_string(&invalid).unwrap()).unwrap();
 
         let err = read_chat_session_file(&path).expect_err("invalid stored id must be an error");
 
         assert!(
-            err.to_string().contains("invalid chat session id"),
+            err.to_string().contains("failed to parse chat session"),
             "unexpected error: {err}"
         );
     }

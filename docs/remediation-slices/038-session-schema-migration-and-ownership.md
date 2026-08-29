@@ -1,6 +1,6 @@
 # S-038: Repair session schema migration and ownership
 
-Status: Planned
+Status: Implemented; artifact-bound VDD pending S-088
 Effort: Medium
 Primary findings: F-070, F-071
 Workstreams: W0, W12, W15
@@ -27,3 +27,35 @@ Make every supported old schema migrate through one owned store without writing 
 ## Handoff
 
 Record changed artifact generations, commands/tests run, typed evidence receipts, unresolved risks, and any newly proposed slice. Completion of this slice does not imply completion of its parent workstream.
+
+## Delivered — 2026-08-29
+
+- Session persistence now dispatches schema 0 through a deterministic migration,
+  accepts schema 1 as current, and rejects future schemas without modifying the
+  source. Migration preflights every candidate before descriptor-safe,
+  generation-checked publication and validates the published bytes.
+- Legacy sessions retain their causal identity, provider state, coordinator
+  state, budgets, transcript watermark, and IDE state. Migration strips only
+  live invocation authority such as permission receipts, active workspace
+  handles, additional roots, and plan approvals.
+- Schema metadata and new transcript writes now live under OpenClaudia-owned
+  application data. Claude transcript storage is read-only: startup records an
+  exact bounded import observation, runtime rejects stale observations, and an
+  approved foreign transcript is copied into owned storage before append.
+- Transcript reads, discovery, and append paths are bounded and reject links or
+  non-regular files. Owned records take precedence when the same session is
+  present in both stores.
+
+## Verification evidence
+
+- Rust 1.98 formatting and locked all-target checking passed.
+- Strict locked all-feature/all-target Clippy with `-D warnings` passed.
+- Migration unit tests passed 24/24, persistence tests passed 14/14,
+  migration-runner E2E passed 7/7, transcript unit tests passed 12/12, and
+  transcript path E2E passed 22/22, all serialized.
+- The foreign-import integration test proves the original Claude JSONL remains
+  byte-exact, OpenClaudia seeds owned storage before append, and a changed
+  foreign marker makes further foreign reads fail closed.
+
+No VDD receipt is claimed here. S-088 remains the independent artifact-bound
+verification boundary.

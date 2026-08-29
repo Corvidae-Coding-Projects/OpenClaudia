@@ -196,9 +196,9 @@ impl HelpOverlay {
         }
 
         // Slash commands implemented by the default TUI.
-        for section in TUI_SLASH_SECTIONS {
+        for section in TUI_SLASH_SECTIONS.iter() {
             lines.push(Line::from(Span::styled(section.title, section_title_style)));
-            for c in section.commands {
+            for c in &section.commands {
                 lines.push(Line::from(vec![
                     Span::raw("  "),
                     Span::styled(c.invocation, key_style),
@@ -359,7 +359,7 @@ mod tests {
             assert!(!shortcuts.is_empty(), "section {title} has no shortcuts");
         }
         assert!(!TUI_SLASH_SECTIONS.is_empty());
-        for section in TUI_SLASH_SECTIONS {
+        for section in TUI_SLASH_SECTIONS.iter() {
             assert!(!section.title.is_empty());
             assert!(
                 !section.commands.is_empty(),
@@ -389,7 +389,7 @@ mod tests {
             "rendered overlay missing a representative TUI command"
         );
         assert!(
-            rendered.contains("/model <name>"),
+            rendered.contains("/model [list|name]"),
             "rendered overlay missing the default-TUI model switch command"
         );
         assert!(

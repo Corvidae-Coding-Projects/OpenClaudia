@@ -25,8 +25,9 @@ pub use compat_import::{
     hook_import_approval_store_path, inspect_repository_hook_imports,
     inspect_repository_hook_imports_at, load_approved_repository_hooks_at,
     revoke_repository_hook_import, revoke_repository_hook_import_at, HookImportBoundFile,
-    HookImportDiagnostic, HookImportError, HookImportKind, HookImportProposal, HookImportReport,
-    HookImportState,
+    HookImportCapability, HookImportDiagnostic, HookImportError, HookImportExecutable,
+    HookImportKind, HookImportOutputAuthority, HookImportOutputField, HookImportOwner,
+    HookImportProposal, HookImportReport, HookImportSourceScope, HookImportState,
 };
 pub use merge::merge_hooks_config;
 

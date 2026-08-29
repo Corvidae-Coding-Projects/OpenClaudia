@@ -50,9 +50,10 @@ const fn default_claude_timeout() -> Option<u64> {
 /// Load hooks from Claude Code-compatible settings sources.
 ///
 /// This is the runtime-facing helper used by the CLI, ACP, and proxy paths.
-/// User-global and managed host settings remain compatibility sources.
-/// Repository and project-local settings are inert proposals until an exact
-/// host approval is recorded by the explicit import workflow.
+/// User-global, repository, and project-local Claude settings are inert
+/// compatibility proposals until an exact host approval is recorded by the
+/// explicit import workflow. Managed enterprise settings remain a host-owned
+/// ceiling.
 #[must_use]
 pub fn load_claude_code_hooks() -> HooksConfig {
     let (config, _) = load_claude_code_hooks_layered();
@@ -156,19 +157,16 @@ pub fn load_claude_settings() -> LayeredSettings {
     }
 }
 
-/// Load compatible hooks while enforcing the repository trust boundary.
+/// Load compatible hooks while enforcing the explicit import trust boundary.
 ///
 /// The returned [`LayeredSettings`] remains a diagnostic view of host-owned
-/// settings sources. It is never the source of executable hooks. Runtime hooks are built
-/// from user-global settings, exact approved repository proposals, and finally
-/// managed host settings, in increasing authority order.
+/// settings sources. It is never the source of executable hooks. Runtime hooks
+/// are built from exact approved user/repository compatibility proposals and
+/// finally managed host settings, in increasing authority order.
+#[must_use]
 pub fn load_claude_code_hooks_layered() -> (HooksConfig, LayeredSettings) {
     let layered = load_claude_settings();
-    let user_hooks = dirs::home_dir().map_or_else(HooksConfig::default, |home| {
-        load_hooks_from_trusted_settings(&home.join(".claude/settings.json"))
-    });
-    let approved_repository_hooks = load_approved_repository_hooks();
-    let mut config = merge_host_hooks(approved_repository_hooks, user_hooks);
+    let mut config = load_approved_repository_hooks();
     if let Some(managed_path) = layered.managed_settings_path.as_deref() {
         config = merge_host_hooks(config, load_hooks_from_trusted_settings(managed_path));
     }

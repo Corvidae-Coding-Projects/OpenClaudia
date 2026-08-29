@@ -16,6 +16,7 @@ pub mod capability_evidence;
 pub mod claude_agent_sdk;
 pub mod claude_credentials;
 pub mod codex_agent_sdk;
+pub mod command_registry;
 pub mod compaction;
 pub mod config;
 pub mod context;

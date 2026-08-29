@@ -22,6 +22,10 @@ mod stamp_transcript_schema_v1;
 mod tests;
 
 pub use ledger::CompletionLedger;
+pub use stamp_transcript_schema_v1::{
+    foreign_transcript_import_is_current, read_foreign_transcript_import_contract,
+    ForeignTranscriptImport,
+};
 
 #[cfg(not(test))]
 const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -277,11 +281,16 @@ pub struct MigrationContext {
     pub claude_home: PathBuf,
     /// `OpenClaudia`-owned application-data root.
     pub openclaudia_data: PathBuf,
+    /// Host-selected workspace used to rebind legacy session identity.
+    pub workspace_root: PathBuf,
 }
 
 impl MigrationContext {
     fn validate(&self) -> Result<(), MigrationFailure> {
-        if self.claude_home.is_absolute() && self.openclaudia_data.is_absolute() {
+        if self.claude_home.is_absolute()
+            && self.openclaudia_data.is_absolute()
+            && self.workspace_root.is_absolute()
+        {
             Ok(())
         } else {
             Err(MigrationFailure::new(
@@ -319,21 +328,46 @@ impl MigrationContext {
                     "resolve OpenClaudia data root",
                 )
             })?;
+        let workspace_root = std::env::current_dir().map_err(|error| {
+            MigrationFailure::from_io(
+                MigrationFailureKind::ContextUnavailable,
+                MigrationStore::StartupContext,
+                "resolve trusted startup workspace",
+                &error,
+            )
+        })?;
         let context = Self {
             claude_home,
             openclaudia_data,
+            workspace_root,
         };
         context.validate()?;
         Ok(context)
     }
 
-    /// Explicit constructor for tests and host code that already owns both
-    /// directory authorities.
+    /// Compatibility constructor for tests that do not migrate legacy files.
+    /// The owned data root is also used as the deterministic workspace.
     #[must_use]
-    pub const fn with_paths(claude_home: PathBuf, openclaudia_data: PathBuf) -> Self {
+    pub fn with_paths(claude_home: PathBuf, openclaudia_data: PathBuf) -> Self {
+        let workspace_root = openclaudia_data.clone();
         Self {
             claude_home,
             openclaudia_data,
+            workspace_root,
+        }
+    }
+
+    /// Explicit constructor for a host that owns storage and workspace roots.
+    #[must_use]
+    pub const fn with_paths_and_workspace(
+        claude_home: PathBuf,
+        openclaudia_data: PathBuf,
+        workspace_root: PathBuf,
+    ) -> Self {
+        Self {
+            claude_home,
+            openclaudia_data,
+            workspace_root,
         }
     }
 }

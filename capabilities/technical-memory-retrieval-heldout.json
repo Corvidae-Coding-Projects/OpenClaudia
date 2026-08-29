@@ -33,7 +33,7 @@
         "observation": "A second runner lesson repeats the same fail-closed trace.",
         "guidance": "After one runner trace is selected, prefer an independent startup-gate check.",
         "applicability": {"paths": ["src/migrations/mod.rs"], "components": ["startup-migrations"], "tags": ["testing"]},
-        "citations": [{"kind": "test", "locator": "tests/migrations_runner_e2e.rs", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:d70230a137c6cd67e37be47911a4c56d30a7459f548d7313422e8ceb26049e6c"}],
+        "citations": [{"kind": "test", "locator": "tests/migrations_runner_e2e.rs", "source_version": "worktree:s038", "digest": "sha256:7e7b32ad2f79201241441b66583f43b3baf9fecb3a62b2d33cc4884551e18f71"}],
         "confidence": "verified_by_test",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}
@@ -51,7 +51,7 @@
         "observation": "The binary startup gate independently blocks agent surfaces on a fail-closed state.",
         "guidance": "Retain startup-gate coverage alongside the runner trace.",
         "applicability": {"paths": ["src/main.rs"], "components": ["startup-gate"], "tags": ["verify"]},
-        "citations": [{"kind": "test", "locator": "tests/migrations_runner_e2e.rs", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:d70230a137c6cd67e37be47911a4c56d30a7459f548d7313422e8ceb26049e6c"}],
+        "citations": [{"kind": "test", "locator": "tests/migrations_runner_e2e.rs", "source_version": "worktree:s038", "digest": "sha256:7e7b32ad2f79201241441b66583f43b3baf9fecb3a62b2d33cc4884551e18f71"}],
         "confidence": "verified_by_test",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}
@@ -69,7 +69,7 @@
         "observation": "The runner emits a typed trace for every fail-closed path.",
         "guidance": "Keep the primary runner trace in the selected technical set.",
         "applicability": {"paths": ["src/migrations/mod.rs"], "components": ["startup-migrations"], "tags": ["testing"]},
-        "citations": [{"kind": "source_file", "locator": "src/migrations/mod.rs", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:71a8f4f2edf115d463b6f29daa4751e2c5a2e534711990a21d2b40599c5fc42d"}],
+        "citations": [{"kind": "source_file", "locator": "src/migrations/mod.rs", "source_version": "worktree:s038", "digest": "sha256:1fef0796b7ad24f13d6e700af0eb0247bdef42f140fe5ef76bd12ed2dcd51d7d"}],
         "confidence": "verified_by_test",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}
@@ -177,7 +177,7 @@
         "observation": "Doctor diagnostics must not acquire a migration lock or repair persistent state.",
         "guidance": "Keep health inspection read-only and separate from the migration runner.",
         "applicability": {"paths": ["src/main.rs"], "components": ["doctor"], "tags": ["doctor", "lock", "migration"]},
-        "citations": [{"kind": "source_file", "locator": "src/main.rs", "source_version": "worktree:s100", "digest": "sha256:a70d042adffa6db7963a7fd70c394ca3cf51d902a603b317cd35a55d5aa8629c"}],
+        "citations": [{"kind": "source_file", "locator": "src/main.rs", "source_version": "worktree:s038", "digest": "sha256:7bb8a80e185f97d541d8f49f5bd5ba18d4aed18271b42526f75b6bd1b8696115"}],
         "confidence": "verified_by_test",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}
@@ -195,7 +195,7 @@
         "observation": "A startup migration lock must cover complete preflight and publication.",
         "guidance": "Acquire the bounded global migration lock before inspecting artifacts.",
         "applicability": {"paths": ["src/migrations/mod.rs"], "symbols": ["MigrationRunner::run_all"], "components": ["startup-migrations"], "tags": ["operate"]},
-        "citations": [{"kind": "test", "locator": "tests/migrations_runner_e2e.rs", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:d70230a137c6cd67e37be47911a4c56d30a7459f548d7313422e8ceb26049e6c"}],
+        "citations": [{"kind": "test", "locator": "tests/migrations_runner_e2e.rs", "source_version": "worktree:s038", "digest": "sha256:7e7b32ad2f79201241441b66583f43b3baf9fecb3a62b2d33cc4884551e18f71"}],
         "confidence": "verified_by_test",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}
@@ -231,7 +231,7 @@
         "observation": "Concurrent schema ownership claims cannot be selected implicitly.",
         "guidance": "Return conflict metadata and require typed resolution.",
         "applicability": {"paths": ["src/session/mod.rs"], "components": ["session-schema"], "tags": ["conflict"]},
-        "citations": [{"kind": "documentation", "locator": "docs/remediation-slices/038-session-schema-migration-and-ownership.md", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:0fde32e71faf941b770529d142f4e12bd6bd9596a12e0f1153ccc56a24bb5440"}],
+        "citations": [{"kind": "documentation", "locator": "docs/remediation-slices/038-session-schema-migration-and-ownership.md", "source_version": "worktree:s038", "digest": "sha256:e55997a56aeaa7f8ec1de74942a0da931c34f0f7f053f59d4561134864ab7d1c"}],
         "confidence": "reproduced",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}

@@ -9,7 +9,7 @@ use super::Migration;
 /// Return every migration in the order it must run.
 pub(super) fn all() -> Vec<Box<dyn Migration>> {
     vec![
-        Box::new(super::stamp_transcript_schema_v1::StampTranscriptSchemaV1),
         Box::new(super::session_state_v1::MigrateSessionStateV1),
+        Box::new(super::stamp_transcript_schema_v1::PublishOwnedSessionSchemaV1),
     ]
 }

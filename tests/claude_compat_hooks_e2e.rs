@@ -14,8 +14,9 @@
 
 use openclaudia::config::Hook;
 use openclaudia::hooks::{
-    inspect_repository_hook_imports, load_claude_code_hooks, load_claude_settings, ClaudeCodeHook,
-    ClaudeCodeHookEntry, ClaudeCodeSettings, HookImportState,
+    approve_repository_hook_import, inspect_repository_hook_imports, load_claude_code_hooks,
+    load_claude_settings, ClaudeCodeHook, ClaudeCodeHookEntry, ClaudeCodeSettings, HookImportKind,
+    HookImportSourceScope, HookImportState,
 };
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -42,6 +43,7 @@ struct EnvCwdGuard {
     cwd: std::path::PathBuf,
     home: Option<String>,
     userprofile: Option<String>,
+    hook_approvals: Option<std::ffi::OsString>,
 }
 
 impl EnvCwdGuard {
@@ -50,10 +52,15 @@ impl EnvCwdGuard {
             cwd: std::env::current_dir().expect("cwd"),
             home: std::env::var("HOME").ok(),
             userprofile: std::env::var("USERPROFILE").ok(),
+            hook_approvals: std::env::var_os("OPENCLAUDIA_HOOK_APPROVALS_PATH"),
         };
         std::env::set_current_dir(cwd).expect("chdir");
         std::env::set_var("HOME", home);
         std::env::set_var("USERPROFILE", home);
+        std::env::set_var(
+            "OPENCLAUDIA_HOOK_APPROVALS_PATH",
+            home.join("hook-import-approvals.json"),
+        );
         guard
     }
 }
@@ -68,6 +75,10 @@ impl Drop for EnvCwdGuard {
         match &self.userprofile {
             Some(value) => std::env::set_var("USERPROFILE", value),
             None => std::env::remove_var("USERPROFILE"),
+        }
+        match &self.hook_approvals {
+            Some(value) => std::env::set_var("OPENCLAUDIA_HOOK_APPROVALS_PATH", value),
+            None => std::env::remove_var("OPENCLAUDIA_HOOK_APPROVALS_PATH"),
         }
     }
 }
@@ -278,7 +289,7 @@ fn load_claude_code_hooks_handles_missing_dot_claude_dir_gracefully() {
 }
 
 #[test]
-fn runtime_loader_keeps_repository_layers_inert_without_host_approval() {
+fn runtime_loader_keeps_user_and_repository_layers_inert_until_exact_approval() {
     let _g = cwd_lock();
     let project = tempfile::TempDir::new().expect("project tempdir");
     let home = tempfile::TempDir::new().expect("home tempdir");
@@ -294,7 +305,7 @@ fn runtime_loader_keeps_repository_layers_inert_without_host_approval() {
         r#"{
           "hooks": {
             "PreToolUse": [
-              {"matcher": "Bash", "hooks": [{"type": "command", "command": "user-hook"}]}
+              {"matcher": "Bash", "hooks": [{"type": "command", "command": "python3 user.py"}]}
             ]
           }
         }"#,
@@ -305,7 +316,7 @@ fn runtime_loader_keeps_repository_layers_inert_without_host_approval() {
         r#"{
           "hooks": {
             "PreToolUse": [
-              {"matcher": "Write", "hooks": [{"type": "command", "command": "project-hook"}]}
+              {"matcher": "Write", "hooks": [{"type": "command", "command": "python3 project.py"}]}
             ]
           }
         }"#,
@@ -316,22 +327,25 @@ fn runtime_loader_keeps_repository_layers_inert_without_host_approval() {
         r#"{
           "hooks": {
             "PreToolUse": [
-              {"matcher": "Edit", "hooks": [{"type": "command", "command": "local-hook"}]}
+              {"matcher": "Edit", "hooks": [{"type": "command", "command": "python3 local.py"}]}
             ]
           }
         }"#,
     )
     .expect("write local settings");
+    for script in ["user.py", "project.py", "local.py"] {
+        std::fs::write(project.path().join(script), "print('hook')\n").expect("write hook script");
+    }
 
     let config = load_claude_code_hooks();
     let commands = command_names(&config.pre_tool_use);
-    assert_eq!(
-        commands,
-        ["user-hook".to_string()],
-        "host-owned user settings remain active; repository settings do not"
+    assert!(
+        commands.is_empty(),
+        "ambient user and repository compatibility settings must remain inert"
     );
     let imports = inspect_repository_hook_imports();
-    assert_eq!(imports.proposals.len(), 2);
+    assert!(imports.diagnostics.is_empty(), "{:?}", imports.diagnostics);
+    assert_eq!(imports.proposals.len(), 3);
     assert!(imports
         .proposals
         .iter()
@@ -339,9 +353,28 @@ fn runtime_loader_keeps_repository_layers_inert_without_host_approval() {
     assert!(imports
         .proposals
         .iter()
-        .any(|proposal| proposal.commands == ["project-hook".to_string()]));
+        .any(|proposal| proposal.commands == ["python3 project.py".to_string()]));
     assert!(imports
         .proposals
         .iter()
-        .any(|proposal| proposal.commands == ["local-hook".to_string()]));
+        .any(|proposal| proposal.commands == ["python3 local.py".to_string()]));
+    assert!(imports
+        .proposals
+        .iter()
+        .any(|proposal| proposal.commands == ["python3 user.py".to_string()]));
+
+    let user_proposal = imports
+        .proposals
+        .iter()
+        .find(|proposal| proposal.kind == HookImportKind::ClaudeUser)
+        .expect("user-global proposal");
+    assert_eq!(user_proposal.source_scope, HookImportSourceScope::User);
+    assert_eq!(user_proposal.source_owner, user_proposal.source_root_owner);
+    approve_repository_hook_import(&user_proposal.proposal_digest)
+        .expect("approve exact user-global proposal");
+    let approved = load_claude_code_hooks();
+    let approved_commands = command_names(&approved.pre_tool_use);
+    assert_eq!(approved_commands.len(), 1);
+    let argv = shlex::split(&approved_commands[0]).expect("approved pinned argv");
+    assert_eq!(&argv[1..], ["user.py"]);
 }

@@ -188,9 +188,9 @@ pub fn slash_help() {
     // Sections (Slash / Memory / Activity / Plugin / Skill) come from the
     // shared SLASH_SECTIONS table so the CLI printer and the TUI help
     // overlay never drift (crosslink #499).
-    for section in openclaudia::slash_commands::SLASH_SECTIONS {
+    for section in openclaudia::slash_commands::SLASH_SECTIONS.iter() {
         println!("\n{}:", section.title);
-        for c in section.commands {
+        for c in &section.commands {
             println!(
                 "  {:<width$} - {}",
                 c.invocation,
@@ -2143,23 +2143,6 @@ fn handle_slash_command_scoped(
         return None;
     }
 
-    let parts: Vec<&str> = input[1..].splitn(2, ' ').collect();
-    let cmd = parts[0].to_lowercase();
-    let args = parts.get(1).copied().unwrap_or("");
-
-    // Plugin run-command path: `/plugin-name:command` bypasses the registry
-    // because the key space is open-ended (any installed plugin name).
-    if cmd.contains(':') {
-        let colon_parts: Vec<&str> = cmd.splitn(2, ':').collect();
-        if colon_parts.len() == 2 {
-            return Some(SlashCommandResult::Plugin(PluginAction::RunCommand {
-                plugin_name: colon_parts[0].to_string(),
-                command_name: colon_parts[1].to_string(),
-                arguments: args.trim().to_string(),
-            }));
-        }
-    }
-
     let mut ctx = super::command_registry::SlashCtx {
         messages,
         provider,
@@ -2171,9 +2154,9 @@ fn handle_slash_command_scoped(
 
     Some(
         super::command_registry::registry()
-            .dispatch(&cmd, &mut ctx, args)
-            .unwrap_or_else(|| {
-                eprintln!("Unknown command: /{cmd}. Type /help for available commands.\n");
+            .parse_and_dispatch(input, &mut ctx)
+            .unwrap_or_else(|error| {
+                eprintln!("{error}\n");
                 SlashCommandResult::Handled
             }),
     )
@@ -4257,24 +4240,19 @@ mod tests {
 
     #[test]
     fn plugin_run_command_slash_preserves_arguments() {
-        let result = handle_slash_command(
-            "/demo:fix src/main.rs --strict",
-            &mut ctx(),
-            "anthropic",
-            "claude-sonnet",
+        let proposal = openclaudia::command_registry::registry()
+            .parse(
+                "/demo:fix src/main.rs --strict",
+                openclaudia::command_registry::CommandFrontend::LegacyCli,
+            )
+            .expect("namespaced plugin command must parse without executing");
+        assert_eq!(
+            proposal.id(),
+            openclaudia::command_registry::CommandId::DynamicPlugin
         );
-        match result {
-            Some(SlashCommandResult::Plugin(PluginAction::RunCommand {
-                plugin_name,
-                command_name,
-                arguments,
-            })) => {
-                assert_eq!(plugin_name, "demo");
-                assert_eq!(command_name, "fix");
-                assert_eq!(arguments, "src/main.rs --strict");
-            }
-            _ => panic!("/plugin:command args must resolve to RunCommand with arguments"),
-        }
+        assert_eq!(proposal.namespace(), Some("demo"));
+        assert_eq!(proposal.component(), Some("fix"));
+        assert_eq!(proposal.arguments_text(), "src/main.rs --strict");
     }
 
     // ── Rewind/checkpoint command parity ─────────────────────────────────────

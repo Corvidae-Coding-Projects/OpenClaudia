@@ -63,6 +63,32 @@ impl MigrateSessionStateV1 {
         )
     }
 
+    const fn schema_failure(error: &crate::state::persist::PersistError) -> MigrationFailure {
+        let kind = match error {
+            crate::state::persist::PersistError::FutureSchema { .. } => {
+                MigrationFailureKind::UnsupportedFutureSchema
+            }
+            crate::state::persist::PersistError::ResourceLimit(_) => {
+                MigrationFailureKind::ResourceLimitExceeded
+            }
+            crate::state::persist::PersistError::Io(_)
+            | crate::state::persist::PersistError::Json(_)
+            | crate::state::persist::PersistError::UnsupportedOldSchema { .. }
+            | crate::state::persist::PersistError::MigrationRequired { .. }
+            | crate::state::persist::PersistError::InvalidMigrationContext
+            | crate::state::persist::PersistError::InvalidRecord(_)
+            | crate::state::persist::PersistError::InconsistentSessionId { .. }
+            | crate::state::persist::PersistError::InvalidProviderNativeState(_) => {
+                MigrationFailureKind::InvalidPersistentState
+            }
+        };
+        MigrationFailure::new(
+            kind,
+            MigrationStore::OpenClaudiaData,
+            "decode saved session schema",
+        )
+    }
+
     fn plan(
         ctx: &MigrationContext,
         storage: &PersistentStorage,
@@ -76,8 +102,6 @@ impl MigrateSessionStateV1 {
                 "bound saved session count",
             ));
         }
-        let cwd = std::env::current_dir()
-            .map_err(|_| Self::invalid("resolve legacy session working directory"))?;
         let directory = Self::sessions_dir(ctx);
         let mut total_bytes = 0_u64;
         let mut plans = Vec::with_capacity(targets.len());
@@ -91,8 +115,8 @@ impl MigrateSessionStateV1 {
             let text = std::str::from_utf8(&raw)
                 .map_err(|_| Self::invalid("decode saved session UTF-8"))?;
             let (document, canonical) =
-                crate::state::persist::decode_document_for_migration(text, &cwd)
-                    .map_err(|_| Self::invalid("decode saved session schema"))?;
+                crate::state::persist::decode_document_for_migration(text, &ctx.workspace_root)
+                    .map_err(|error| Self::schema_failure(&error))?;
             let path = directory.join(&target);
             crate::state::validate_session_file(
                 &path,
@@ -105,6 +129,16 @@ impl MigrateSessionStateV1 {
                 serde_json::to_vec_pretty(&document)
                     .map_err(|_| Self::invalid("encode canonical saved session"))?
             };
+            let desired_text = std::str::from_utf8(&desired)
+                .map_err(|_| Self::invalid("verify canonical saved session UTF-8"))?;
+            let (_, verified_current) = crate::state::persist::decode_document_for_migration(
+                desired_text,
+                &ctx.workspace_root,
+            )
+            .map_err(|error| Self::schema_failure(&error))?;
+            if !verified_current {
+                return Err(Self::invalid("verify canonical saved session schema"));
+            }
             total_bytes = total_bytes
                 .checked_add(u64::try_from(desired.len()).unwrap_or(u64::MAX))
                 .filter(|total| *total <= MAX_SESSION_STORE_BYTES)
@@ -227,6 +261,27 @@ impl MigrateSessionStateV1 {
                     .with_committed_artifacts(changed_artifacts),
                 );
             }
+            let verified = match storage.read(PathBuf::from(&plan.target), FileClass::Session) {
+                Ok(verified) => verified,
+                Err(error) => {
+                    return MigrationOutcome::Failed(
+                        Self::persistence_failure("verify published saved session", &error)
+                            .with_committed_artifacts(changed_artifacts),
+                    );
+                }
+            };
+            let bytes_match = verified
+                .expose_bytes(|bytes| bytes.is_some_and(|bytes| bytes == plan.desired.as_slice()));
+            if verified.generation() != receipt.generation() || !bytes_match {
+                return MigrationOutcome::Failed(
+                    MigrationFailure::new(
+                        MigrationFailureKind::ConcurrentChange,
+                        MigrationStore::OpenClaudiaData,
+                        "verify published saved session generation",
+                    )
+                    .with_committed_artifacts(changed_artifacts),
+                );
+            }
         }
         if changed_artifacts == 0 {
             MigrationOutcome::Current
@@ -275,9 +330,12 @@ mod tests {
 
     fn context() -> (tempfile::TempDir, MigrationContext) {
         let root = tempfile::tempdir().unwrap();
-        let context = MigrationContext::with_paths(
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let context = MigrationContext::with_paths_and_workspace(
             root.path().join("claude"),
             root.path().join("openclaudia"),
+            workspace,
         );
         std::fs::create_dir_all(context.openclaudia_data.join("chat_sessions")).unwrap();
         (root, context)
@@ -295,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_tui_shape_is_rewritten_losslessly() {
+    fn legacy_tui_shape_retains_content_and_strips_path_authority() {
         let (_root, context) = context();
         let path = session_path(&context, "legacy-session");
         std::fs::write(&path, legacy_fixture("legacy-session")).unwrap();
@@ -333,10 +391,15 @@ mod tests {
         assert_eq!(state.conversation.messages[0]["content"], "remember me");
         assert_eq!(state.conversation.undo_stack.len(), 1);
         assert_eq!(state.conversation.approved_plan.as_deref(), Some("ship it"));
-        assert_eq!(
-            state.identity.additional_directories_for_claude_md,
-            vec![PathBuf::from("/tmp/shared")]
-        );
+        assert!(state
+            .identity
+            .additional_directories_for_claude_md
+            .is_empty());
+        assert_eq!(state.identity.cwd, context.workspace_root);
+        assert_eq!(state.identity.original_cwd, state.identity.cwd);
+        assert_eq!(state.identity.project_root, state.identity.cwd);
+        assert_eq!(state.identity.session_project_dir, state.identity.cwd);
+        assert_eq!(state.transcript.transcript_cwd, state.identity.cwd);
     }
 
     #[test]
@@ -378,7 +441,7 @@ mod tests {
     fn canonical_document_is_byte_stable_and_idempotent() {
         let (_root, context) = context();
         let path = session_path(&context, "canonical");
-        let mut state = crate::state::SessionState::default();
+        let mut state = crate::state::SessionState::new(context.workspace_root.clone());
         state.identity.session_id = crate::state::SessionId::from_raw_unchecked("canonical");
         let document = crate::state::SessionDocument::from_state(
             "title".to_string(),
@@ -434,10 +497,72 @@ mod tests {
     }
 
     #[test]
+    fn version_zero_preserves_causal_state_and_strips_live_authority() {
+        let (_root, context) = context();
+        let path = session_path(&context, "legacy-v0");
+        let mut state = crate::state::SessionState::new(PathBuf::from("/untrusted/source"));
+        state.identity.session_id = crate::state::SessionId::from_raw_unchecked("legacy-v0");
+        state
+            .identity
+            .additional_directories_for_claude_md
+            .push(PathBuf::from("/untrusted/additional"));
+        state.modes.coordinator = true;
+        state.budgets.thinking_budget_override = Some(u32::MAX);
+        state.transcript.watermark = 1;
+        state
+            .conversation
+            .messages
+            .push(serde_json::json!({"role": "user", "content": "retained"}));
+        let document = crate::state::SessionDocument::from_state(
+            "legacy-v0".to_string(),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            "model".to_string(),
+            "provider".to_string(),
+            state,
+        );
+        let mut value = serde_json::to_value(document).unwrap();
+        value["session_state"]["version"] = serde_json::json!(0);
+        value["session_state"]["permissions"] = serde_json::json!({
+            "bypass_mode": true,
+            "trust_accepted": true,
+            "persistence_disabled": false
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        assert!(matches!(
+            MigrateSessionStateV1.run(&context),
+            MigrationOutcome::Applied {
+                changed_artifacts: 1
+            }
+        ));
+
+        let migrated: crate::state::Session =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let state = migrated.state_snapshot();
+        assert_eq!(state.identity.cwd, PathBuf::from("/untrusted/source"));
+        assert_eq!(state.identity.original_cwd, state.identity.cwd);
+        assert_eq!(state.identity.project_root, state.identity.cwd);
+        assert_eq!(state.identity.session_project_dir, state.identity.cwd);
+        assert!(state
+            .identity
+            .additional_directories_for_claude_md
+            .is_empty());
+        assert!(state.identity.active_workspace.is_none());
+        assert!(state.modes.coordinator);
+        assert_eq!(state.budgets.thinking_budget_override, Some(u32::MAX));
+        assert!(!state.permissions.bypass_mode);
+        assert!(!state.permissions.trust_accepted);
+        assert_eq!(state.transcript.watermark, 1);
+        assert_eq!(state.transcript.transcript_cwd, state.identity.cwd);
+        assert_eq!(state.conversation.messages[0]["content"], "retained");
+    }
+
+    #[test]
     fn future_schema_fails_without_downgrading_file() {
         let (_root, context) = context();
         let path = session_path(&context, "future");
-        let mut state = crate::state::SessionState::default();
+        let mut state = crate::state::SessionState::new(context.workspace_root.clone());
         state.identity.session_id = crate::state::SessionId::from_raw_unchecked("future");
         let mut envelope = SessionStateV1::wrap(state);
         envelope.version = 999;
@@ -452,10 +577,13 @@ mod tests {
         .unwrap();
         std::fs::write(&path, &original).unwrap();
 
-        assert!(matches!(
-            MigrateSessionStateV1.run(&context),
-            MigrationOutcome::Failed(_)
-        ));
+        let MigrationOutcome::Failed(failure) = MigrateSessionStateV1.run(&context) else {
+            panic!("future session schema must fail closed");
+        };
+        assert_eq!(
+            failure.kind(),
+            MigrationFailureKind::UnsupportedFutureSchema
+        );
         assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 

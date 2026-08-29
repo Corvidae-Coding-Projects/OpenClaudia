@@ -23,8 +23,7 @@ use ratatui::{
 };
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::sync::LazyLock;
+use std::process::Output;
 use std::time::Duration;
 
 use crate::file_error::{self, FileError};
@@ -33,21 +32,6 @@ use crate::state::{AgentMode, Session};
 const INPUT_PROMPT_WIDTH: u16 = 2;
 const MIN_INPUT_HEIGHT: u16 = 3;
 const MAX_INPUT_HEIGHT: u16 = 8;
-
-/// Absolute, PATH-independent location of `git` for synchronous TUI helpers.
-static GIT_BIN: LazyLock<Result<PathBuf, String>> =
-    LazyLock::new(|| which::which("git").map_err(|e| format!("git binary not found on PATH: {e}")));
-
-fn git_bin() -> Result<&'static Path, String> {
-    match &*GIT_BIN {
-        Ok(path) => Ok(path.as_path()),
-        Err(msg) => Err(msg.clone()),
-    }
-}
-
-fn git_command() -> Result<Command, String> {
-    Ok(Command::new(git_bin()?))
-}
 
 fn inserts_newline(modifiers: KeyModifiers) -> bool {
     modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL)
@@ -386,59 +370,6 @@ struct PendingPlanApproval {
     allowed_prompts: Vec<crate::tools::ToolAllowedPrompt>,
     scroll_offset: u16,
     reply: tokio::sync::oneshot::Sender<PlanModeReply>,
-}
-
-/// Dispatch table for the TUI's no-argument slash commands (crosslink #259).
-///
-/// Each entry maps a canonical command spelling (`/quit`, `/help`, …) to
-/// the [`App`] method that handles it. The TUI keeps its own table — the
-/// CLI's [`command_registry`] cannot be reused directly because CLI
-/// handlers print to stdout, which corrupts the TUI's alternate-screen
-/// rendering. Mirroring the registry *pattern* here (table-driven
-/// dispatch over an if-chain) is the OCP win #232 brought to the CLI;
-/// this commit extends it to the TUI for the exact branches below.
-///
-/// Adding a new no-arg TUI command:
-///   1. Add a `slash_<name>` method on [`App`] that takes `&mut self`.
-///   2. Append `("/canonical_name", App::slash_<name>)` to this table.
-///   3. (Optional) Add aliases by appending more `(alias, App::slash_<name>)`
-///      rows pointing at the same handler.
-///
-/// Commands that take arguments (`/load <id>`, `/rewind N`, `/effort low`,
-/// `/rename <title>`, …) bypass the table because their key shape is a
-/// prefix, not an exact match — they continue through `handle_session_slash`,
-/// `handle_export_effort_slash`, and `handle_info_slash` until a future pass
-/// generalises the table to prefix dispatch (documented in
-/// [`App::handle_slash_command`]'s rustdoc).
-type TuiSlashHandler = fn(&mut App);
-
-const TUI_SLASH_TABLE: &[(&str, TuiSlashHandler)] = &[
-    ("/quit", App::slash_quit),
-    ("/exit", App::slash_quit),
-    ("/help", App::slash_help),
-    ("?", App::slash_help),
-    ("/resume", App::slash_resume),
-    ("/continue", App::slash_resume),
-    ("/new", App::slash_clear),
-    ("/clear", App::slash_clear),
-    ("/status", App::slash_status),
-    ("/copy", App::slash_copy),
-    ("/keybindings", App::slash_keybindings),
-    ("/keys", App::slash_keybindings),
-    ("/bindings", App::slash_keybindings),
-    ("/mode", App::slash_mode),
-    ("/plan", App::slash_mode),
-    ("/skill", App::slash_skill_list),
-    ("/skills", App::slash_skill_list),
-];
-
-/// O(n) lookup for the TUI slash table. The table is small (fewer than 24 entries
-/// in practice) so linear scan beats a `HashMap` on cache locality and
-/// avoids the `OnceLock` build the CLI registry needs.
-fn lookup_tui_slash(text: &str) -> Option<TuiSlashHandler> {
-    TUI_SLASH_TABLE
-        .iter()
-        .find_map(|(name, handler)| (*name == text).then_some(*handler))
 }
 
 const fn tui_supports_key_action(action: &crate::keybindings::KeyAction) -> bool {
@@ -3323,10 +3254,14 @@ impl App {
                 crate::tools::safe_truncate(&self.chat_session.id(), 8)
             );
             let path_for_render = export_path.clone();
+            let run = self.run_context.as_ref().ok().cloned();
             self.spawn_fs(SpawnTarget::Files, move || {
-                std::fs::write(&export_path, md.as_bytes())
-                    .map(|()| format!("Exported to {path_for_render}"))
-                    .map_err(|e| format!("Export failed: {e}"))
+                let run = run.ok_or_else(|| {
+                    "Export failed: no active workspace-write capability".to_string()
+                })?;
+                crate::tools::create_capability_text_file(&run, &export_path, &md)
+                    .map(|_| format!("Exported to {path_for_render}"))
+                    .map_err(|error| format!("Export failed: {error}"))
             });
             return true;
         }
@@ -3349,56 +3284,176 @@ impl App {
         false
     }
 
-    /// Handle slash commands. Returns true if the command was recognized.
-    ///
-    /// No-argument branches (`/quit`, `/exit`, `/help`, `?`, `/resume`,
-    /// `/continue`, `/new`, `/clear`, `/status`, `/copy`, `/keybindings`,
-    /// `/mode`, `/plan`, `/skill`, `/skills`) are
-    /// dispatched via the [`TUI_SLASH_TABLE`] lookup — the same OCP-clean
-    /// dispatch pattern the CLI's [`command_registry::registry`] uses
-    /// (crosslink #232 / #259). Branches that take arguments (`/load <id>`,
-    /// `/rewind N`, `/effort high`, …) stay in the longer-form
-    /// `handle_session_slash` / `handle_export_effort_slash` / etc.
-    /// helpers below because their dispatch is on a *prefix*, not a
-    /// canonical name, and the table is keyed by full canonical name to
-    /// keep the lookup O(1).
-    ///
-    /// REMAINING IF-BRANCHES (documented for the next migration pass):
-    ///
-    /// * `/load <id>` / `/continue <id>` — prefix dispatch.
-    /// * `/rewind` / `/rewind N` — prefix dispatch.
-    /// * `/undo`, `/redo` — would fit the table once helpers exist.
-    /// * `/sessions`, `/list` — would fit the table once helpers exist.
-    /// * `/export`, `/effort` / `/effort <lvl>` — prefix dispatch.
-    /// * `/rename <title>` — prefix dispatch.
-    /// * `/provider [name]`, `/model`, `/models`, `/cost`, `/files [dir]`,
-    ///   `/diff`, `/context`, `/doctor`, `/review`, and `/init` peers in
-    ///   `handle_diagnostic_slash` — would fit the table once helpers exist.
-    ///
-    /// The next person to touch this file should hoist these remaining
-    /// branches into the table; each is a 3-line entry once a sibling
-    /// helper exists.
+    /// Parse and execute a slash command through the shared typed registry.
+    /// Frontend-specific behavior remains on [`App`], but names, aliases,
+    /// arguments, availability, capabilities, and lifecycle admission do not.
     fn handle_slash_command(&mut self, text: &str) -> bool {
-        if let Some(handler) = lookup_tui_slash(text) {
-            handler(self);
-            return true;
+        let registry = crate::command_registry::registry();
+        let proposal = match registry.parse(text, crate::command_registry::CommandFrontend::Tui) {
+            Ok(proposal) => proposal,
+            Err(crate::command_registry::CommandParseError::NotACommand) => return false,
+            Err(error) => {
+                self.messages.add(DisplayMessage::error(error.to_string()));
+                return true;
+            }
+        };
+        let run = self.run_context.as_ref().ok().cloned();
+        if let Err(error) = registry.execute(&proposal, run.as_deref(), |proposal| {
+            self.dispatch_tui_proposed(proposal);
+        }) {
+            self.messages.add(DisplayMessage::error(error.to_string()));
         }
+        true
+    }
 
-        if self.handle_session_slash(text) {
-            return true;
+    // This exhaustive typed-handler match is intentionally kept together so a
+    // new command cannot be silently omitted from TUI dispatch.
+    #[allow(clippy::too_many_lines)]
+    fn dispatch_tui_proposed(&mut self, proposal: &crate::command_registry::ProposedCommand) {
+        use crate::command_registry::CommandId;
+
+        let args = proposal.arguments_text();
+        match proposal.id() {
+            CommandId::Help => self.slash_help(),
+            CommandId::New => self.slash_clear(),
+            CommandId::Sessions => {
+                self.handle_session_slash("/sessions");
+            }
+            CommandId::Continue => {
+                if args.is_empty() {
+                    self.slash_resume();
+                } else {
+                    self.resume_session_by_id(args);
+                }
+            }
+            CommandId::Exit => self.slash_quit(),
+            CommandId::Model => {
+                let command = if proposal.invoked_name() == "models" {
+                    "/models".to_string()
+                } else if args.is_empty() {
+                    "/model".to_string()
+                } else {
+                    format!("/model {args}")
+                };
+                self.handle_slash_model(&command);
+            }
+            CommandId::Export => {
+                self.handle_export_effort_slash("/export");
+            }
+            CommandId::Undo => {
+                self.handle_session_slash("/undo");
+            }
+            CommandId::Redo => {
+                self.handle_session_slash("/redo");
+            }
+            CommandId::Rewind => {
+                let command = if args.is_empty() {
+                    "/rewind".to_string()
+                } else {
+                    format!("/rewind {args}")
+                };
+                self.handle_session_slash(&command);
+            }
+            CommandId::Copy => self.slash_copy(),
+            CommandId::Init => self.handle_slash_init(),
+            CommandId::Review => self.handle_slash_review(),
+            CommandId::Status => self.slash_status(),
+            CommandId::Plan | CommandId::Mode => self.slash_mode(),
+            CommandId::Keybindings => self.slash_keybindings(),
+            CommandId::Rename => {
+                self.handle_info_slash(&format!("/rename {args}"));
+            }
+            CommandId::Doctor => self.handle_slash_doctor(),
+            CommandId::Effort => {
+                let command = if args.is_empty() {
+                    "/effort".to_string()
+                } else {
+                    format!("/effort {args}")
+                };
+                self.handle_export_effort_slash(&command);
+            }
+            CommandId::Skill => {
+                if args.is_empty() {
+                    self.slash_skill_list();
+                } else {
+                    self.handle_info_slash(&format!("/skill {args}"));
+                }
+            }
+            CommandId::Cost => self.handle_slash_cost(),
+            CommandId::Context => {
+                self.handle_diagnostic_slash("/context");
+            }
+            CommandId::Provider => {
+                let command = if args.is_empty() {
+                    "/provider".to_string()
+                } else {
+                    format!("/provider {args}")
+                };
+                self.handle_slash_provider(&command);
+            }
+            CommandId::Files => {
+                let command = if args.is_empty() {
+                    "/files".to_string()
+                } else {
+                    format!("/files {args}")
+                };
+                self.handle_slash_files(&command);
+            }
+            CommandId::Diff => self.handle_slash_diff(),
+            CommandId::DynamicPlugin => {
+                let namespace = proposal.namespace().unwrap_or_default();
+                let component = proposal.component().unwrap_or_default();
+                let namespaced_name = format!("{namespace}:{component}");
+                if let Some(invocation) = self.resolve_plugin_turn(&namespaced_name, args) {
+                    self.apply_plugin_turn(invocation);
+                } else {
+                    self.messages.add(DisplayMessage::error(format!(
+                        "Plugin command /{namespaced_name} is unavailable."
+                    )));
+                }
+            }
+            CommandId::DirectSkill => {
+                let name = proposal.component().unwrap_or_default();
+                let command = if args.is_empty() {
+                    format!("/{name}")
+                } else {
+                    format!("/{name} {args}")
+                };
+                self.handle_info_slash(&command);
+            }
+            CommandId::History
+            | CommandId::Compact
+            | CommandId::Editor
+            | CommandId::Teleport
+            | CommandId::Thinkback
+            | CommandId::Connect
+            | CommandId::Theme
+            | CommandId::Vim
+            | CommandId::Agents
+            | CommandId::Version
+            | CommandId::Config
+            | CommandId::Mcp
+            | CommandId::Permissions
+            | CommandId::Hooks
+            | CommandId::Debug
+            | CommandId::Fast
+            | CommandId::Find
+            | CommandId::Memory
+            | CommandId::Activity
+            | CommandId::Plugin
+            | CommandId::Commit
+            | CommandId::CommitPushPr
+            | CommandId::Login
+            | CommandId::Logout
+            | CommandId::AddDir
+            | CommandId::Branch
+            | CommandId::Btw => {
+                self.messages.add(DisplayMessage::error(format!(
+                    "Command /{} is unavailable in the full-screen TUI.",
+                    proposal.invoked_name()
+                )));
+            }
         }
-
-        if self.handle_export_effort_slash(text) {
-            return true;
-        }
-
-        // Skill invocations and info/diagnostic commands starting with /
-        if text.starts_with('/') {
-            self.handle_info_slash(text);
-            return true;
-        }
-
-        false
     }
 
     /// Table-handler entry point for `/quit` / `/exit`.
@@ -4144,9 +4199,14 @@ impl App {
         let dir = text.strip_prefix("/files").unwrap_or("").trim().to_owned();
         let dir = if dir.is_empty() { ".".to_string() } else { dir };
         let dir_for_render = dir.clone();
+        let run = self.run_context.as_ref().ok().cloned();
         self.spawn_fs(SpawnTarget::Files, move || {
-            let entries =
-                std::fs::read_dir(&dir).map_err(|e| format!("Failed to list {dir}: {e}"))?;
+            let run =
+                run.ok_or_else(|| format!("Failed to list {dir}: no active read capability"))?;
+            let resolved = crate::tools::resolve_capability_path(&run, &dir)
+                .map_err(|error| format!("Failed to list {dir}: {error}"))?;
+            let entries = std::fs::read_dir(&resolved)
+                .map_err(|error| format!("Failed to list {dir}: {error}"))?;
             let mut items: Vec<String> = entries
                 .flatten()
                 .map(|e| {
@@ -4242,11 +4302,16 @@ impl App {
             self.messages.add(DisplayMessage::error(error));
             return;
         }
-        let content = match git_command().and_then(|mut cmd| {
-            cmd.args(["diff", "HEAD"])
-                .output()
-                .map_err(|e| e.to_string())
-        }) {
+        let content = match run
+            .resolve_executable("git")
+            .map_err(|error| error.to_string())
+            .and_then(|git| {
+                std::process::Command::new(git)
+                    .current_dir(run.working_directory())
+                    .args(["diff", "HEAD"])
+                    .output()
+                    .map_err(|error| error.to_string())
+            }) {
             Ok(out) => format_review_command_output(&out),
             Err(e) => format!("Failed to run git diff: {e}"),
         };
@@ -6773,10 +6838,10 @@ mod tests {
     use super::{
         append_context_reference_message, create_orphan_recovery_dir, format_api_retry_delay,
         format_api_retry_message, format_review_command_output, format_stream_timeout_message,
-        git_bin, handle_turn_result, list_sessions, lookup_tui_slash, provider_state_after_turn,
-        read_tui_session_file, resolve_provider_switch_auth, save_session,
-        write_orphan_recovery_file, ApiClient, App, AppEvent, EffortLevel, MessageKind, Mode,
-        ProviderSwitch, SpawnTarget, TurnContext, TEST_SESSIONS_DIR, TUI_SLASH_TABLE,
+        handle_turn_result, list_sessions, provider_state_after_turn, read_tui_session_file,
+        resolve_provider_switch_auth, save_session, write_orphan_recovery_file, ApiClient, App,
+        AppEvent, EffortLevel, MessageKind, Mode, ProviderSwitch, SpawnTarget, TurnContext,
+        TEST_SESSIONS_DIR,
     };
     use super::{compile_file_ref_regex, expand_file_refs};
     use crate::slash_commands::all_tui_commands;
@@ -6789,14 +6854,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn tui_git_helpers_use_resolved_binary_path() {
-        let git = git_bin().expect("tui tests require git on PATH");
-        assert!(
-            git.is_absolute(),
-            "git_bin must resolve git to an absolute path, got {}",
-            git.display()
-        );
-
+    fn tui_review_never_invokes_bare_git() {
         let src = include_str!("app.rs");
         let cfg_test = src
             .find("#[cfg(test)]")
@@ -7173,59 +7231,33 @@ mod tests {
             .collect()
     }
 
-    fn tui_runtime_command_roots() -> Vec<&'static str> {
-        let mut roots = TUI_SLASH_TABLE
-            .iter()
-            .map(|(name, _)| *name)
-            .collect::<Vec<_>>();
-        roots.extend([
-            "/sessions",
-            "/list",
-            "/load",
-            "/continue",
-            "/rewind",
-            "/undo",
-            "/redo",
-            "/export",
-            "/effort",
-            "/rename",
-            "/provider",
-            "/model",
-            "/models",
-            "/cost",
-            "/files",
-            "/diff",
-            "/context",
-            "/doctor",
-            "/review",
-            "/init",
-            "/skill",
-            "/skills",
-            "/<skill-name>",
-        ]);
-        roots.sort_unstable();
-        roots.dedup();
-        roots
-    }
-
     #[test]
-    fn advertised_tui_slash_commands_have_runtime_roots() {
-        let runtime_roots = tui_runtime_command_roots();
+    fn advertised_tui_slash_commands_resolve_through_canonical_registry() {
+        let registry = crate::command_registry::registry();
         for command in all_tui_commands() {
             for root in advertised_tui_invocation_roots(command.invocation) {
+                let concrete = root
+                    .replace("<plugin>", "demo")
+                    .replace("<command>", "run")
+                    .replace("<skill-name>", "demo-skill");
+                let resolves = if root.contains("<plugin>") || root.contains("<skill-name>") {
+                    registry
+                        .parse(&concrete, crate::command_registry::CommandFrontend::Tui)
+                        .is_ok()
+                } else {
+                    registry
+                        .get(root.trim_start_matches('/'))
+                        .is_some_and(|spec| {
+                            spec.frontends
+                                .contains(crate::command_registry::CommandFrontend::Tui)
+                        })
+                };
                 assert!(
-                    runtime_roots.contains(&root.as_str()),
-                    "TUI help advertises `{}` but the default TUI runtime has no handler root for `{root}`",
+                    resolves,
+                    "TUI help advertises `{}` but the canonical registry does not resolve {concrete:?}",
                     command.invocation
                 );
             }
-        }
-
-        for (exact, _) in TUI_SLASH_TABLE {
-            assert!(
-                lookup_tui_slash(exact).is_some(),
-                "exact TUI slash root {exact} must resolve through lookup_tui_slash"
-            );
         }
     }
 
@@ -8893,6 +8925,9 @@ mod tests {
 
         let mut older = Session::new("old-model", "initial-provider");
         older.set_id(OLDER_ID.to_string());
+        older.created_at = chrono::DateTime::parse_from_rfc3339("2025-12-31T00:00:00Z")
+            .expect("valid timestamp")
+            .with_timezone(&chrono::Utc);
         older.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .expect("valid timestamp")
             .with_timezone(&chrono::Utc);
@@ -8915,6 +8950,9 @@ mod tests {
         .expect("explicit explore target");
         newer.set_behavior_mode_and_targets(newer.behavior_mode(), explore_targets);
         newer.set_id(NEWER_ID.to_string());
+        newer.created_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("valid timestamp")
+            .with_timezone(&chrono::Utc);
         newer.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
             .expect("valid timestamp")
             .with_timezone(&chrono::Utc);
@@ -9021,12 +9059,18 @@ mod tests {
 
         let mut older = Session::new("old-model", "initial-provider");
         older.set_id(OLDER_ID.to_string());
+        older.created_at = chrono::DateTime::parse_from_rfc3339("2025-12-31T00:00:00Z")
+            .expect("valid timestamp")
+            .with_timezone(&chrono::Utc);
         older.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .expect("valid timestamp")
             .with_timezone(&chrono::Utc);
 
         let mut newer = Session::new("new-model", "initial-provider");
         newer.set_id(NEWER_ID.to_string());
+        newer.created_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("valid timestamp")
+            .with_timezone(&chrono::Utc);
         newer.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
             .expect("valid timestamp")
             .with_timezone(&chrono::Utc);
@@ -9087,16 +9131,21 @@ mod tests {
 
         let mut valid = Session::new("valid-model", "provider");
         valid.set_id("abc".to_string());
+        valid.created_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("valid timestamp")
+            .with_timezone(&chrono::Utc);
         valid.updated_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
             .expect("valid timestamp")
             .with_timezone(&chrono::Utc);
         save_session(&valid).expect("short valid id should save");
 
         let invalid = Session::new("invalid-model", "provider");
-        invalid.set_id("../outside".to_string());
+        let mut invalid_value =
+            serde_json::to_value(&invalid).expect("serialize structurally valid fixture");
+        invalid_value["id"] = serde_json::json!("../outside");
         std::fs::write(
             session_dir.join("invalid.json"),
-            serde_json::to_string(&invalid).expect("serialize invalid fixture"),
+            serde_json::to_string(&invalid_value).expect("serialize invalid fixture bytes"),
         )
         .expect("write invalid fixture");
 
@@ -9127,11 +9176,10 @@ mod tests {
     fn transcript_subscriber_advances_watermark_to_len_on_message_events() {
         // Happy path: every queued message persists successfully, so the
         // watermark moves all the way to session_messages.len(). The
-        // transcript writes land under `CLAUDE_CONFIG_HOME_DIR/projects/...`
-        // which we redirect into a tempdir so the test can't pollute
-        // the user's real `~/.claude/projects/` tree.
+        // Transcript writes land in OpenClaudia-owned storage, redirected to
+        // a tempdir so the test cannot pollute the user's data directory.
         let tmp = tempfile::tempdir().expect("tempdir");
-        let _guard = EnvGuard::set("CLAUDE_CONFIG_HOME_DIR", tmp.path());
+        let _guard = EnvGuard::set("OPENCLAUDIA_TRANSCRIPT_HOME_DIR", tmp.path());
 
         let mut app = App::new("test-model", "test-provider");
         app.chat_session
@@ -9161,14 +9209,14 @@ mod tests {
         //
         // Failure is injected by placing a regular FILE at the path
         // `create_dir_all` would otherwise create as a directory
-        // (`<CLAUDE_CONFIG_HOME_DIR>/projects/`). `create_dir_all`
+        // (`<OPENCLAUDIA_TRANSCRIPT_HOME_DIR>/projects/`). `create_dir_all`
         // then errors with "Not a directory" on every append, so zero
         // entries persist and the watermark must stay at 0 (the bug
         // jumped it straight to 3).
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join("projects"), b"not a directory")
             .expect("write blocker file");
-        let _guard = EnvGuard::set("CLAUDE_CONFIG_HOME_DIR", tmp.path());
+        let _guard = EnvGuard::set("OPENCLAUDIA_TRANSCRIPT_HOME_DIR", tmp.path());
 
         let mut app = App::new("test-model", "test-provider");
         app.chat_session
@@ -9201,7 +9249,7 @@ mod tests {
     #[test]
     fn transcript_subscriber_clamps_watermark_after_rewind() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let _guard = EnvGuard::set("CLAUDE_CONFIG_HOME_DIR", tmp.path());
+        let _guard = EnvGuard::set("OPENCLAUDIA_TRANSCRIPT_HOME_DIR", tmp.path());
 
         let mut app = App::new("test-model", "test-provider");
         app.chat_session.replace_messages(vec![serde_json::json!({
@@ -9223,7 +9271,7 @@ mod tests {
     #[test]
     fn transcript_subscriber_reconciles_after_event_channel_lag() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let _guard = EnvGuard::set("CLAUDE_CONFIG_HOME_DIR", tmp.path());
+        let _guard = EnvGuard::set("OPENCLAUDIA_TRANSCRIPT_HOME_DIR", tmp.path());
         let mut app = App::new("test-model", "test-provider");
         app.chat_session
             .set_transcript_position(tmp.path().to_path_buf(), 0);

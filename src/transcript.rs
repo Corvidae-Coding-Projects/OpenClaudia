@@ -1,16 +1,17 @@
-//! Claude Code-compatible session transcript persistence.
+//! OpenClaudia-owned, Claude Code-compatible session transcript persistence.
 //!
 //! Port of `utils/sessionStorage.ts` and `utils/sessionStoragePortable.ts`.
 //! Transcripts are append-only JSONL files, one message per line. Layout:
 //!
 //! ```text
-//! $CLAUDE_CONFIG_HOME_DIR/projects/<sanitized-cwd>/<session-id>.jsonl
+//! $XDG_DATA_HOME/openclaudia/transcripts/projects/<sanitized-cwd>/<session-id>.jsonl
 //! ```
 //!
-//! `CLAUDE_CONFIG_HOME_DIR` defaults to `~/.claude`. `sanitized-cwd`
-//! replaces every non-alphanumeric byte in the absolute path with `-`
-//! (e.g. `/home/doll/OpenClaudia` → `-home-doll-OpenClaudia`), so
-//! sessions created here are readable by Claude Code and vice versa.
+//! The wire shape remains Claude-compatible, but new writes never claim
+//! ownership inside Claude's configuration directory. Existing Claude
+//! transcripts are available through the startup-published, bounded,
+//! read-only compatibility importer and are copied into owned storage before
+//! the first subsequent append.
 //!
 //! Each line is a [`SerializedMessage`] — the underlying chat message
 //! plus envelope fields (`cwd`, `sessionId`, `timestamp`, `version`,
@@ -18,7 +19,7 @@
 //! [`OpenOptions`], which is atomic for small writes on POSIX.
 
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read as _, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -27,11 +28,17 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::persistence::{FileClass, PersistenceError, PersistentStorage, StorageGeneration};
 use crate::state::{StateEvent, StateStore, StateSubscription};
 
 /// Crate version baked in by Cargo. Matches Claude Code's `version`
 /// field on each serialized message.
 pub const TRANSCRIPT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const TRANSCRIPT_HOME_OVERRIDE_ENV: &str = "OPENCLAUDIA_TRANSCRIPT_HOME_DIR";
+const MAX_TRANSCRIPT_BYTES: u64 = FileClass::Session.max_bytes();
+const MAX_TRANSCRIPT_LINE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TRANSCRIPT_ENTRIES: usize = 100_000;
 
 /// Absolute, PATH-independent location of `git` for transcript metadata.
 static GIT_BIN: LazyLock<Result<PathBuf, String>> =
@@ -115,9 +122,30 @@ pub fn claude_config_home_dir() -> PathBuf {
         .join(".claude")
 }
 
-/// `<claude_config_home>/projects`.
+/// OpenClaudia-owned transcript root.
+#[must_use]
+pub fn openclaudia_transcript_home_dir() -> PathBuf {
+    std::env::var_os(TRANSCRIPT_HOME_OVERRIDE_ENV).map_or_else(
+        || {
+            dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("openclaudia")
+                .join("transcripts")
+        },
+        PathBuf::from,
+    )
+}
+
+/// `<openclaudia transcript home>/projects`.
 #[must_use]
 pub fn projects_dir() -> PathBuf {
+    openclaudia_transcript_home_dir().join("projects")
+}
+
+/// Foreign Claude transcript root inspected only through the bounded import
+/// contract.
+#[must_use]
+pub fn claude_projects_dir() -> PathBuf {
     claude_config_home_dir().join("projects")
 }
 
@@ -166,12 +194,17 @@ pub fn sanitize_path(name: &str) -> String {
     format!("{sanitized}-{suffix}")
 }
 
-/// Absolute projects-dir path for `cwd` (e.g.
-/// `~/.claude/projects/-home-doll-OpenClaudia`).
+/// Absolute owned projects-dir path for `cwd` (for example,
+/// `$XDG_DATA_HOME/openclaudia/transcripts/projects/-home-doll-OpenClaudia-*`).
 #[must_use]
 pub fn project_dir_for(cwd: &Path) -> PathBuf {
     let key = cwd.to_string_lossy();
     projects_dir().join(sanitize_path(&key))
+}
+
+fn claude_project_dir_for(cwd: &Path) -> PathBuf {
+    let key = cwd.to_string_lossy();
+    claude_projects_dir().join(sanitize_path(&key))
 }
 
 /// Absolute transcript path for `(cwd, session_id)`.
@@ -301,10 +334,121 @@ pub fn append_entry(
     if let Some(parent) = path.parent() {
         create_dir_all_secure(parent)?;
     }
+    let _ = seed_owned_transcript_from_foreign(cwd, session_id, &path)?;
     let line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
+    let existing_bytes = std::fs::symlink_metadata(&path)
+        .and_then(|metadata| {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                Err(std::io::Error::other(
+                    "owned transcript must be a regular non-symlink file",
+                ))
+            } else {
+                Ok(metadata.len())
+            }
+        })
+        .or_else(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Ok(0)
+            } else {
+                Err(error)
+            }
+        })?;
+    let appended_bytes = u64::try_from(line.len().saturating_add(1)).unwrap_or(u64::MAX);
+    if existing_bytes.saturating_add(appended_bytes) > MAX_TRANSCRIPT_BYTES {
+        return Err(std::io::Error::other(format!(
+            "transcript exceeds the {MAX_TRANSCRIPT_BYTES}-byte limit"
+        )));
+    }
     let mut file = open_append_secure(&path)?;
     writeln!(file, "{line}")?;
     Ok(())
+}
+
+fn foreign_import_context() -> Option<crate::migrations::MigrationContext> {
+    let openclaudia_data = dirs::data_local_dir()?.join("openclaudia");
+    let workspace = std::env::current_dir().ok()?;
+    Some(
+        crate::migrations::MigrationContext::with_paths_and_workspace(
+            claude_config_home_dir(),
+            openclaudia_data,
+            workspace,
+        ),
+    )
+}
+
+fn foreign_transcript_import_is_current() -> bool {
+    foreign_import_context().is_some_and(|context| {
+        crate::migrations::foreign_transcript_import_is_current(&context).unwrap_or(false)
+    })
+}
+
+fn read_bounded_transcript_bytes(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(std::io::Error::other(
+            "transcript source must be a regular non-symlink file",
+        ));
+    }
+    if metadata.len() > MAX_TRANSCRIPT_BYTES {
+        return Err(std::io::Error::other(format!(
+            "transcript source exceeds the {MAX_TRANSCRIPT_BYTES}-byte limit"
+        )));
+    }
+    let mut file = std::fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_TRANSCRIPT_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_TRANSCRIPT_BYTES {
+        return Err(std::io::Error::other(
+            "transcript source changed while reading and exceeded its limit",
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+fn seed_owned_transcript_from_foreign(
+    cwd: &Path,
+    session_id: &str,
+    owned_path: &Path,
+) -> std::io::Result<bool> {
+    if owned_path.exists() {
+        return Ok(true);
+    }
+    if !foreign_transcript_import_is_current() {
+        return Ok(false);
+    }
+    let foreign_path = claude_project_dir_for(cwd).join(format!("{session_id}.jsonl"));
+    let Some(bytes) = read_bounded_transcript_bytes(&foreign_path)? else {
+        return Ok(false);
+    };
+    let parent = owned_path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("owned transcript has no parent"))?;
+    let target = owned_path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("owned transcript has no file name"))?;
+    let storage = PersistentStorage::open(parent).map_err(std::io::Error::other)?;
+    let observed = storage
+        .read(PathBuf::from(target), FileClass::Session)
+        .map_err(std::io::Error::other)?;
+    if observed.generation() != StorageGeneration::Missing {
+        return Ok(true);
+    }
+    match storage.commit(
+        PathBuf::from(target),
+        FileClass::Session,
+        StorageGeneration::Missing,
+        &bytes,
+    ) {
+        Ok(_) | Err(PersistenceError::Conflict { .. }) if owned_path.exists() => Ok(true),
+        Ok(_) => Ok(true),
+        Err(error) => Err(std::io::Error::other(error)),
+    }
 }
 
 /// Event-driven writer for the canonical session transcript tail.
@@ -361,7 +505,21 @@ impl TranscriptStateSubscriber {
             )
         });
         let total = messages.len();
-        let start = watermark.min(total);
+        let owned_path = transcript_path(&cwd, session_id.as_str());
+        let prior_transcript_available = seed_owned_transcript_from_foreign(
+            &cwd,
+            session_id.as_str(),
+            &owned_path,
+        )
+        .unwrap_or_else(|error| {
+            tracing::warn!(error = %error, "could not prepare owned transcript before reconciliation");
+            false
+        });
+        let start = if prior_transcript_available {
+            watermark.min(total)
+        } else {
+            0
+        };
         let mut appended = 0;
         for message in &messages[start..] {
             let kind = message
@@ -410,6 +568,7 @@ fn open_append_secure(path: &Path) -> std::io::Result<std::fs::File> {
         .create(true)
         .append(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
 }
 
@@ -483,21 +642,81 @@ pub fn entries_after_last_boundary(entries: &[SerializedMessage]) -> &[Serialize
         .map_or(entries, |idx| &entries[idx..])
 }
 
-/// Read every JSONL line in `path` as a [`SerializedMessage`]. Lines
-/// that fail to parse are skipped (and logged via `tracing::warn`) so a
-/// partial/corrupt tail doesn't break resume.
+/// Read a bounded JSONL transcript. Foreign Claude paths additionally require
+/// the exact startup-published import contract to remain current.
+///
+/// Lines that fail to parse are skipped (and logged via `tracing::warn`) so a
+/// partial/corrupt tail doesn't break resume. Oversized files or lines are
+/// rejected as a unit so a foreign transcript cannot force an unbounded
+/// allocation.
 #[must_use]
 pub fn load_transcript(path: &Path) -> Vec<SerializedMessage> {
+    if path.starts_with(claude_projects_dir()) && !foreign_transcript_import_is_current() {
+        tracing::warn!(path = %path.display(), "foreign transcript import contract is absent or stale");
+        return Vec::new();
+    }
+    load_transcript_bounded(path)
+}
+
+fn load_transcript_bounded(path: &Path) -> Vec<SerializedMessage> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.len() <= MAX_TRANSCRIPT_BYTES =>
+        {
+            metadata
+        }
+        Ok(metadata) => {
+            tracing::warn!(
+                path = %path.display(),
+                bytes = metadata.len(),
+                "rejecting unsafe or oversized transcript"
+            );
+            return Vec::new();
+        }
+        Err(_) => return Vec::new(),
+    };
     let Ok(file) = std::fs::File::open(path) else {
         return Vec::new();
     };
+    if file.metadata().map_or(true, |opened| {
+        !opened.is_file() || opened.len() != metadata.len()
+    }) {
+        tracing::warn!(path = %path.display(), "transcript changed while opening");
+        return Vec::new();
+    }
     let mut out = Vec::new();
-    for (idx, line) in BufReader::new(file).lines().enumerate() {
-        let Ok(line) = line else { continue };
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    for idx in 0..MAX_TRANSCRIPT_ENTRIES {
+        line.clear();
+        let read = match reader.read_until(b'\n', &mut line) {
+            Ok(read) => read,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), error = %error, "failed to read transcript line");
+                break;
+            }
+        };
+        if read == 0 {
+            return out;
+        }
+        if line.len() > MAX_TRANSCRIPT_LINE_BYTES {
+            tracing::warn!(
+                path = %path.display(),
+                line = idx + 1,
+                "rejecting transcript with an oversized JSONL entry"
+            );
+            return Vec::new();
+        }
+        let Ok(line) = std::str::from_utf8(&line) else {
+            tracing::warn!(path = %path.display(), line = idx + 1, "skipping non-UTF-8 transcript line");
+            continue;
+        };
         if line.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str::<SerializedMessage>(&line) {
+        match serde_json::from_str::<SerializedMessage>(line) {
             Ok(msg) => out.push(msg),
             Err(err) => tracing::warn!(
                 path = %path.display(),
@@ -507,7 +726,12 @@ pub fn load_transcript(path: &Path) -> Vec<SerializedMessage> {
             ),
         }
     }
-    out
+    tracing::warn!(
+        path = %path.display(),
+        limit = MAX_TRANSCRIPT_ENTRIES,
+        "rejecting transcript that exceeds the entry-count limit"
+    );
+    Vec::new()
 }
 
 /// Summary of a transcript on disk, used by `--resume` pickers.
@@ -524,20 +748,39 @@ pub struct TranscriptInfo {
 /// Non-JSONL files and files we can't read are silently skipped.
 #[must_use]
 pub fn list_transcripts(cwd: &Path) -> Vec<TranscriptInfo> {
-    let dir = project_dir_for(cwd);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    let mut out = list_transcripts_in_dir(&project_dir_for(cwd));
+    if foreign_transcript_import_is_current() {
+        let mut seen = out
+            .iter()
+            .map(|transcript| transcript.session_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        out.extend(
+            list_transcripts_in_dir(&claude_project_dir_for(cwd))
+                .into_iter()
+                .filter(|transcript| seen.insert(transcript.session_id.clone())),
+        );
+    }
+    out.sort_by_key(|transcript| std::cmp::Reverse(transcript.modified));
+    out
+}
+
+fn list_transcripts_in_dir(dir: &Path) -> Vec<TranscriptInfo> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut out: Vec<TranscriptInfo> = entries
+    entries
         .flatten()
         .filter_map(|e| {
+            if !e.file_type().ok()?.is_file() {
+                return None;
+            }
             let path = e.path();
             if path.extension()?.to_str()? != "jsonl" {
                 return None;
             }
             let session_id = path.file_stem()?.to_str()?.to_string();
             let modified = e.metadata().ok()?.modified().ok()?;
-            let messages = load_transcript(&path);
+            let messages = load_transcript_bounded(&path);
             let first_prompt = messages
                 .iter()
                 .find(|m| m.kind == "user")
@@ -551,9 +794,7 @@ pub fn list_transcripts(cwd: &Path) -> Vec<TranscriptInfo> {
                 modified,
             })
         })
-        .collect();
-    out.sort_by_key(|t| std::cmp::Reverse(t.modified));
-    out
+        .collect()
 }
 
 /// Pull plain text out of a `{ role, content }` payload where `content`
@@ -577,19 +818,28 @@ fn extract_text_content(message: &Value) -> Option<String> {
     None
 }
 
-/// Locate a transcript anywhere under `projects_dir()` by session ID.
-/// Used by `--resume <session-id>` when the user doesn't pass `--cwd`.
+/// Locate a transcript anywhere under the owned projects directory by session
+/// ID, falling back to an explicitly authorized foreign Claude import.
 #[must_use]
 pub fn find_transcript_by_id(session_id: &str) -> Option<PathBuf> {
-    let projects = projects_dir();
-    let entries = std::fs::read_dir(&projects).ok()?;
+    find_transcript_in_projects(&projects_dir(), session_id).or_else(|| {
+        foreign_transcript_import_is_current()
+            .then(|| find_transcript_in_projects(&claude_projects_dir(), session_id))
+            .flatten()
+    })
+}
+
+fn find_transcript_in_projects(projects: &Path, session_id: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(projects).ok()?;
     for project_entry in entries.flatten() {
-        let project_path = project_entry.path();
-        if !project_path.is_dir() {
+        if !project_entry.file_type().ok()?.is_dir() {
             continue;
         }
+        let project_path = project_entry.path();
         let candidate = project_path.join(format!("{session_id}.jsonl"));
-        if candidate.exists() {
+        if std::fs::symlink_metadata(&candidate)
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        {
             return Some(candidate);
         }
     }
@@ -771,14 +1021,17 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let _g = EnvGuard::set("CLAUDE_CONFIG_HOME_DIR", tmp.path().to_str().unwrap());
         assert_eq!(claude_config_home_dir(), tmp.path());
-        assert_eq!(projects_dir(), tmp.path().join("projects"));
+        assert_eq!(claude_projects_dir(), tmp.path().join("projects"));
+        let owned = TempDir::new().unwrap();
+        let _owned = EnvGuard::set(TRANSCRIPT_HOME_OVERRIDE_ENV, owned.path().to_str().unwrap());
+        assert_eq!(projects_dir(), owned.path().join("projects"));
     }
 
     #[test]
     fn append_and_load_roundtrip() {
         let _lock = env_lock();
         let tmp = TempDir::new().unwrap();
-        let _g = EnvGuard::set("CLAUDE_CONFIG_HOME_DIR", tmp.path().to_str().unwrap());
+        let _g = EnvGuard::set(TRANSCRIPT_HOME_OVERRIDE_ENV, tmp.path().to_str().unwrap());
         let cwd = PathBuf::from("/home/doll/OpenClaudia");
         let session_id = "11111111-2222-3333-4444-555555555555";
 
@@ -807,10 +1060,85 @@ mod tests {
     }
 
     #[test]
+    fn approved_foreign_transcript_is_copied_before_append_and_stale_contract_is_denied() {
+        let _lock = env_lock();
+        let tmp = TempDir::new().unwrap();
+        let claude_home = tmp.path().join("claude");
+        let data_home = tmp.path().join("data");
+        let owned_transcripts = data_home.join("openclaudia").join("transcripts");
+        let _claude = EnvGuard::set("CLAUDE_CONFIG_HOME_DIR", claude_home.to_str().unwrap());
+        let _data = EnvGuard::set("XDG_DATA_HOME", data_home.to_str().unwrap());
+        let _owned = EnvGuard::set(
+            TRANSCRIPT_HOME_OVERRIDE_ENV,
+            owned_transcripts.to_str().unwrap(),
+        );
+        let cwd = std::env::current_dir().unwrap();
+        let session_id = "foreign-session";
+        let denied_session_id = "foreign-after-marker-change";
+        let foreign_project = claude_project_dir_for(&cwd);
+        std::fs::create_dir_all(&foreign_project).unwrap();
+
+        let original = envelope_for(
+            "user",
+            &cwd,
+            session_id,
+            Some(json!({"role": "user", "content": "foreign"})),
+        );
+        let denied = envelope_for(
+            "user",
+            &cwd,
+            denied_session_id,
+            Some(json!({"role": "user", "content": "stale"})),
+        );
+        let foreign_path = foreign_project.join(format!("{session_id}.jsonl"));
+        let denied_path = foreign_project.join(format!("{denied_session_id}.jsonl"));
+        let original_bytes = format!("{}\n", serde_json::to_string(&original).unwrap());
+        std::fs::write(&foreign_path, &original_bytes).unwrap();
+        std::fs::write(
+            &denied_path,
+            format!("{}\n", serde_json::to_string(&denied).unwrap()),
+        )
+        .unwrap();
+
+        let context = crate::migrations::MigrationContext::with_paths_and_workspace(
+            claude_home,
+            data_home.join("openclaudia"),
+            cwd.clone(),
+        );
+        assert!(crate::migrations::run_all(&context).is_writable());
+        assert_eq!(load_transcript(&foreign_path).len(), 1);
+
+        let appended = envelope_for(
+            "assistant",
+            &cwd,
+            session_id,
+            Some(json!({"role": "assistant", "content": "owned"})),
+        );
+        append_entry(&cwd, session_id, &appended).unwrap();
+        let owned_path = transcript_path(&cwd, session_id);
+        let owned = load_transcript(&owned_path);
+        assert_eq!(owned.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(&foreign_path).unwrap(),
+            original_bytes,
+            "foreign transcript must remain read-only"
+        );
+
+        std::fs::write(
+            claude_projects_dir().join(".schema-version.json"),
+            br#"{"transcripts":1}"#,
+        )
+        .unwrap();
+        assert!(load_transcript(&denied_path).is_empty());
+        assert!(find_transcript_by_id(denied_session_id).is_none());
+        assert_eq!(load_transcript(&owned_path).len(), 2);
+    }
+
+    #[test]
     fn list_transcripts_sorts_newest_first() {
         let _lock = env_lock();
         let tmp = TempDir::new().unwrap();
-        let _g = EnvGuard::set("CLAUDE_CONFIG_HOME_DIR", tmp.path().to_str().unwrap());
+        let _g = EnvGuard::set(TRANSCRIPT_HOME_OVERRIDE_ENV, tmp.path().to_str().unwrap());
         let cwd = PathBuf::from("/tmp/proj");
         for id in ["aaa", "bbb"] {
             let entry = envelope_for("user", &cwd, id, Some(json!({"content": id})));
@@ -882,7 +1210,7 @@ mod tests {
     fn find_by_id_searches_all_projects() {
         let _lock = env_lock();
         let tmp = TempDir::new().unwrap();
-        let _g = EnvGuard::set("CLAUDE_CONFIG_HOME_DIR", tmp.path().to_str().unwrap());
+        let _g = EnvGuard::set(TRANSCRIPT_HOME_OVERRIDE_ENV, tmp.path().to_str().unwrap());
         let cwd = PathBuf::from("/tmp/elsewhere");
         let session_id = "needle-id";
         let entry = envelope_for("user", &cwd, session_id, None);

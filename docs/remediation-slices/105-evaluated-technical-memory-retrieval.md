@@ -203,6 +203,17 @@ and the evaluation digest is
 The corresponding review remains explicitly rejected; regeneration is not an
 independent review or a VDD promotion.
 
+S-038 later changed the cited migration implementation, migration-runner tests,
+and slice document while preserving the retrieval case's startup-migration
+contract. Those citations are rebound to `worktree:s038`; the checked-in
+generator rebuilt the evaluation and the deliberately rejected review was
+rebound without changing its verdict. The current tuning, held-out, evaluation,
+and review artifact digests are respectively
+`962d7ff71e731ff5581cddff9f27ed738bf5663362a1e56b9b58fb11b18a43e2`,
+`e907cf72521c49a282750688968ccfccf23c3f2df791f85a28d2b9c31bc3649a`,
+`5197bc7d116c904234135dbc9c67084c28424a08f04a26dbadb8f3f62831b32d`,
+and `6b2d0d2f952063e3c1ead79f8c8001f554fa6458cdcf2bd3adeff835d61b40d6`.
+
 ## Residual boundaries
 
 - S-088 owns the independent artifact-bound VDD review, including the required

@@ -52,9 +52,12 @@ impl TestContext {
         let root = tempfile::tempdir().expect("temporary migration root");
         let claude_home = root.path().join("claude");
         let openclaudia_data = root.path().join("data/openclaudia");
+        let workspace = root.path().join("workspace");
         std::fs::create_dir_all(&claude_home).expect("Claude root");
         std::fs::create_dir_all(&openclaudia_data).expect("OpenClaudia root");
-        let ctx = MigrationContext::with_paths(claude_home, openclaudia_data);
+        std::fs::create_dir_all(&workspace).expect("workspace root");
+        let ctx =
+            MigrationContext::with_paths_and_workspace(claude_home, openclaudia_data, workspace);
         Self { _root: root, ctx }
     }
 }
@@ -281,13 +284,22 @@ fn competing_startup_lock_reaches_bounded_recovery_state() {
 }
 
 #[test]
-fn malformed_marker_fails_closed_without_exposing_stored_text() {
+fn malformed_owned_manifest_fails_closed_without_exposing_stored_text() {
     let test = TestContext::new();
-    let projects = test.ctx.claude_home.join("projects");
-    std::fs::create_dir_all(&projects).expect("projects root");
-    let marker = projects.join(".schema-version.json");
+    let marker = test
+        .ctx
+        .openclaudia_data
+        .join(".openclaudia-session-schema.json");
     let secret = "persisted-secret-marker-value";
-    std::fs::write(&marker, format!("{{not-json-{secret}")).expect("write malformed marker");
+    std::fs::write(&marker, format!("{{not-json-{secret}"))
+        .expect("write malformed owned manifest");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-private malformed manifest");
+    }
 
     let trace = TraceWriter::default();
     let subscriber = tracing_subscriber::fmt()
@@ -309,7 +321,7 @@ fn malformed_marker_fails_closed_without_exposing_stored_text() {
     );
     assert!(!diagnostic.contains(secret));
     let trace = trace.text();
-    assert!(trace.contains("stamp-transcript-schema-v1"));
+    assert!(trace.contains("m002-owned-session-schema-v1"));
     assert!(trace.contains("migration_invalid_persistent_state"));
     assert!(trace.contains("recovery="));
     assert!(!trace.contains(secret));
@@ -320,44 +332,76 @@ fn malformed_marker_fails_closed_without_exposing_stored_text() {
 }
 
 #[test]
-fn old_marker_is_upgraded_once_and_unknown_fields_are_preserved() {
+fn foreign_marker_is_preserved_and_import_observation_is_owned() {
     let test = TestContext::new();
     let projects = test.ctx.claude_home.join("projects");
     std::fs::create_dir_all(&projects).expect("projects root");
     let marker = projects.join(".schema-version.json");
-    std::fs::write(&marker, r#"{"other_producer": 7, "transcripts": 0}"#)
-        .expect("write old marker");
+    let original = r#"{"other_producer": 7, "transcripts": 0}"#;
+    std::fs::write(&marker, original).expect("write foreign marker");
 
     let first = run_all(&test.ctx);
-    assert!(first.is_writable(), "old supported marker must migrate");
+    assert!(
+        first.is_writable(),
+        "foreign marker must be observed read-only"
+    );
     let first_reports = first.into_writable().expect("first reports");
     assert!(matches!(
-        first_reports[0].outcome,
+        first_reports[1].outcome,
         MigrationOutcome::Applied {
             changed_artifacts: 1
         }
     ));
-    let migrated: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&marker).expect("read upgraded marker"))
-            .expect("valid upgraded marker");
-    assert_eq!(migrated["transcripts"], 1);
-    assert_eq!(migrated["other_producer"], 7);
+    assert_eq!(
+        std::fs::read_to_string(&marker).expect("read foreign marker"),
+        original
+    );
+    let owned: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            test.ctx
+                .openclaudia_data
+                .join(".openclaudia-session-schema.json"),
+        )
+        .expect("owned manifest"),
+    )
+    .expect("valid owned manifest");
+    assert_eq!(owned["producer"], "openclaudia");
+    assert_eq!(owned["session_documents"]["minimum"], 0);
+    assert_eq!(owned["session_documents"]["current"], 1);
+    assert_eq!(
+        owned["foreign_transcript_import"]["status"],
+        "claimed_compatible"
+    );
 
-    let bytes = std::fs::read(&marker).expect("read first generation");
+    let bytes = std::fs::read(
+        test.ctx
+            .openclaudia_data
+            .join(".openclaudia-session-schema.json"),
+    )
+    .expect("read first owned generation");
     let second = run_all(&test.ctx);
     assert!(second.is_writable());
     assert!(matches!(
-        second.reports()[0].outcome,
+        second.reports()[1].outcome,
         MigrationOutcome::Current
     ));
     assert_eq!(
-        std::fs::read(marker).expect("read second generation"),
+        std::fs::read(
+            test.ctx
+                .openclaudia_data
+                .join(".openclaudia-session-schema.json")
+        )
+        .expect("read second owned generation"),
         bytes
+    );
+    assert_eq!(
+        std::fs::read_to_string(marker).expect("foreign marker retained"),
+        original
     );
 }
 
 #[test]
-fn future_marker_is_terminal_and_never_downgraded() {
+fn future_foreign_claim_is_recorded_without_granting_startup_authority() {
     let test = TestContext::new();
     let projects = test.ctx.claude_home.join("projects");
     std::fs::create_dir_all(&projects).expect("projects root");
@@ -365,22 +409,31 @@ fn future_marker_is_terminal_and_never_downgraded() {
     let original = br#"{"transcripts": 999}"#;
     std::fs::write(&marker, original).expect("write future marker");
 
-    let error = run_all(&test.ctx)
-        .into_writable()
-        .expect_err("future schema must block startup");
+    let status = run_all(&test.ctx);
 
+    assert!(status.is_writable());
     assert_eq!(
-        error.cause().kind(),
-        MigrationFailureKind::UnsupportedFutureSchema
-    );
-    assert_eq!(
-        std::fs::read(marker).expect("future marker retained"),
+        std::fs::read(&marker).expect("future marker retained"),
         original
     );
+    let owned: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            test.ctx
+                .openclaudia_data
+                .join(".openclaudia-session-schema.json"),
+        )
+        .expect("owned manifest"),
+    )
+    .expect("valid owned manifest");
+    assert_eq!(
+        owned["foreign_transcript_import"]["status"],
+        "claimed_future"
+    );
+    assert_eq!(owned["foreign_transcript_import"]["schema_version"], 999);
 }
 
 #[test]
-fn existing_transcript_store_without_marker_is_stamped_idempotently() {
+fn existing_foreign_store_without_marker_remains_unmodified() {
     let test = TestContext::new();
     let projects = test.ctx.claude_home.join("projects");
     std::fs::create_dir_all(&projects).expect("projects root");
@@ -389,27 +442,41 @@ fn existing_transcript_store_without_marker_is_stamped_idempotently() {
     let first = run_all(&test.ctx);
     assert!(first.is_writable());
     assert!(matches!(
-        first.reports()[0].outcome,
+        first.reports()[1].outcome,
         MigrationOutcome::Applied {
             changed_artifacts: 1
         }
     ));
+    assert!(!marker.exists());
+    let owned = test
+        .ctx
+        .openclaudia_data
+        .join(".openclaudia-session-schema.json");
     let value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&marker).expect("schema marker"))
-            .expect("valid schema marker");
-    assert_eq!(value["transcripts"], 1);
+        serde_json::from_slice(&std::fs::read(&owned).expect("owned schema manifest"))
+            .expect("valid owned schema manifest");
+    assert_eq!(
+        value["foreign_transcript_import"]["status"],
+        "claimed_compatible"
+    );
+    assert_eq!(value["foreign_transcript_import"]["schema_version"], 1);
+    assert_eq!(
+        value["foreign_transcript_import"]["source_generation"]["state"],
+        "missing"
+    );
 
-    let first_generation = std::fs::read(&marker).expect("first marker generation");
+    let first_generation = std::fs::read(&owned).expect("first owned generation");
     let second = run_all(&test.ctx);
     assert!(second.is_writable());
     assert!(matches!(
-        second.reports()[0].outcome,
+        second.reports()[1].outcome,
         MigrationOutcome::Current
     ));
     assert_eq!(
-        std::fs::read(marker).expect("second marker generation"),
+        std::fs::read(owned).expect("second owned generation"),
         first_generation
     );
+    assert!(!marker.exists());
 }
 
 #[test]
@@ -418,12 +485,23 @@ fn absent_foreign_and_session_stores_remain_absent_and_writable_on_restart() {
 
     let first = run_all(&test.ctx);
     assert!(first.is_writable());
-    assert!(first
-        .reports()
-        .iter()
-        .all(|report| matches!(report.outcome, MigrationOutcome::Current)));
+    assert!(matches!(
+        first.reports()[0].outcome,
+        MigrationOutcome::Current
+    ));
+    assert!(matches!(
+        first.reports()[1].outcome,
+        MigrationOutcome::Applied {
+            changed_artifacts: 1
+        }
+    ));
     assert!(!test.ctx.claude_home.join("projects").exists());
     assert!(!test.ctx.openclaudia_data.join("chat_sessions").exists());
+    assert!(test
+        .ctx
+        .openclaudia_data
+        .join(".openclaudia-session-schema.json")
+        .is_file());
 
     let second = run_all(&test.ctx);
     assert!(second.is_writable());

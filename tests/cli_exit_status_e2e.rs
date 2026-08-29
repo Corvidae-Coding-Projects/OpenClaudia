@@ -2997,7 +2997,7 @@ fn readme_cli_examples_do_not_advertise_stale_tui_or_coordinator_modes() {
         "README default-TUI slash docs must advertise the implemented provider switch command"
     );
     assert!(
-        readme.contains("| `/model <name>` | Switch to a different model |"),
+        readme.contains("| `/model [list\\|name], /models` | Show, list, or switch models |"),
         "README default-TUI slash docs must advertise the implemented model switch command"
     );
     assert!(
@@ -3024,6 +3024,40 @@ fn readme_cli_examples_do_not_advertise_stale_tui_or_coordinator_modes() {
             "README default-TUI slash docs must not advertise unsupported/stale command: {stale_tui_claim}"
         );
     }
+}
+
+#[test]
+fn readme_default_tui_command_table_matches_the_canonical_registry() {
+    use openclaudia::command_registry::{registry, CommandFrontend};
+
+    let readme = include_str!("../README.md");
+    let slash_section = readme
+        .split_once("## Slash Commands (Default TUI)")
+        .expect("README must document default-TUI slash commands")
+        .1
+        .split_once("## Keyboard Shortcuts (Default TUI)")
+        .expect("README slash-command section must have a bounded end")
+        .0;
+    let actual = slash_section
+        .split_once("| Command | Current surface |\n|---|---|\n")
+        .expect("README slash-command section must contain its table")
+        .1
+        .trim();
+    let expected = registry()
+        .help_sections(CommandFrontend::Tui)
+        .into_iter()
+        .flat_map(|section| section.commands)
+        .map(|command| {
+            format!(
+                "| `{}` | {} |",
+                command.invocation.replace('|', "\\|"),
+                command.description
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert_eq!(actual, expected, "README command docs drifted from runtime");
 }
 
 #[test]

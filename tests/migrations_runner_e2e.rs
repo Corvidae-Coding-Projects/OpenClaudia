@@ -16,9 +16,12 @@ fn sandboxed_ctx() -> (TempDir, MigrationContext) {
     let root = tempfile::tempdir().expect("migration sandbox");
     let claude_home = root.path().join("claude");
     let openclaudia_data = root.path().join("data/openclaudia");
+    let workspace = root.path().join("workspace");
     std::fs::create_dir_all(&claude_home).expect("Claude root");
     std::fs::create_dir_all(&openclaudia_data).expect("OpenClaudia root");
-    let context = MigrationContext::with_paths(claude_home, openclaudia_data);
+    std::fs::create_dir_all(&workspace).expect("workspace root");
+    let context =
+        MigrationContext::with_paths_and_workspace(claude_home, openclaudia_data, workspace);
     (root, context)
 }
 
@@ -33,8 +36,8 @@ fn legacy_fixture(id: &str) -> String {
     include_str!("fixtures/session_legacy_tui.json").replace("legacy-session", id)
 }
 
-fn canonical_session(id: &str) -> Vec<u8> {
-    let mut state = SessionState::default();
+fn canonical_session(context: &MigrationContext, id: &str) -> Vec<u8> {
+    let mut state = SessionState::new(context.workspace_root.clone());
     state.identity.session_id = SessionId::from_raw_unchecked(id);
     let document = SessionDocument::from_state(
         "canonical".to_string(),
@@ -57,12 +60,22 @@ fn first_start_and_restart_reach_deterministic_writable_states() {
         "empty supported stores must initialize"
     );
     assert_eq!(first.reports().len(), 2);
-    assert!(first
-        .reports()
-        .iter()
-        .all(|report| matches!(report.outcome, MigrationOutcome::Current)));
+    assert!(matches!(
+        first.reports()[0].outcome,
+        MigrationOutcome::Current
+    ));
+    assert!(matches!(
+        first.reports()[1].outcome,
+        MigrationOutcome::Applied {
+            changed_artifacts: 1
+        }
+    ));
     assert!(!context.claude_home.join("projects").exists());
     assert!(!context.openclaudia_data.join("chat_sessions").exists());
+    assert!(context
+        .openclaudia_data
+        .join(".openclaudia-session-schema.json")
+        .is_file());
 
     let second = run_all(&context);
     assert!(second.is_writable(), "restart must reconcile cleanly");
@@ -73,11 +86,25 @@ fn first_start_and_restart_reach_deterministic_writable_states() {
 }
 
 #[test]
-fn count_wrapper_preserves_terminal_failure_instead_of_returning_a_false_count() {
+fn count_wrapper_preserves_owned_manifest_failure_instead_of_returning_a_false_count() {
     let (_root, context) = sandboxed_ctx();
-    let projects = context.claude_home.join("projects");
-    std::fs::create_dir_all(&projects).expect("projects root");
-    std::fs::write(projects.join(".schema-version.json"), b"{broken").expect("malformed marker");
+    std::fs::write(
+        context
+            .openclaudia_data
+            .join(".openclaudia-session-schema.json"),
+        b"{broken",
+    )
+    .expect("malformed owned manifest");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let manifest = context
+            .openclaudia_data
+            .join(".openclaudia-session-schema.json");
+        std::fs::set_permissions(manifest, std::fs::Permissions::from_mode(0o600))
+            .expect("owner-private malformed manifest");
+    }
 
     let error = run_all_count_applied(&context)
         .expect_err("count wrapper must not erase the migration failure");
@@ -128,7 +155,7 @@ fn restart_reconciles_a_preexisting_partial_migration_prefix() {
     let sessions = context.openclaudia_data.join("chat_sessions");
     std::fs::create_dir_all(&sessions).expect("session store");
     let current_path = session_path(&context, "a-current");
-    let current_bytes = canonical_session("a-current");
+    let current_bytes = canonical_session(&context, "a-current");
     std::fs::write(&current_path, &current_bytes).expect("current session");
     let legacy_path = session_path(&context, "z-legacy");
     std::fs::write(&legacy_path, legacy_fixture("z-legacy")).expect("legacy session");
@@ -162,6 +189,70 @@ fn restart_reconciles_a_preexisting_partial_migration_prefix() {
         .reports()
         .iter()
         .all(|report| matches!(report.outcome, MigrationOutcome::Current)));
+}
+
+#[test]
+fn foreign_marker_is_never_modified_and_only_owned_metadata_is_published() {
+    let (_root, context) = sandboxed_ctx();
+    let projects = context.claude_home.join("projects");
+    std::fs::create_dir_all(&projects).expect("foreign projects root");
+    let marker = projects.join(".schema-version.json");
+    let original = br#"{"other_producer":7,"transcripts":0}"#;
+    std::fs::write(&marker, original).expect("foreign marker");
+
+    let status = run_all(&context);
+
+    assert!(status.is_writable());
+    assert_eq!(
+        std::fs::read(&marker).expect("foreign marker retained"),
+        original
+    );
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            context
+                .openclaudia_data
+                .join(".openclaudia-session-schema.json"),
+        )
+        .expect("owned schema manifest"),
+    )
+    .expect("valid owned schema manifest");
+    assert_eq!(manifest["producer"], "openclaudia");
+    assert_eq!(manifest["session_documents"]["minimum"], 0);
+    assert_eq!(manifest["session_documents"]["current"], 1);
+    assert_eq!(
+        manifest["foreign_transcript_import"]["status"],
+        "claimed_compatible"
+    );
+}
+
+#[test]
+fn future_session_schema_blocks_startup_without_modification() {
+    let (_root, context) = sandboxed_ctx();
+    let sessions = context.openclaudia_data.join("chat_sessions");
+    std::fs::create_dir_all(&sessions).expect("session store");
+    let path = session_path(&context, "future");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&canonical_session(&context, "future")).expect("canonical fixture");
+    document["session_state"]["version"] = serde_json::json!(2);
+    let original = serde_json::to_vec_pretty(&document).expect("future fixture");
+    std::fs::write(&path, &original).expect("future session");
+
+    let error = run_all(&context)
+        .into_writable()
+        .expect_err("future session schema must block startup");
+
+    assert_eq!(
+        error.cause().kind(),
+        MigrationFailureKind::UnsupportedFutureSchema
+    );
+    assert_eq!(
+        std::fs::read(path).expect("future session retained"),
+        original
+    );
+    assert!(!context
+        .openclaudia_data
+        .join(".openclaudia-session-schema.json")
+        .exists());
 }
 
 #[test]
