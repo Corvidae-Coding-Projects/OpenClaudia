@@ -1,6 +1,6 @@
 {
   "next_display_id": 1208,
-  "next_comment_id": 1926,
+  "next_comment_id": 1927,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -36025,11 +36025,22 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-29T23:26:12.768740263Z",
-      "updated_at": "2026-08-29T23:26:23.502386940Z",
+      "updated_at": "2026-08-29T23:31:04.254217045Z",
       "labels": [
         "bug",
         "remediation"
-      ]
+      ],
+      "comments": {
+        "815f3dbc-68b4-409a-85e5-ec804475ec29": {
+          "display_id": 1926,
+          "author": "6Vw9",
+          "content": "Root cause fixed in the background-job supervisor. It previously persisted terminal state before recording the command observation, committing the mutation freshness reservation, and invalidating prior verifier receipts; bash_output could therefore report finished while an immediate quality gate still correctly saw a mutation in progress. Terminal state is now published last after those lifecycle finalizers. The E2E assertion was strengthened from a 200 ms retry loop to requiring the first post-terminal quality gate to pass. Evidence: exact failing test 1/1, complete ledger_decision_e2e 20/20, Rust 1.98 fmt and strict locked all-feature/all-target Clippy green.",
+          "created_at": "2026-08-29T23:31:04.250219251Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAw5FkmnLagA5XWd8fu8N/sF5SzOL9IOTi+YBHlTLe2s1jlvciHdDZ3ojXolHDvQuksEO73dqq5P2ixH2vmJskBw=="
+        }
+      }
     },
     "fc394543-2a7c-4674-b416-6981c2fd99fa": {
       "uuid": "fc394543-2a7c-4674-b416-6981c2fd99fa",
@@ -48747,11 +48758,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2334,
       "timestamp": "2026-08-29T23:26:57.466227571Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2335,
+      "timestamp": "2026-08-29T23:31:04.254217045Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-29T23:26:57.466227571Z",
+    "timestamp": "2026-08-29T23:31:04.254217045Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2334
+    "agent_seq": 2335
   }
 }
