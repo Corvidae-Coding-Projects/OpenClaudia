@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1209,
+  "next_display_id": 1210,
   "next_comment_id": 1928,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -785,6 +785,7 @@
     "b0ac9d41-3bff-45e5-b29f-e0cb29d0ef27": 22,
     "b0cb96f2-951a-44b4-b8d3-a84db6619496": 226,
     "b0d267fb-f08d-4edb-af67-c28a28a71794": 163,
+    "b0d31d3b-928c-430f-94d2-5c19f57e968e": 1209,
     "b0d680f5-9ac5-4f00-b0dd-23abf5cddc98": 1205,
     "b101db2b-99e6-411d-8165-aafd680e57d0": 991,
     "b11c769c-9b9d-413f-9c32-ffbc5ece8a9c": 46,
@@ -26596,6 +26597,18 @@
         "qa"
       ]
     },
+    "b0d31d3b-928c-430f-94d2-5c19f57e968e": {
+      "uuid": "b0d31d3b-928c-430f-94d2-5c19f57e968e",
+      "display_id": 1209,
+      "title": "Await complete background settlement in exit-code regression test",
+      "description": "Steps to reproduce:\n1. \n\nExpected: \nActual: \n\nThe fix674 settled-job unit test sleeps a fixed 600 ms before asserting that twenty concurrent background shells are terminal. Issue #1207 intentionally makes terminal publication wait for ledger, freshness, and receipt finalization, so a loaded Linux runner can exceed that assumption. Poll the real terminal contract to a bounded deadline and retain the exit-code invariant without adding production delays.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-29T23:51:55.774380470Z",
+      "updated_at": "2026-08-29T23:51:55.774380470Z"
+    },
     "b0d680f5-9ac5-4f00-b0dd-23abf5cddc98": {
       "uuid": "b0d680f5-9ac5-4f00-b0dd-23abf5cddc98",
       "display_id": 1205,
@@ -48816,11 +48829,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2341,
       "timestamp": "2026-08-29T23:51:51.307104496Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2342,
+      "timestamp": "2026-08-29T23:51:55.774380470Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-29T23:51:51.307104496Z",
+    "timestamp": "2026-08-29T23:51:55.774380470Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2341
+    "agent_seq": 2342
   }
 }
