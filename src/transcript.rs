@@ -331,7 +331,10 @@ impl TranscriptStateSubscriber {
     pub fn drain_pending(&mut self) -> usize {
         let mut should_flush = false;
         while let Some(event) = self.subscription.try_recv() {
-            if matches!(event, StateEvent::MessageAppended { .. }) {
+            if matches!(
+                event,
+                StateEvent::MessageAppended { .. } | StateEvent::SnapshotReplaced
+            ) {
                 should_flush = true;
             }
         }

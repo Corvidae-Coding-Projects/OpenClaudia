@@ -5162,7 +5162,7 @@ async fn fire_session_start(state: &ProxyState) -> Result<String, ProxyError> {
     Ok(session_id)
 }
 
-async fn finish_proxy_runtime(state: &ProxyState, handoff: Option<&str>) {
+async fn finish_proxy_runtime(state: &ProxyState, handoff: Option<&str>) -> anyhow::Result<()> {
     let session_id = {
         let sm = state.session_manager.read().await;
         sm.get_session().map(|session| session.id.clone())
@@ -5175,25 +5175,34 @@ async fn finish_proxy_runtime(state: &ProxyState, handoff: Option<&str>) {
     if let Err(error) = state.mcp_manager.write().await.disconnect_all().await {
         warn!(%error, "Failed to disconnect MCP servers during proxy shutdown");
     }
-    if let Some(session_id) = session_id {
+    let finalization = if let Some(session_id) = session_id {
         let mut sm = state.session_manager.write().await;
         if sm
             .get_session()
             .is_some_and(|session| session.id == session_id)
         {
-            if let Err(error) = sm.end_session(handoff) {
-                warn!(%error, "Failed to persist session during proxy shutdown");
-            }
+            sm.end_session(handoff)
+                .map(|_| ())
+                .map_err(anyhow::Error::from)
+        } else {
+            Ok(())
         }
-    }
+    } else {
+        Ok(())
+    };
     crate::tools::retire_run(&state.run_context);
+    if let Err(error) = finalization.as_ref() {
+        warn!(%error, "Failed to finalize session during proxy shutdown");
+    }
+    finalization
 }
 
 /// Start the proxy server.
 ///
 /// # Errors
 ///
-/// Returns an error if binding the TCP listener or serving fails.
+/// Returns an error if binding the TCP listener, serving, or session
+/// finalization fails.
 pub async fn start_server(config: AppConfig) -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.proxy.host, config.proxy.port);
     let state = build_proxy_state(config).await?;
@@ -5203,22 +5212,23 @@ pub async fn start_server(config: AppConfig) -> anyhow::Result<()> {
 
     info!(address = %addr, "Starting OpenClaudia proxy server");
 
-    let result = async {
+    let result: anyhow::Result<()> = async {
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         axum::serve(listener, app).await?;
         Ok(())
     }
     .await;
-    finish_proxy_runtime(&state, None).await;
-    result
+    let finalization = finish_proxy_runtime(&state, None).await;
+    result?;
+    finalization
 }
 
 /// Start the proxy server with graceful shutdown support.
 ///
 /// # Errors
 ///
-/// Returns an error if binding the TCP listener, serving, or VDD
-/// configuration validation fails.
+/// Returns an error if binding the TCP listener, serving, VDD configuration
+/// validation, or session finalization fails.
 pub async fn start_server_with_shutdown(
     config: AppConfig,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
@@ -5239,7 +5249,7 @@ pub async fn start_server_with_shutdown(
 
     info!(address = %addr, "Starting OpenClaudia proxy server (with shutdown support)");
 
-    let result = async {
+    let result: anyhow::Result<()> = async {
         let listener = tokio::net::TcpListener::bind(&addr).await?;
 
         // Use axum's graceful shutdown
@@ -5257,8 +5267,9 @@ pub async fn start_server_with_shutdown(
         Ok(())
     }
     .await;
-    finish_proxy_runtime(&state, None).await;
-    result
+    let finalization = finish_proxy_runtime(&state, None).await;
+    result?;
+    finalization
 }
 
 /// Start the proxy server in loop mode.
@@ -5270,8 +5281,8 @@ pub async fn start_server_with_shutdown(
 ///
 /// # Errors
 ///
-/// Returns an error if binding the TCP listener, serving, or VDD
-/// configuration validation fails.
+/// Returns an error if binding the TCP listener, serving, VDD configuration
+/// validation, or session finalization fails.
 pub async fn start_loop_server(config: AppConfig, max_iterations: u32) -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.proxy.host, config.proxy.port);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -5318,7 +5329,7 @@ pub async fn start_loop_server(config: AppConfig, max_iterations: u32) -> anyhow
     let handoff = format!(
         "Loop mode completed after {completed} iteration(s).\nSession ended after {completed} iteration(s)."
     );
-    finish_proxy_runtime(&state, Some(&handoff)).await;
+    finish_proxy_runtime(&state, Some(&handoff)).await?;
     serve_result?;
 
     info!(completed, session_id, "Loop mode ended");

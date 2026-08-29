@@ -49,6 +49,7 @@ __pycache__/
 # Machine-local runtime state. Ledgers and advisory locks are regenerated;
 # agent worktrees are represented by their branches, not committed as a tree.
 .openclaudia/reality-ledgers/
+.openclaudia/session/
 .openclaudia/schedules.json.lock
 .openclaudia/sandbox-transactions/
 .openclaudia/plugins/installed_plugins.json

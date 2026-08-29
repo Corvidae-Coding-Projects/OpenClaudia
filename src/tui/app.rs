@@ -8948,14 +8948,23 @@ mod tests {
                 .class,
             crate::modes::RuntimeModeClass::ReadOnly
         );
-        assert!(matches!(
-            state_events.try_recv(),
-            Some(crate::state::StateEvent::SessionSwitched {
-                from,
-                to,
-                from_messages: 0,
-            }) if from.as_str() == initial_id && to.as_str() == NEWER_ID
-        ));
+        let mut saw_session_switch = false;
+        while let Some(event) = state_events.try_recv() {
+            if matches!(
+                event,
+                crate::state::StateEvent::SessionSwitched {
+                    from,
+                    to,
+                    from_messages: 0,
+                } if from.as_str() == initial_id && to.as_str() == NEWER_ID
+            ) {
+                saw_session_switch = true;
+            }
+        }
+        assert!(
+            saw_session_switch,
+            "resume must publish the session boundary"
+        );
     }
 
     #[test]

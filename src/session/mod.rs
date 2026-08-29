@@ -42,6 +42,14 @@ use thiserror::Error;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::persistence::{
+    CommitReceipt, CommitState, FileClass, PersistentStorage, StorageGeneration,
+};
+
+const SESSION_TRANSACTION_DIRECTORY: &str = ".session-transactions";
+const SESSION_HEAD_TARGET: &str = "head.json";
+const SESSION_HEAD_SCHEMA_VERSION: u32 = 1;
+
 /// Errors produced by [`SessionManager::end_session`].
 ///
 /// Replaces the previous `Option<Session>` return which silently conflated
@@ -55,16 +63,40 @@ pub enum EndSessionError {
     #[error("no current session is active")]
     NotFound,
 
-    /// Persistence of the session (any of `session.id.json`, `latest.json`,
-    /// `handoff.md`) failed.  The in-memory session has already been
-    /// `take`n from the manager; recovery requires the caller to either
-    /// retry persistence externally or accept loss.
+    /// The authoritative finalization commit failed. The active session is
+    /// retained in memory and the caller may retry ending it.
     #[error("failed to persist session to disk: {source}")]
     PersistFailed {
         /// The underlying I/O / serialisation error.
         #[source]
         source: anyhow::Error,
     },
+}
+
+/// Terminal state stored in the authoritative session-finalization head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SessionTerminalOutcome {
+    /// A live session completed through [`SessionManager::end_session`].
+    Ended,
+    /// A pre-transaction `latest.json` session was adopted during migration.
+    ImportedLegacy,
+}
+
+/// One fully serialized terminal session generation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionTerminalRecord {
+    outcome: SessionTerminalOutcome,
+    session: Session,
+    handoff: String,
+}
+
+/// The single authoritative commit point for session finalization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionFinalizationHead {
+    schema_version: u32,
+    generation: u64,
+    terminal: Option<SessionTerminalRecord>,
 }
 
 /// Maximum number of [`TurnMetrics`] entries retained in [`Session::turn_metrics`].
@@ -705,6 +737,151 @@ impl Session {
     }
 }
 
+fn observe_session_head(
+    storage: &PersistentStorage,
+) -> anyhow::Result<(Option<SessionFinalizationHead>, StorageGeneration)> {
+    let observed = storage.read(SESSION_HEAD_TARGET, FileClass::Session)?;
+    let generation = observed.generation();
+    let head = observed.expose_bytes(|bytes| {
+        bytes
+            .map(serde_json::from_slice::<SessionFinalizationHead>)
+            .transpose()
+    })?;
+    if let Some(head) = head.as_ref() {
+        validate_session_head(head)?;
+    }
+    Ok((head, generation))
+}
+
+fn validate_session_head(head: &SessionFinalizationHead) -> anyhow::Result<()> {
+    if head.schema_version != SESSION_HEAD_SCHEMA_VERSION {
+        anyhow::bail!(
+            "unsupported session finalization schema version {}",
+            head.schema_version
+        );
+    }
+    if let Some(terminal) = head.terminal.as_ref() {
+        validate_session_file_id(&terminal.session.id).map_err(|reason| {
+            anyhow::anyhow!(
+                "invalid session id {:?} in finalization head: {reason}",
+                terminal.session.id
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn commit_session_head_durably(
+    storage: &PersistentStorage,
+    expected: StorageGeneration,
+    bytes: &[u8],
+) -> anyhow::Result<CommitReceipt> {
+    let mut receipt = storage.commit(SESSION_HEAD_TARGET, FileClass::Session, expected, bytes)?;
+    if receipt.state() == CommitState::PublishedDurabilityUncertain {
+        receipt = storage.commit(SESSION_HEAD_TARGET, FileClass::Session, expected, bytes)?;
+    }
+    if receipt.state() == CommitState::PublishedDurabilityUncertain {
+        anyhow::bail!("session finalization is visible but directory durability remains uncertain");
+    }
+    Ok(receipt)
+}
+
+fn prepare_session_transaction_storage(persist_dir: &Path) -> anyhow::Result<PersistentStorage> {
+    let transaction_dir = persist_dir.join(SESSION_TRANSACTION_DIRECTORY);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        if let Err(error) = builder.create(&transaction_dir) {
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(error.into());
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    if let Err(error) = fs::create_dir(&transaction_dir) {
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(error.into());
+        }
+    }
+    let transaction_dir = fs::canonicalize(transaction_dir)?;
+    let storage = PersistentStorage::open(&transaction_dir)?;
+
+    let (existing, expected) = observe_session_head(&storage)?;
+    if existing.is_some() {
+        return Ok(storage);
+    }
+
+    let latest_path = persist_dir.join("latest.json");
+    let terminal = SessionManager::load_session_from_path(&latest_path).map(|session| {
+        let handoff = fs::read_to_string(persist_dir.join("handoff.md"))
+            .unwrap_or_else(|_| session.generate_handoff());
+        SessionTerminalRecord {
+            outcome: SessionTerminalOutcome::ImportedLegacy,
+            session,
+            handoff,
+        }
+    });
+    let bootstrap = SessionFinalizationHead {
+        schema_version: SESSION_HEAD_SCHEMA_VERSION,
+        generation: 0,
+        terminal,
+    };
+    let bytes = serde_json::to_vec_pretty(&bootstrap)?;
+    match commit_session_head_durably(&storage, expected, &bytes) {
+        Ok(_) => Ok(storage),
+        Err(error) => {
+            // Another manager may have initialized the same root after our
+            // observation. Accept only a valid head; preserve any other
+            // failure as the initialization error.
+            let (raced, _) = observe_session_head(&storage)?;
+            match raced {
+                Some(raced) if serde_json::to_vec_pretty(&raced)? != bytes => Ok(storage),
+                Some(_) | None => Err(error),
+            }
+        }
+    }
+}
+
+fn atomic_write_if_changed(path: &Path, data: &[u8]) -> anyhow::Result<()> {
+    if fs::read(path).is_ok_and(|current| current == data) {
+        return Ok(());
+    }
+    atomic_write(path, data)
+}
+
+fn write_session_compatibility_projections(
+    persist_dir: &Path,
+    session: &Session,
+    session_json: &[u8],
+    handoff: &[u8],
+) -> anyhow::Result<()> {
+    let targets = [
+        (
+            persist_dir.join(format!("{}.json", session.id)),
+            session_json,
+        ),
+        (persist_dir.join("latest.json"), session_json),
+        (persist_dir.join("handoff.md"), handoff),
+    ];
+    let mut failures = Vec::new();
+    for (path, bytes) in targets {
+        if let Err(error) = atomic_write_if_changed(&path, bytes) {
+            failures.push(format!("{}: {error}", path.display()));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "authoritative session committed but compatibility projection failed: {}",
+            failures.join("; ")
+        )
+    }
+}
+
 /// Manages session lifecycle and persistence
 #[derive(Debug, Clone)]
 pub struct SessionManager {
@@ -712,6 +889,10 @@ pub struct SessionManager {
     persist_dir: PathBuf,
     /// Current active session
     current_session: Option<Session>,
+    /// Descriptor-pinned authority for the session-finalization head.
+    transaction_storage: Option<PersistentStorage>,
+    /// Initialization failure retained so ending a session fails safely.
+    transaction_init_error: Option<String>,
     /// Typed VDD advisory observation for the next turn.
     vdd_pending_observation: Option<crate::context::ContextItem>,
     /// Structured task manager for `task_create`/`update`/`get`/`list` tools
@@ -728,19 +909,44 @@ impl SessionManager {
             warn!(error = %e, path = ?persist_dir, "Failed to create session directory");
         }
 
-        Self {
+        let (transaction_storage, transaction_init_error) =
+            match prepare_session_transaction_storage(&persist_dir) {
+                Ok(storage) => (Some(storage), None),
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        path = ?persist_dir,
+                        "Failed to initialize transactional session persistence"
+                    );
+                    (None, Some(error.to_string()))
+                }
+            };
+
+        let manager = Self {
             persist_dir,
             current_session: None,
+            transaction_storage,
+            transaction_init_error,
             vdd_pending_observation: None,
             task_manager: TaskManager::new(),
+        };
+        if let Err(error) = manager.repair_compatibility_projections() {
+            warn!(error = %error, "Unable to repair session compatibility projections");
         }
+        manager
+    }
+
+    fn ensure_current_session(&mut self) -> &mut Session {
+        if self.current_session.is_none() {
+            self.current_session = Some(self.create_session_for_persist_dir());
+        }
+        self.current_session
+            .get_or_insert_with(Session::new_initializer)
     }
 
     /// Get the current session, creating one if none exists.
     pub fn get_or_create_session(&mut self) -> &Session {
-        let persist_dir = self.persist_dir.clone();
-        self.current_session
-            .get_or_insert_with(|| Self::create_session_for_persist_dir(&persist_dir))
+        self.ensure_current_session()
     }
 
     /// Get the current session mutably
@@ -771,10 +977,7 @@ impl SessionManager {
     /// that need a brand-new initializer/coding session should continue using
     /// [`Self::start_initializer`] or [`Self::start_coding`].
     pub fn set_current_mode(&mut self, mode: SessionMode) -> &Session {
-        let persist_dir = self.persist_dir.clone();
-        let session = self
-            .current_session
-            .get_or_insert_with(|| Self::create_session_for_persist_dir(&persist_dir));
+        let session = self.ensure_current_session();
         session.mode = mode;
         if mode == SessionMode::Initializer {
             session.parent_session_id = None;
@@ -793,10 +996,9 @@ impl SessionManager {
         self.vdd_pending_observation.take()
     }
 
-    fn create_session_for_persist_dir(persist_dir: &Path) -> Session {
+    fn create_session_for_persist_dir(&self) -> Session {
         // Check if there's a previous session to continue from
-        let latest_path = persist_dir.join("latest.json");
-        if let Some(last_session) = Self::load_session_from_path(&latest_path) {
+        if let Some(last_session) = self.load_latest_session() {
             info!(
                 parent_id = %last_session.id,
                 "Creating coding session continuing from previous"
@@ -833,25 +1035,27 @@ impl SessionManager {
     /// * [`EndSessionError::NotFound`] — no current session was active
     ///   (previously returned `None` silently, conflating with persist
     ///   failure; see #356).
-    /// * [`EndSessionError::PersistFailed`] — persistence of one of the
-    ///   session files failed.  The in-memory session has already been
-    ///   removed from the manager when this is returned.
+    /// * [`EndSessionError::PersistFailed`] — the authoritative transaction
+    ///   could not be durably committed. The active session remains available
+    ///   for inspection or retry.
     pub fn end_session(&mut self, handoff_notes: Option<&str>) -> Result<Session, EndSessionError> {
         let mut session = self
             .current_session
-            .take()
+            .clone()
             .ok_or(EndSessionError::NotFound)?;
 
         if let Some(notes) = handoff_notes {
             session.set_handoff_notes(notes);
         }
 
-        // Persist the session; failure must surface to the caller, not be
-        // swallowed via warn!() as it was prior to #356.
-        let persist_result = self.persist_session(&session);
+        self.persist_session(&session)
+            .map_err(|source| EndSessionError::PersistFailed { source })?;
+
+        // Publication is the lifecycle boundary. Only now remove the live
+        // session and terminate resources owned by it.
+        self.current_session = None;
         crate::tools::cancel_session_sandbox_processes(&session.id);
         crate::tools::terminate_session_background_jobs(&session.id);
-        persist_result.map_err(|source| EndSessionError::PersistFailed { source })?;
 
         info!(
             session_id = %session.id,
@@ -862,33 +1066,111 @@ impl SessionManager {
         Ok(session)
     }
 
-    /// Persist a session to disk using atomic write-to-temp-then-rename.
-    ///
-    /// Each file is written to a `.tmp` file first, then atomically renamed.
-    /// If the process crashes mid-write, the original file remains intact.
+    /// Commit one authoritative finalization generation, then update the
+    /// existing compatibility artifacts. A projection failure is logged and
+    /// repaired from the head by later managers; it cannot roll back or hide
+    /// a completed authoritative commit.
     fn persist_session(&self, session: &Session) -> anyhow::Result<()> {
         validate_session_file_id(&session.id)
             .map_err(|reason| anyhow::anyhow!("invalid session id {:?}: {reason}", session.id))?;
-        let filename = format!("{}.json", session.id);
-        let path = self.persist_dir.join(&filename);
 
-        let json = serde_json::to_string_pretty(session)?;
-        atomic_write(&path, json.as_bytes())?;
+        let storage = self.transaction_storage.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "transactional session persistence is unavailable: {}",
+                self.transaction_init_error
+                    .as_deref()
+                    .unwrap_or("unknown initialization failure")
+            )
+        })?;
+        // Do not advance past a terminal generation whose compatibility
+        // artifacts are still incomplete. This preserves per-session history
+        // even when one manager ends several sessions without restarting.
+        self.repair_compatibility_projections()?;
+        let (head, expected) = observe_session_head(storage)?;
+        let head = head.ok_or_else(|| anyhow::anyhow!("session finalization head is missing"))?;
+        let generation = head
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("session finalization generation exhausted"))?;
+        let handoff = session.generate_handoff();
+        let proposal = SessionFinalizationHead {
+            schema_version: SESSION_HEAD_SCHEMA_VERSION,
+            generation,
+            terminal: Some(SessionTerminalRecord {
+                outcome: SessionTerminalOutcome::Ended,
+                session: session.clone(),
+                handoff,
+            }),
+        };
+        validate_session_head(&proposal)?;
+        let proposal_json = serde_json::to_vec_pretty(&proposal)?;
+        let receipt = commit_session_head_durably(storage, expected, &proposal_json)?;
 
-        debug!(path = ?path, "Persisted session");
+        debug!(
+            session_id = %session.id,
+            generation,
+            commit_state = ?receipt.state(),
+            "Committed authoritative session finalization"
+        );
 
-        // Also update the "latest" symlink/file
-        let latest_path = self.persist_dir.join("latest.json");
-        atomic_write(
-            &latest_path,
-            serde_json::to_string_pretty(session)?.as_bytes(),
-        )?;
-
-        // Generate and save handoff document
-        let handoff_path = self.persist_dir.join("handoff.md");
-        atomic_write(&handoff_path, session.generate_handoff().as_bytes())?;
+        if let Err(error) = self.repair_compatibility_projections() {
+            warn!(
+                error = %error,
+                session_id = %session.id,
+                generation,
+                "Session compatibility projections require repair"
+            );
+        }
 
         Ok(())
+    }
+
+    fn read_committed_head(&self) -> anyhow::Result<Option<SessionFinalizationHead>> {
+        let Some(storage) = self.transaction_storage.as_ref() else {
+            anyhow::bail!(
+                "transactional session persistence is unavailable: {}",
+                self.transaction_init_error
+                    .as_deref()
+                    .unwrap_or("unknown initialization failure")
+            );
+        };
+        observe_session_head(storage).map(|(head, _)| head)
+    }
+
+    fn repair_compatibility_projections(&self) -> anyhow::Result<()> {
+        let storage = self.transaction_storage.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "transactional session persistence is unavailable: {}",
+                self.transaction_init_error
+                    .as_deref()
+                    .unwrap_or("unknown initialization failure")
+            )
+        })?;
+
+        // A second process may finalize a newer session while projections are
+        // being written. Re-observe the head after each write set and repair
+        // again if its storage generation advanced.
+        for _ in 0..3 {
+            let (head, observed_generation) = observe_session_head(storage)?;
+            let Some(head) = head else {
+                return Ok(());
+            };
+            let Some(terminal) = head.terminal else {
+                return Ok(());
+            };
+            let session_json = serde_json::to_vec_pretty(&terminal.session)?;
+            write_session_compatibility_projections(
+                &self.persist_dir,
+                &terminal.session,
+                &session_json,
+                terminal.handoff.as_bytes(),
+            )?;
+            let (_, current_generation) = observe_session_head(storage)?;
+            if current_generation == observed_generation {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("session finalization advanced repeatedly during projection repair")
     }
 
     /// Load a session by ID
@@ -905,6 +1187,16 @@ impl SessionManager {
     /// Load the most recent session
     #[must_use]
     pub fn load_latest_session(&self) -> Option<Session> {
+        if self.transaction_storage.is_some() {
+            return match self.read_committed_head() {
+                Ok(Some(head)) => head.terminal.map(|terminal| terminal.session),
+                Ok(None) => None,
+                Err(error) => {
+                    warn!(error = %error, "Failed to load authoritative session finalization head");
+                    None
+                }
+            };
+        }
         let path = self.persist_dir.join("latest.json");
         Self::load_session_from_path(&path)
     }
@@ -1805,7 +2097,7 @@ mod tests {
     }
 
     /// (3) `end_session` with a broken persist dir returns
-    ///     `Err(PersistFailed { .. })` — failures are NOT swallowed.
+    ///     `Err(PersistFailed { .. })` and retains the recoverable session.
     #[test]
     fn end_session_persist_failure_surfaces() {
         let dir = TempDir::new().unwrap();
@@ -1822,11 +2114,15 @@ mod tests {
             matches!(err, EndSessionError::PersistFailed { .. }),
             "expected EndSessionError::PersistFailed, got {err:?}"
         );
-        // The in-memory session has been consumed; the manager is back to
-        // the "no current session" state.
         assert!(
-            manager.get_session().is_none(),
-            "current_session must be cleared even on persist failure",
+            manager.get_session().is_some(),
+            "current_session must remain available after persist failure",
+        );
+        assert!(
+            manager
+                .get_session()
+                .is_some_and(|session| session.progress.handoff_notes.is_empty()),
+            "failed proposal must not mutate the committed in-memory session",
         );
     }
 
@@ -1924,8 +2220,8 @@ mod tests {
             } // guard drops here
 
             assert!(
-                manager.get_session().is_none(),
-                "guard Drop must clear current_session even on failure"
+                manager.get_session().is_some(),
+                "guard Drop must retain current_session on persistence failure"
             );
         });
 
@@ -1937,6 +2233,83 @@ mod tests {
         assert!(
             log.contains("failed to persist session on drop"),
             "Drop's error message must mention persist failure, got: {log}"
+        );
+    }
+
+    #[test]
+    fn committed_head_repairs_missing_compatibility_projections() {
+        let dir = TempDir::new().unwrap();
+        let persist_dir = dir.path().join("sessions");
+        let mut manager = SessionManager::new(&persist_dir);
+        let session_id = manager.get_or_create_session().id.clone();
+        manager
+            .end_session(Some("recover projections"))
+            .expect("authoritative finalization");
+
+        fs::remove_file(persist_dir.join(format!("{session_id}.json"))).unwrap();
+        fs::remove_file(persist_dir.join("latest.json")).unwrap();
+        fs::remove_file(persist_dir.join("handoff.md")).unwrap();
+
+        let recovered = SessionManager::new(&persist_dir);
+
+        assert_eq!(
+            recovered.load_latest_session().map(|session| session.id),
+            Some(session_id.clone())
+        );
+        assert!(persist_dir.join(format!("{session_id}.json")).is_file());
+        assert!(persist_dir.join("latest.json").is_file());
+        assert!(fs::read_to_string(persist_dir.join("handoff.md"))
+            .unwrap()
+            .contains("recover projections"));
+    }
+
+    #[test]
+    fn broken_compatibility_projection_cannot_hide_committed_finalization() {
+        let dir = TempDir::new().unwrap();
+        let persist_dir = dir.path().join("sessions");
+        let mut manager = SessionManager::new(&persist_dir);
+        let session_id = manager.get_or_create_session().id.clone();
+        fs::create_dir(persist_dir.join("latest.json")).unwrap();
+
+        let ended = manager
+            .end_session(Some("canonical commit wins"))
+            .expect("projection failure must not undo authoritative commit");
+
+        assert_eq!(ended.id, session_id);
+        assert!(manager.get_session().is_none());
+        assert_eq!(
+            manager.load_latest_session().map(|session| session.id),
+            Some(session_id)
+        );
+    }
+
+    #[test]
+    fn authoritative_head_generation_is_monotonic_and_ignores_stale_latest_file() {
+        let dir = TempDir::new().unwrap();
+        let persist_dir = dir.path().join("sessions");
+        let mut manager = SessionManager::new(&persist_dir);
+
+        let first_id = manager.get_or_create_session().id.clone();
+        manager.end_session(None).unwrap();
+        let first_json = fs::read(persist_dir.join(format!("{first_id}.json"))).unwrap();
+
+        let second_id = manager.get_or_create_session().id.clone();
+        manager.end_session(None).unwrap();
+        fs::write(persist_dir.join("latest.json"), first_json).unwrap();
+
+        let (head, _) =
+            observe_session_head(manager.transaction_storage.as_ref().unwrap()).unwrap();
+        assert_eq!(head.unwrap().generation, 2);
+        assert_eq!(
+            manager.load_latest_session().map(|session| session.id),
+            Some(second_id.clone()),
+            "the compatibility file cannot regress the committed latest generation"
+        );
+
+        let recovered = SessionManager::new(&persist_dir);
+        assert_eq!(
+            recovered.load_latest_session().map(|session| session.id),
+            Some(second_id)
         );
     }
 
