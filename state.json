@@ -1,6 +1,6 @@
 {
   "next_display_id": 1207,
-  "next_comment_id": 1923,
+  "next_comment_id": 1924,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -18438,7 +18438,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-29T21:22:16.383200036Z",
-      "updated_at": "2026-08-29T21:23:52.790811521Z",
+      "updated_at": "2026-08-29T23:05:19.196324463Z",
       "labels": [
         "remediation"
       ],
@@ -18451,6 +18451,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAxdi3soN12ez0PQv0M9VIeKOfSL1xUWW24pGddcOsGvwtnSmwT0E/yhN7DMn3Y+430JTWerlDpY25GjjlziG9AQ=="
+        },
+        "ec35fad1-b7e8-4c83-87c2-7228092da9e5": {
+          "display_id": 1923,
+          "author": "6Vw9",
+          "content": "Implemented S-075 with one typed command registry shared by CLI REPL and TUI for canonical names, aliases, arguments, help, completion, capabilities, effect class, admission, and execution routing. Production callers supply the active ToolRunContext; effectful commands are admitted before dispatch; deferred streaming keybindings use the same registry path; README/help/catalogue parity is generated from the same definitions. Existing command behavior was wired, not removed. S-077 remains the deliberate generation-bound Git review/commit consumer. Evidence: registry 5/5, generated catalogue 4/4, subagent/slash E2E 27/27, TUI 86/86; Rust 1.98 fmt/check/strict all-feature all-target Clippy green; exact locked native all-target all-feature suite exit 0; Windows GNU all-target all-feature check green; repository policy 27/27 plus hygiene, cargo-deny root/fuzz, fuzz check/Clippy/lib 4/4 all green.",
+          "created_at": "2026-08-29T23:05:19.193852409Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA5RDiEAAWYudqRsPaT8PAyw5BQ8daFMTd9p26HkdD83qa+MFbOU4VgUV0xUoBmFf9GeSMNCGNwgQ6jZq863TDCQ=="
         }
       }
     },
@@ -48646,11 +48655,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2324,
       "timestamp": "2026-08-29T23:05:14.648512589Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2325,
+      "timestamp": "2026-08-29T23:05:19.196324463Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-29T23:05:14.648512589Z",
+    "timestamp": "2026-08-29T23:05:19.196324463Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2324
+    "agent_seq": 2325
   }
 }
