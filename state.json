@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1204,
+  "next_display_id": 1205,
   "next_comment_id": 1917,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -372,6 +372,7 @@
     "56ef6e6e-8f37-450f-8e2c-cff01808c859": 678,
     "56f05f88-270b-405d-9eed-d1d1dec78ede": 506,
     "5761f3f4-1da4-4206-bd19-84815ace19ef": 455,
+    "57c006f8-fafd-4ec9-912b-30a76403b889": 1204,
     "57dfbcfb-77ca-41e7-8e38-af1369afc75f": 292,
     "585676a3-5b3e-4925-8f2c-2d4a652d2259": 1014,
     "588eade6-3433-4e57-83e4-50304fc73a46": 118,
@@ -13056,6 +13057,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAVNWQnxvizpXAX07ri/VkzwWMdf8y8IS683C/4VG0CHRV9qeK2dAv1UWq6Zca5cTXoyK/JrhfxL0nj8Bnv0GECQ=="
         }
       }
+    },
+    "57c006f8-fafd-4ec9-912b-30a76403b889": {
+      "uuid": "57c006f8-fafd-4ec9-912b-30a76403b889",
+      "display_id": 1204,
+      "title": "S-038: Repair session schema migration and ownership",
+      "description": "Implement docs/remediation-slices/038-session-schema-migration-and-ownership.md completely. Define strict minimum, current, and future schema handling; route supported old records through bounded transactional validation; keep schema metadata in OpenClaudia-owned storage; and retain foreign transcripts as explicit bounded imports. Preserve existing session functionality and S-037 atomic finalization. Worker writes production and test code only; main agent owns review, verification, documentation, commit, push, and CI.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-29T21:21:58.096438048Z",
+      "updated_at": "2026-08-29T21:21:58.096438048Z"
     },
     "57dfbcfb-77ca-41e7-8e38-af1369afc75f": {
       "uuid": "57dfbcfb-77ca-41e7-8e38-af1369afc75f",
@@ -48478,11 +48491,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2312,
       "timestamp": "2026-08-29T21:21:11.420169886Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2313,
+      "timestamp": "2026-08-29T21:21:58.096438048Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-29T21:21:11.420169886Z",
+    "timestamp": "2026-08-29T21:21:58.096438048Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2312
+    "agent_seq": 2313
   }
 }
