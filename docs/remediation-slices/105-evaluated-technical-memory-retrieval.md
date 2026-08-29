@@ -214,6 +214,18 @@ and review artifact digests are respectively
 `5197bc7d116c904234135dbc9c67084c28424a08f04a26dbadb8f3f62831b32d`,
 and `6b2d0d2f952063e3c1ead79f8c8001f554fa6458cdcf2bd3adeff835d61b40d6`.
 
+A post-S-037 CI repair changed the cited `src/tools/bash/mod.rs` so a
+background job publishes terminal state only after its command evidence,
+freshness generation, and prior-verifier invalidation are finalized. That
+citation is rebound to `worktree:s037` at source digest
+`c5afac6714f4409286ce43c8c9e15675d5a78f68be04ec18187f53bcd0d89c40`.
+The regenerated tuning, held-out, evaluation, and deliberately rejected review
+digests are respectively
+`702d85d34bae885cac5d73bda74696cd0a48d95c84b96e64e964af69c7e3486b`,
+`e907cf72521c49a282750688968ccfccf23c3f2df791f85a28d2b9c31bc3649a`,
+`50a2a964fb05554e9d3ed018b50ae438b0664484d858d212e93b6dc4235be532`,
+and `c6af92cebbb68f2c0579aa35118fb7c0ef3103284216fe335f6c08352dcbbd24`.
+
 ## Residual boundaries
 
 - S-088 owns the independent artifact-bound VDD review, including the required

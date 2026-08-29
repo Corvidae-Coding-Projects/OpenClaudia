@@ -2544,17 +2544,21 @@ mod tests {
             ids.len()
         );
 
-        // Wait long enough for every wait-thread to reap.
-        std::thread::sleep(std::time::Duration::from_millis(600));
-
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         for (id, expected) in &ids {
-            let read = mgr
-                .get_output(test_run(), id, Some(0))
-                .expect("fix674-b: get_output must succeed");
-            assert!(
-                !read.state.is_running(),
-                "fix674-b: shell {id} must be settled after 600ms"
-            );
+            let read = loop {
+                let read = mgr
+                    .get_output(test_run(), id, Some(0))
+                    .expect("fix674-b: get_output must succeed");
+                if read.state.is_terminal() {
+                    break read;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fix674-b: shells must settle within the bounded lifecycle deadline"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
             assert_eq!(
                 read.state.exit_code(),
                 Some(*expected),
