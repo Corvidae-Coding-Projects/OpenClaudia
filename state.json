@@ -26580,12 +26580,13 @@
       "display_id": 1205,
       "title": "S-058: Require explicit trust for hook imports",
       "description": "Implement docs/remediation-slices/058-explicit-hook-import-trust.md completely. Finish the existing inert compatibility importer so host approval is stored outside the repository and bound to source scope, path, digest, owner, workspace, events, executables, outputs, and capabilities; changed or hostile imports must fail atomically and visibly. Preserve supported hooks and host policy. Worker writes production and test code only; main agent owns review, verification, documentation, commit, push, and CI.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-29T21:22:07.057086655Z",
-      "updated_at": "2026-08-29T23:05:14.648512589Z",
+      "updated_at": "2026-08-29T23:05:54.084976454Z",
+      "closed_at": "2026-08-29T23:05:54.084970014Z",
       "labels": [
         "remediation"
       ],
@@ -48680,11 +48681,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2327,
       "timestamp": "2026-08-29T23:05:49.462339405Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2328,
+      "timestamp": "2026-08-29T23:05:54.084976454Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-29T23:05:49.462339405Z",
+    "timestamp": "2026-08-29T23:05:54.084976454Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2327
+    "agent_seq": 2328
   }
 }
