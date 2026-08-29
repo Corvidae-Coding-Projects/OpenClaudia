@@ -1,6 +1,6 @@
 {
   "next_display_id": 1208,
-  "next_comment_id": 1927,
+  "next_comment_id": 1928,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9510,7 +9510,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-29T23:06:46.985255735Z",
+      "updated_at": "2026-08-29T23:31:57.614831880Z",
       "labels": [
         "remediation"
       ],
@@ -10825,6 +10825,15 @@
           "kind": "result",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAtIcRqtqCYT9h0n3I18vRQsjx1oTdf6/wcZLzz3VzBvCvIIe5peayKgwojg6YSA0o7GdVKwRJU7NLmOZZU3xkAA=="
+        },
+        "dcb41a77-6431-443c-9b3f-e271d918c4fa": {
+          "display_id": 1927,
+          "author": "6Vw9",
+          "content": "Commit 8193d179 fix(runtime): finalize background mutation before terminal state closes #1207 after exact-head Linux CI exposed an existing supervisor ordering race. Terminal bash_output state is now published only after command evidence, freshness reservation commit, and verifier receipt invalidation. The regression test now requires the first post-terminal gate to pass. Rust 1.98 exact failing test 1/1, full ledger_decision_e2e 20/20, fmt, and strict locked all-feature/all-target Clippy are green.",
+          "created_at": "2026-08-29T23:31:57.612026138Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAWkc9TFM8YPG3bOZLUnNHLg60lPipeMmC17CJF14BnRJ5ZZzrm2hS3G+IbSOHTX62ZuSPsTgSC0m3rkiI2alMBg=="
         },
         "dff2fbb1-3631-42e1-9771-112e2c2a4d2b": {
           "display_id": 1286,
@@ -48770,11 +48779,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2337,
       "timestamp": "2026-08-29T23:31:13.322695714Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2338,
+      "timestamp": "2026-08-29T23:31:57.614831880Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-29T23:31:13.322695714Z",
+    "timestamp": "2026-08-29T23:31:57.614831880Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2337
+    "agent_seq": 2338
   }
 }
