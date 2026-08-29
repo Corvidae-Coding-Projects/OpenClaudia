@@ -1,6 +1,6 @@
 {
   "next_display_id": 1207,
-  "next_comment_id": 1918,
+  "next_comment_id": 1919,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -26537,10 +26537,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-29T21:22:07.057086655Z",
-      "updated_at": "2026-08-29T21:22:11.634085160Z",
+      "updated_at": "2026-08-29T21:23:48.319939346Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "6d1de4b2-face-466d-adc9-f9214aa2b534": {
+          "display_id": 1918,
+          "author": "6Vw9",
+          "content": "Code-only worker assigned with ownership limited to the hook compatibility trust importer and its direct wiring. Main agent retains architecture review, integration, all execution-based verification, documentation, issue closure, commit, push, and CI.",
+          "created_at": "2026-08-29T21:23:48.317449835Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABABnUTqJR0b/w0uhcUDkPScteMwlo1kO1wygdKNsCeNJ8TDHp06twccIerDaBAlj5+85laInqwsttTsnaqgKcIDg=="
+        }
+      }
     },
     "b101db2b-99e6-411d-8165-aafd680e57d0": {
       "uuid": "b101db2b-99e6-411d-8165-aafd680e57d0",
@@ -48572,11 +48583,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2319,
       "timestamp": "2026-08-29T21:23:43.809796859Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2320,
+      "timestamp": "2026-08-29T21:23:48.319939346Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-29T21:23:43.809796859Z",
+    "timestamp": "2026-08-29T21:23:48.319939346Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2319
+    "agent_seq": 2320
   }
 }
