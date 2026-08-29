@@ -1,6 +1,6 @@
 {
   "next_display_id": 1210,
-  "next_comment_id": 1929,
+  "next_comment_id": 1930,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -26611,11 +26611,22 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-29T23:51:55.774380470Z",
-      "updated_at": "2026-08-29T23:52:04.508981213Z",
+      "updated_at": "2026-08-29T23:58:41.022309292Z",
       "labels": [
         "bug",
         "test-reliability"
-      ]
+      ],
+      "comments": {
+        "3374b7fc-370d-4120-968d-5e8b3c8a55d3": {
+          "display_id": 1929,
+          "author": "6Vw9",
+          "content": "Replaced the fixed 600 ms sleep in fix674_settled_finished_has_exit_code with polling of the actual terminal contract under one shared bounded 10-second deadline. The exit-code invariant remains exact for every admitted shell; production delays were not added and assertions were not weakened. Evidence: exact unit 1/1, ledger_decision_e2e 20/20, Rust 1.98 fmt and strict locked all-feature/all-target Clippy green.",
+          "created_at": "2026-08-29T23:58:41.019759621Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAv9t2Ezqz8NMFX03dGdA0mgB3N9gkOmD4jURDOR/c4GmtEYz3ObAx7WTFOeyDAMTVF1nKCQMMfO1fNETiq2unDg=="
+        }
+      }
     },
     "b0d680f5-9ac5-4f00-b0dd-23abf5cddc98": {
       "uuid": "b0d680f5-9ac5-4f00-b0dd-23abf5cddc98",
@@ -48873,11 +48884,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2346,
       "timestamp": "2026-08-29T23:58:36.410818699Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2347,
+      "timestamp": "2026-08-29T23:58:41.022309292Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-29T23:58:36.410818699Z",
+    "timestamp": "2026-08-29T23:58:41.022309292Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2346
+    "agent_seq": 2347
   }
 }
