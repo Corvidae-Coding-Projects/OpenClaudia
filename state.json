@@ -1,6 +1,6 @@
 {
   "next_display_id": 1207,
-  "next_comment_id": 1919,
+  "next_comment_id": 1920,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -18420,10 +18420,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-29T21:22:16.383200036Z",
-      "updated_at": "2026-08-29T21:22:22.550916740Z",
+      "updated_at": "2026-08-29T21:23:52.790811521Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "d9b51b58-afab-438c-b7d3-58dfd4b73bb6": {
+          "display_id": 1919,
+          "author": "6Vw9",
+          "content": "Code-only worker assigned with ownership limited to canonical command registry and CLI/TUI consumers. Main agent retains architecture review, integration, all execution-based verification, documentation, issue closure, commit, push, and CI.",
+          "created_at": "2026-08-29T21:23:52.788449717Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAxdi3soN12ez0PQv0M9VIeKOfSL1xUWW24pGddcOsGvwtnSmwT0E/yhN7DMn3Y+430JTWerlDpY25GjjlziG9AQ=="
+        }
+      }
     },
     "7ace8980-ed9d-4732-8114-ddc6e6778fa4": {
       "uuid": "7ace8980-ed9d-4732-8114-ddc6e6778fa4",
@@ -48588,11 +48599,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2320,
       "timestamp": "2026-08-29T21:23:48.319939346Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2321,
+      "timestamp": "2026-08-29T21:23:52.790811521Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-29T21:23:48.319939346Z",
+    "timestamp": "2026-08-29T21:23:52.790811521Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2320
+    "agent_seq": 2321
   }
 }
