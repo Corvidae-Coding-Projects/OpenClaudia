@@ -1,6 +1,6 @@
 {
   "next_display_id": 1207,
-  "next_comment_id": 1917,
+  "next_comment_id": 1918,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -13070,10 +13070,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-29T21:21:58.096438048Z",
-      "updated_at": "2026-08-29T21:22:02.480503383Z",
+      "updated_at": "2026-08-29T21:23:43.809796859Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "2cc4d59d-8156-4295-b724-67349b4ef119": {
+          "display_id": 1917,
+          "author": "6Vw9",
+          "content": "Code-only worker assigned with ownership limited to session persistence and startup migration surfaces. Main agent retains architecture review, integration, all execution-based verification, documentation, issue closure, commit, push, and CI.",
+          "created_at": "2026-08-29T21:23:43.807029273Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA40oHPwfMq0gCUFzRoYSRR+y+gu77K5Z6UgQToElN09XnelyC4yLT+F/d23eWpfwhZpVsZNqP7YtQNXrLKjGABQ=="
+        }
+      }
     },
     "57dfbcfb-77ca-41e7-8e38-af1369afc75f": {
       "uuid": "57dfbcfb-77ca-41e7-8e38-af1369afc75f",
@@ -48556,11 +48567,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2318,
       "timestamp": "2026-08-29T21:22:22.550916740Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2319,
+      "timestamp": "2026-08-29T21:23:43.809796859Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-29T21:22:22.550916740Z",
+    "timestamp": "2026-08-29T21:23:43.809796859Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2318
+    "agent_seq": 2319
   }
 }
