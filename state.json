@@ -7445,11 +7445,12 @@
       "uuid": "35b183ac-35c1-4ae6-8cde-e42275092b3c",
       "display_id": 1203,
       "title": "S-037: Make session mutation and finalization atomic",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-29T03:42:52.703698333Z",
-      "updated_at": "2026-08-29T04:40:27.904495164Z",
+      "updated_at": "2026-08-29T04:40:32.372089231Z",
+      "closed_at": "2026-08-29T04:40:32.372087648Z",
       "labels": [
         "remediation"
       ],
@@ -48372,11 +48373,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2300,
       "timestamp": "2026-08-29T04:40:27.904495164Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2301,
+      "timestamp": "2026-08-29T04:40:32.372089231Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-29T04:40:27.904495164Z",
+    "timestamp": "2026-08-29T04:40:32.372089231Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2300
+    "agent_seq": 2301
   }
 }
