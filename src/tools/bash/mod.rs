@@ -918,18 +918,15 @@ fn supervise_background_job(
     if let Err(error) = background_budget.commit() {
         tracing::error!(job_id, %error, "Failed to release background process budget");
     }
-    let mut core = recover_mutex_lock(core, "supervise", "job_core", Some(job_id));
-    if let Err(error) = core.set_state(terminal_state) {
-        tracing::error!(job_id, %error, "Failed to persist terminal background-job state");
-    }
-    let stdout = core.ledger_output(JobOutputStream::Stdout, LEDGER_COMMAND_OUTPUT_MAX_BYTES);
-    let stderr = core.ledger_output(JobOutputStream::Stderr, LEDGER_COMMAND_OUTPUT_MAX_BYTES);
-    let exit_code = core.state().exit_code().or_else(|| {
+    let core_guard = recover_mutex_lock(core, "supervise", "job_core", Some(job_id));
+    let stdout = core_guard.ledger_output(JobOutputStream::Stdout, LEDGER_COMMAND_OUTPUT_MAX_BYTES);
+    let stderr = core_guard.ledger_output(JobOutputStream::Stderr, LEDGER_COMMAND_OUTPUT_MAX_BYTES);
+    let exit_code = terminal_state.exit_code().or_else(|| {
         root_status
             .as_ref()
             .map(|status| status.code().unwrap_or(-1))
     });
-    drop(core);
+    drop(core_guard);
     record_command_observation_for_session(
         run_for_ledger,
         owner_for_ledger,
@@ -946,6 +943,15 @@ fn supervise_background_job(
         run_for_ledger.run_id,
         run_for_ledger.capability_generation,
     );
+
+    // Publish the terminal state last. `bash_output` exposes this state as the
+    // lifecycle-completion signal, so making it visible before freshness and
+    // receipt finalization lets an immediate verifier race a mutation that the
+    // caller was already told had finished.
+    let mut core = recover_mutex_lock(core, "supervise", "job_core", Some(job_id));
+    if let Err(error) = core.set_state(terminal_state) {
+        tracing::error!(job_id, %error, "Failed to persist terminal background-job state");
+    }
 }
 
 fn stop_background_shell(shell: &BackgroundShell, requested: BackgroundJobState) {

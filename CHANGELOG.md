@@ -125,6 +125,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - TUI: every turn now dual-writes — the existing JSON snapshot at `~/.local/share/openclaudia/chat_sessions/<uuid>.json` stays for backward compat, and new entries also append to the JSONL transcript via `App::persist_transcript_tail`. Watermark tracking skips re-appending on resume
 
 ### Fixed
+- Publish background terminal state after freshness finalization (#1207)
 - Deliver the selected source snapshot to canonical VDD (#1187)
 - Join verifier-owned processes before publishing a VDD receipt (#1185)
 - Bind canonical VDD identity to the actual resolved verifier route (#1184)

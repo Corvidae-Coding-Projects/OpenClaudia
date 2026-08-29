@@ -751,24 +751,16 @@ fn background_bash_mutation_blocks_verification_until_reaped() {
     assert!(completed, "background mutation did not finish in time");
     assert_eq!(std::fs::read(&source).expect("read mutated source"), b"b");
 
-    let mut fresh_gate = None;
-    for _ in 0..20 {
-        let candidate = openclaudia::guardrails::run_quality_gates(&verifier_run, "test-model")
-            .into_iter()
-            .next()
-            .expect("post-mutation gate result");
-        if candidate.passed() {
-            fresh_gate = Some(candidate);
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    append_quality_gate_observations(
-        &verifier_run,
-        &mut ledger,
-        &fresh_gate.expect("fresh gate must pass after mutation is reaped"),
-    )
-    .expect("post-mutation gate may mint fresh evidence");
+    let fresh_gate = openclaudia::guardrails::run_quality_gates(&verifier_run, "test-model")
+        .into_iter()
+        .next()
+        .expect("post-mutation gate result");
+    assert!(
+        fresh_gate.passed(),
+        "terminal background state must imply completed freshness finalization: {fresh_gate:?}"
+    );
+    append_quality_gate_observations(&verifier_run, &mut ledger, &fresh_gate)
+        .expect("post-mutation gate may mint fresh evidence");
 }
 
 #[test]
