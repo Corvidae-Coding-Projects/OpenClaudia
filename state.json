@@ -1,6 +1,6 @@
 {
   "next_display_id": 1210,
-  "next_comment_id": 1928,
+  "next_comment_id": 1929,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -34479,11 +34479,22 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-29T23:51:42.501393236Z",
-      "updated_at": "2026-08-29T23:51:51.307104496Z",
+      "updated_at": "2026-08-29T23:58:36.410818699Z",
       "labels": [
         "bug",
         "remediation"
-      ]
+      ],
+      "comments": {
+        "98f63085-1bd5-46e4-a173-8cbc076d5a28": {
+          "display_id": 1928,
+          "author": "6Vw9",
+          "content": "Rebound the checked-in src/tools/bash/mod.rs citation to the post-S-037 finalization repair as worktree:s037 with exact source digest c5afac6714f4409286ce43c8c9e15675d5a78f68be04ec18187f53bcd0d89c40. Regenerated the timing-bearing evaluation and rebound the deliberately rejected review without promotion. Exact artifact digests: tuning 702d85d34bae885cac5d73bda74696cd0a48d95c84b96e64e964af69c7e3486b; held-out e907cf72521c49a282750688968ccfccf23c3f2df791f85a28d2b9c31bc3649a; evaluation 50a2a964fb05554e9d3ed018b50ae438b0664484d858d212e93b6dc4235be532; rejected review c6af92cebbb68f2c0579aa35118fb7c0ef3103284216fe335f6c08352dcbbd24. Evidence: retrieval unit 7/7 and adversarial evidence E2E 9/9 green.",
+          "created_at": "2026-08-29T23:58:36.406943965Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA6H9Qd0m1wC7reYQPo6wpjxxDbLT8qzJ2bebnyC/K1jsdzzveIZjO5nbNd3wUezIec2rq1RFhcNMebjVJQUM6Dw=="
+        }
+      }
     },
     "ee540af1-1471-4b64-8ef8-5dc42ba27632": {
       "uuid": "ee540af1-1471-4b64-8ef8-5dc42ba27632",
@@ -48857,11 +48868,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2345,
       "timestamp": "2026-08-29T23:52:15.285311664Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2346,
+      "timestamp": "2026-08-29T23:58:36.410818699Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-29T23:52:15.285311664Z",
+    "timestamp": "2026-08-29T23:58:36.410818699Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2345
+    "agent_seq": 2346
   }
 }
