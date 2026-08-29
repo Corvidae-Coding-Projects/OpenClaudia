@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1206,
+  "next_display_id": 1207,
   "next_comment_id": 1917,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -536,6 +536,7 @@
     "7981ba52-0389-4ec2-9241-8dfac0bc4fe6": 964,
     "79a86144-6cad-4e5f-ac35-b3a6b9d17a68": 1167,
     "79f3fb57-dfdc-40a9-8f2d-9bc9b371f0a6": 996,
+    "7aca4758-cb75-4fa4-b75d-dac620ff9049": 1206,
     "7ace8980-ed9d-4732-8114-ddc6e6778fa4": 744,
     "7affeebf-2e4d-4376-ae71-74483ede9b0c": 1171,
     "7b7677f6-2896-4c57-bc57-cd7566fff977": 493,
@@ -18397,6 +18398,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABASHJD6yC4LTpLl0fSpJ6esL8Tm4RJuYQVlBWUg7QFZkjuVHTKXB/KDJH0RDSZKKg4P53l1rJN7LBc5JjirRJODA=="
         }
       }
+    },
+    "7aca4758-cb75-4fa4-b75d-dac620ff9049": {
+      "uuid": "7aca4758-cb75-4fa4-b75d-dac620ff9049",
+      "display_id": 1206,
+      "title": "S-075: Create one typed command registry",
+      "description": "Implement docs/remediation-slices/075-typed-command-registry.md completely. Consolidate canonical names, aliases, typed arguments, effects, capabilities, frontend availability, help, and completion metadata beside handlers; make parsing pure; reject collisions; and route actions through canonical lifecycle boundaries without removing supported commands. Worker writes production and test code only; main agent owns review, verification, documentation, commit, push, and CI.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-29T21:22:16.383200036Z",
+      "updated_at": "2026-08-29T21:22:16.383200036Z"
     },
     "7ace8980-ed9d-4732-8114-ddc6e6778fa4": {
       "uuid": "7ace8980-ed9d-4732-8114-ddc6e6778fa4",
@@ -48530,11 +48543,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2316,
       "timestamp": "2026-08-29T21:22:11.634085160Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2317,
+      "timestamp": "2026-08-29T21:22:16.383200036Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-29T21:22:11.634085160Z",
+    "timestamp": "2026-08-29T21:22:16.383200036Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2316
+    "agent_seq": 2317
   }
 }
