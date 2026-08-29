@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1205,
+  "next_display_id": 1206,
   "next_comment_id": 1917,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -784,6 +784,7 @@
     "b0ac9d41-3bff-45e5-b29f-e0cb29d0ef27": 22,
     "b0cb96f2-951a-44b4-b8d3-a84db6619496": 226,
     "b0d267fb-f08d-4edb-af67-c28a28a71794": 163,
+    "b0d680f5-9ac5-4f00-b0dd-23abf5cddc98": 1205,
     "b101db2b-99e6-411d-8165-aafd680e57d0": 991,
     "b11c769c-9b9d-413f-9c32-ffbc5ece8a9c": 46,
     "b1489b6d-9dae-432a-bf03-bc5fa52fd481": 871,
@@ -26499,6 +26500,18 @@
         "qa"
       ]
     },
+    "b0d680f5-9ac5-4f00-b0dd-23abf5cddc98": {
+      "uuid": "b0d680f5-9ac5-4f00-b0dd-23abf5cddc98",
+      "display_id": 1205,
+      "title": "S-058: Require explicit trust for hook imports",
+      "description": "Implement docs/remediation-slices/058-explicit-hook-import-trust.md completely. Finish the existing inert compatibility importer so host approval is stored outside the repository and bound to source scope, path, digest, owner, workspace, events, executables, outputs, and capabilities; changed or hostile imports must fail atomically and visibly. Preserve supported hooks and host policy. Worker writes production and test code only; main agent owns review, verification, documentation, commit, push, and CI.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-29T21:22:07.057086655Z",
+      "updated_at": "2026-08-29T21:22:07.057086655Z"
+    },
     "b101db2b-99e6-411d-8165-aafd680e57d0": {
       "uuid": "b101db2b-99e6-411d-8165-aafd680e57d0",
       "display_id": 991,
@@ -48504,11 +48517,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2314,
       "timestamp": "2026-08-29T21:22:02.480503383Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2315,
+      "timestamp": "2026-08-29T21:22:07.057086655Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-29T21:22:02.480503383Z",
+    "timestamp": "2026-08-29T21:22:07.057086655Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2314
+    "agent_seq": 2315
   }
 }
