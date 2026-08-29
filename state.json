@@ -1,6 +1,6 @@
 {
   "next_display_id": 1210,
-  "next_comment_id": 1930,
+  "next_comment_id": 1931,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9512,7 +9512,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-29T23:31:57.614831880Z",
+      "updated_at": "2026-08-29T23:59:25.781946838Z",
       "labels": [
         "remediation"
       ],
@@ -9930,6 +9930,15 @@
           "kind": "handoff",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAJW14vHv6/hV8sufgqlVi+idzGOeIA1dUZpHk9XG0T4SPLwT2JEUHLfE9PSPYZzGHtjOkOf3f2X8AS1kID45MBg=="
+        },
+        "2f7e24aa-be1d-4670-8c0a-ec78574a588d": {
+          "display_id": 1930,
+          "author": "6Vw9",
+          "content": "Commit 4b68ec7c fix(ci): await and bind background settlement closes #1208 and #1209 after the second exact-head Linux run exposed the cited-source digest and fixed-600ms settlement assumptions. Exact background unit 1/1, ledger decision E2E 20/20, retrieval evidence unit 7/7, adversarial evidence E2E 9/9, Rust 1.98 fmt, and strict locked all-feature/all-target Clippy are green. Review remains deliberately rejected pending independent VDD.",
+          "created_at": "2026-08-29T23:59:25.779198591Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAUWZp6QFlP7ztBV1EvHfoQ0kBr3rxtdtPISoO0IWBEJi4bZ1uoRo6wKV2APb0wq4079PGCNpKMHuFe8gk2PaNCQ=="
         },
         "313b0281-eb8d-4379-a0ce-8d711ca79b5d": {
           "display_id": 1618,
@@ -48902,11 +48911,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2350,
       "timestamp": "2026-08-29T23:58:54.649670411Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2351,
+      "timestamp": "2026-08-29T23:59:25.781946838Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-29T23:58:54.649670411Z",
+    "timestamp": "2026-08-29T23:59:25.781946838Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2350
+    "agent_seq": 2351
   }
 }
