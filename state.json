@@ -1,6 +1,6 @@
 {
   "next_display_id": 1207,
-  "next_comment_id": 1922,
+  "next_comment_id": 1923,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -26566,11 +26566,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-29T21:22:07.057086655Z",
-      "updated_at": "2026-08-29T21:23:48.319939346Z",
+      "updated_at": "2026-08-29T23:05:14.648512589Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "403996a4-f7c4-4f81-8c6f-5b84e0d0216f": {
+          "display_id": 1922,
+          "author": "6Vw9",
+          "content": "Implemented S-058 as explicit inert-by-default hook import. Discovery is bounded and read-only; imported repository hooks cannot execute until the exact workspace/source/owner/content/event/effect/capability/output/executable identity is approved in a host-owned store outside the repository. Host policy remains authoritative, approval invalidates on drift, unsafe parents/symlinks/oversized inputs fail closed, and ordinary unrelated Claude settings remain compatible rather than disabling discovery. Evidence: repository hook-import E2E 19/19 and Claude compatibility hook E2E 18/18; Rust 1.98 fmt/check/strict all-feature all-target Clippy green; exact locked native all-target all-feature suite exit 0; Windows GNU all-target all-feature check green; repository policy 27/27 plus hygiene, cargo-deny root/fuzz, fuzz check/Clippy/lib 4/4 all green.",
+          "created_at": "2026-08-29T23:05:14.645904728Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAeuNxfzGtBgshFV+EDXhs1IsgO2raY8GMDlkrrvWSgWhlaJPvSTV4VmN4edZivSoL6IhhNnwRvhNQORkD2FqZCQ=="
+        },
         "6d1de4b2-face-466d-adc9-f9214aa2b534": {
           "display_id": 1918,
           "author": "6Vw9",
@@ -48632,11 +48641,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2323,
       "timestamp": "2026-08-29T23:05:09.039092423Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2324,
+      "timestamp": "2026-08-29T23:05:14.648512589Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-29T23:05:09.039092423Z",
+    "timestamp": "2026-08-29T23:05:14.648512589Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2323
+    "agent_seq": 2324
   }
 }
