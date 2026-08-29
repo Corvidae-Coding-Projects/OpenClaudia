@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1207,
+  "next_display_id": 1208,
   "next_comment_id": 1926,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -1115,6 +1115,7 @@
     "fbad4f79-3807-444c-8c0f-96a8eaca9403": 858,
     "fc07d641-ce9d-4532-b64e-e5644cbab6d6": 689,
     "fc0d5651-4062-431f-8fcb-3045fbe58c20": 141,
+    "fc15b0c1-2043-4165-b8ca-f0122455b5c3": 1207,
     "fc394543-2a7c-4674-b416-6981c2fd99fa": 849,
     "fc4aa97b-6e77-4f7f-bace-2f330e95082b": 159,
     "fc5ec86a-198b-4432-a529-6a90d72511a5": 742,
@@ -36010,6 +36011,18 @@
         "qa"
       ]
     },
+    "fc15b0c1-2043-4165-b8ca-f0122455b5c3": {
+      "uuid": "fc15b0c1-2043-4165-b8ca-f0122455b5c3",
+      "display_id": 1207,
+      "title": "Publish background terminal state after freshness finalization",
+      "description": "Steps to reproduce:\n1. \n\nExpected: \nActual: \n\nLinux CI exposed a real lifecycle race: bash_output can observe a terminal background job before its mutation reservation is committed and verification receipts are invalidated, so an immediate quality gate still sees mutation-in-progress. Make terminal publication the last supervisor action, cover the ordering deterministically, retain fail-closed behavior, and verify Rust 1.98 runners.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-29T23:26:12.768740263Z",
+      "updated_at": "2026-08-29T23:26:12.768740263Z"
+    },
     "fc394543-2a7c-4674-b416-6981c2fd99fa": {
       "uuid": "fc394543-2a7c-4674-b416-6981c2fd99fa",
       "display_id": 849,
@@ -48706,11 +48719,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2330,
       "timestamp": "2026-08-29T23:06:46.985255735Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2331,
+      "timestamp": "2026-08-29T23:26:12.768740263Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-29T23:06:46.985255735Z",
+    "timestamp": "2026-08-29T23:26:12.768740263Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2330
+    "agent_seq": 2331
   }
 }
