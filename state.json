@@ -26606,12 +26606,13 @@
       "display_id": 1209,
       "title": "Await complete background settlement in exit-code regression test",
       "description": "Steps to reproduce:\n1. \n\nExpected: \nActual: \n\nThe fix674 settled-job unit test sleeps a fixed 600 ms before asserting that twenty concurrent background shells are terminal. Issue #1207 intentionally makes terminal publication wait for ledger, freshness, and receipt finalization, so a loaded Linux runner can exceed that assumption. Poll the real terminal contract to a bounded deadline and retain the exit-code invariant without adding production delays.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-29T23:51:55.774380470Z",
-      "updated_at": "2026-08-29T23:58:41.022309292Z",
+      "updated_at": "2026-08-29T23:58:50.277070655Z",
+      "closed_at": "2026-08-29T23:58:50.277068964Z",
       "labels": [
         "bug",
         "test-reliability"
@@ -48895,11 +48896,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2348,
       "timestamp": "2026-08-29T23:58:45.574372973Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2349,
+      "timestamp": "2026-08-29T23:58:50.277070655Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-29T23:58:45.574372973Z",
+    "timestamp": "2026-08-29T23:58:50.277070655Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2348
+    "agent_seq": 2349
   }
 }
