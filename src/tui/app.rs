@@ -768,6 +768,14 @@ fn resolve_provider_switch(
     requested: &str,
     prompt_blocks: Option<crate::prompt::SystemPromptBlocks>,
 ) -> Result<ProviderSwitch, String> {
+    resolve_provider_switch_for_model(requested, None, prompt_blocks)
+}
+
+fn resolve_provider_switch_for_model(
+    requested: &str,
+    requested_model: Option<&str>,
+    prompt_blocks: Option<crate::prompt::SystemPromptBlocks>,
+) -> Result<ProviderSwitch, String> {
     let target = requested.trim().to_ascii_lowercase();
     if target.is_empty() {
         return Err("Usage: /provider <name>".to_string());
@@ -781,9 +789,11 @@ fn resolve_provider_switch(
         .cloned()
         .ok_or_else(|| format!("No provider config found for '{target}'."))?;
     let auth = resolve_provider_switch_auth(&target, &provider)?;
-    let model = provider
-        .model
-        .clone()
+    let model = requested_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+        .or_else(|| provider.model.clone())
         .or_else(|| crate::providers::default_model_for_target(&target).map(str::to_string))
         .ok_or_else(|| {
             format!("Provider '{target}' has no configured model; set providers.{target}.model")
@@ -989,6 +999,246 @@ impl Default for ApiClient {
     }
 }
 
+/// User-visible provider selection operation guarded by the TUI transition
+/// barrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderTransitionKind {
+    ProviderSwitch,
+    ModelSwitch,
+    SessionResume,
+    ModelCall,
+}
+
+impl std::fmt::Display for ProviderTransitionKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::ProviderSwitch => "provider switch",
+            Self::ModelSwitch => "model switch",
+            Self::SessionResume => "session resume",
+            Self::ModelCall => "model call",
+        })
+    }
+}
+
+/// Fail-closed provider-binding transition error.
+#[derive(Debug, thiserror::Error)]
+pub enum ProviderTransitionError {
+    #[error("cannot start {requested} while {active} is still resolving")]
+    Conflict {
+        active: ProviderTransitionKind,
+        requested: ProviderTransitionKind,
+    },
+    #[error("cannot start {operation} while a model call is active or cancelling")]
+    ActiveCall { operation: ProviderTransitionKind },
+    #[error("provider binding is not configured")]
+    Unconfigured,
+    #[error(
+        "provider binding generation changed while {operation} was resolving (expected {expected}, found {found})"
+    )]
+    StaleGeneration {
+        operation: ProviderTransitionKind,
+        expected: u64,
+        found: u64,
+    },
+    #[error("active session changed while {operation} was resolving")]
+    SessionChanged { operation: ProviderTransitionKind },
+    #[error("provider binding is inconsistent: {0}")]
+    Binding(String),
+    #[error("provider-native history is incompatible with the selected binding: {0}")]
+    IncompatibleHistory(String),
+    #[error("provider transition could not be prepared: {0}")]
+    Preparation(String),
+}
+
+#[derive(Debug, Clone)]
+struct PendingProviderTransition {
+    kind: ProviderTransitionKind,
+    expected_generation: Option<u64>,
+    expected_session_id: String,
+}
+
+/// One immutable generation of the provider adapter, authentication,
+/// transport, model, native-state capability contract, and continuation.
+///
+/// The older public `App` fields remain UI projections for callers that render
+/// status. Model calls are built only from this value after it has been checked
+/// against the canonical session, so a partial projection update cannot send a
+/// mixed request.
+#[derive(Clone)]
+struct ProviderBinding {
+    generation: u64,
+    session_id: String,
+    provider: String,
+    adapter: &'static str,
+    model: String,
+    protocol: crate::runtime::ProviderWireProtocol,
+    state_contract: crate::runtime::ProviderStateContract,
+    continuation: crate::runtime::ProviderContinuation,
+    api: ApiClient,
+    vdd_builder_auth: crate::vdd::VddProviderAuth,
+}
+
+impl std::fmt::Debug for ProviderBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderBinding")
+            .field("generation", &self.generation)
+            .field("session_id", &self.session_id)
+            .field("provider", &self.provider)
+            .field("adapter", &self.adapter)
+            .field("model", &self.model)
+            .field("protocol", &self.protocol)
+            .field("state_contract", &self.state_contract)
+            .field("continuation", &self.continuation)
+            .field("endpoint", &self.api.endpoint)
+            .field("wire_api", &self.api.wire_api)
+            .field("vdd_builder_auth", &self.vdd_builder_auth)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProviderBinding {
+    fn prepare(
+        generation: u64,
+        session: &Session,
+        provider: String,
+        model: String,
+        api: ApiClient,
+        vdd_builder_auth: crate::vdd::VddProviderAuth,
+        provider_native_state: Option<&crate::runtime::ProviderNativeState>,
+    ) -> Result<Self, ProviderTransitionError> {
+        if generation == 0 {
+            return Err(ProviderTransitionError::Binding(
+                "provider generation must be non-zero".to_string(),
+            ));
+        }
+        if api.endpoint.trim().is_empty() {
+            return Err(ProviderTransitionError::Binding(
+                "provider endpoint must be resolved before publication".to_string(),
+            ));
+        }
+        let adapter = crate::providers::get_adapter(&provider)
+            .map_err(|error| ProviderTransitionError::Preparation(error.to_string()))?;
+        let protocol = crate::pipeline::provider_wire_protocol(api.wire_api, &provider);
+        let state_contract = *adapter
+            .state_contract(protocol)
+            .map_err(|error| ProviderTransitionError::Preparation(error.to_string()))?;
+        Self::validate_auth_shape(&provider, &api, &vdd_builder_auth)?;
+
+        let provider_id = crate::runtime::ProviderId::new(provider.to_ascii_lowercase())
+            .map_err(|error| ProviderTransitionError::Binding(error.to_string()))?;
+        let continuation = if let Some(state) = provider_native_state {
+            state
+                .validate_binding(&provider, &model, protocol)
+                .map_err(|error| ProviderTransitionError::IncompatibleHistory(error.to_string()))?;
+            state_contract
+                .validate_state(state)
+                .map_err(|error| ProviderTransitionError::IncompatibleHistory(error.to_string()))?;
+            state.continuation_binding()
+        } else {
+            crate::runtime::ProviderContinuation::Fresh {
+                provider: provider_id,
+            }
+        };
+
+        Ok(Self {
+            generation,
+            session_id: session.id(),
+            provider,
+            adapter: adapter.name(),
+            model,
+            protocol,
+            state_contract,
+            continuation,
+            api,
+            vdd_builder_auth,
+        })
+    }
+
+    fn validate_auth_shape(
+        provider: &str,
+        api: &ApiClient,
+        vdd_builder_auth: &crate::vdd::VddProviderAuth,
+    ) -> Result<(), ProviderTransitionError> {
+        let auth_modes = u8::from(api.claude_code_token.is_some())
+            + u8::from(api.claude_agent_sdk.is_some())
+            + u8::from(api.codex_agent_sdk.is_some());
+        if auth_modes > 1 {
+            return Err(ProviderTransitionError::Binding(
+                "multiple provider-native authentication transports were selected".to_string(),
+            ));
+        }
+        if api.codex_agent_sdk.is_some()
+            && (!provider.eq_ignore_ascii_case("openai")
+                || api.wire_api != crate::pipeline::WireApi::OpenAiResponses
+                || !api.headers.is_empty())
+        {
+            return Err(ProviderTransitionError::Binding(
+                "Codex account auth requires OpenAI Responses with no direct HTTP headers"
+                    .to_string(),
+            ));
+        }
+        if (api.claude_agent_sdk.is_some() || api.claude_code_token.is_some())
+            && !provider.eq_ignore_ascii_case("anthropic")
+        {
+            return Err(ProviderTransitionError::Binding(
+                "Claude account auth can only bind the Anthropic adapter".to_string(),
+            ));
+        }
+        let vdd_matches = match vdd_builder_auth {
+            crate::vdd::VddProviderAuth::CodexAgentSdk(sdk) => {
+                api.codex_agent_sdk.as_ref() == Some(sdk)
+            }
+            crate::vdd::VddProviderAuth::ClaudeAgentSdk(sdk) => {
+                api.claude_agent_sdk.as_ref() == Some(sdk)
+            }
+            crate::vdd::VddProviderAuth::ClaudeCodeToken(token) => {
+                api.claude_code_token.as_ref() == Some(token)
+            }
+            crate::vdd::VddProviderAuth::ApiKey(_) | crate::vdd::VddProviderAuth::None => {
+                auth_modes == 0
+            }
+        };
+        if !vdd_matches {
+            return Err(ProviderTransitionError::Binding(
+                "VDD builder authentication does not match the provider transport".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_session(&self, session: &Session) -> Result<(), ProviderTransitionError> {
+        if self.session_id != session.id()
+            || !self.provider.eq_ignore_ascii_case(&session.provider)
+            || self.model != session.model
+        {
+            return Err(ProviderTransitionError::SessionChanged {
+                operation: ProviderTransitionKind::SessionResume,
+            });
+        }
+        let expected_continuation = if let Some(state) = session.provider_native_state_snapshot() {
+            state
+                .validate_binding(&self.provider, &self.model, self.protocol)
+                .map_err(|error| ProviderTransitionError::IncompatibleHistory(error.to_string()))?;
+            self.state_contract
+                .validate_state(&state)
+                .map_err(|error| ProviderTransitionError::IncompatibleHistory(error.to_string()))?;
+            state.continuation_binding()
+        } else {
+            crate::runtime::ProviderContinuation::Fresh {
+                provider: crate::runtime::ProviderId::new(self.provider.to_ascii_lowercase())
+                    .map_err(|error| ProviderTransitionError::Binding(error.to_string()))?,
+            }
+        };
+        if self.continuation != expected_continuation {
+            return Err(ProviderTransitionError::Binding(
+                "provider continuation changed outside its binding generation".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn build_startup_session_run_context(
     session: &Session,
     provider: &str,
@@ -1163,6 +1413,12 @@ pub struct App {
     /// fields `client`, `endpoint`, `headers`, `claude_code_token`,
     /// `prompt_blocks` that used to live directly on `App`.
     pub api_client: ApiClient,
+    /// Sole request authority for the selected adapter, authentication,
+    /// transport, model, capabilities, and provider-native continuation.
+    provider_binding: Option<ProviderBinding>,
+    /// Off-state transition currently resolving credentials or validating a
+    /// resumable session. Requests are rejected while this is populated.
+    pending_provider_transition: Option<PendingProviderTransition>,
     next_turn_effort_level: Option<EffortLevel>,
     next_turn_model: Option<String>,
     next_turn_allowed_tool_rules: Vec<crate::permissions::PermissionRule>,
@@ -1347,6 +1603,8 @@ impl App {
             streaming_raw_text: String::new(),
             api_event_tx: None,
             api_client: ApiClient::new(),
+            provider_binding: None,
+            pending_provider_transition: None,
             next_turn_effort_level: None,
             next_turn_model: None,
             next_turn_allowed_tool_rules: Vec::new(),
@@ -1490,24 +1748,221 @@ impl App {
         self.pending_key_events.clear();
     }
 
+    fn next_provider_generation(&self) -> Result<u64, ProviderTransitionError> {
+        self.provider_binding.as_ref().map_or(Ok(1), |binding| {
+            binding.generation.checked_add(1).ok_or_else(|| {
+                ProviderTransitionError::Binding(
+                    "provider binding generation exhausted".to_string(),
+                )
+            })
+        })
+    }
+
+    fn begin_provider_transition(
+        &mut self,
+        kind: ProviderTransitionKind,
+    ) -> Result<(), ProviderTransitionError> {
+        if let Some(active) = &self.pending_provider_transition {
+            return Err(ProviderTransitionError::Conflict {
+                active: active.kind,
+                requested: kind,
+            });
+        }
+        if self.active_turn.is_some() || self.is_waiting {
+            return Err(ProviderTransitionError::ActiveCall { operation: kind });
+        }
+        self.pending_provider_transition = Some(PendingProviderTransition {
+            kind,
+            expected_generation: self
+                .provider_binding
+                .as_ref()
+                .map(|binding| binding.generation),
+            expected_session_id: self.chat_session.id(),
+        });
+        Ok(())
+    }
+
+    fn validate_pending_provider_transition(
+        &self,
+        kind: ProviderTransitionKind,
+    ) -> Result<(), ProviderTransitionError> {
+        let Some(pending) = self.pending_provider_transition.as_ref() else {
+            // Direct application is used during startup composition, before
+            // the interactive event loop can create a concurrent operation.
+            return Ok(());
+        };
+        if pending.kind != kind {
+            return Err(ProviderTransitionError::Conflict {
+                active: pending.kind,
+                requested: kind,
+            });
+        }
+        if self.active_turn.is_some() || self.is_waiting {
+            return Err(ProviderTransitionError::ActiveCall { operation: kind });
+        }
+        if pending.expected_session_id != self.chat_session.id() {
+            return Err(ProviderTransitionError::SessionChanged { operation: kind });
+        }
+        let found = self
+            .provider_binding
+            .as_ref()
+            .map(|binding| binding.generation);
+        if pending.expected_generation != found {
+            return Err(ProviderTransitionError::StaleGeneration {
+                operation: kind,
+                expected: pending.expected_generation.unwrap_or(0),
+                found: found.unwrap_or(0),
+            });
+        }
+        Ok(())
+    }
+
+    fn reject_pending_provider_transition(&mut self, error: &ProviderTransitionError) {
+        self.pending_provider_transition = None;
+        self.messages.add(DisplayMessage::error(format!(
+            "Provider transition rejected: {error}"
+        )));
+    }
+
+    fn cancel_pending_provider_transition(&mut self) -> bool {
+        let Some(pending) = self.pending_provider_transition.take() else {
+            return false;
+        };
+        if let (Some(supervisor), Some(call_id)) = (
+            self.supervisor.as_ref(),
+            self.latest_background_calls
+                .get(&TuiTaskKind::ProviderDiscovery),
+        ) {
+            supervisor.cancel_call(*call_id, &crate::runtime::CancellationReason::User);
+        }
+        self.messages.add(DisplayMessage::system(format!(
+            "Cancelled {} before it changed the active provider binding.",
+            pending.kind
+        )));
+        true
+    }
+
+    fn validate_provider_projection(&self) -> Result<&ProviderBinding, ProviderTransitionError> {
+        if let Some(pending) = &self.pending_provider_transition {
+            return Err(ProviderTransitionError::Conflict {
+                active: pending.kind,
+                requested: ProviderTransitionKind::ModelCall,
+            });
+        }
+        let binding = self
+            .provider_binding
+            .as_ref()
+            .ok_or(ProviderTransitionError::Unconfigured)?;
+        binding.validate_session(&self.chat_session)?;
+        let api_matches = binding.api.endpoint == self.api_client.endpoint
+            && binding.api.headers == self.api_client.headers
+            && binding.api.wire_api == self.api_client.wire_api
+            && binding.api.claude_code_token == self.api_client.claude_code_token
+            && binding.api.claude_agent_sdk == self.api_client.claude_agent_sdk
+            && binding.api.codex_agent_sdk == self.api_client.codex_agent_sdk
+            && binding.api.prompt_blocks == self.api_client.prompt_blocks;
+        if binding.provider != self.provider
+            || binding.model != self.model
+            || !api_matches
+            || binding.vdd_builder_auth != self.vdd_builder_auth
+        {
+            return Err(ProviderTransitionError::Binding(
+                "display, authentication, transport, or model projection drifted from the active generation"
+                    .to_string(),
+            ));
+        }
+        Ok(binding)
+    }
+
+    fn publish_provider_binding(&mut self, binding: ProviderBinding) {
+        self.provider.clone_from(&binding.provider);
+        self.model.clone_from(&binding.model);
+        self.api_client = binding.api.clone();
+        self.vdd_builder_auth = binding.vdd_builder_auth.clone();
+        self.provider_binding = Some(binding);
+    }
+
+    fn advance_binding_to_session_continuation(&mut self) -> Result<(), ProviderTransitionError> {
+        let current = self
+            .provider_binding
+            .as_ref()
+            .ok_or(ProviderTransitionError::Unconfigured)?
+            .clone();
+        let next = ProviderBinding::prepare(
+            current.generation.checked_add(1).ok_or_else(|| {
+                ProviderTransitionError::Binding(
+                    "provider binding generation exhausted".to_string(),
+                )
+            })?,
+            &self.chat_session,
+            current.provider,
+            current.model,
+            current.api,
+            current.vdd_builder_auth,
+            self.chat_session.provider_native_state_snapshot().as_ref(),
+        )?;
+        self.publish_provider_binding(next);
+        Ok(())
+    }
+
+    fn prepare_scheduler_service(
+        &self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
+        config: Option<&std::sync::Arc<crate::config::AppConfig>>,
+        client: reqwest::Client,
+    ) -> Result<Option<crate::tools::SchedulerServiceHandle>, ProviderTransitionError> {
+        if self.runtime_handle.is_none() {
+            return Ok(None);
+        }
+        let config = config.cloned().ok_or_else(|| {
+            ProviderTransitionError::Preparation(
+                "durable scheduler requires active application configuration".to_string(),
+            )
+        })?;
+        crate::tools::SchedulerServiceHandle::start(std::sync::Arc::clone(run), config, client)
+            .map(Some)
+            .map_err(ProviderTransitionError::Preparation)
+    }
+
+    fn projected_app_config(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Option<std::sync::Arc<crate::config::AppConfig>> {
+        let mut updated = self.app_config.as_deref()?.clone();
+        updated.proxy.target = provider.to_string();
+        if let Some(provider_config) = updated.providers.get_mut(provider) {
+            provider_config.model = Some(model.to_string());
+        }
+        Some(std::sync::Arc::new(updated))
+    }
+
     #[allow(clippy::too_many_lines)] // Session replacement is one atomic frontend transition.
-    fn apply_loaded_session(&mut self, loaded: &Session) -> bool {
+    fn try_apply_loaded_session(
+        &mut self,
+        loaded: &Session,
+    ) -> Result<(), ProviderTransitionError> {
+        self.validate_pending_provider_transition(ProviderTransitionKind::SessionResume)?;
+        let current_binding = self
+            .provider_binding
+            .as_ref()
+            .ok_or(ProviderTransitionError::Unconfigured)?
+            .clone();
+        if !loaded
+            .provider
+            .eq_ignore_ascii_case(&current_binding.provider)
+        {
+            return Err(ProviderTransitionError::IncompatibleHistory(format!(
+                "saved provider '{}' does not match active provider '{}'; run /provider {} before resuming this session",
+                loaded.provider, current_binding.provider, loaded.provider
+            )));
+        }
         let current_run = match self.run_context.as_ref() {
             Ok(run) => std::sync::Arc::clone(run),
-            Err(error) => {
-                self.messages.add(DisplayMessage::error(format!(
-                    "Cannot replace a session whose current run is unavailable: {error}"
-                )));
-                return false;
-            }
+            Err(error) => return Err(ProviderTransitionError::Preparation(error.clone())),
         };
-        let next_run = match derive_session_run_context(&current_run, loaded, &self.provider) {
-            Ok(run) => run,
-            Err(error) => {
-                self.messages.add(DisplayMessage::error(error));
-                return false;
-            }
-        };
+        let next_run = derive_session_run_context(&current_run, loaded, &current_binding.provider)
+            .map_err(ProviderTransitionError::Preparation)?;
         let durable_tasks = self
             .task_mgr
             .lock()
@@ -1518,48 +1973,76 @@ impl App {
         } else {
             crate::session::TaskManager::for_run(&next_run)
         };
-        let next_task_manager = match next_task_manager {
-            Ok(manager) => manager,
-            Err(error) => {
-                self.messages.add(DisplayMessage::error(format!(
-                    "Cannot bind the loaded session task graph: {error}"
-                )));
-                return false;
-            }
-        };
+        let next_task_manager = next_task_manager.map_err(|error| {
+            ProviderTransitionError::Preparation(format!(
+                "cannot bind the loaded session task graph: {error}"
+            ))
+        })?;
         let permission_bypass = self.chat_session.permission_bypass_enabled();
         if let Some(config) = self.app_config.as_ref() {
-            if let Err(error) = crate::guardrails::configure(&next_run, &config.guardrails) {
-                self.messages.add(DisplayMessage::error(format!(
-                    "Session guardrails configuration is invalid: {error}"
-                )));
-                return false;
-            }
+            crate::guardrails::configure(&next_run, &config.guardrails).map_err(|error| {
+                ProviderTransitionError::Preparation(format!(
+                    "session guardrails configuration is invalid: {error}"
+                ))
+            })?;
         }
+
+        let projected_config = self.projected_app_config(&loaded.provider, &loaded.model);
+        let provider_config = projected_config
+            .as_deref()
+            .and_then(|config| config.get_provider(&loaded.provider))
+            .ok_or_else(|| {
+                ProviderTransitionError::Preparation(format!(
+                    "no provider config found for '{}' while resuming",
+                    loaded.provider
+                ))
+            })?;
+        let mut next_api = current_binding.api.clone();
+        next_api.endpoint = crate::pipeline::resolve_endpoint_for_wire(
+            next_api.wire_api,
+            &loaded.provider,
+            &loaded.model,
+            &provider_config.base_url,
+            next_api.claude_code_token.as_ref(),
+        )
+        .map_err(|error| ProviderTransitionError::Preparation(error.to_string()))?;
+        if next_api.prompt_blocks.is_some() {
+            next_api.prompt_blocks = Some(crate::prompt::build_prompt_context_with_items_for_run(
+                &loaded.behavior_mode(),
+                &next_run,
+                self.next_turn_skill_context.clone(),
+                crate::context::ContextBudget::default(),
+            ));
+        }
+        let next_binding = ProviderBinding::prepare(
+            self.next_provider_generation()?,
+            loaded,
+            loaded.provider.clone(),
+            loaded.model.clone(),
+            next_api,
+            current_binding.vdd_builder_auth,
+            loaded.provider_native_state_snapshot().as_ref(),
+        )?;
+        let next_scheduler = self.prepare_scheduler_service(
+            &next_run,
+            projected_config.as_ref(),
+            next_binding.api.client.clone(),
+        )?;
 
         // Flush the old snapshot before replacement. Subscribers stay attached
         // because `apply_loaded` replaces the shared store in place.
         self.transcript_subscriber.flush_now();
-        self.stop_scheduler_service();
-        crate::tools::retire_run(&current_run);
         self.chat_session.apply_loaded(loaded);
         self.chat_session.set_permission_bypass(permission_bypass);
-        self.model.clone_from(&loaded.model);
-        self.provider.clone_from(&loaded.provider);
         self.run_context = Ok(std::sync::Arc::clone(&next_run));
         self.task_mgr = std::sync::Arc::new(std::sync::Mutex::new(next_task_manager));
+        self.app_config = projected_config;
+        self.scheduler_service = next_scheduler;
+        self.publish_provider_binding(next_binding);
         self.rebind_permission_manager(&next_run);
-        self.refresh_prompt_context_for_run();
         self.rebind_mcp_runtime(&next_run);
         self.mode = tui_mode_for_agent(loaded.agent_mode());
-        self.refresh_app_config_target();
-        if let Err(error) = self.rebind_scheduler_service(&next_run) {
-            self.messages.add(DisplayMessage::error(format!(
-                "Loaded session scheduler could not start: {error}"
-            )));
-            self.should_quit = true;
-            return false;
-        }
+        crate::tools::retire_run(&current_run);
         let _ = self.chat_session.refresh_estimated_tokens();
         let transcript_cwd = self.run_context.as_ref().map_or_else(
             |_| {
@@ -1597,7 +2080,34 @@ impl App {
             });
         }
         self.drain_state_subscribers();
-        true
+        Ok(())
+    }
+
+    fn apply_loaded_session(&mut self, loaded: &Session) -> bool {
+        let owns_transition = self.pending_provider_transition.is_none();
+        if owns_transition {
+            if let Err(error) =
+                self.begin_provider_transition(ProviderTransitionKind::SessionResume)
+            {
+                self.messages.add(DisplayMessage::error(format!(
+                    "Session resume rejected: {error}"
+                )));
+                return false;
+            }
+        }
+        let result = self.try_apply_loaded_session(loaded);
+        if owns_transition {
+            self.pending_provider_transition = None;
+        }
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                self.messages.add(DisplayMessage::error(format!(
+                    "Session resume rejected: {error}"
+                )));
+                false
+            }
+        }
     }
 
     fn refresh_prompt_context_for_run(&mut self) {
@@ -1606,15 +2116,32 @@ impl App {
         }
         let Ok(run) = self.run_context.as_ref() else {
             self.api_client.prompt_blocks = None;
+            self.provider_binding = None;
             return;
         };
-        self.api_client.prompt_blocks =
-            Some(crate::prompt::build_prompt_context_with_items_for_run(
-                &self.chat_session.behavior_mode(),
-                run,
-                self.next_turn_skill_context.clone(),
-                crate::context::ContextBudget::default(),
-            ));
+        let prompt_blocks = crate::prompt::build_prompt_context_with_items_for_run(
+            &self.chat_session.behavior_mode(),
+            run,
+            self.next_turn_skill_context.clone(),
+            crate::context::ContextBudget::default(),
+        );
+        self.api_client.prompt_blocks = Some(prompt_blocks.clone());
+        let next_generation = self
+            .provider_binding
+            .as_ref()
+            .map(|binding| binding.generation.checked_add(1));
+        match next_generation {
+            Some(None) => {
+                self.provider_binding = None;
+            }
+            Some(Some(next_generation)) => {
+                if let Some(binding) = self.provider_binding.as_mut() {
+                    binding.generation = next_generation;
+                    binding.api.prompt_blocks = Some(prompt_blocks);
+                }
+            }
+            None => {}
+        }
     }
 
     fn rebind_mcp_runtime(&mut self, run: &std::sync::Arc<crate::tools::ToolRunContext>) {
@@ -1971,7 +2498,50 @@ impl App {
     }
 
     /// Set the API connection details needed to make requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed binding error when the adapter, authentication,
+    /// protocol capabilities, or current continuation are incompatible.
     #[allow(clippy::too_many_arguments)] // Transport capabilities must change atomically on provider switch.
+    pub fn try_set_api_config(
+        &mut self,
+        endpoint: String,
+        headers: crate::secrets::SensitiveHeaders,
+        wire_api: crate::pipeline::WireApi,
+        prompt_blocks: Option<crate::prompt::SystemPromptBlocks>,
+        claude_code_token: Option<crate::secrets::OAuthToken>,
+        claude_agent_sdk: Option<crate::claude_agent_sdk::ClaudeAgentSdk>,
+        codex_agent_sdk: Option<crate::codex_agent_sdk::CodexAgentSdk>,
+    ) -> Result<(), ProviderTransitionError> {
+        let api = ApiClient {
+            client: self.api_client.client.clone(),
+            endpoint,
+            headers,
+            wire_api,
+            claude_code_token,
+            claude_agent_sdk,
+            codex_agent_sdk,
+            prompt_blocks,
+        };
+        let binding = ProviderBinding::prepare(
+            self.next_provider_generation()?,
+            &self.chat_session,
+            self.provider.clone(),
+            self.model.clone(),
+            api,
+            self.vdd_builder_auth.clone(),
+            self.chat_session.provider_native_state_snapshot().as_ref(),
+        )?;
+        self.publish_provider_binding(binding);
+        Ok(())
+    }
+
+    /// Configure the provider transport during non-fallible composition.
+    /// Invalid bundles remain unpublished and are surfaced through tracing;
+    /// production startup uses [`Self::try_set_api_config`] to return the typed
+    /// error to its caller.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_api_config(
         &mut self,
         endpoint: String,
@@ -1982,13 +2552,60 @@ impl App {
         claude_agent_sdk: Option<crate::claude_agent_sdk::ClaudeAgentSdk>,
         codex_agent_sdk: Option<crate::codex_agent_sdk::CodexAgentSdk>,
     ) {
-        self.api_client.endpoint = endpoint;
-        self.api_client.headers = headers;
-        self.api_client.wire_api = wire_api;
-        self.api_client.prompt_blocks = prompt_blocks;
-        self.api_client.claude_code_token = claude_code_token;
-        self.api_client.claude_agent_sdk = claude_agent_sdk;
-        self.api_client.codex_agent_sdk = codex_agent_sdk;
+        if let Err(error) = self.try_set_api_config(
+            endpoint,
+            headers,
+            wire_api,
+            prompt_blocks,
+            claude_code_token,
+            claude_agent_sdk,
+            codex_agent_sdk,
+        ) {
+            tracing::error!(%error, "provider transport binding was rejected");
+        }
+    }
+
+    /// Replace the run-scoped prompt projection by publishing a new complete
+    /// provider-binding generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no provider binding exists or the current session's
+    /// provider-native continuation no longer matches it.
+    pub fn set_provider_prompt_blocks(
+        &mut self,
+        prompt_blocks: Option<crate::prompt::SystemPromptBlocks>,
+    ) -> Result<(), ProviderTransitionError> {
+        let current = self
+            .provider_binding
+            .as_ref()
+            .ok_or(ProviderTransitionError::Unconfigured)?
+            .clone();
+        let mut api = current.api;
+        api.prompt_blocks = prompt_blocks;
+        let binding = ProviderBinding::prepare(
+            current.generation.checked_add(1).ok_or_else(|| {
+                ProviderTransitionError::Binding(
+                    "provider binding generation exhausted".to_string(),
+                )
+            })?,
+            &self.chat_session,
+            current.provider,
+            current.model,
+            api,
+            current.vdd_builder_auth,
+            self.chat_session.provider_native_state_snapshot().as_ref(),
+        )?;
+        self.publish_provider_binding(binding);
+        Ok(())
+    }
+
+    /// Current immutable provider-binding generation, when configured.
+    #[must_use]
+    pub fn provider_binding_generation(&self) -> Option<u64> {
+        self.provider_binding
+            .as_ref()
+            .map(|binding| binding.generation)
     }
 
     /// Retain the launch-time MCP discovery/trust snapshot so a later session
@@ -2006,7 +2623,27 @@ impl App {
         });
     }
 
-    fn apply_provider_switch(&mut self, switch: ProviderSwitch) {
+    #[allow(clippy::too_many_lines)] // Resolve every fallible binding dependency before publication.
+    fn try_apply_provider_switch(
+        &mut self,
+        switch: ProviderSwitch,
+    ) -> Result<(), ProviderTransitionError> {
+        let operation = self
+            .pending_provider_transition
+            .as_ref()
+            .map_or(ProviderTransitionKind::ProviderSwitch, |pending| {
+                pending.kind
+            });
+        if !matches!(
+            operation,
+            ProviderTransitionKind::ProviderSwitch | ProviderTransitionKind::ModelSwitch
+        ) {
+            return Err(ProviderTransitionError::Conflict {
+                active: operation,
+                requested: ProviderTransitionKind::ProviderSwitch,
+            });
+        }
+        self.validate_pending_provider_transition(operation)?;
         let ProviderSwitch {
             provider,
             model,
@@ -2020,88 +2657,108 @@ impl App {
             prompt_blocks,
         } = switch;
 
-        let current_run = match self.run_context.as_ref() {
-            Ok(run) => std::sync::Arc::clone(run),
-            Err(error) => {
-                self.messages.add(DisplayMessage::error(format!(
-                    "Provider switch cannot create a run capability: {error}"
-                )));
-                return;
-            }
-        };
+        let current_run = self
+            .run_context
+            .as_ref()
+            .map(std::sync::Arc::clone)
+            .map_err(|error| ProviderTransitionError::Preparation(error.clone()))?;
         let identity = self
             .chat_session
             .inspect_state(|state| state.identity.clone());
-        let next_run = match current_run.derive_frontend_session(
-            identity.session_id,
-            &identity.project_root,
-            &identity.cwd,
-            &provider,
-        ) {
-            Ok(run) => run,
-            Err(error) => {
-                self.messages.add(DisplayMessage::error(format!(
-                    "Provider switch cannot bind the session run: {error}"
-                )));
-                return;
-            }
-        };
+        let next_run = current_run
+            .derive_frontend_session(
+                identity.session_id,
+                &identity.project_root,
+                &identity.cwd,
+                &provider,
+            )
+            .map_err(ProviderTransitionError::Preparation)?;
 
         if let Some(config) = self.app_config.as_ref() {
-            if let Err(error) = crate::guardrails::configure(&next_run, &config.guardrails) {
-                self.messages.add(DisplayMessage::error(format!(
-                    "Provider guardrails configuration is invalid: {error}"
-                )));
-                return;
-            }
+            crate::guardrails::configure(&next_run, &config.guardrails).map_err(|error| {
+                ProviderTransitionError::Preparation(format!(
+                    "provider guardrails configuration is invalid: {error}"
+                ))
+            })?;
         }
 
-        self.stop_scheduler_service();
-        crate::tools::retire_run(&current_run);
-        self.run_context = Ok(std::sync::Arc::clone(&next_run));
-        self.chat_session
-            .set_provider_and_model(provider.clone(), model.clone());
-        self.provider = provider;
-        self.model = model;
-        self.refresh_app_config_target();
-        if let Err(error) = self.rebind_scheduler_service(&next_run) {
-            self.messages.add(DisplayMessage::error(format!(
-                "Provider scheduler could not start: {error}"
-            )));
-            self.should_quit = true;
-            return;
+        let durable_tasks = self
+            .task_mgr
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_durable();
+        let next_task_manager = if durable_tasks {
+            crate::session::TaskManager::open_for_run(&next_run)
+        } else {
+            crate::session::TaskManager::for_run(&next_run)
         }
-        self.rebind_permission_manager(&next_run);
-
-        self.set_api_config(
+        .map_err(|error| {
+            ProviderTransitionError::Preparation(format!(
+                "cannot bind the provider session task graph: {error}"
+            ))
+        })?;
+        let projected_config = self.projected_app_config(&provider, &model);
+        let mut next_api = ApiClient {
+            client: self.api_client.client.clone(),
             endpoint,
             headers,
             wire_api,
-            prompt_blocks,
             claude_code_token,
             claude_agent_sdk,
             codex_agent_sdk,
-        );
-        self.refresh_prompt_context_for_run();
+            prompt_blocks,
+        };
+        if next_api.prompt_blocks.is_some() {
+            next_api.prompt_blocks = Some(crate::prompt::build_prompt_context_with_items_for_run(
+                &self.chat_session.behavior_mode(),
+                &next_run,
+                self.next_turn_skill_context.clone(),
+                crate::context::ContextBudget::default(),
+            ));
+        }
+        let next_binding = ProviderBinding::prepare(
+            self.next_provider_generation()?,
+            &self.chat_session,
+            provider.clone(),
+            model.clone(),
+            next_api,
+            vdd_builder_auth,
+            None,
+        )?;
+        let next_scheduler = self.prepare_scheduler_service(
+            &next_run,
+            projected_config.as_ref(),
+            next_binding.api.client.clone(),
+        )?;
+
+        self.run_context = Ok(std::sync::Arc::clone(&next_run));
+        self.chat_session.set_provider_and_model(provider, model);
+        self.chat_session.clear_provider_native_state();
+        self.task_mgr = std::sync::Arc::new(std::sync::Mutex::new(next_task_manager));
+        self.app_config = projected_config;
+        self.scheduler_service = next_scheduler;
+        self.publish_provider_binding(next_binding);
+        self.rebind_permission_manager(&next_run);
         self.rebind_mcp_runtime(&next_run);
-        self.vdd_builder_auth = vdd_builder_auth;
+        crate::tools::retire_run(&current_run);
         self.persist_session();
-        self.messages.add(DisplayMessage::system(format!(
-            "Provider switched to {} ({})",
-            self.provider, self.model
-        )));
+        let message = if operation == ProviderTransitionKind::ModelSwitch {
+            format!("Model switched to {}", self.model)
+        } else {
+            format!("Provider switched to {} ({})", self.provider, self.model)
+        };
+        self.messages.add(DisplayMessage::system(message));
+        Ok(())
     }
 
-    fn refresh_app_config_target(&mut self) {
-        let Some(app_config) = self.app_config.as_ref() else {
-            return;
-        };
-        let mut updated = (**app_config).clone();
-        updated.proxy.target.clone_from(&self.provider);
-        if let Some(provider_config) = updated.providers.get_mut(&self.provider) {
-            provider_config.model = Some(self.model.clone());
+    fn apply_provider_switch(&mut self, switch: ProviderSwitch) {
+        let result = self.try_apply_provider_switch(switch);
+        self.pending_provider_transition = None;
+        if let Err(error) = result {
+            self.messages.add(DisplayMessage::error(format!(
+                "Provider switch rejected: {error}"
+            )));
         }
-        self.app_config = Some(std::sync::Arc::new(updated));
     }
 
     /// Get an event sender for pushing async API events into the TUI loop.
@@ -2280,6 +2937,9 @@ impl App {
         }
         if !matches!(&completion.outcome, TuiTaskOutcome::Completed) {
             self.remove_background_call(completion.call_id);
+            if completion.kind == TuiTaskKind::ProviderDiscovery {
+                self.pending_provider_transition = None;
+            }
         }
         if let TuiTaskOutcome::Panicked(error) = completion.outcome {
             self.messages.add(DisplayMessage::error(format!(
@@ -2804,20 +3464,55 @@ impl App {
                 messages,
                 provider_native_state,
             }) => {
-                if self.chat_session.id() != session_id {
+                if self.chat_session.id() == session_id {
+                    let next_binding = self.provider_binding.as_ref().map_or_else(
+                        || Err(ProviderTransitionError::Unconfigured),
+                        |binding| {
+                            ProviderBinding::prepare(
+                                binding.generation.checked_add(1).ok_or_else(|| {
+                                    ProviderTransitionError::Binding(
+                                        "provider binding generation exhausted".to_string(),
+                                    )
+                                })?,
+                                &self.chat_session,
+                                binding.provider.clone(),
+                                binding.model.clone(),
+                                binding.api.clone(),
+                                binding.vdd_builder_auth.clone(),
+                                provider_native_state.as_ref(),
+                            )
+                        },
+                    );
+                    match next_binding {
+                        Ok(next_binding) => {
+                            if let Err(error) = self
+                                .chat_session
+                                .replace_messages_and_provider_native_state(
+                                    messages,
+                                    provider_native_state,
+                                )
+                            {
+                                self.messages.add(DisplayMessage::error(format!(
+                                    "Provider continuation was not committed: {error}"
+                                )));
+                                self.is_waiting = false;
+                            } else {
+                                self.publish_provider_binding(next_binding);
+                            }
+                        }
+                        Err(error) => {
+                            self.messages.add(DisplayMessage::error(format!(
+                                "Provider continuation binding was rejected: {error}"
+                            )));
+                            self.is_waiting = false;
+                        }
+                    }
+                } else {
                     tracing::warn!(
                         current_session_id = %self.chat_session.id(),
                         response_session_id = %session_id,
                         "ignored provider continuation for a session that is no longer active"
                     );
-                } else if let Err(error) = self
-                    .chat_session
-                    .replace_messages_and_provider_native_state(messages, provider_native_state)
-                {
-                    self.messages.add(DisplayMessage::error(format!(
-                        "Provider continuation was not committed: {error}"
-                    )));
-                    self.is_waiting = false;
                 }
             }
             Ok(AppEvent::PermissionRequest {
@@ -2867,9 +3562,7 @@ impl App {
                 self.apply_provider_switch(*switch);
             }
             Ok(AppEvent::ProviderSwitchError(msg)) => {
-                self.messages.add(DisplayMessage::error(format!(
-                    "Provider switch failed: {msg}"
-                )));
+                self.reject_pending_provider_transition(&ProviderTransitionError::Preparation(msg));
             }
             Ok(AppEvent::ModelListReady {
                 provider,
@@ -3379,6 +4072,9 @@ impl App {
     /// the global escape hatch.
     fn handle_global_ctrl_c(&mut self) {
         self.cancel_pending_keybinding();
+        if self.cancel_pending_provider_transition() {
+            return;
+        }
         // If permission prompt is active, deny and dismiss without quitting.
         if let Some(perm) = self.pending_permission.take() {
             let _ = perm.reply.send(super::events::PermissionResponse::Deny);
@@ -3471,6 +4167,9 @@ impl App {
 
     fn cancel_streaming_response(&mut self) {
         self.cancel_pending_keybinding();
+        if self.cancel_pending_provider_transition() {
+            return;
+        }
         let Some(turn) = self.active_turn.as_mut() else {
             self.is_waiting = false;
             self.messages.finish_streaming();
@@ -3963,6 +4662,14 @@ impl App {
         }
         if text == "/undo" {
             if self.chat_session.undo() {
+                if self.provider_binding.is_some() {
+                    if let Err(error) = self.advance_binding_to_session_continuation() {
+                        self.provider_binding = None;
+                        self.messages.add(DisplayMessage::error(format!(
+                            "Undo invalidated the provider binding: {error}"
+                        )));
+                    }
+                }
                 if self.messages.len() >= 2 {
                     self.messages.pop_last(2);
                 }
@@ -3977,6 +4684,14 @@ impl App {
         }
         if text == "/redo" {
             if self.chat_session.redo() {
+                if self.provider_binding.is_some() {
+                    if let Err(error) = self.advance_binding_to_session_continuation() {
+                        self.provider_binding = None;
+                        self.messages.add(DisplayMessage::error(format!(
+                            "Redo invalidated the provider binding: {error}"
+                        )));
+                    }
+                }
                 self.messages
                     .add(DisplayMessage::system("Redone last undone messages."));
                 self.persist_session();
@@ -4026,6 +4741,14 @@ impl App {
                     }
                 }
                 if rewound > 0 {
+                    if self.provider_binding.is_some() {
+                        if let Err(error) = self.advance_binding_to_session_continuation() {
+                            self.provider_binding = None;
+                            self.messages.add(DisplayMessage::error(format!(
+                                "Rewind invalidated the provider binding: {error}"
+                            )));
+                        }
+                    }
                     let to_remove = rewound * 2;
                     if self.messages.len() >= to_remove {
                         self.messages.pop_last(to_remove);
@@ -4304,6 +5027,14 @@ impl App {
             });
             events.push(crate::state::StateEvent::Cleared);
         });
+        if self.provider_binding.is_some() {
+            if let Err(error) = self.advance_binding_to_session_continuation() {
+                self.provider_binding = None;
+                self.messages.add(DisplayMessage::error(format!(
+                    "Clear invalidated the provider binding: {error}"
+                )));
+            }
+        }
     }
 
     /// Table-handler entry point for `/status`.
@@ -4882,6 +5613,12 @@ impl App {
             ));
             return true;
         }
+        if let Err(error) = self.begin_provider_transition(ProviderTransitionKind::ProviderSwitch) {
+            self.messages.add(DisplayMessage::error(format!(
+                "Provider switch rejected: {error}"
+            )));
+            return true;
+        }
 
         let requested = requested.to_string();
         let prompt_blocks = self.api_client.prompt_blocks.clone();
@@ -5027,13 +5764,46 @@ impl App {
         } else {
             args.to_string()
         };
-        self.chat_session.set_model(model.clone());
-        self.model = model;
-        self.persist_session();
+
+        // Construction-time Apps have no transport and cannot send a request;
+        // retain their selected model so startup can resolve one complete
+        // binding later. Interactive Apps must resolve endpoint, auth,
+        // adapter capabilities, and continuation off-state.
+        if self.provider_binding.is_none() {
+            self.chat_session.set_model(model.clone());
+            self.model = model;
+            self.persist_session();
+            self.messages.add(DisplayMessage::system(format!(
+                "Model selected as {}; provider transport is not configured yet",
+                self.model
+            )));
+            return true;
+        }
+        if self.runtime_handle.is_none() || self.event_sender().is_none() {
+            self.messages.add(DisplayMessage::error(
+                "No TUI runtime/event channel bound; cannot switch the active model.",
+            ));
+            return true;
+        }
+        if let Err(error) = self.begin_provider_transition(ProviderTransitionKind::ModelSwitch) {
+            self.messages.add(DisplayMessage::error(format!(
+                "Model switch rejected: {error}"
+            )));
+            return true;
+        }
+        let provider = self.provider.clone();
+        let prompt_blocks = self.api_client.prompt_blocks.clone();
         self.messages.add(DisplayMessage::system(format!(
-            "Model switched to {}",
-            self.model
+            "Switching model to {model}..."
         )));
+        drop(
+            self.spawn_owned_event(TuiTaskKind::ProviderDiscovery, async move {
+                match resolve_provider_switch_for_model(&provider, Some(&model), prompt_blocks) {
+                    Ok(switch) => AppEvent::ProviderSwitchReady(Box::new(switch)),
+                    Err(error) => AppEvent::ProviderSwitchError(error),
+                }
+            }),
+        );
         true
     }
 
@@ -5331,6 +6101,12 @@ impl App {
 
     /// Send a user message to the API.
     fn send_user_message(&mut self, text: &str) {
+        if let Err(error) = self.validate_provider_projection() {
+            self.messages.add(DisplayMessage::error(format!(
+                "Request was not started because the provider binding is unavailable: {error}"
+            )));
+            return;
+        }
         self.messages.add(DisplayMessage::user(text.to_string()));
         self.pending_tui_attachment_prompt = Some(text.to_string());
 
@@ -5611,7 +6387,25 @@ impl App {
             self.clear_next_turn_metadata();
             return;
         }
+        if let Err(error) = self.validate_provider_projection() {
+            self.handle_api_error(&format!(
+                "Provider binding conflict prevented request send: {error}"
+            ));
+            self.clear_next_turn_metadata();
+            return;
+        }
         self.refresh_prompt_context_for_run();
+
+        let binding = match self.validate_provider_projection() {
+            Ok(binding) => binding.clone(),
+            Err(error) => {
+                self.handle_api_error(&format!(
+                    "Provider binding conflict prevented request send: {error}"
+                ));
+                self.clear_next_turn_metadata();
+                return;
+            }
+        };
 
         let Some(event_output) = self.event_sender() else {
             self.is_waiting = false;
@@ -5619,16 +6413,23 @@ impl App {
             return;
         };
 
-        // ApiClient owns the transport bundle (#253) — one clone instead of five.
-        let api = self.api_client.clone();
+        // ProviderBinding is the sole authority for the complete transport,
+        // adapter, auth, model, capabilities, and continuation generation.
+        let api = binding.api;
         let client = api.client;
         let endpoint = api.endpoint;
         let headers = api.headers;
-        let provider = self.provider.clone();
-        let model = self
-            .next_turn_model
-            .take()
-            .unwrap_or_else(|| self.model.clone());
+        let provider = binding.provider;
+        let model = binding.model;
+        if let Some(requested_model) = self.next_turn_model.take() {
+            if requested_model != model {
+                self.handle_api_error(&format!(
+                    "Skill requested model '{requested_model}', but the atomic provider binding owns '{model}'; use /model before retrying"
+                ));
+                self.clear_next_turn_metadata();
+                return;
+            }
+        }
         let effort_level = self
             .next_turn_effort_level
             .take()
@@ -5659,7 +6460,7 @@ impl App {
         let run_context = if launch_run.isolated_workspace().is_some() {
             launch_run
         } else {
-            match derive_session_run_context(&launch_run, &self.chat_session, &self.provider) {
+            match derive_session_run_context(&launch_run, &self.chat_session, &provider) {
                 Ok(run) => run,
                 Err(error) => {
                     self.handle_api_error(&format!("Cannot create model-turn run: {error}"));
@@ -5674,7 +6475,7 @@ impl App {
         let app_config = self.app_config.clone();
         let permission_mgr = self.permission_mgr.clone();
         let vdd_engine = self.vdd_engine.clone();
-        let vdd_builder_auth = self.vdd_builder_auth.clone();
+        let vdd_builder_auth = binding.vdd_builder_auth;
         let policy_enforcer = std::sync::Arc::clone(&self.policy_enforcer);
         let task_mgr = self.task_mgr.clone();
         let turn_mcp = self.mcp_runtime.as_ref().map(|runtime| {
@@ -8314,6 +9115,28 @@ mod tests {
             .as_str()
     }
 
+    fn bind_test_transport(app: &mut App) {
+        app.try_set_api_config(
+            "http://127.0.0.1:1234/v1/chat/completions".to_string(),
+            crate::secrets::SensitiveHeaders::new(),
+            crate::pipeline::WireApi::ChatCompletions,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("complete test provider binding");
+    }
+
+    fn bind_local_resume_environment(app: &mut App) {
+        let config: crate::config::AppConfig = serde_yaml::from_str(
+            "proxy:\n  port: 8080\n  host: 127.0.0.1\n  target: local\nproviders:\n  local:\n    base_url: http://127.0.0.1:1234/v1\n",
+        )
+        .expect("local resume config");
+        app.app_config = Some(Arc::new(config));
+        bind_test_transport(app);
+    }
+
     #[test]
     fn tui_model_slash_reports_current_model() {
         let mut app = App::new("claude-sonnet-4-6", "anthropic");
@@ -8368,7 +9191,7 @@ mod tests {
 
         assert_eq!(app.model, "claude-opus-4-99-future");
         assert_eq!(app.chat_session.model, "claude-opus-4-99-future");
-        assert!(last_display_content(&app).contains("Model switched"));
+        assert!(last_display_content(&app).contains("Model selected"));
     }
 
     #[test]
@@ -8999,29 +9822,30 @@ mod tests {
         );
     }
 
-    /// `set_api_config` writes through to `api_client`, not to ghost
+    /// `try_set_api_config` writes through to `api_client`, not to ghost
     /// fields on App. Pins the migration: the previous version of this
     /// setter wrote `self.endpoint = ...`, which compiled but stayed in
     /// the old struct shape.
     #[test]
-    fn set_api_config_threads_through_api_client() {
+    fn try_set_api_config_threads_through_api_client() {
         let mut app = App::new("test-model", "anthropic");
         let mut headers = crate::secrets::SensitiveHeaders::new();
         headers
             .insert_literal("x-api-key", "secret".to_string())
             .expect("test header");
-        app.set_api_config(
+        let token = crate::secrets::OAuthToken::try_from_string("oauth-token".to_string())
+            .expect("test token");
+        app.vdd_builder_auth = crate::vdd::VddProviderAuth::ClaudeCodeToken(token.clone());
+        app.try_set_api_config(
             "https://example.com/v1".to_string(),
             headers,
-            crate::pipeline::WireApi::OpenAiResponses,
+            crate::pipeline::WireApi::ChatCompletions,
             None,
-            Some(
-                crate::secrets::OAuthToken::try_from_string("oauth-token".to_string())
-                    .expect("test token"),
-            ),
+            Some(token),
             None,
             None,
-        );
+        )
+        .expect("valid provider/VDD authentication bundle");
         assert_eq!(app.api_client.endpoint, "https://example.com/v1");
         assert!(app.api_client.headers.matches_value("x-api-key", "secret"));
         assert!(app.api_client.prompt_blocks.is_none());
@@ -9032,8 +9856,60 @@ mod tests {
             .is_some_and(|token| token.matches("oauth-token")));
         assert_eq!(
             app.api_client.wire_api,
-            crate::pipeline::WireApi::OpenAiResponses
+            crate::pipeline::WireApi::ChatCompletions
         );
+        assert_eq!(app.provider_binding_generation(), Some(1));
+    }
+
+    #[test]
+    fn rejected_provider_auth_does_not_publish_partial_transport() {
+        let mut app = App::new("test-model", "anthropic");
+        let token = crate::secrets::OAuthToken::try_from_string("oauth-token".to_string())
+            .expect("test token");
+
+        let error = app
+            .try_set_api_config(
+                "https://example.com/v1/messages".to_string(),
+                crate::secrets::SensitiveHeaders::new(),
+                crate::pipeline::WireApi::ChatCompletions,
+                None,
+                Some(token),
+                None,
+                None,
+            )
+            .expect_err("VDD and transport authentication must be one binding");
+
+        assert!(matches!(error, super::ProviderTransitionError::Binding(_)));
+        assert_eq!(app.provider_binding_generation(), None);
+        assert!(app.api_client.endpoint.is_empty());
+        assert!(app.api_client.claude_code_token.is_none());
+    }
+
+    #[test]
+    fn pending_or_drifted_provider_binding_rejects_before_transcript_mutation() {
+        let mut app = App::new("test-model", "local");
+        bind_test_transport(&mut app);
+        let initial_messages = app.chat_session.message_count();
+
+        app.begin_provider_transition(super::ProviderTransitionKind::ProviderSwitch)
+            .expect("begin transition");
+        app.send_user_message("must not be queued while provider discovery is pending");
+        assert_eq!(app.chat_session.message_count(), initial_messages);
+        assert!(!app
+            .messages
+            .messages
+            .iter()
+            .any(|message| matches!(&message.kind, MessageKind::User)));
+
+        assert!(app.cancel_pending_provider_transition());
+        app.api_client.endpoint = "http://127.0.0.1:9/drifted".to_string();
+        app.send_user_message("must not be queued through a mixed transport");
+        assert_eq!(app.chat_session.message_count(), initial_messages);
+        assert!(!app
+            .messages
+            .messages
+            .iter()
+            .any(|message| matches!(&message.kind, MessageKind::User)));
     }
 
     #[test]
@@ -9068,7 +9944,8 @@ mod tests {
             .expect("header");
         let old_token =
             crate::secrets::OAuthToken::try_from_string("oauth-token".to_string()).expect("token");
-        app.set_api_config(
+        app.vdd_builder_auth = crate::vdd::VddProviderAuth::ClaudeCodeToken(old_token.clone());
+        app.try_set_api_config(
             "https://old.example/v1/messages".to_string(),
             old_headers,
             crate::pipeline::WireApi::ChatCompletions,
@@ -9076,7 +9953,8 @@ mod tests {
             Some(old_token),
             None,
             None,
-        );
+        )
+        .expect("valid initial provider binding");
 
         let mut switched_headers = crate::secrets::SensitiveHeaders::new();
         switched_headers
@@ -9329,7 +10207,8 @@ mod tests {
     #[test]
     fn enter_submits_full_multiline_prompt() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let mut app = App::new("test", "anthropic");
+        let mut app = App::new("test", "local");
+        bind_test_transport(&mut app);
         app.input.insert_str("first\nsecond");
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -9846,7 +10725,8 @@ mod tests {
 
     #[test]
     fn handle_input_keeps_attachment_bytes_out_of_user_instruction_text() {
-        let mut app = App::new("test-model", "test-provider");
+        let mut app = App::new("test-model", "local");
+        bind_test_transport(&mut app);
         app.handle_input("please read @prompt.txt");
 
         let messages = app.chat_session.messages_snapshot();
@@ -9976,7 +10856,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _guard = SessionDirGuard::set(tmp.path().join("chat_sessions"));
 
-        let mut older = Session::new("old-model", "initial-provider");
+        let mut older = Session::new("old-model", "local");
         older.set_id(OLDER_ID.to_string());
         older.created_at = chrono::DateTime::parse_from_rfc3339("2025-12-31T00:00:00Z")
             .expect("valid timestamp")
@@ -9988,7 +10868,7 @@ mod tests {
 
         let mut newer = Session::new_with_behavior_mode(
             "new-model",
-            "initial-provider",
+            "local",
             crate::modes::BehaviorMode::from_preset(crate::modes::Preset::Explore),
         );
         let project_root = std::env::current_dir()
@@ -10014,7 +10894,8 @@ mod tests {
         save_session(&older).expect("older session should save");
         save_session(&newer).expect("newer session should save");
 
-        let mut app = App::new("initial-model", "initial-provider");
+        let mut app = App::new("initial-model", "local");
+        bind_local_resume_environment(&mut app);
         let initial_id = app.chat_session.id();
         let mut state_events = app.chat_session.state_store().subscribe_log_lag();
         app.apply_startup_resume(true, None);
@@ -10030,7 +10911,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(app.model, "new-model");
-        assert_eq!(app.provider, "initial-provider");
+        assert_eq!(app.provider, "local");
         assert_eq!(app.chat_session.messages_snapshot()[0]["content"], "newer");
         assert_eq!(
             app.tool_run_context()
@@ -10077,13 +10958,14 @@ mod tests {
 
         let saved = Session::new_with_behavior_mode(
             "saved-model",
-            "initial-provider",
+            "local",
             crate::modes::BehaviorMode::from_preset(crate::modes::Preset::Safe),
         );
         saved.set_id(SESSION_ID.to_string());
         save_session(&saved).expect("narrow session should save");
 
-        let mut app = App::new("initial-model", "initial-provider");
+        let mut app = App::new("initial-model", "local");
+        bind_local_resume_environment(&mut app);
         app.apply_startup_resume_with_behavior(true, None, None, &target_values)
             .expect("startup target override should bind the resumed run");
 
@@ -10110,7 +10992,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _guard = SessionDirGuard::set(tmp.path().join("chat_sessions"));
 
-        let mut older = Session::new("old-model", "initial-provider");
+        let mut older = Session::new("old-model", "local");
         older.set_id(OLDER_ID.to_string());
         older.created_at = chrono::DateTime::parse_from_rfc3339("2025-12-31T00:00:00Z")
             .expect("valid timestamp")
@@ -10119,7 +11001,7 @@ mod tests {
             .expect("valid timestamp")
             .with_timezone(&chrono::Utc);
 
-        let mut newer = Session::new("new-model", "initial-provider");
+        let mut newer = Session::new("new-model", "local");
         newer.set_id(NEWER_ID.to_string());
         newer.created_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .expect("valid timestamp")
@@ -10131,7 +11013,8 @@ mod tests {
         save_session(&older).expect("older session should save");
         save_session(&newer).expect("newer session should save");
 
-        let mut app = App::new("initial-model", "initial-provider");
+        let mut app = App::new("initial-model", "local");
+        bind_local_resume_environment(&mut app);
         app.apply_startup_resume(true, Some("11111111"));
 
         assert_eq!(app.chat_session.id(), OLDER_ID);
@@ -10142,21 +11025,22 @@ mod tests {
     fn startup_resume_rejects_a_different_provider_without_rebinding_transport() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _guard = SessionDirGuard::set(tmp.path().join("chat_sessions"));
-        let foreign = Session::new("foreign-model", "foreign-provider");
+        let foreign = Session::new("foreign-model", "anthropic");
         let foreign_id = foreign.id();
         save_session(&foreign).expect("foreign session should save");
 
-        let mut app = App::new("initial-model", "initial-provider");
+        let mut app = App::new("initial-model", "local");
+        bind_local_resume_environment(&mut app);
         let initial_id = app.chat_session.id();
         app.apply_startup_resume(false, Some(&foreign_id));
 
         assert_eq!(app.chat_session.id(), initial_id);
-        assert_eq!(app.provider, "initial-provider");
+        assert_eq!(app.provider, "local");
         assert!(app
             .messages
             .messages
             .iter()
-            .any(|message| { message.content.contains("differs from the active provider") }));
+            .any(|message| { message.content.contains("does not match active provider") }));
     }
 
     #[test]

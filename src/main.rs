@@ -1053,27 +1053,6 @@ fn apply_tui_launch_behavior(
     .map_err(anyhow::Error::msg)
 }
 
-fn rebuild_resumed_tui_endpoint(
-    config: &config::AppConfig,
-    model: &str,
-    wire_api: openclaudia::pipeline::WireApi,
-    claude_code_token: Option<&openclaudia::secrets::OAuthToken>,
-) -> anyhow::Result<String> {
-    let provider = config.active_provider().ok_or_else(|| {
-        anyhow::anyhow!(
-            "cannot rebuild resumed TUI endpoint for missing provider '{}'",
-            config.proxy.target
-        )
-    })?;
-    Ok(openclaudia::pipeline::resolve_endpoint_for_wire(
-        wire_api,
-        &config.proxy.target,
-        model,
-        &provider.base_url,
-        claude_code_token,
-    )?)
-}
-
 #[allow(clippy::too_many_lines, clippy::future_not_send)] // Current-thread TUI composition is one fail-closed startup transaction.
 async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
     use openclaudia::hooks::{load_effective_hooks, HookEngine};
@@ -1124,6 +1103,16 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
         init_vdd_engine_if_enabled_with_auth(config, vdd_adversary_auth).map(std::sync::Arc::new);
     app.vdd_builder_auth = builder_vdd_auth;
     app.app_config = Some(std::sync::Arc::new(config.clone()));
+    app.try_set_api_config(
+        endpoint,
+        headers,
+        wire_api,
+        None,
+        claude_code_token,
+        claude_agent_sdk,
+        codex_agent_sdk,
+    )
+    .map_err(anyhow::Error::msg)?;
     apply_tui_launch_behavior(
         &mut app,
         resume,
@@ -1132,11 +1121,6 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
         &scope_target_values,
     )?;
     app.bind_durable_task_graph().map_err(anyhow::Error::msg)?;
-    let endpoint = if app.model == model {
-        endpoint
-    } else {
-        rebuild_resumed_tui_endpoint(config, &app.model, wire_api, claude_code_token.as_ref())?
-    };
     // MCP subprocesses/reconnects retain this exact resumed-session
     // capability rather than discovering identity from a worker thread.
     let run_context = app.tool_run_context().map_err(anyhow::Error::msg)?;
@@ -1148,15 +1132,8 @@ async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
     )));
     let tui_prompt_blocks =
         prompt::build_prompt_context_for_run(&app.behavior_mode(), &run_context);
-    app.set_api_config(
-        endpoint,
-        headers,
-        wire_api,
-        Some(tui_prompt_blocks),
-        claude_code_token,
-        claude_agent_sdk,
-        codex_agent_sdk,
-    );
+    app.set_provider_prompt_blocks(Some(tui_prompt_blocks))
+        .map_err(anyhow::Error::msg)?;
     app.memory_db = memory_db.map(std::sync::Arc::new);
     guardrails::configure(&run_context, &config.guardrails).map_err(anyhow::Error::msg)?;
     let plugin_manager = std::sync::Arc::new(init_plugin_manager(run_context.project_root()));

@@ -24,6 +24,7 @@ pub const ARTIFACT_ENVELOPE_PATH: &str = ".claude-plugin/artifact.json";
 pub const ARTIFACT_SCHEMA_VERSION: u32 = 1;
 
 const MAX_TREE_FILES: usize = 4_096;
+const MAX_TREE_ENTRIES: usize = 8_192;
 const MAX_TREE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TREE_DEPTH: usize = 16;
@@ -226,6 +227,7 @@ pub fn digest_package_tree(root: &Path) -> Result<String, PluginTransactionError
 
 #[derive(Default)]
 struct TreeBudget {
+    entries: usize,
     files: usize,
     bytes: u64,
 }
@@ -242,10 +244,18 @@ fn digest_directory(
             "package exceeds maximum directory depth {MAX_TREE_DEPTH}"
         )));
     }
+    let remaining_entries = MAX_TREE_ENTRIES.saturating_sub(budget.entries);
     let mut entries = fs::read_dir(directory)
         .map_err(|error| PluginTransactionError::io("read staged package directory", error))?
+        .take(remaining_entries.saturating_add(1))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| PluginTransactionError::io("enumerate staged package directory", error))?;
+    if entries.len() > remaining_entries {
+        return Err(PluginTransactionError::InvalidPackage(format!(
+            "package exceeds maximum entry count {MAX_TREE_ENTRIES}"
+        )));
+    }
+    budget.entries = budget.entries.saturating_add(entries.len());
     entries.sort_by_key(std::fs::DirEntry::file_name);
 
     for entry in entries {
@@ -873,6 +883,7 @@ impl PluginInstallTransaction {
             if let Some(previous_receipt) =
                 read_generation_receipt(Path::new(&previous_entry.install_path))?
             {
+                validate_generation_receipt(&previous_receipt)?;
                 validate_successor(&previous_receipt, receipt)?;
             }
         }
@@ -1058,9 +1069,69 @@ pub fn verify_installed_generation(
     package_path: &Path,
 ) -> Result<Option<ArtifactGenerationReceipt>, PluginTransactionError> {
     read_generation_receipt(package_path)?.map_or(Ok(None), |receipt| {
+        validate_generation_receipt(&receipt)?;
         verify_generation(package_path, Some(&receipt))?;
         Ok(Some(receipt))
     })
+}
+
+fn validate_generation_receipt(
+    receipt: &ArtifactGenerationReceipt,
+) -> Result<(), PluginTransactionError> {
+    if receipt.schema_version != ARTIFACT_SCHEMA_VERSION
+        || receipt.statement.schema_version != ARTIFACT_SCHEMA_VERSION
+    {
+        return Err(PluginTransactionError::Verification(
+            "generation receipt uses an unsupported schema".to_string(),
+        ));
+    }
+    let expected_package = receipt
+        .plugin_id
+        .split('@')
+        .next()
+        .unwrap_or(&receipt.plugin_id);
+    super::validate::validate_plugin_dir_name(expected_package).map_err(|error| {
+        PluginTransactionError::Verification(format!(
+            "generation receipt has an invalid plugin identity: {error}"
+        ))
+    })?;
+    if receipt.statement.package != expected_package
+        || !valid_digest(&receipt.statement.artifact_digest)
+        || receipt.statement.source_revision.trim().is_empty()
+        || receipt.statement.source_revision != receipt.source.resolved_revision
+        || receipt.statement.publisher.trim().is_empty()
+        || receipt.statement.publisher.len() > 256
+        || receipt.statement.publisher.chars().any(char::is_control)
+        || receipt.plugin_id.len() > 512
+        || receipt.plugin_id.chars().any(char::is_control)
+        || receipt.source.kind.trim().is_empty()
+        || receipt.source.locator.trim().is_empty()
+        || receipt.source.kind.len() > 128
+        || receipt.source.locator.len() > 16 * 1024
+        || receipt.source.resolved_revision.len() > 4 * 1024
+        || receipt.source.kind.chars().any(char::is_control)
+        || receipt.source.locator.chars().any(char::is_control)
+        || receipt
+            .source
+            .resolved_revision
+            .chars()
+            .any(char::is_control)
+    {
+        return Err(PluginTransactionError::Verification(
+            "generation receipt does not bind a valid package, source, revision, and digest"
+                .to_string(),
+        ));
+    }
+    if receipt.verified_signers.len() > 128
+        || receipt.verified_signers.iter().any(|signer| {
+            signer.is_empty() || signer.len() > 256 || signer.chars().any(char::is_control)
+        })
+    {
+        return Err(PluginTransactionError::Verification(
+            "generation receipt has an invalid signer set".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn read_generation_receipt(
@@ -1139,9 +1210,11 @@ fn receipts_name_same_generation(
         && candidate.statement == stored.statement
         && candidate.source.kind == stored.source.kind
         && candidate.source.locator == stored.source.locator
+        && candidate.source.requested_revision == stored.source.requested_revision
         && candidate.source.resolved_revision == stored.source.resolved_revision
         && candidate.verified_signers == stored.verified_signers
         && candidate.verification == stored.verification
+        && candidate.activated_at_unix == stored.activated_at_unix
 }
 
 fn sync_package_tree(root: &Path) -> Result<(), PluginTransactionError> {

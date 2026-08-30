@@ -205,6 +205,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-098: Make TUI provider switching and resume atomic (#1218)
+- S-061: Bind plugin identity and discovery to trusted scope (#1217)
+- S-060: Sandbox and budget hook execution (#1216)
+- Reconcile stale remediation slice status documents (#1202)
 - S-097: Contain TUI file attachments (#1215)
 - S-093: Isolate proxy tenant and session state (#1214)
 - S-090: Bound and validate ACP transport (#1213)

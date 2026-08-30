@@ -42,6 +42,7 @@ pub fn load_effective_hooks(host_hooks: HooksConfig) -> HooksConfig {
 }
 
 use crate::config::{Hook, HookEntry, HookMatcherTarget, HookPolicy, HooksConfig, SandboxMode};
+use futures::stream::{FuturesUnordered, StreamExt as _};
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -76,6 +77,10 @@ static TRUST_UNSANDBOXED_HOOKS: LazyLock<Result<bool, String>> = LazyLock::new(|
     })
 });
 const MAX_HOOK_OUTPUT_BYTES_PER_STREAM: usize = 1024 * 1024;
+const MAX_HOOKS_PER_BATCH: usize = 64;
+const MAX_HOOK_BATCH_INPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_HOOK_BATCH_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MODEL_HOOK_OUTPUT_BYTES: usize = 16 * 1024;
 const HOOK_OUTPUT_TRUNCATED_MARKER: &[u8] = b"\n[hook output truncated at 1 MiB]\n";
 
 /// All hook event types supported by `OpenClaudia`
@@ -144,6 +149,8 @@ pub enum HookBatchStatus {
     Complete,
     PartiallyFailed,
     Failed,
+    /// The complete batch was rejected during admission; no hook started.
+    Skipped,
     Cancelled,
 }
 
@@ -178,6 +185,34 @@ struct HookExecution {
     errors: Vec<HookError>,
     decision: HookDecision,
     cancelled: bool,
+    skipped: bool,
+}
+
+struct AdmittedHook<'a> {
+    index: usize,
+    timeout: Duration,
+    kind: AdmittedHookKind<'a>,
+}
+
+enum AdmittedHookKind<'a> {
+    Command {
+        command: Command,
+        sandbox_mode: SandboxMode,
+    },
+    Prompt(&'a str),
+    Model {
+        prompt: &'a str,
+        model: &'a str,
+        provider: Option<&'a str>,
+    },
+}
+
+struct HookBatchAdmission<'a> {
+    hooks: Vec<AdmittedHook<'a>>,
+    reservation: crate::runtime::BudgetReservation,
+    cancellation: crate::runtime::CancellationHandle,
+    deadline: tokio::time::Instant,
+    command_output_bytes_per_stream: usize,
 }
 
 impl HookReceipt {
@@ -600,6 +635,15 @@ pub enum HookError {
     #[error("Hook event was cancelled before all configured hooks ran")]
     Cancelled,
 
+    #[error("Hook batch was skipped during admission: {0}")]
+    AdmissionDenied(String),
+
+    #[error("Hook batch was skipped by the canonical run budget: {0}")]
+    Budget(#[from] crate::runtime::BudgetError),
+
+    #[error("Hook output exceeded the admitted {max_bytes}-byte limit")]
+    OutputLimitExceeded { max_bytes: usize },
+
     /// Allowlist enforcement rejected the command's executable.
     #[error("Hook command denied by allowlist: binary '{binary}' is not in allowed_commands")]
     Denied { binary: String },
@@ -862,10 +906,13 @@ impl HookEngine {
             errors,
             decision,
             cancelled,
+            skipped,
         } = execution;
 
         let status = if cancelled {
             HookBatchStatus::Cancelled
+        } else if skipped {
+            HookBatchStatus::Skipped
         } else if errors.is_empty() {
             HookBatchStatus::Complete
         } else if outputs.is_empty() {
@@ -877,7 +924,7 @@ impl HookEngine {
             warn!(
                 event = ?event,
                 error_count = errors.len(),
-                "Blocking hook event failed; unscheduled hooks were not started"
+                "Blocking hook event failed; admitted sibling work was cancelled and joined"
             );
         }
 
@@ -893,6 +940,7 @@ impl HookEngine {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // Admission, cancellation, ordered composition, and settlement are one batch lifecycle.
     async fn execute_hooks(
         &self,
         event: HookEvent,
@@ -901,23 +949,96 @@ impl HookEngine {
         input_json: &str,
         hooks_to_run: Vec<(&Hook, u64)>,
     ) -> HookExecution {
+        if input.run_context.runtime().cancellation().is_cancelled() {
+            return HookExecution {
+                outputs: Vec::new(),
+                errors: vec![HookError::Cancelled],
+                decision: HookDecision::Allow,
+                cancelled: true,
+                skipped: false,
+            };
+        }
+
+        let admission = match self.admit_hook_batch(input, input_json, hooks_to_run) {
+            Ok(admission) => admission,
+            Err(error) => {
+                let cancelled = matches!(
+                    &error,
+                    HookError::Cancelled
+                        | HookError::Budget(crate::runtime::BudgetError::Cancelled { .. })
+                );
+                return HookExecution {
+                    outputs: Vec::new(),
+                    errors: vec![error],
+                    decision: HookDecision::Allow,
+                    cancelled,
+                    skipped: !cancelled,
+                };
+            }
+        };
+        let HookBatchAdmission {
+            hooks,
+            reservation,
+            cancellation,
+            deadline,
+            command_output_bytes_per_stream,
+        } = admission;
+        let hook_count = hooks.len();
+        let mut completed = std::iter::repeat_with(|| None)
+            .take(hook_count)
+            .collect::<Vec<_>>();
+        let mut pending = FuturesUnordered::new();
+        for hook in hooks {
+            let hook_cancellation = cancellation.clone();
+            pending.push(async move {
+                let index = hook.index;
+                let result = self
+                    .run_admitted_hook(
+                        &input.run_context,
+                        hook,
+                        input_json,
+                        command_output_bytes_per_stream,
+                        hook_cancellation,
+                    )
+                    .await;
+                (index, result)
+            });
+        }
+
+        let mut cancellation_requested = false;
+        let mut deadline_elapsed = false;
+        while !pending.is_empty() {
+            let completed_hook = tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(deadline), if !deadline_elapsed => {
+                    let _receipt = cancellation.cancel(crate::runtime::CancellationReason::Deadline);
+                    cancellation_requested = true;
+                    deadline_elapsed = true;
+                    continue;
+                }
+                result = pending.next() => result,
+            };
+            let Some((index, result)) = completed_hook else {
+                break;
+            };
+            let blocks = Self::hook_result_blocks(event, contract, &result);
+            completed[index] = Some(result);
+            if blocks && !pending.is_empty() && !cancellation_requested {
+                let _receipt =
+                    cancellation.cancel(crate::runtime::CancellationReason::ParentTerminated);
+                cancellation_requested = true;
+            }
+        }
+
         let mut execution = HookExecution {
             outputs: Vec::new(),
             errors: Vec::new(),
             decision: HookDecision::Allow,
             cancelled: false,
+            skipped: false,
         };
-        for (hook, timeout_secs) in hooks_to_run {
-            if input.run_context.runtime().cancellation().is_cancelled() {
-                execution.errors.push(HookError::Cancelled);
-                execution.cancelled = true;
-                break;
-            }
-
-            match self
-                .run_hook(&input.run_context, hook, input_json, timeout_secs)
-                .await
-            {
+        for result in completed.into_iter().flatten() {
+            match result {
                 Ok((output, exit_code)) => {
                     if exit_code == 2 {
                         execution.decision =
@@ -942,18 +1063,254 @@ impl HookEngine {
                 }
                 Err(e) => {
                     error!(error = %e, "Hook execution failed");
+                    execution.cancelled |= matches!(&e, HookError::Cancelled);
                     execution.errors.push(e);
                 }
             }
-
-            let blocks = matches!(contract.failure_mode, HookFailureMode::Block)
-                && (!execution.errors.is_empty()
-                    || !matches!(execution.decision, HookDecision::Allow));
-            if blocks {
-                break;
-            }
+        }
+        if let Err(error) = reservation.finish_unknown() {
+            execution.errors.push(HookError::Budget(error));
         }
         execution
+    }
+
+    #[allow(clippy::too_many_lines)] // Every aggregate limit must be checked before any admitted hook can launch.
+    fn admit_hook_batch<'a>(
+        &self,
+        input: &HookInput,
+        input_json: &str,
+        hooks_to_run: Vec<(&'a Hook, u64)>,
+    ) -> Result<HookBatchAdmission<'a>, HookError> {
+        if hooks_to_run.len() > MAX_HOOKS_PER_BATCH {
+            return Err(HookError::AdmissionDenied(format!(
+                "{} matching hooks exceed the per-event limit of {MAX_HOOKS_PER_BATCH}",
+                hooks_to_run.len()
+            )));
+        }
+
+        let mut command_calls = 0_u64;
+        let mut model_calls = 0_u64;
+        let mut model_input_tokens = 0_u64;
+        let mut prompt_output_bytes = 0_usize;
+        for (hook, _) in &hooks_to_run {
+            match hook {
+                Hook::Command { .. } => {
+                    command_calls = command_calls.checked_add(1).ok_or_else(|| {
+                        HookError::AdmissionDenied("hook process count overflow".to_string())
+                    })?;
+                }
+                Hook::Prompt { prompt, .. } => {
+                    prompt_output_bytes = prompt_output_bytes
+                        .checked_add(prompt.len())
+                        .ok_or_else(|| {
+                            HookError::AdmissionDenied(
+                                "hook prompt output budget overflow".to_string(),
+                            )
+                        })?;
+                }
+                Hook::Model { prompt, .. } => {
+                    model_calls = model_calls.checked_add(1).ok_or_else(|| {
+                        HookError::AdmissionDenied("hook model-call count overflow".to_string())
+                    })?;
+                    model_input_tokens = model_input_tokens
+                        .checked_add(u64::try_from(prompt.len()).map_err(|_| {
+                            HookError::AdmissionDenied(
+                                "hook model input budget overflow".to_string(),
+                            )
+                        })?)
+                        .ok_or_else(|| {
+                            HookError::AdmissionDenied(
+                                "hook model input budget overflow".to_string(),
+                            )
+                        })?;
+                }
+            }
+        }
+
+        if command_calls > 0 {
+            input
+                .run_context
+                .require(crate::tools::ToolResource::Process)?;
+            let sandbox_mode = self
+                .config
+                .policy
+                .as_ref()
+                .map_or(SandboxMode::FullSandbox, |policy| policy.sandbox.clone());
+            if sandbox_mode != SandboxMode::FullSandbox {
+                let trusted = TRUST_UNSANDBOXED_HOOKS
+                    .as_ref()
+                    .copied()
+                    .map_err(Clone::clone)
+                    .map_err(HookError::AdmissionDenied)?;
+                if !trusted {
+                    return Err(HookError::AdmissionDenied(format!(
+                        "hook sandbox mode '{sandbox_mode:?}' requests host execution, which is blocked. A host operator must explicitly start OpenClaudia with {TRUST_UNSANDBOXED_HOOKS_ENV}=true"
+                    )));
+                }
+            }
+        }
+        if model_calls > 0 {
+            input
+                .run_context
+                .require(crate::tools::ToolResource::Network)?;
+            input
+                .run_context
+                .require(crate::tools::ToolResource::Secrets)?;
+        }
+
+        let command_calls_usize = usize::try_from(command_calls).map_err(|_| {
+            HookError::AdmissionDenied("hook process count does not fit this platform".to_string())
+        })?;
+        let command_input_bytes = input_json
+            .len()
+            .checked_mul(command_calls_usize)
+            .ok_or_else(|| HookError::AdmissionDenied("hook input budget overflow".to_string()))?;
+        let model_input_bytes = usize::try_from(model_input_tokens).map_err(|_| {
+            HookError::AdmissionDenied("hook model input does not fit this platform".to_string())
+        })?;
+        let aggregate_input_bytes = command_input_bytes
+            .checked_add(model_input_bytes)
+            .ok_or_else(|| HookError::AdmissionDenied("hook input budget overflow".to_string()))?;
+        if aggregate_input_bytes > MAX_HOOK_BATCH_INPUT_BYTES {
+            return Err(HookError::AdmissionDenied(format!(
+                "hook batch requires {aggregate_input_bytes} input bytes; limit is {MAX_HOOK_BATCH_INPUT_BYTES}"
+            )));
+        }
+
+        let model_calls_usize = usize::try_from(model_calls).map_err(|_| {
+            HookError::AdmissionDenied("hook model count does not fit this platform".to_string())
+        })?;
+        let model_output_bytes = model_calls_usize
+            .checked_mul(MAX_MODEL_HOOK_OUTPUT_BYTES)
+            .ok_or_else(|| HookError::AdmissionDenied("hook output budget overflow".to_string()))?;
+        let fixed_output_bytes = prompt_output_bytes
+            .checked_add(model_output_bytes)
+            .ok_or_else(|| HookError::AdmissionDenied("hook output budget overflow".to_string()))?;
+        if fixed_output_bytes > MAX_HOOK_BATCH_OUTPUT_BYTES {
+            return Err(HookError::AdmissionDenied(format!(
+                "hook batch requires at least {fixed_output_bytes} output bytes; limit is {MAX_HOOK_BATCH_OUTPUT_BYTES}"
+            )));
+        }
+        let command_streams = command_calls_usize.checked_mul(2).ok_or_else(|| {
+            HookError::AdmissionDenied("hook output stream count overflow".to_string())
+        })?;
+        let available = MAX_HOOK_BATCH_OUTPUT_BYTES - fixed_output_bytes;
+        let command_output_bytes_per_stream = match available.checked_div(command_streams) {
+            None => 0,
+            Some(per_stream) => {
+                let per_stream = per_stream.min(MAX_HOOK_OUTPUT_BYTES_PER_STREAM);
+                if per_stream == 0 {
+                    return Err(HookError::AdmissionDenied(
+                        "hook batch has no output capacity for command streams".to_string(),
+                    ));
+                }
+                per_stream
+            }
+        };
+
+        let remaining_time = input.run_context.budget().remaining_time()?;
+        let policy = self.config.policy.as_ref();
+        let mut hooks = Vec::with_capacity(hooks_to_run.len());
+        for (index, (hook, timeout_secs)) in hooks_to_run.into_iter().enumerate() {
+            let hook_timeout = Duration::from_secs(timeout_secs).min(remaining_time);
+            if hook_timeout.is_zero() {
+                return Err(HookError::AdmissionDenied(
+                    "canonical run deadline leaves no time for hook execution".to_string(),
+                ));
+            }
+            let kind = match hook {
+                Hook::Command { command, shell, .. } => {
+                    let mut command = if *shell {
+                        Self::build_shell_command(&input.run_context, command, policy)?
+                    } else {
+                        Self::build_direct_command(&input.run_context, command, policy)?
+                    };
+                    Self::apply_hook_env(
+                        &mut command,
+                        &input.run_context,
+                        input.run_context.working_directory(),
+                    );
+                    AdmittedHookKind::Command {
+                        command,
+                        sandbox_mode: policy.map_or(SandboxMode::FullSandbox, |hook_policy| {
+                            hook_policy.sandbox.clone()
+                        }),
+                    }
+                }
+                Hook::Prompt { prompt, .. } => AdmittedHookKind::Prompt(prompt),
+                Hook::Model {
+                    prompt,
+                    model,
+                    provider,
+                    ..
+                } => AdmittedHookKind::Model {
+                    prompt,
+                    model,
+                    provider: provider.as_deref(),
+                },
+            };
+            hooks.push(AdmittedHook {
+                index,
+                timeout: hook_timeout,
+                kind,
+            });
+        }
+
+        let output_tokens = model_calls
+            .checked_mul(u64::from(crate::DEFAULT_MAX_TOKENS))
+            .ok_or_else(|| HookError::AdmissionDenied("hook token budget overflow".to_string()))?;
+        let cost_microusd = if model_calls == 0 {
+            0
+        } else {
+            crate::session::conservative_budget_cost_microusd(&crate::session::TokenUsage {
+                input_tokens: model_input_tokens,
+                output_tokens,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            })
+            .map_err(|error| {
+                HookError::AdmissionDenied(format!("hook cost budget overflow: {error}"))
+            })?
+            .microusd
+        };
+        let concurrent_calls = command_calls.checked_add(model_calls).ok_or_else(|| {
+            HookError::AdmissionDenied("hook concurrency budget overflow".to_string())
+        })?;
+        let reservation = input
+            .run_context
+            .budget()
+            .reserve(crate::runtime::BudgetAmounts {
+                input_tokens: model_input_tokens,
+                output_tokens,
+                turns: model_calls,
+                provider_calls: model_calls,
+                tool_calls: command_calls,
+                concurrent_calls,
+                cost_microusd,
+                ..crate::runtime::BudgetAmounts::default()
+            })?;
+        Ok(HookBatchAdmission {
+            hooks,
+            reservation,
+            cancellation: input.run_context.runtime().cancellation().child(),
+            deadline: tokio::time::Instant::now() + remaining_time,
+            command_output_bytes_per_stream,
+        })
+    }
+
+    fn hook_result_blocks(
+        event: HookEvent,
+        contract: HookEventContract,
+        result: &Result<(HookOutput, i32), HookError>,
+    ) -> bool {
+        if !matches!(contract.failure_mode, HookFailureMode::Block) {
+            return false;
+        }
+        match result {
+            Err(_) | Ok((_, 2)) => true,
+            Ok((output, _)) => Self::validate_output(event, output)
+                .map_or(true, |decision| !matches!(decision, HookDecision::Allow)),
+        }
     }
 
     fn matching_hooks<'a>(&'a self, event: HookEvent, input: &HookInput) -> Vec<(&'a Hook, u64)> {
@@ -1219,62 +1576,49 @@ impl HookEngine {
         vec![self.run(HookEvent::Notification, &input).await]
     }
 
-    /// Run a single hook
-    async fn run_hook(
+    async fn run_admitted_hook(
         &self,
         run: &crate::tools::ToolRunContext,
-        hook: &Hook,
+        hook: AdmittedHook<'_>,
         input_json: &str,
-        timeout_secs: u64,
+        command_output_bytes_per_stream: usize,
+        cancellation: crate::runtime::CancellationHandle,
     ) -> Result<(HookOutput, i32), HookError> {
-        let budget = run
-            .budget()
-            .reserve(crate::runtime::BudgetAmounts {
-                concurrent_calls: 1,
-                ..crate::runtime::BudgetAmounts::default()
-            })
-            .map_err(|error| {
-                HookError::CommandFailed(format!("Run budget denied hook dispatch: {error}"))
-            })?;
-        let result = match hook {
-            Hook::Command { command, shell, .. } => {
-                self.run_command_hook(
+        if cancellation.is_cancelled() {
+            return Err(HookError::Cancelled);
+        }
+        match hook.kind {
+            AdmittedHookKind::Command {
+                command,
+                sandbox_mode,
+            } => {
+                self.run_admitted_command_hook(
                     run,
                     command,
-                    *shell,
-                    self.config.policy.as_ref(),
+                    sandbox_mode,
                     input_json,
-                    timeout_secs,
+                    hook.timeout,
+                    command_output_bytes_per_stream,
+                    cancellation,
                 )
                 .await
             }
-            Hook::Prompt { prompt, .. } => {
-                // Hook-authored prompts are observations/suggestions. They do
-                // not acquire system authority from the hook transport.
-                Ok((
-                    HookOutput {
-                        additional_context: Some(prompt.clone()),
-                        ..Default::default()
-                    },
-                    0,
-                ))
-            }
-            Hook::Model {
+            AdmittedHookKind::Prompt(prompt) => Ok((
+                HookOutput {
+                    additional_context: Some(prompt.to_string()),
+                    ..Default::default()
+                },
+                0,
+            )),
+            AdmittedHookKind::Model {
                 prompt,
                 model,
                 provider,
-                ..
             } => {
-                run.require(crate::tools::ToolResource::Network)?;
-                run.require(crate::tools::ToolResource::Secrets)?;
-                self.run_model_hook(prompt, model, provider.as_deref(), timeout_secs)
+                self.run_model_hook(run, prompt, model, provider, hook.timeout, cancellation)
                     .await
             }
-        };
-        budget.commit().map_err(|error| {
-            HookError::CommandFailed(format!("Hook budget reconciliation failed: {error}"))
-        })?;
-        result
+        }
     }
 
     /// Build a [`Command`] for direct-spawn mode (no shell).
@@ -1288,9 +1632,9 @@ impl HookEngine {
         policy: Option<&HookPolicy>,
     ) -> Result<Command, HookError> {
         let tokens = shlex::split(command).ok_or_else(|| {
-            HookError::CommandFailed(format!(
-                "Failed to tokenise hook command (unterminated quote?): {command}"
-            ))
+            HookError::CommandFailed(
+                "Failed to tokenise hook command because its quoting is incomplete".to_string(),
+            )
         })?;
 
         if tokens.is_empty() {
@@ -1300,37 +1644,8 @@ impl HookEngine {
         }
 
         let binary_path = &tokens[0];
-        // Strip to basename so "/usr/bin/python3" matches allowlist entry "python3".
-        let binary_name = Path::new(binary_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(binary_path.as_str());
-
-        match policy {
-            Some(p) => {
-                if let Some(allowed) = &p.allowed_commands {
-                    if !allowed.contains(binary_name) {
-                        return Err(HookError::Denied {
-                            binary: binary_name.to_string(),
-                        });
-                    }
-                }
-            }
-            None => {
-                if !ALLOW_ALL_DEPRECATION_WARNED.swap(true, Ordering::Relaxed) {
-                    warn!(
-                        "HooksConfig has no `policy` field — allowing every hook \
-                         executable name inside the full OS sandbox. Add \
-                         `policy: {{allowed_commands: [...]}}` to restrict which \
-                         binaries hooks may execute."
-                    );
-                }
-            }
-        }
-
-        let resolved = run
-            .resolve_executable(binary_path)
-            .map_err(|error| HookError::CommandFailed(error.to_string()))?;
+        let resolved = Self::resolve_hook_executable(run, binary_path)?;
+        Self::authorize_hook_executable(run, binary_path, &resolved, policy)?;
         let mut cmd = Command::new(resolved);
         if tokens.len() > 1 {
             cmd.args(&tokens[1..]);
@@ -1338,21 +1653,21 @@ impl HookEngine {
         Ok(cmd)
     }
 
-    /// Replace ambient process state with this run's exact environment grants
-    /// and the one harness-owned project-directory value documented for hooks.
-    fn apply_hook_env(
-        cmd: &mut Command,
+    fn build_shell_command(
         run: &crate::tools::ToolRunContext,
-        project_dir: &std::path::Path,
-    ) {
-        cmd.env_clear();
-        run.environment_grants().apply_std(cmd);
-        cmd.env("HOME", run.private_temp_root())
-            .env("TMPDIR", run.private_temp_root())
-            .env("TMP", run.private_temp_root())
-            .env("TEMP", run.private_temp_root())
-            .env("PATH", run.executable_search_path())
-            .env("CLAUDE_PROJECT_DIR", project_dir);
+        command: &str,
+        policy: Option<&HookPolicy>,
+    ) -> Result<Command, HookError> {
+        let (resolved, shell_arg) = Self::resolved_hook_shell(run)?;
+        let shell = if cfg!(windows) { "cmd" } else { "sh" };
+        Self::authorize_hook_executable(run, shell, &resolved, policy)?;
+        warn!(
+            executable = %resolved.display(),
+            "Hook is running in explicitly configured shell compatibility mode"
+        );
+        let mut cmd = Command::new(resolved);
+        cmd.arg(shell_arg).arg(command);
+        Ok(cmd)
     }
 
     fn resolved_hook_shell(
@@ -1363,10 +1678,96 @@ impl HookEngine {
         } else {
             ("sh", "-c")
         };
-        let shell_path = run
-            .resolve_executable(shell)
-            .map_err(|error| HookError::CommandFailed(error.to_string()))?;
-        Ok((shell_path, shell_arg))
+        Self::resolve_hook_executable(run, shell).map(|path| (path, shell_arg))
+    }
+
+    fn resolve_hook_executable(
+        run: &crate::tools::ToolRunContext,
+        executable: &str,
+    ) -> Result<PathBuf, HookError> {
+        let resolved = run
+            .resolve_executable(executable)
+            .map_err(|error| HookError::CommandFailed(error.to_string()))?
+            .canonicalize()
+            .map_err(|error| {
+                HookError::CommandFailed(format!(
+                    "Failed to canonicalize the resolved hook executable: {error}"
+                ))
+            })?;
+        let metadata = std::fs::metadata(&resolved).map_err(|error| {
+            HookError::CommandFailed(format!(
+                "Failed to inspect the resolved hook executable: {error}"
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(HookError::CommandFailed(
+                "Resolved hook executable is not a regular file".to_string(),
+            ));
+        }
+        Ok(resolved)
+    }
+
+    fn authorize_hook_executable(
+        run: &crate::tools::ToolRunContext,
+        requested: &str,
+        resolved: &Path,
+        policy: Option<&HookPolicy>,
+    ) -> Result<(), HookError> {
+        let Some(policy) = policy else {
+            if !ALLOW_ALL_DEPRECATION_WARNED.swap(true, Ordering::Relaxed) {
+                warn!(
+                    "HooksConfig has no `policy` field — allowing canonical hook executable identities under the default full sandbox"
+                );
+            }
+            return Ok(());
+        };
+        let Some(allowed) = policy.allowed_commands.as_ref() else {
+            return Ok(());
+        };
+        let mut allowed_executables = allowed.iter().collect::<Vec<_>>();
+        allowed_executables.sort_unstable();
+        for allowed_executable in allowed_executables {
+            match Self::resolve_hook_executable(run, allowed_executable) {
+                Ok(allowed_identity) if allowed_identity == resolved => return Ok(()),
+                Ok(_) => {}
+                Err(error) => {
+                    debug!(
+                        allowed_executable,
+                        %error,
+                        "Ignoring unavailable hook allowlist entry while checking canonical executable identities"
+                    );
+                }
+            }
+        }
+        let binary = Path::new(requested)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("<non-unicode>")
+            .to_string();
+        Err(HookError::Denied { binary })
+    }
+
+    /// Replace ambient process state with this run's exact environment grants
+    /// and the one harness-owned project-directory value documented for hooks.
+    fn apply_hook_env(
+        cmd: &mut Command,
+        run: &crate::tools::ToolRunContext,
+        project_dir: &std::path::Path,
+    ) {
+        cmd.env_clear();
+        for name in run.environment_grants().keys() {
+            if !crate::tools::is_sensitive_env(name) {
+                let _applied = run.environment_grants().with_value(name, |value| {
+                    cmd.env(name, value);
+                });
+            }
+        }
+        cmd.env("HOME", run.private_temp_root())
+            .env("TMPDIR", run.private_temp_root())
+            .env("TMP", run.private_temp_root())
+            .env("TEMP", run.private_temp_root())
+            .env("PATH", run.executable_search_path())
+            .env("CLAUDE_PROJECT_DIR", project_dir);
     }
 
     #[cfg(test)]
@@ -1386,50 +1787,33 @@ impl HookEngine {
 
     /// Execute a command hook.
     ///
-    /// Two execution paths:
-    /// - `use_shell = false` (default): tokenise with `shlex`, exec directly —
-    ///   shell metacharacters are inert literal arguments.
-    /// - `use_shell = true` (opt-in): pass to `sh -c`, warn loudly on every call.
-    ///
-    /// Credentials are scrubbed in both paths. See [`Self::build_direct_command`].
-    async fn run_command_hook(
+    /// The executable and argv were resolved during aggregate admission. This
+    /// method owns only sandbox preparation and the cancellable process
+    /// lifecycle, so policy denial cannot race a sibling launch.
+    #[allow(clippy::too_many_arguments)] // Carries one immutable admission record into one supervised process lifecycle.
+    async fn run_admitted_command_hook(
         &self,
         run: &crate::tools::ToolRunContext,
-        command: &str,
-        use_shell: bool,
-        policy: Option<&HookPolicy>,
+        child_cmd: Command,
+        sandbox_mode: SandboxMode,
         input_json: &str,
-        timeout_secs: u64,
+        hook_timeout: Duration,
+        output_bytes_per_stream: usize,
+        cancellation: crate::runtime::CancellationHandle,
     ) -> Result<(HookOutput, i32), HookError> {
-        debug!(command = %command, shell = use_shell, "Running command hook");
-
-        // Resolve cwd eagerly — missing cwd is a hard error, not a silent "".
-        run.require(crate::tools::ToolResource::Process)?;
         let project_dir = run.working_directory().to_path_buf();
-
-        let mut child_cmd = if use_shell {
-            warn!(
-                command = %command,
-                "Hook is running with shell:true — shell injection risk. \
-                 Consider converting to a direct-spawn hook."
-            );
-            let (shell_path, shell_arg) = Self::resolved_hook_shell(run)?;
-            let mut cmd = Command::new(shell_path);
-            cmd.arg(shell_arg).arg(command);
-            cmd
-        } else {
-            Self::build_direct_command(run, command, policy)?
-        };
-
-        Self::apply_hook_env(&mut child_cmd, run, &project_dir);
-        let sandbox_mode = policy.map_or(SandboxMode::FullSandbox, |hook_policy| {
-            hook_policy.sandbox.clone()
-        });
         let _projection_guard = if sandbox_mode == SandboxMode::FullSandbox {
-            Some(self.command_projection_lock.lock().await)
+            Some(tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(HookError::Cancelled),
+                guard = self.command_projection_lock.lock() => guard,
+            })
         } else {
             None
         };
+        if cancellation.is_cancelled() {
+            return Err(HookError::Cancelled);
+        }
         let prepared_command = if sandbox_mode == SandboxMode::FullSandbox {
             crate::tools::sandboxed_hook_command(run, &child_cmd, &project_dir).map_err(
                 |error| {
@@ -1437,17 +1821,6 @@ impl HookEngine {
                 },
             )?
         } else {
-            let trusted = TRUST_UNSANDBOXED_HOOKS
-                .as_ref()
-                .map_err(Clone::clone)
-                .map_err(HookError::CommandFailed)?;
-            if !trusted {
-                return Err(HookError::CommandFailed(format!(
-                    "hook sandbox mode '{sandbox_mode:?}' requests host execution, which is blocked. \
-                     A host operator must explicitly start OpenClaudia with \
-                     {TRUST_UNSANDBOXED_HOOKS_ENV}=true to trust unsandboxed hooks"
-                )));
-            }
             warn!(
                 mode = ?sandbox_mode,
                 env = TRUST_UNSANDBOXED_HOOKS_ENV,
@@ -1456,18 +1829,16 @@ impl HookEngine {
             crate::tools::command::PreparedProcessCommand::host(child_cmd)
         };
 
-        let limits = crate::tools::command::ProcessLimits::new(Duration::from_secs(timeout_secs))
-            .with_output_limit(
-                MAX_HOOK_OUTPUT_BYTES_PER_STREAM,
-                HOOK_OUTPUT_TRUNCATED_MARKER,
-            )
+        let limits = crate::tools::command::ProcessLimits::new(hook_timeout)
+            .with_output_limit(output_bytes_per_stream, HOOK_OUTPUT_TRUNCATED_MARKER)
             .with_stdin_early_close_allowed();
-        match crate::tools::command::run_prepared_run_owned(
+        match crate::tools::command::run_prepared_run_owned_with_cancellation(
             run,
             prepared_command,
             "hook",
             limits,
             Some(input_json.as_bytes().to_vec()),
+            cancellation,
         )
         .await
         {
@@ -1477,12 +1848,13 @@ impl HookEngine {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 if !stderr.is_empty() {
-                    debug!(stderr = %stderr, "Hook stderr");
+                    debug!(stderr_bytes = stderr.len(), "Hook wrote bounded stderr");
                 }
                 if exit_code != 0 && exit_code != 2 {
                     const MAX_HOOK_ERROR_BYTES: usize = 4096;
+                    let sanitized = run.sanitize_diagnostic(stderr.trim());
                     let diagnostic =
-                        crate::tools::safe_truncate(stderr.trim(), MAX_HOOK_ERROR_BYTES);
+                        crate::tools::safe_truncate(sanitized.as_str(), MAX_HOOK_ERROR_BYTES);
                     let suffix = if diagnostic.is_empty() {
                         String::new()
                     } else {
@@ -1495,8 +1867,9 @@ impl HookEngine {
                 Ok((Self::parse_hook_output(&stdout), exit_code))
             }
             Err(crate::tools::command::CommandError::TimedOut { .. }) => {
-                Err(HookError::Timeout(timeout_secs))
+                Err(HookError::Timeout(hook_timeout.as_secs().max(1)))
             }
+            Err(crate::tools::command::CommandError::Cancelled { .. }) => Err(HookError::Cancelled),
             Err(error) => Err(HookError::CommandFailed(error.to_string())),
         }
     }
@@ -1504,16 +1877,14 @@ impl HookEngine {
     /// Execute a model hook by sending a prompt to a specified model/provider
     async fn run_model_hook(
         &self,
+        run: &crate::tools::ToolRunContext,
         prompt: &str,
         model: &str,
         provider: Option<&str>,
-        timeout_secs: u64,
+        hook_timeout: Duration,
+        cancellation: crate::runtime::CancellationHandle,
     ) -> Result<(HookOutput, i32), HookError> {
-        debug!(
-            model = %model,
-            provider = ?provider,
-            "Running model hook"
-        );
+        debug!("Running admitted model hook");
 
         let callback = self.model_hook_callback.as_ref().ok_or_else(|| {
             HookError::CommandFailed(
@@ -1528,16 +1899,26 @@ impl HookEngine {
             provider.map(String::from),
         );
 
-        match timeout(Duration::from_secs(timeout_secs), future).await {
-            Ok(Ok(response)) => Ok((
-                HookOutput {
-                    additional_context: Some(response),
-                    ..Default::default()
-                },
-                0,
-            )),
-            Ok(Err(e)) => Err(HookError::CommandFailed(format!("Model hook error: {e}"))),
-            Err(_) => Err(HookError::Timeout(timeout_secs)),
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(HookError::Cancelled),
+            result = timeout(hook_timeout, future) => match result {
+                Ok(Ok(response)) if response.len() <= MAX_MODEL_HOOK_OUTPUT_BYTES => Ok((
+                    HookOutput {
+                        additional_context: Some(response),
+                        ..Default::default()
+                    },
+                    0,
+                )),
+                Ok(Ok(_)) => Err(HookError::OutputLimitExceeded {
+                    max_bytes: MAX_MODEL_HOOK_OUTPUT_BYTES,
+                }),
+                Ok(Err(error)) => Err(HookError::CommandFailed(format!(
+                    "Model hook failed: {}",
+                    run.sanitize_diagnostic(&error)
+                ))),
+                Err(_) => Err(HookError::Timeout(hook_timeout.as_secs().max(1))),
+            }
         }
     }
 }
@@ -1762,6 +2143,23 @@ mod tests {
         assert_eq!(scoped.config.pre_tool_use.len(), 2);
     }
 
+    #[test]
+    fn unavailable_allowlist_entry_does_not_mask_a_later_canonical_match() {
+        let executable = if cfg!(windows) { "cmd" } else { "sh" };
+        let resolved =
+            HookEngine::resolve_hook_executable(test_run(), executable).expect("test shell");
+        let policy = HookPolicy {
+            allowed_commands: Some(std::collections::HashSet::from([
+                "__openclaudia_missing_allowlist_entry__".to_string(),
+                executable.to_string(),
+            ])),
+            sandbox: SandboxMode::FullSandbox,
+        };
+
+        HookEngine::authorize_hook_executable(test_run(), executable, &resolved, Some(&policy))
+            .expect("a missing unrelated entry must not mask the canonical match");
+    }
+
     #[tokio::test]
     async fn model_hook_requires_secrets_before_invoking_provider_callback() {
         let root = tempfile::tempdir().expect("temp directory");
@@ -1779,31 +2177,33 @@ mod tests {
                 .expect("network-only hook test run");
         let callback_invoked = std::sync::Arc::new(AtomicBool::new(false));
         let callback_probe = std::sync::Arc::clone(&callback_invoked);
-        let engine = HookEngine::new(HooksConfig::default()).with_model_callback(Box::new(
-            move |_, _, _| {
-                callback_probe.store(true, Ordering::SeqCst);
-                Box::pin(async { Ok("unexpected provider response".to_string()) })
-            },
-        ));
-        let hook = Hook::Model {
-            prompt: "review this".to_string(),
-            model: "test-model".to_string(),
-            provider: Some("test-provider".to_string()),
-            timeout: 1,
-        };
+        let engine = HookEngine::new(HooksConfig {
+            session_start: vec![HookEntry {
+                matcher: None,
+                hooks: vec![Hook::Model {
+                    prompt: "review this".to_string(),
+                    model: "test-model".to_string(),
+                    provider: Some("test-provider".to_string()),
+                    timeout: 1,
+                }],
+            }],
+            ..HooksConfig::default()
+        })
+        .with_model_callback(Box::new(move |_, _, _| {
+            callback_probe.store(true, Ordering::SeqCst);
+            Box::pin(async { Ok("unexpected provider response".to_string()) })
+        }));
+        let input = HookInput::for_run(&run, HookEvent::SessionStart);
 
-        let error = engine
-            .run_hook(&run, &hook, "{}", 1)
-            .await
-            .expect_err("missing secret capability must reject the model hook");
+        let result = engine.run(HookEvent::SessionStart, &input).await;
 
-        assert!(matches!(
+        assert!(result.errors.iter().any(|error| matches!(
             error,
             HookError::Capability(crate::tools::ToolCapabilityError::Unavailable {
                 resource: crate::tools::ToolResource::Secrets,
                 ..
             })
-        ));
+        )));
         assert!(
             !callback_invoked.load(Ordering::SeqCst),
             "provider callback must not run before every required capability is authorized"
@@ -1829,15 +2229,30 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn command_hook_deadline_covers_blocked_stdin_delivery() {
-        let engine = HookEngine::new(HooksConfig::default());
-        let input = "x".repeat(2 * 1024 * 1024);
+        let engine = HookEngine::new(HooksConfig {
+            post_tool_use: vec![HookEntry {
+                matcher: None,
+                hooks: vec![Hook::Command {
+                    command: "sleep 60".to_string(),
+                    shell: false,
+                    timeout: 1,
+                }],
+            }],
+            ..HooksConfig::default()
+        });
+        let input = HookInput::for_run(test_run(), HookEvent::PostToolUse)
+            .with_extra("padding", serde_json::Value::String("x".repeat(512 * 1024)));
         let started = std::time::Instant::now();
-        let error = engine
-            .run_command_hook(test_run(), "sleep 60", false, None, &input, 1)
-            .await
-            .expect_err("blocked hook stdin must obey the hook deadline");
 
-        assert!(matches!(error, HookError::Timeout(1)), "{error:?}");
+        let result = engine.run(HookEvent::PostToolUse, &input).await;
+
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| matches!(error, HookError::Timeout(1))),
+            "{result:?}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "one-second hook deadline did not return promptly"
@@ -2704,20 +3119,9 @@ mod tests {
             shell_path.display()
         );
         assert_eq!(shell_arg, if cfg!(windows) { "/C" } else { "-c" });
-
-        let source = include_str!("mod.rs");
-        let cfg_test = source
-            .find("#[cfg(test)]")
-            .expect("test marker must be present");
-        let production = &source[..cfg_test];
-        assert!(
-            !production.contains("Command::new(shell)"),
-            "hook shell mode must not spawn an unresolved shell binary"
-        );
-        assert!(
-            production.contains(".resolve_executable(shell)"),
-            "hook shell mode must resolve the platform shell through the run capability"
-        );
+        let command = HookEngine::build_shell_command(test_run(), "true", None)
+            .expect("resolved shell command");
+        assert_eq!(Path::new(command.get_program()), shell_path);
     }
 
     /// Environment replacement must remove both ambient inheritance and

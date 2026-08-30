@@ -170,17 +170,15 @@ fn collect_command_executables(config: &HooksConfig, commands: &mut HashSet<Stri
     ] {
         for entry in entries {
             for hook in &entry.hooks {
-                let Hook::Command { command, .. } = hook else {
+                let Hook::Command { command, shell, .. } = hook else {
                     continue;
                 };
-                if let Some(executable) = shlex::split(command).and_then(|tokens| {
-                    tokens.first().and_then(|token| {
-                        Path::new(token)
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .map(str::to_string)
-                    })
-                }) {
+                let executable = if *shell {
+                    Some(if cfg!(windows) { "cmd" } else { "sh" }.to_string())
+                } else {
+                    shlex::split(command).and_then(|tokens| tokens.into_iter().next())
+                };
+                if let Some(executable) = executable {
                     commands.insert(executable);
                 }
             }

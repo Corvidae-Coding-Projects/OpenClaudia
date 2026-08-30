@@ -8,7 +8,7 @@
 
 use crate::config::AppConfig;
 use crate::file_types::extensions_from_tool_input;
-use crate::hooks::{HookEngine, HookError, HookEvent, HookInput};
+use crate::hooks::{HookEngine, HookEvent, HookInput};
 use crate::memory::MemoryDb;
 use crate::permissions::{AuthorizationResult, ExecutionPermit, PermissionManager};
 use crate::runtime::BudgetAmounts;
@@ -157,12 +157,10 @@ impl ToolExecutor {
             hook_input = hook_input.with_extra("extensions", serde_json::json!(extensions));
         }
 
-        let hook_result = hook_engine.run(HookEvent::PreToolUse, &hook_input).await;
-        if let Err(hook_err) = HookEngine::check_blocked(&hook_result) {
-            let reason = match hook_err {
-                HookError::Blocked(reason) => reason,
-                other => other.to_string(),
-            };
+        let hook_receipt = hook_engine
+            .run_lifecycle(HookEvent::PreToolUse, &hook_input)
+            .await;
+        if let Some(reason) = hook_receipt.blocking_reason() {
             tracing::warn!(
                 tool = %tool_name,
                 session_id = ?session_id,

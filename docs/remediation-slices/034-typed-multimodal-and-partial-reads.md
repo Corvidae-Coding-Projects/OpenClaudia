@@ -1,12 +1,33 @@
 # S-034: Implement typed multimodal and partial reads
 
-Status: Planned
+Status: Implemented and deterministically verified; artifact-bound VDD receipt not recorded
 Effort: Medium
 Primary findings: F-040, F-041
 Workstreams: W3, W15
 Depends on: [S-011](./011-canonical-typed-tool-results.md), [S-019](./019-explicit-session-capabilities.md)
 
 Canonical sources: [full audit](../full-codebase-audit-2026-08-16.md) and [remediation design](../production-remediation-design.md).
+
+## Delivered — 2026-08-25
+
+Commits `db72f6d8` and `ec205a36` delivered descriptor-pinned bounded text and
+binary pages with generation-bound cursors, typed MIME/encoding/sensitivity and
+artifact metadata, transient non-durable image payloads, provider-native media
+projection where supported, and explicit unsupported outcomes elsewhere. Raw
+attachment bytes do not enter durable tool results or transcripts.
+
+## Verification evidence
+
+Crosslink issue #1136 records Rust 1.98 formatting, strict all-target/all-feature
+Clippy, the complete serialized workspace suite, focused read/registry/provider
+and integration tests, fuzz and dependency-policy gates, and Windows GNU checks
+as passing. PR #66 head `ec205a36` subsequently passed repository-policy, MSRV,
+Linux, macOS fail-closed, and Windows fail-closed runners.
+
+## Residual boundary
+
+The typed read and transport behavior is complete. An independent,
+artifact-bound VDD receipt was not recorded with this slice.
 
 ## Outcome
 

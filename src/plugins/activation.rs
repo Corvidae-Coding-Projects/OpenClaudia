@@ -60,6 +60,11 @@ impl std::fmt::Display for PluginComponentKind {
 pub struct PluginPackageProvenance {
     pub plugin_id: String,
     pub package: String,
+    pub normalized_package: String,
+    pub host_scope: super::InstallScope,
+    pub canonical_source: String,
+    pub manifest_schema: &'static str,
+    pub owner: String,
     pub publisher: String,
     pub version: Option<String>,
     pub artifact_digest: String,
@@ -74,6 +79,12 @@ impl PluginPackageProvenance {
         let observed_digest = digest_package_tree(plugin.root()).map_err(|error| {
             PluginActivationError::package(plugin, format!("cannot bind package bytes: {error}"))
         })?;
+        if observed_digest != plugin.identity().artifact_digest {
+            return Err(PluginActivationError::package(
+                plugin,
+                "package changed after its host identity was bound",
+            ));
+        }
         let receipt = match plugin.generation_receipt() {
             Some(receipt) => Some(receipt.clone()),
             None => verify_installed_generation(plugin.root()).map_err(|error| {
@@ -94,20 +105,25 @@ impl PluginPackageProvenance {
                     ),
                 ));
             }
-            return Ok(Self::from_receipt(receipt));
+            return Ok(Self::from_receipt(plugin, receipt));
         }
 
         Ok(Self {
             plugin_id: plugin.id.clone(),
             package: plugin.name().to_string(),
-            publisher: "host-observed-unsigned".to_string(),
+            normalized_package: plugin.identity().normalized_package.clone(),
+            host_scope: plugin.identity().host_scope,
+            canonical_source: plugin.identity().canonical_source.clone(),
+            manifest_schema: plugin.identity().manifest_schema,
+            owner: plugin.identity().owner.clone(),
+            publisher: plugin.identity().owner.clone(),
             version: plugin.manifest.version.clone(),
-            artifact_digest: observed_digest.clone(),
+            artifact_digest: observed_digest,
             source: ArtifactSourceProvenance {
                 kind: plugin.source.clone(),
                 locator: plugin.root().to_string_lossy().into_owned(),
                 requested_revision: None,
-                resolved_revision: observed_digest,
+                resolved_revision: plugin.identity().source_revision.clone(),
             },
             verification: ArtifactVerificationLevel::DigestBound,
             verified_signers: Vec::new(),
@@ -115,10 +131,15 @@ impl PluginPackageProvenance {
         })
     }
 
-    fn from_receipt(receipt: ArtifactGenerationReceipt) -> Self {
+    fn from_receipt(plugin: &Plugin, receipt: ArtifactGenerationReceipt) -> Self {
         Self {
             plugin_id: receipt.plugin_id,
             package: receipt.statement.package,
+            normalized_package: plugin.identity().normalized_package.clone(),
+            host_scope: plugin.identity().host_scope,
+            canonical_source: plugin.identity().canonical_source.clone(),
+            manifest_schema: plugin.identity().manifest_schema,
+            owner: plugin.identity().owner.clone(),
             publisher: receipt.statement.publisher,
             version: receipt.statement.version,
             artifact_digest: receipt.statement.artifact_digest,
@@ -134,6 +155,10 @@ impl PluginPackageProvenance {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct PluginLifecycleOwner {
     pub plugin_id: String,
+    pub host_scope: super::InstallScope,
+    pub canonical_source: String,
+    pub manifest_schema: &'static str,
+    pub owner: String,
     pub artifact_digest: String,
     pub source_revision: String,
 }
@@ -142,6 +167,10 @@ impl From<&PluginPackageProvenance> for PluginLifecycleOwner {
     fn from(provenance: &PluginPackageProvenance) -> Self {
         Self {
             plugin_id: provenance.plugin_id.clone(),
+            host_scope: provenance.host_scope,
+            canonical_source: provenance.canonical_source.clone(),
+            manifest_schema: provenance.manifest_schema,
+            owner: provenance.owner.clone(),
             artifact_digest: provenance.artifact_digest.clone(),
             source_revision: provenance.source.resolved_revision.clone(),
         }
@@ -843,7 +872,8 @@ fn compile_hooks(
     });
     for (index, mut hook) in hooks.into_iter().enumerate() {
         if let Some(command) = hook.command.as_mut() {
-            let quoted_root = shlex::try_quote(&provenance.source.locator).map_err(|error| {
+            let plugin_root = plugin.root().to_string_lossy();
+            let quoted_root = shlex::try_quote(plugin_root.as_ref()).map_err(|error| {
                 PluginActivationError::component(
                     plugin,
                     PluginComponentKind::Hook,
@@ -1182,14 +1212,26 @@ fn registration_metadata(
     let plugin_namespace = encode_name(plugin.name());
     let component_namespace = encode_name(component_name);
     let package_namespace = encode_name(&provenance.package);
-    let publisher_namespace = encode_name(&provenance.publisher);
-    let digest_namespace = encode_name(&provenance.artifact_digest);
+    let owner_namespace = encode_name(&provenance.owner);
+    let scope_namespace = encode_name(&provenance.host_scope.to_string());
+    let identity_digest = crate::runtime::ContentDigest::sha256(format!(
+        "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+        provenance.host_scope,
+        provenance.normalized_package,
+        provenance.canonical_source,
+        provenance.source.resolved_revision,
+        provenance.artifact_digest,
+        provenance.manifest_schema,
+        provenance.owner,
+        provenance.plugin_id,
+    ));
+    let digest_namespace = encode_name(&identity_digest.to_string());
     let logical_name = format!(
         "plugin__{plugin_namespace}__{}__{component_namespace}",
         kind.as_str()
     );
     let canonical_name = format!(
-        "plugin__{publisher_namespace}__{package_namespace}__{}__{component_namespace}__g{digest_namespace}",
+        "plugin__{scope_namespace}__{owner_namespace}__{package_namespace}__{}__{component_namespace}__g{digest_namespace}",
         kind.as_str()
     );
     PluginRegistrationMetadata {

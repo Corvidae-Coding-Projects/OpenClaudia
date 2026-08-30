@@ -8955,8 +8955,10 @@ blast_radius:
         std::fs::write(&source, "effect-observed\n").expect("partial-mutation source fixture");
         std::fs::create_dir(&destination).expect("partial-mutation destination fixture");
         let mutation = destination.join("mutation-observed");
-        let success_capture = fixture.path().join("post-success.json");
-        let failure_capture = fixture.path().join("post-failure.json");
+        // Capture audit input in run-owned scratch rather than relying on a
+        // transactional project mutation to persist the observation.
+        let success_capture = run.private_temp_root().join("post-success.json");
+        let failure_capture = run.private_temp_root().join("post-failure.json");
         let success_script =
             write_hook_capture_script(fixture.path(), "capture-success.sh", &success_capture);
         let failure_script =
@@ -8978,8 +8980,8 @@ blast_radius:
         });
         hooks.policy = Some(HookPolicy {
             allowed_commands: Some(std::collections::HashSet::from([
-                "capture-success.sh".to_string(),
-                "capture-failure.sh".to_string(),
+                success_script.to_string_lossy().into_owned(),
+                failure_script.to_string_lossy().into_owned(),
             ])),
             ..Default::default()
         });
@@ -10311,7 +10313,8 @@ mod pre_tool_gate_tests {
     /// when the wiring regresses.
     #[tokio::test]
     async fn hook_denial_blocks_tool_dispatch() {
-        let tmp = tempfile::tempdir_in(".").expect("project-local tempdir");
+        let tmp = tempfile::tempdir_in(test_run().working_directory())
+            .expect("run-visible project-local tempdir");
         let script = write_deny_script(tmp.path(), "blocked-by-policy");
 
         let mut cfg = HooksConfig::default();
@@ -10323,7 +10326,9 @@ mod pre_tool_gate_tests {
                 timeout: 10,
             }],
         });
-        cfg.policy = Some(allow_only("deny.sh"));
+        cfg.policy = Some(allow_only(
+            script.to_str().expect("deny script path must be UTF-8"),
+        ));
         let engine = HookEngine::new(cfg);
 
         let blocked = pre_tool_use_gate(
@@ -10367,7 +10372,9 @@ mod pre_tool_gate_tests {
                 timeout: 10,
             }],
         });
-        cfg.policy = Some(allow_only("deny.sh"));
+        cfg.policy = Some(allow_only(
+            script.to_str().expect("deny script path must be UTF-8"),
+        ));
         let engine = HookEngine::new(cfg);
 
         let outcome = pre_tool_use_gate(
@@ -10422,7 +10429,8 @@ mod pre_tool_gate_tests {
     /// is wired correctly through the ACP code path.
     #[tokio::test]
     async fn matcher_match_triggers_deny() {
-        let tmp = tempfile::tempdir_in(".").expect("project-local tempdir");
+        let tmp = tempfile::tempdir_in(test_run().working_directory())
+            .expect("run-visible project-local tempdir");
         let script = write_deny_script(tmp.path(), "bash-not-allowed");
 
         let mut cfg = HooksConfig::default();
@@ -10434,7 +10442,9 @@ mod pre_tool_gate_tests {
                 timeout: 10,
             }],
         });
-        cfg.policy = Some(allow_only("deny.sh"));
+        cfg.policy = Some(allow_only(
+            script.to_str().expect("deny script path must be UTF-8"),
+        ));
         let engine = HookEngine::new(cfg);
 
         let outcome = pre_tool_use_gate(

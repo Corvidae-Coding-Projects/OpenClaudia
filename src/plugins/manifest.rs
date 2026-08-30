@@ -29,6 +29,7 @@ use std::collections::HashMap;
 
 /// Plugin author information
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PluginAuthor {
     /// Display name of the plugin author or organization
     pub name: String,
@@ -253,6 +254,7 @@ pub struct HooksDefinition {
 
 /// A single hook entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HookEntry {
     /// Matcher pattern (tool name regex for PreToolUse/PostToolUse)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -292,6 +294,7 @@ pub enum McpServersSpecEntry {
 
 /// MCP server configuration (matches Claude Code format)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
     /// Command to execute
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -372,6 +375,7 @@ where
 /// plugin author owns); on enable the host registers it with the LSP
 /// pool so the standard `lsp` tool dispatches against it transparently.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LspServerConfig {
     /// Executable to spawn.
     pub command: String,
@@ -415,6 +419,7 @@ pub enum SkillsSpec {
 
 /// Claude Code-compatible plugin manifest (.claude-plugin/plugin.json)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginManifest {
     /// Plugin name (kebab-case, unique identifier)
     pub name: String,

@@ -1,6 +1,6 @@
 # S-098: Make TUI provider switching and resume atomic
 
-Status: Planned
+Status: Implemented and verified (2026-08-30)
 Effort: Medium
 Primary findings: F-132
 Workstreams: W3, W12
@@ -27,3 +27,38 @@ Prevent displayed provider/model/session state from diverging from the credentia
 ## Handoff
 
 Record changed artifact generations, commands/tests run, typed evidence receipts, unresolved risks, and any newly proposed slice. Completion of this slice does not imply completion of its parent workstream.
+
+## Delivered implementation
+
+- The TUI now represents its active provider as one generation-bound
+  `ProviderBinding`: provider/adapter, model, endpoint, headers, wire protocol,
+  Claude/Codex SDK or account authentication, prompt context, VDD builder
+  authentication, session identity, and provider-native continuation contract.
+- Provider/model switches and session resume prepare every fallible run,
+  guardrail, task, scheduler, transport, authentication, and continuation
+  dependency off-state. Publication occurs only after validation succeeds;
+  failure leaves the previous complete binding active.
+- Pending transitions are typed and mutually exclusive. Cancellation retires
+  the pending transition, stale or superseded continuation events cannot
+  publish, same-provider resume validates exact native history, and switching
+  provider/model clears incompatible native state before publishing the new
+  generation.
+- Every outbound turn revalidates the displayed provider/model and the complete
+  API/VDD projection before transcript mutation or request spawn. Startup binds
+  an explicit provider target before applying resume state.
+
+## Verification
+
+- Focused TUI coverage passed 90 tests, including failed authentication,
+  provider/model switching, same-provider resume, incompatible history,
+  pending and stale transitions, cancellation, native continuation state, and
+  rejection before transcript mutation.
+- Rust 1.98 format and strict all-target/all-feature Clippy gates pass. The
+  complete all-target/all-feature suite is also run at the integration commit.
+
+## Residual boundary
+
+Provider calls remain externally effectful once their supervised request has
+started, so cancellation can prevent publication but cannot prove a remote
+service performed no work. The binding prevents that response from changing a
+superseded local session and does not claim stronger remote cancellation.

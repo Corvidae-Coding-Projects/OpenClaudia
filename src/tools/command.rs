@@ -655,6 +655,30 @@ pub async fn run_prepared_run_owned(
         program_label.to_string(),
         limits,
         stdin_input,
+        None,
+    )
+    .await
+}
+
+/// Execute a prepared run-owned process under a narrower operation
+/// cancellation node. The supplied handle must be a child of the owning run's
+/// cancellation tree; callers use this when a batch needs to stop and join its
+/// own children without terminating the whole run.
+pub async fn run_prepared_run_owned_with_cancellation(
+    run: &crate::tools::security::ToolRunContext,
+    command: PreparedProcessCommand,
+    program_label: &str,
+    limits: ProcessLimits,
+    stdin_input: Option<Vec<u8>>,
+    cancellation: crate::runtime::CancellationHandle,
+) -> Result<SupervisedProcessOutput, CommandError> {
+    supervise_prepared_process(
+        ProcessExecution::RunOwned(run),
+        command,
+        program_label.to_string(),
+        limits,
+        stdin_input,
+        Some(cancellation),
     )
     .await
 }
@@ -684,6 +708,7 @@ fn drive_supervisor_sync(
                     program,
                     limits,
                     stdin_input,
+                    None,
                 ))
             }),
             _ => std::thread::scope(|scope| {
@@ -695,6 +720,7 @@ fn drive_supervisor_sync(
                             program,
                             limits,
                             stdin_input,
+                            None,
                         ))
                     })
                     .join()
@@ -710,6 +736,7 @@ fn drive_supervisor_sync(
         program,
         limits,
         stdin_input,
+        None,
     ))
 }
 
@@ -720,6 +747,7 @@ async fn supervise_prepared_process(
     program: String,
     limits: ProcessLimits,
     stdin_input: Option<Vec<u8>>,
+    operation_cancellation: Option<crate::runtime::CancellationHandle>,
 ) -> Result<SupervisedProcessOutput, CommandError> {
     let (mut command, mut workspace_projection) = prepared.into_parts();
     if let Some(input) = stdin_input.as_ref() {
@@ -730,6 +758,42 @@ async fn supervise_prepared_process(
                 max_bytes: limits.stdin_bytes,
             });
         }
+    }
+
+    let tracked_run = match execution {
+        ProcessExecution::RunOwned(run) => Some(run),
+        #[cfg(test)]
+        ProcessExecution::TestHost => None,
+    };
+    let cancellation =
+        operation_cancellation.or_else(|| tracked_run.map(|run| run.runtime().cancellation()));
+    if let Some(receipt) = cancellation
+        .as_ref()
+        .and_then(crate::runtime::CancellationHandle::receipt)
+    {
+        return Err(CommandError::Cancelled {
+            program,
+            reason: receipt.reason,
+            partial: Box::new(ProcessSnapshot {
+                status: None,
+                stdout: CapturedStream {
+                    bytes: Vec::new(),
+                    truncated: false,
+                },
+                stderr: CapturedStream {
+                    bytes: Vec::new(),
+                    truncated: false,
+                },
+                stdin: stdin_input
+                    .as_ref()
+                    .map_or(StdinDelivery::NotRequested, |input| {
+                        StdinDelivery::Pending {
+                            written: 0,
+                            total: input.len(),
+                        }
+                    }),
+            }),
+        });
     }
 
     let deadline = tokio::time::Instant::now() + limits.timeout;
@@ -764,13 +828,7 @@ async fn supervise_prepared_process(
             stdin: StdinDelivery::NotRequested,
         }),
     })?;
-    let tracked_run = match execution {
-        ProcessExecution::RunOwned(run) => Some(run),
-        #[cfg(test)]
-        ProcessExecution::TestHost => None,
-    };
     let _active_process = tracked_run.map(|run| ActiveSandboxProcess::register(run, pid));
-    let cancellation = tracked_run.map(|run| run.runtime().cancellation());
 
     let stdout_state = Arc::new(Mutex::new(CaptureState::default()));
     let stderr_state = Arc::new(Mutex::new(CaptureState::default()));

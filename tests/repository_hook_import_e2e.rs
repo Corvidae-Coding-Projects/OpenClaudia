@@ -188,12 +188,10 @@ fn exact_approval_activates_and_source_mutation_requires_reapproval() {
     let pending_digest = pending.proposals[0].proposal_digest.clone();
     let pending_source_digest = pending.proposals[0].source_digest.clone();
     let pending_bound_digest = pending.proposals[0].bound_files[0].digest.clone();
-    let pending_binary = pending.proposals[0].executables[0]
+    let pending_executable = pending.proposals[0].executables[0]
         .resolved_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .expect("resolved executable basename")
-        .to_string();
+        .to_string_lossy()
+        .into_owned();
 
     let approved = approve_repository_hook_import_at(project.path(), &approvals, &pending_digest)
         .expect("approve exact proposal");
@@ -206,7 +204,7 @@ fn exact_approval_activates_and_source_mutation_requires_reapproval() {
     assert!(policy
         .allowed_commands
         .expect("exact executable allowlist")
-        .contains(&pending_binary));
+        .contains(&pending_executable));
 
     write_project_file(
         project.path(),
@@ -702,12 +700,10 @@ fn approved_repository_policy_preserves_host_command_hooks_and_precedence() {
     assert_eq!(effective.pre_tool_use.len(), 2);
     let policy = effective.policy.expect("repository sandbox policy");
     let allowed = policy.allowed_commands.expect("command allowlist");
-    let imported_binary = report.proposals[0].executables[0]
+    let imported_executable = report.proposals[0].executables[0]
         .resolved_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .expect("resolved executable basename");
-    assert!(allowed.contains(imported_binary));
+        .to_string_lossy();
+    assert!(allowed.contains(imported_executable.as_ref()));
     assert!(allowed.contains("node"));
     assert_eq!(policy.sandbox, SandboxMode::FullSandbox);
 }

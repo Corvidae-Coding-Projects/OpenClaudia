@@ -9,17 +9,21 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, warn};
 
 use super::PluginError;
+
+const MAX_INSTALLED_CATALOGUE_BYTES: u64 = 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Installation tracking (installed_plugins.json V2)
 // ---------------------------------------------------------------------------
 
 /// Installation scope for a plugin
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum InstallScope {
     Managed,
@@ -33,7 +37,7 @@ impl InstallScope {
     /// `Managed` and `User`. Returns `false` for `Project` and `Local`, which
     /// live in the per-project file under `<project_root>/.openclaudia/`.
     #[must_use]
-    pub const fn is_global(&self) -> bool {
+    pub const fn is_global(self) -> bool {
         matches!(self, Self::Managed | Self::User)
     }
 }
@@ -152,18 +156,21 @@ impl InstalledPlugins {
     /// directory whose `.openclaudia/` subtree holds project-scoped state).
     pub fn load(project_root: &Path) -> Self {
         let mut merged = Self::default();
+        let canonical_project = project_root
+            .canonicalize()
+            .unwrap_or_else(|_| project_root.to_path_buf());
 
         // Global (User + Managed). If home_dir is unavailable there is no
         // global file to load — leave the global half empty.
         if let Some(global) = Self::global_file_path() {
-            Self::merge_file_into(&global, &mut merged);
+            Self::merge_file_into(&global, &mut merged, true, &canonical_project);
         } else {
             debug!("home_dir() is None; skipping global installed_plugins.json load");
         }
 
         // Project (Project + Local).
         let project = Self::project_file_path(project_root);
-        Self::merge_file_into(&project, &mut merged);
+        Self::merge_file_into(&project, &mut merged, false, &canonical_project);
 
         debug!(
             count = merged.plugins.len(),
@@ -175,17 +182,34 @@ impl InstalledPlugins {
     /// Read a single tracking file (if it exists) and append its entries
     /// into `target`. Missing files are skipped silently; parse / read
     /// errors are logged and skipped.
-    fn merge_file_into(path: &Path, target: &mut Self) {
-        if !path.exists() {
-            return;
-        }
-        match std::fs::read_to_string(path) {
+    fn merge_file_into(
+        path: &Path,
+        target: &mut Self,
+        global_catalogue: bool,
+        canonical_project: &Path,
+    ) {
+        match read_catalogue_bounded(path) {
             Ok(content) => match serde_json::from_str::<Self>(&content) {
                 Ok(data) => {
                     target.disabled_plugins.extend(data.disabled_plugins);
                     for (plugin_id, entries) in data.plugins {
-                        let bucket = target.plugins.entry(plugin_id).or_default();
-                        for entry in entries {
+                        for mut entry in entries {
+                            if entry.scope.is_global() != global_catalogue {
+                                warn!(
+                                    catalogue = %path.display(),
+                                    plugin = %plugin_id,
+                                    declared_scope = %entry.scope,
+                                    "Rejected plugin scope outside the host-selected catalogue domain"
+                                );
+                                continue;
+                            }
+                            entry.project_path = match entry.scope {
+                                InstallScope::Project | InstallScope::Local => {
+                                    Some(canonical_project.to_string_lossy().into_owned())
+                                }
+                                InstallScope::Managed | InstallScope::User => None,
+                            };
+                            let bucket = target.plugins.entry(plugin_id.clone()).or_default();
                             // Preserve existing dedup semantics from `upsert`
                             // (match by scope + project_path).
                             if let Some(existing) = bucket.iter_mut().find(|e| {
@@ -236,6 +260,7 @@ impl InstalledPlugins {
                     }
                 }
             },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => {
                 warn!(path = ?path, error = %e, "Failed to read installed_plugins.json");
             }
@@ -413,6 +438,51 @@ impl InstalledPlugins {
             .map(std::string::String::as_str)
             .collect()
     }
+}
+
+fn read_catalogue_bounded(path: &Path) -> io::Result<String> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_INSTALLED_CATALOGUE_BYTES
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "plugin catalogue must be a non-linked regular file within its byte limit",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file()
+        || opened.len() != metadata.len()
+        || opened.len() > MAX_INSTALLED_CATALOGUE_BYTES
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "plugin catalogue changed while being opened",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(opened.len())
+            .unwrap_or(0)
+            .min(usize::try_from(MAX_INSTALLED_CATALOGUE_BYTES).unwrap_or(0)),
+    );
+    file.take(MAX_INSTALLED_CATALOGUE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_INSTALLED_CATALOGUE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "plugin catalogue grew beyond its byte limit while being read",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 /// Atomically write `view` to `path` (write-tmp + fsync + rename + mode 0o600).
@@ -603,6 +673,60 @@ mod save_tests {
     /// Serializes all tests that touch `$HOME` so they don't trample each
     /// other when the suite is run with multiple threads.
     static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn catalogue_domain_rejects_cross_scope_claims_and_rebinds_project_identity() {
+        let project = TempDir::new().expect("project");
+        let canonical_project = project.path().canonicalize().expect("canonical project");
+        let global_file = project.path().join("global.json");
+        let project_file = project.path().join("project.json");
+
+        let mut global = InstalledPlugins::default();
+        global.plugins.insert(
+            "claimed@m".to_string(),
+            vec![
+                user_entry("/global/user"),
+                project_entry("/forged/project", "/global/forged-project"),
+            ],
+        );
+        std::fs::write(
+            &global_file,
+            serde_json::to_vec(&global).expect("global catalogue"),
+        )
+        .expect("write global catalogue");
+
+        let mut project_catalogue = InstalledPlugins::default();
+        project_catalogue.plugins.insert(
+            "claimed@m".to_string(),
+            vec![
+                local_entry("/forged/project", "/project/local"),
+                managed_entry("/project/forged-managed"),
+            ],
+        );
+        std::fs::write(
+            &project_file,
+            serde_json::to_vec(&project_catalogue).expect("project catalogue"),
+        )
+        .expect("write project catalogue");
+
+        let mut merged = InstalledPlugins::default();
+        InstalledPlugins::merge_file_into(&global_file, &mut merged, true, &canonical_project);
+        InstalledPlugins::merge_file_into(&project_file, &mut merged, false, &canonical_project);
+
+        let entries = &merged.plugins["claimed@m"];
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .any(|entry| { entry.scope == InstallScope::User && entry.project_path.is_none() }));
+        assert!(entries.iter().any(|entry| {
+            entry.scope == InstallScope::Local
+                && entry.project_path.as_deref()
+                    == Some(canonical_project.to_string_lossy().as_ref())
+        }));
+        assert!(!entries
+            .iter()
+            .any(|entry| { matches!(entry.scope, InstallScope::Managed | InstallScope::Project) }));
+    }
 
     // -----------------------------------------------------------------
     // (1) Save with User-scope entry writes only to global file.

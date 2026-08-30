@@ -5,13 +5,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
+const MAX_PLUGIN_SEARCH_CANDIDATES: usize = 4_096;
+
 use super::git::{
     copy_dir_recursive_within, git_clone, git_pull, read_origin_url_sidecar,
     write_origin_url_sidecar,
 };
 use super::install::InstalledPlugins;
 #[cfg(test)]
-use super::install::{InstallScope, PluginInstallEntry};
+use super::install::PluginInstallEntry;
 use super::marketplace::{
     GitHubSource, MarketplaceManifest, MarketplacePlugin, MarketplaceSource, PluginSource,
     PluginSourceDef, UrlSource,
@@ -25,10 +27,16 @@ use super::transaction::{
 };
 use super::zip_cache::ZipCache;
 use super::{
-    Plugin, PluginAgentInvocation, PluginCapabilityRegistry, PluginCapabilityRevocation,
-    PluginCommand, PluginCommandInvocation, PluginError, PluginHook, PluginMcpServer,
-    PluginSkillInvocation,
+    InstallScope, Plugin, PluginAgentInvocation, PluginCapabilityRegistry,
+    PluginCapabilityRevocation, PluginCommand, PluginCommandInvocation, PluginError, PluginHook,
+    PluginMcpServer, PluginSkillInvocation,
 };
+
+#[derive(Debug, Clone)]
+struct PluginSearchRoot {
+    path: PathBuf,
+    scope: InstallScope,
+}
 
 /// Outcome of [`PluginManager::fetch_plugin_archive`].
 ///
@@ -77,7 +85,7 @@ pub struct PluginManager {
     /// Loaded plugins by name
     plugins: HashMap<String, Plugin>,
     /// Search paths for plugins
-    search_paths: Vec<PathBuf>,
+    search_paths: Vec<PluginSearchRoot>,
     /// Installation tracking
     installed: InstalledPlugins,
     /// Exact project root for project-scoped discovery and install state.
@@ -103,20 +111,21 @@ impl PluginManager {
     #[must_use]
     pub fn new() -> Self {
         let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        Self::build(dirs::home_dir(), project_root)
+        Self::build(dirs::home_dir(), &project_root)
     }
 
     /// Create a lenient manager bound to an explicit project root.
     #[must_use]
     pub fn new_for_project(project_root: impl Into<PathBuf>) -> Self {
-        Self::build(dirs::home_dir(), project_root.into())
+        let project_root = project_root.into();
+        Self::build(dirs::home_dir(), &project_root)
     }
 
     /// Create a new plugin manager, returning an error when no home directory
     /// can be resolved.
     ///
-    /// `~/.openclaudia/plugins` and `~/.claude/plugins` are the two user-scope
-    /// search locations; without a home directory, plugin discovery can only
+    /// `~/.openclaudia/plugins` is the user-scope search location; foreign
+    /// caches are available only through explicit import paths. Without a home directory, plugin discovery can only
     /// see project-scoped installs, which silently masks the failure case
     /// where the user installed a plugin globally but the harness can't find
     /// it. Production code paths (proxy startup, `openclaudia plugin …`,
@@ -148,23 +157,30 @@ impl PluginManager {
                         .to_string(),
                 ))
             },
-            |home| Ok(Self::build(Some(home), project_root)),
+            |home| Ok(Self::build(Some(home), &project_root)),
         )
     }
 
     /// Internal helper shared by [`Self::new`] and [`Self::try_new`].
-    fn build(home_dir: Option<PathBuf>, project_root: PathBuf) -> Self {
+    fn build(home_dir: Option<PathBuf>, project_root: &Path) -> Self {
+        let project_root = project_root
+            .canonicalize()
+            .unwrap_or_else(|_| project_root.to_path_buf());
         let mut search_paths = Vec::new();
 
         // User plugins directory
         if let Some(home) = home_dir {
-            search_paths.push(home.join(".openclaudia").join("plugins"));
-            // Also search Claude Code's plugin cache for compatibility
-            search_paths.push(home.join(".claude").join("plugins"));
+            search_paths.push(PluginSearchRoot {
+                path: home.join(".openclaudia").join("plugins"),
+                scope: InstallScope::User,
+            });
         }
 
         // Project plugins directory
-        search_paths.push(project_root.join(".openclaudia/plugins"));
+        search_paths.push(PluginSearchRoot {
+            path: project_root.join(".openclaudia/plugins"),
+            scope: InstallScope::Project,
+        });
 
         let installed = InstalledPlugins::load(&project_root);
         if let Err(error) = recover_pending_transactions(&project_root, &installed) {
@@ -194,6 +210,24 @@ impl PluginManager {
     #[must_use]
     pub fn with_paths_for_project(paths: Vec<PathBuf>, project_root: impl Into<PathBuf>) -> Self {
         let project_root = project_root.into();
+        let project_root = project_root
+            .canonicalize()
+            .unwrap_or_else(|_| project_root.clone());
+        let paths = paths
+            .into_iter()
+            .map(|path| {
+                let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+                let scope = if canonical.starts_with(&project_root) {
+                    InstallScope::Project
+                } else {
+                    InstallScope::Local
+                };
+                PluginSearchRoot {
+                    path: canonical,
+                    scope,
+                }
+            })
+            .collect();
         let installed = InstalledPlugins::load(&project_root);
         if let Err(error) = recover_pending_transactions(&project_root, &installed) {
             warn!(error = %error, "Plugin transaction recovery could not reconcile all staging state");
@@ -211,14 +245,34 @@ impl PluginManager {
     }
 
     /// Discover and load all plugins from search paths and `installed_plugins.json`
+    #[allow(clippy::too_many_lines)] // One ordered pass binds tracked authority before convention discovery and registry publication.
     pub fn discover(&mut self) -> Vec<PluginError> {
         let mut errors = Vec::new();
         let reserved_names = self.discover_tracked_plugins(&mut errors);
 
         // Load from search paths (convention-based discovery)
-        for search_path in &self.search_paths.clone() {
-            if !search_path.exists() {
-                debug!(path = ?search_path, "Plugin search path does not exist");
+        let mut ambiguous_names = HashSet::new();
+        for search_root in &self.search_paths.clone() {
+            let search_path = &search_root.path;
+            let search_metadata = match fs::symlink_metadata(search_path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    debug!(path = ?search_path, "Plugin search path does not exist");
+                    continue;
+                }
+                Err(error) => {
+                    errors.push(PluginError::IoError(format!(
+                        "cannot inspect plugin search root {}: {error}",
+                        search_path.display()
+                    )));
+                    continue;
+                }
+            };
+            if search_metadata.file_type().is_symlink() || !search_metadata.is_dir() {
+                errors.push(PluginError::InvalidManifest(format!(
+                    "plugin search root must be a real directory: {}",
+                    search_path.display()
+                )));
                 continue;
             }
 
@@ -230,7 +284,26 @@ impl PluginManager {
                 }
             };
 
-            let mut entries = entries.flatten().collect::<Vec<_>>();
+            let mut entries = match entries
+                .take(MAX_PLUGIN_SEARCH_CANDIDATES.saturating_add(1))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(entries) => entries,
+                Err(error) => {
+                    errors.push(PluginError::IoError(format!(
+                        "cannot enumerate plugin search root {}: {error}",
+                        search_path.display()
+                    )));
+                    continue;
+                }
+            };
+            if entries.len() > MAX_PLUGIN_SEARCH_CANDIDATES {
+                errors.push(PluginError::InvalidManifest(format!(
+                    "plugin search root {} exceeds {MAX_PLUGIN_SEARCH_CANDIDATES} candidates",
+                    search_path.display()
+                )));
+                continue;
+            }
             entries.sort_by_key(std::fs::DirEntry::file_name);
             for entry in entries {
                 let path = entry.path();
@@ -238,13 +311,67 @@ impl PluginManager {
                 if matches!(file_name.to_str(), Some(".generations" | ".transactions")) {
                     continue;
                 }
-                if path.is_dir() {
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(error) => {
+                        errors.push(PluginError::IoError(format!(
+                            "cannot inspect plugin candidate {}: {error}",
+                            path.display()
+                        )));
+                        continue;
+                    }
+                };
+                if file_type.is_symlink() {
+                    errors.push(PluginError::InvalidManifest(format!(
+                        "plugin discovery refuses linked candidate {}",
+                        path.display()
+                    )));
+                    continue;
+                }
+                if file_type.is_dir() {
                     match Plugin::load(&path) {
                         Ok(mut plugin) => {
-                            if reserved_names.contains(plugin.name()) {
-                                debug!(name = %plugin.name(), path = ?path, "Tracked plugin authority suppresses convention-directory shadow");
+                            let normalized_name = plugin.identity().normalized_package.clone();
+                            if reserved_names.contains(&normalized_name) {
+                                errors.push(PluginError::InvalidManifest(format!(
+                                    "convention plugin '{}' attempts to shadow a tracked package",
+                                    plugin.name()
+                                )));
                                 continue;
                             }
+                            if ambiguous_names.contains(&normalized_name) {
+                                continue;
+                            }
+                            let existing = self
+                                .plugins
+                                .values()
+                                .find(|existing| {
+                                    existing.identity().normalized_package == normalized_name
+                                })
+                                .map(|existing| {
+                                    (existing.name().to_string(), existing.identity().host_scope)
+                                });
+                            if let Some((existing_name, existing_scope)) = existing {
+                                if existing_scope == search_root.scope {
+                                    self.plugins.remove(&existing_name);
+                                    ambiguous_names.insert(normalized_name);
+                                    errors.push(PluginError::InvalidManifest(format!(
+                                        "ambiguous plugin name '{}' appears more than once in {} scope",
+                                        plugin.name(), search_root.scope
+                                    )));
+                                } else {
+                                    errors.push(PluginError::InvalidManifest(format!(
+                                        "plugin '{}' in {} scope cannot shadow the active {}-scope package",
+                                        plugin.name(), search_root.scope, existing_scope
+                                    )));
+                                }
+                                continue;
+                            }
+                            plugin.bind_host_identity(
+                                search_root.scope,
+                                self.host_owner(search_root.scope),
+                                format!("convention-directory:{}", plugin.root().display()),
+                            );
                             if self.disabled_plugins.contains(plugin.name()) {
                                 plugin.enabled = false;
                             }
@@ -276,6 +403,7 @@ impl PluginManager {
         errors
     }
 
+    #[allow(clippy::too_many_lines)] // Selection, receipt validation, and identity binding form one tracked-package transaction.
     fn discover_tracked_plugins(&mut self, errors: &mut Vec<PluginError>) -> HashSet<String> {
         // Tracked entries are activation authority. Reserve their names even
         // when validation fails so convention directories cannot shadow a
@@ -284,7 +412,13 @@ impl PluginManager {
             .installed
             .plugins
             .keys()
-            .map(|plugin_id| plugin_id.split('@').next().unwrap_or(plugin_id).to_string())
+            .map(|plugin_id| {
+                plugin_id
+                    .split('@')
+                    .next()
+                    .unwrap_or(plugin_id)
+                    .to_ascii_lowercase()
+            })
             .collect::<HashSet<_>>();
         let mut tracked = self
             .installed
@@ -297,14 +431,73 @@ impl PluginManager {
             })
             .collect::<Vec<_>>();
         tracked.sort_by(|left, right| {
-            (&left.0, &left.1.install_path).cmp(&(&right.0, &right.1.install_path))
+            let left_name = left
+                .0
+                .split('@')
+                .next()
+                .unwrap_or(&left.0)
+                .to_ascii_lowercase();
+            let right_name = right
+                .0
+                .split('@')
+                .next()
+                .unwrap_or(&right.0)
+                .to_ascii_lowercase();
+            (
+                left_name,
+                Self::scope_precedence(left.1.scope),
+                &left.0,
+                &left.1.install_path,
+            )
+                .cmp(&(
+                    right_name,
+                    Self::scope_precedence(right.1.scope),
+                    &right.0,
+                    &right.1.install_path,
+                ))
         });
+        let mut selected_scopes = HashMap::<String, InstallScope>::new();
+        let mut ambiguous = HashSet::new();
         for (plugin_id, entry) in tracked {
-            let install_path = PathBuf::from(&entry.install_path);
-            if !install_path.exists() {
-                debug!(plugin = %plugin_id, path = ?install_path, "Installed plugin path missing");
+            let expected_name = plugin_id.split('@').next().unwrap_or(&plugin_id);
+            let normalized_name = expected_name.to_ascii_lowercase();
+            if ambiguous.contains(&normalized_name) {
                 continue;
             }
+            if let Some(selected_scope) = selected_scopes.get(&normalized_name).copied() {
+                if Self::scope_precedence(selected_scope) == Self::scope_precedence(entry.scope) {
+                    if let Some(existing) = self
+                        .plugins
+                        .values()
+                        .find(|plugin| plugin.identity().normalized_package == normalized_name)
+                        .map(|plugin| plugin.name().to_string())
+                    {
+                        self.plugins.remove(&existing);
+                    }
+                    ambiguous.insert(normalized_name);
+                    errors.push(PluginError::InvalidManifest(format!(
+                        "tracked plugin identity '{expected_name}' has multiple active entries in {selected_scope} scope"
+                    )));
+                } else {
+                    errors.push(PluginError::InvalidManifest(format!(
+                        "tracked plugin '{expected_name}' in {} scope cannot shadow the selected {selected_scope}-scope package",
+                        entry.scope
+                    )));
+                }
+                continue;
+            }
+            // Claim the normalized name before touching package bytes. A
+            // rejected higher-authority entry remains reserved so lower-scope
+            // metadata cannot replace a trusted package that failed closed.
+            selected_scopes.insert(normalized_name.clone(), entry.scope);
+            let install_path = match self.canonical_tracked_install_path(&entry) {
+                Ok(path) => path,
+                Err(error) => {
+                    warn!(plugin = %plugin_id, error = %error, "Rejected plugin catalogue path");
+                    errors.push(error);
+                    continue;
+                }
+            };
             let generation_receipt = match verify_installed_generation(&install_path) {
                 Ok(receipt) => receipt,
                 Err(error) => {
@@ -313,11 +506,6 @@ impl PluginManager {
                     continue;
                 }
             };
-            let expected_name = plugin_id.split('@').next().unwrap_or(&plugin_id);
-            if self.plugins.contains_key(expected_name) {
-                warn!(plugin = %plugin_id, "Duplicate tracked plugin identity ignored deterministically");
-                continue;
-            }
             match Plugin::load(&install_path) {
                 Ok(mut plugin) if plugin.name() == expected_name => {
                     plugin.id.clone_from(&plugin_id);
@@ -325,7 +513,17 @@ impl PluginManager {
                         plugin.source = marketplace.to_string();
                     }
                     if let Some(receipt) = generation_receipt {
-                        plugin.bind_generation_receipt(receipt);
+                        if let Err(error) = plugin.bind_generation_receipt(entry.scope, receipt) {
+                            warn!(plugin = %plugin_id, error = %error, "Rejected plugin receipt identity");
+                            errors.push(error);
+                            continue;
+                        }
+                    } else {
+                        plugin.bind_host_identity(
+                            entry.scope,
+                            self.host_owner(entry.scope),
+                            format!("catalogue-directory:{}", install_path.display()),
+                        );
                     }
                     if self.disabled_plugins.contains(plugin.name()) {
                         plugin.enabled = false;
@@ -349,6 +547,140 @@ impl PluginManager {
             }
         }
         reserved_names
+    }
+
+    const fn scope_precedence(scope: InstallScope) -> u8 {
+        match scope {
+            InstallScope::Managed => 0,
+            InstallScope::User => 1,
+            InstallScope::Project => 2,
+            InstallScope::Local => 3,
+        }
+    }
+
+    fn host_owner(&self, scope: InstallScope) -> String {
+        match scope {
+            InstallScope::Managed => "host-managed-catalogue".to_string(),
+            InstallScope::User => "host-user-catalogue".to_string(),
+            InstallScope::Project | InstallScope::Local => format!(
+                "workspace:{}",
+                crate::runtime::ContentDigest::sha256(
+                    self.project_root.as_os_str().as_encoded_bytes()
+                )
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // Every path component is checked as one catalogue-containment decision.
+    fn canonical_tracked_install_path(
+        &self,
+        entry: &super::PluginInstallEntry,
+    ) -> Result<PathBuf, PluginError> {
+        let configured_root = match entry.scope {
+            InstallScope::Managed | InstallScope::User => dirs::home_dir()
+                .ok_or_else(|| {
+                    PluginError::InvalidManifest(
+                        "global plugin catalogue is unavailable without a home directory"
+                            .to_string(),
+                    )
+                })?
+                .join(".openclaudia/plugins"),
+            InstallScope::Project | InstallScope::Local => {
+                let bound_project = entry.project_path.as_deref().ok_or_else(|| {
+                    PluginError::InvalidManifest(
+                        "project plugin catalogue entry has no host project binding".to_string(),
+                    )
+                })?;
+                let bound_project = Path::new(bound_project).canonicalize().map_err(|error| {
+                    PluginError::InvalidManifest(format!(
+                        "cannot canonicalize project plugin binding: {error}"
+                    ))
+                })?;
+                if bound_project != self.project_root {
+                    return Err(PluginError::InvalidManifest(
+                        "project plugin catalogue entry belongs to another workspace".to_string(),
+                    ));
+                }
+                self.project_root.join(".openclaudia/plugins")
+            }
+        };
+        let root_metadata = fs::symlink_metadata(&configured_root).map_err(|error| {
+            PluginError::InvalidManifest(format!(
+                "cannot inspect plugin catalogue root {}: {error}",
+                configured_root.display()
+            ))
+        })?;
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin catalogue root must be a real directory: {}",
+                configured_root.display()
+            )));
+        }
+        let canonical_root = configured_root.canonicalize().map_err(|error| {
+            PluginError::InvalidManifest(format!(
+                "cannot canonicalize plugin catalogue root {}: {error}",
+                configured_root.display()
+            ))
+        })?;
+        let declared = Path::new(&entry.install_path);
+        if !declared.is_absolute() {
+            return Err(PluginError::InvalidManifest(
+                "plugin catalogue install path must be absolute".to_string(),
+            ));
+        }
+        let relative = declared.strip_prefix(&configured_root).map_err(|_| {
+            PluginError::InvalidManifest(format!(
+                "plugin install path {} is not rooted in its host-selected catalogue",
+                declared.display()
+            ))
+        })?;
+        let mut walked = configured_root.clone();
+        for component in relative.components() {
+            let std::path::Component::Normal(component) = component else {
+                return Err(PluginError::InvalidManifest(
+                    "plugin install path contains a non-normal component".to_string(),
+                ));
+            };
+            walked.push(component);
+            let metadata = fs::symlink_metadata(&walked).map_err(|error| {
+                PluginError::InvalidManifest(format!(
+                    "cannot inspect plugin install path component {}: {error}",
+                    walked.display()
+                ))
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(PluginError::InvalidManifest(format!(
+                    "plugin install path contains a symbolic link: {}",
+                    walked.display()
+                )));
+            }
+        }
+        let canonical = declared.canonicalize().map_err(|error| {
+            PluginError::InvalidManifest(format!(
+                "cannot canonicalize plugin install path {}: {error}",
+                declared.display()
+            ))
+        })?;
+        if !canonical.starts_with(&canonical_root) {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin install path {} escapes its {} catalogue",
+                canonical.display(),
+                entry.scope
+            )));
+        }
+        let metadata = fs::symlink_metadata(&canonical).map_err(|error| {
+            PluginError::InvalidManifest(format!(
+                "cannot inspect plugin install path {}: {error}",
+                canonical.display()
+            ))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin install path must be a real directory: {}",
+                canonical.display()
+            )));
+        }
+        Ok(canonical)
     }
 
     /// Get a plugin by name
@@ -1797,6 +2129,21 @@ mod policy_tests {
     use super::*;
     use std::io::Write as _;
     use tempfile::TempDir;
+
+    #[test]
+    fn default_discovery_does_not_ambiently_activate_foreign_claude_cache() {
+        let project = TempDir::new().expect("project");
+        let manager = PluginManager::new_for_project(project.path());
+
+        assert!(!manager
+            .search_paths
+            .iter()
+            .any(|root| root.path.ends_with(Path::new(".claude/plugins"))));
+        assert!(manager.search_paths.iter().any(|root| {
+            root.scope == InstallScope::Project
+                && root.path.ends_with(Path::new(".openclaudia/plugins"))
+        }));
+    }
 
     fn cached_plugin_archive() -> Vec<u8> {
         let cursor = std::io::Cursor::new(Vec::new());

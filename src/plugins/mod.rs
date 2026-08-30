@@ -62,11 +62,25 @@ pub use validate::{
     SignatureError,
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 use tracing::{debug, warn};
+
+/// Stable schema for host-bound package identities.
+pub const PLUGIN_IDENTITY_SCHEMA: &str = "openclaudia.plugin_identity.v1";
+/// Exact host interpretation of `.claude-plugin/plugin.json`.
+pub const CLAUDE_PLUGIN_MANIFEST_SCHEMA: &str = "claude-code.plugin-manifest.v1";
+/// Exact host interpretation of root `plugin.json` compatibility packages.
+pub const ROOT_PLUGIN_MANIFEST_SCHEMA: &str = "claude-code.root-plugin-manifest.v1";
+/// Exact host interpretation of legacy `OpenClaudia` manifests.
+pub const LEGACY_PLUGIN_MANIFEST_SCHEMA: &str = "openclaudia.legacy-plugin-manifest.v1";
+
+const MAX_PLUGIN_METADATA_FILE_BYTES: u64 = 256 * 1024;
+const MAX_PLUGIN_NAME_BYTES: usize = 128;
+const MAX_PLUGIN_COMPONENTS_PER_KIND: usize = 512;
 
 // ---------------------------------------------------------------------------
 // Path safety helpers (crosslink #347)
@@ -193,14 +207,60 @@ fn validate_plugin_path(root: &Path, rel: &str) -> Result<PathBuf, PluginError> 
 /// so an attacker who can plant `.claude-plugin/plugin.json` as a
 /// symlink to `/etc/shadow` cannot make us read it.
 fn read_plugin_file(path: &Path) -> Result<String, PluginError> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => Err(PluginError::InvalidManifest(format!(
-            "plugin file is a symlink (refusing to follow): {}",
+    let observed =
+        fs::symlink_metadata(path).map_err(|error| PluginError::IoError(error.to_string()))?;
+    if observed.file_type().is_symlink() || !observed.is_file() {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin metadata must be a regular file, not a link or special entry: {}",
             path.display()
-        ))),
-        Ok(_) => fs::read_to_string(path).map_err(|e| PluginError::IoError(e.to_string())),
-        Err(e) => Err(PluginError::IoError(e.to_string())),
+        )));
     }
+    if observed.len() > MAX_PLUGIN_METADATA_FILE_BYTES {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin metadata {} exceeds {MAX_PLUGIN_METADATA_FILE_BYTES} bytes",
+            path.display()
+        )));
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| PluginError::IoError(error.to_string()))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| PluginError::IoError(error.to_string()))?;
+    if !opened.is_file() || opened.len() != observed.len() {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin metadata changed while being opened: {}",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(opened.len())
+            .unwrap_or(0)
+            .min(usize::try_from(MAX_PLUGIN_METADATA_FILE_BYTES).unwrap_or(0)),
+    );
+    file.take(MAX_PLUGIN_METADATA_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| PluginError::IoError(error.to_string()))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_PLUGIN_METADATA_FILE_BYTES {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin metadata changed beyond {MAX_PLUGIN_METADATA_FILE_BYTES} bytes while being read: {}",
+            path.display()
+        )));
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        PluginError::InvalidManifest(format!(
+            "plugin metadata is not UTF-8 at {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -633,6 +693,101 @@ where
 // Plugin loading
 // ---------------------------------------------------------------------------
 
+/// Host-bound identity of one immutable plugin package snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PluginPackageIdentity {
+    /// Identity record schema owned by the host.
+    pub schema: &'static str,
+    /// Normalized package key used for collision detection.
+    pub normalized_package: String,
+    /// Catalogue/search authority selected by the host.
+    pub host_scope: InstallScope,
+    /// Canonical source observed by the host, including its source family.
+    pub canonical_source: String,
+    /// SHA-256 of the complete bounded package tree.
+    pub artifact_digest: String,
+    /// Immutable source revision, or the tree digest for directory packages.
+    pub source_revision: String,
+    /// Exact parser schema used for the package manifest.
+    pub manifest_schema: &'static str,
+    /// Host or verified publisher identity responsible for the package.
+    pub owner: String,
+}
+
+fn normalized_plugin_name(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
+fn canonical_artifact_source(source: &ArtifactSourceProvenance) -> Result<String, PluginError> {
+    const MAX_CANONICAL_SOURCE_BYTES: usize = 16 * 1024;
+    if source.kind.trim().is_empty()
+        || source.locator.trim().is_empty()
+        || source.kind.len().saturating_add(source.locator.len()) > MAX_CANONICAL_SOURCE_BYTES
+        || source.kind.chars().any(char::is_control)
+        || source.locator.chars().any(char::is_control)
+    {
+        return Err(PluginError::InvalidManifest(
+            "installed receipt has an invalid or oversized canonical source".to_string(),
+        ));
+    }
+    let locator = url::Url::parse(&source.locator).map_or_else(
+        |_| source.locator.clone(),
+        |mut url| {
+            url.set_fragment(None);
+            url.to_string()
+        },
+    );
+    Ok(format!("{}:{locator}", source.kind))
+}
+
+fn validate_manifest_component_bounds(manifest: &PluginManifest) -> Result<(), PluginError> {
+    fn reject_if_oversized(kind: &str, count: usize) -> Result<(), PluginError> {
+        if count > MAX_PLUGIN_COMPONENTS_PER_KIND {
+            Err(PluginError::InvalidManifest(format!(
+                "plugin manifest declares {count} {kind}; maximum is {MAX_PLUGIN_COMPONENTS_PER_KIND}"
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    let commands = manifest
+        .commands
+        .as_ref()
+        .map_or(0, |commands| match commands {
+            CommandsSpec::Path(_) => 1,
+            CommandsSpec::Paths(paths) => paths.len(),
+            CommandsSpec::Map(commands) => commands.len(),
+        });
+    let hooks = manifest.hooks.as_ref().map_or(0, |hooks| match hooks {
+        HooksSpec::Path(_) | HooksSpec::Inline(_) => 1,
+        HooksSpec::Array(entries) => entries.len(),
+    });
+    let agents = manifest.agents.as_ref().map_or(0, |agents| match agents {
+        AgentsSpec::Path(_) => 1,
+        AgentsSpec::Paths(paths) => paths.len(),
+    });
+    let skills = manifest.skills.as_ref().map_or(0, |skills| match skills {
+        SkillsSpec::Path(_) => 1,
+        SkillsSpec::Paths(paths) => paths.len(),
+    });
+    let mcp = manifest
+        .mcp_servers
+        .as_ref()
+        .map_or(0, |servers| match servers {
+            McpServersSpec::Path(_) | McpServersSpec::Map(_) => 1,
+            McpServersSpec::Array(entries) => entries.len(),
+        });
+    let lsp = manifest.lsp_servers.as_ref().map_or(0, HashMap::len);
+
+    reject_if_oversized("command entries", commands)?;
+    reject_if_oversized("hook entries", hooks)?;
+    reject_if_oversized("agent entries", agents)?;
+    reject_if_oversized("skill entries", skills)?;
+    reject_if_oversized("MCP entries", mcp)?;
+    reject_if_oversized("LSP entries", lsp)
+}
+
 /// A loaded plugin
 #[derive(Debug, Clone)]
 pub struct Plugin {
@@ -666,6 +821,8 @@ pub struct Plugin {
     /// plugins have no receipt and are bound to a host-observed tree digest
     /// when their capability generation is compiled.
     generation_receipt: Option<ArtifactGenerationReceipt>,
+    /// Stable package identity bound before the package can be activated.
+    identity: PluginPackageIdentity,
 }
 
 impl Plugin {
@@ -673,43 +830,87 @@ impl Plugin {
     ///
     /// # Errors
     /// Returns an error if plugin loading fails.
+    #[allow(clippy::too_many_lines)] // Package probing, manifest validation, digesting, and identity sealing are one load transaction.
     pub fn load(path: &Path) -> Result<Self, PluginError> {
+        let root_metadata =
+            fs::symlink_metadata(path).map_err(|error| PluginError::IoError(error.to_string()))?;
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin root must be a real directory, not a link or special entry: {}",
+                path.display()
+            )));
+        }
+        let canonical_root = path.canonicalize().map_err(|error| {
+            PluginError::IoError(format!(
+                "cannot canonicalize plugin root {}: {error}",
+                path.display()
+            ))
+        })?;
+        let initial_digest = digest_package_tree(&canonical_root)?;
+
         // Try Claude Code format first: .claude-plugin/plugin.json
-        let cc_manifest_path = path.join(".claude-plugin").join("plugin.json");
+        let cc_manifest_path = canonical_root.join(".claude-plugin").join("plugin.json");
         // Also try plugin.json at root (legacy Claude Code location)
-        let root_plugin_json = path.join("plugin.json");
+        let root_plugin_json = canonical_root.join("plugin.json");
         // Legacy OpenClaudia format
-        let legacy_manifest_path = path.join("manifest.json");
+        let legacy_manifest_path = canonical_root.join("manifest.json");
+
+        let candidates = [
+            (&cc_manifest_path, CLAUDE_PLUGIN_MANIFEST_SCHEMA),
+            (&root_plugin_json, ROOT_PLUGIN_MANIFEST_SCHEMA),
+            (&legacy_manifest_path, LEGACY_PLUGIN_MANIFEST_SCHEMA),
+        ]
+        .into_iter()
+        .filter_map(
+            |(candidate, schema)| match fs::symlink_metadata(candidate) {
+                Ok(_) => Some(Ok((candidate, schema))),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => Some(Err(PluginError::IoError(error.to_string()))),
+            },
+        )
+        .collect::<Result<Vec<_>, _>>()?;
+        if candidates.len() > 1 {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin package has ambiguous manifests under {}",
+                canonical_root.display()
+            )));
+        }
+        let Some((manifest_path, manifest_schema)) = candidates.first().copied() else {
+            return Err(PluginError::ManifestNotFound(canonical_root));
+        };
 
         // Manifest reads MUST go through `read_plugin_file` so that a
         // symlinked `plugin.json` (pointing at e.g. `/etc/shadow`) is
         // rejected before we touch its contents. See crosslink #347.
-        let manifest: PluginManifest = if cc_manifest_path.exists() {
-            debug!(path = ?cc_manifest_path, "Loading Claude Code plugin manifest");
-            let content = read_plugin_file(&cc_manifest_path)?;
+        let manifest: PluginManifest = if manifest_schema == CLAUDE_PLUGIN_MANIFEST_SCHEMA {
+            debug!(path = ?manifest_path, "Loading Claude Code plugin manifest");
+            let content = read_plugin_file(manifest_path)?;
             serde_json::from_str(&content).map_err(|e| {
-                PluginError::InvalidManifest(format!("{}: {}", cc_manifest_path.display(), e))
+                PluginError::InvalidManifest(format!("{}: {}", manifest_path.display(), e))
             })?
-        } else if root_plugin_json.exists() {
-            debug!(path = ?root_plugin_json, "Loading plugin.json from root");
-            let content = read_plugin_file(&root_plugin_json)?;
+        } else if manifest_schema == ROOT_PLUGIN_MANIFEST_SCHEMA {
+            debug!(path = ?manifest_path, "Loading plugin.json from root");
+            let content = read_plugin_file(manifest_path)?;
             serde_json::from_str(&content).map_err(|e| {
-                PluginError::InvalidManifest(format!("{}: {}", root_plugin_json.display(), e))
+                PluginError::InvalidManifest(format!("{}: {}", manifest_path.display(), e))
             })?
-        } else if legacy_manifest_path.exists() {
-            debug!(path = ?legacy_manifest_path, "Loading legacy manifest.json");
-            Self::load_legacy_manifest(&legacy_manifest_path)?
+        } else if manifest_schema == LEGACY_PLUGIN_MANIFEST_SCHEMA {
+            debug!(path = ?manifest_path, "Loading legacy manifest.json");
+            Self::load_legacy_manifest(manifest_path)?
         } else {
-            return Err(PluginError::ManifestNotFound(path.to_path_buf()));
+            return Err(PluginError::InvalidManifest(
+                "plugin manifest schema is unsupported".to_string(),
+            ));
         };
 
         Self::validate_manifest(&manifest)?;
+        let normalized_package = normalized_plugin_name(&manifest.name);
 
         let mut plugin = Self {
             id: manifest.name.clone(),
             source: "local".to_string(),
             manifest,
-            path: path.to_path_buf(),
+            path: canonical_root.clone(),
             enabled: true,
             command_paths: Vec::new(),
             command_metadata: HashMap::new(),
@@ -719,15 +920,57 @@ impl Plugin {
             agent_paths: Vec::new(),
             skill_paths: Vec::new(),
             generation_receipt: None,
+            identity: PluginPackageIdentity {
+                schema: PLUGIN_IDENTITY_SCHEMA,
+                normalized_package,
+                host_scope: InstallScope::Local,
+                canonical_source: format!("local-directory:{}", canonical_root.display()),
+                artifact_digest: initial_digest.clone(),
+                source_revision: initial_digest.clone(),
+                manifest_schema,
+                owner: "host-observed-local".to_string(),
+            },
         };
 
         // Resolve all components
         plugin.resolve_commands();
         plugin.resolve_hooks();
-        plugin.resolve_mcp_servers();
+        plugin.resolve_mcp_servers()?;
         plugin.resolve_lsp_servers();
         plugin.resolve_agents();
         plugin.resolve_skills();
+
+        for (kind, count) in [
+            (
+                "commands",
+                plugin
+                    .command_paths
+                    .len()
+                    .saturating_add(plugin.command_metadata.len()),
+            ),
+            ("hooks", plugin.hook_definitions.len()),
+            ("MCP servers", plugin.mcp_configs.len()),
+            ("LSP servers", plugin.lsp_configs.len()),
+            ("agents", plugin.agent_paths.len()),
+            ("skills", plugin.skill_paths.len()),
+        ] {
+            if count > MAX_PLUGIN_COMPONENTS_PER_KIND {
+                return Err(PluginError::InvalidManifest(format!(
+                    "plugin discovery found {count} {kind}; maximum is {MAX_PLUGIN_COMPONENTS_PER_KIND}"
+                )));
+            }
+        }
+
+        for command_path in &plugin.command_paths {
+            read_plugin_file(command_path)?;
+        }
+
+        let final_digest = digest_package_tree(&canonical_root)?;
+        if final_digest != initial_digest {
+            return Err(PluginError::InvalidManifest(
+                "plugin package changed while discovery was reading it".to_string(),
+            ));
+        }
 
         Ok(plugin)
     }
@@ -840,7 +1083,16 @@ impl Plugin {
                     .to_string(),
             ));
         }
+        if manifest.name.len() > MAX_PLUGIN_NAME_BYTES
+            || !manifest.name.is_ascii()
+            || manifest.name.contains('@')
+        {
+            return Err(PluginError::InvalidManifest(format!(
+                "Plugin name must be unscoped ASCII without '@' and no longer than {MAX_PLUGIN_NAME_BYTES} bytes"
+            )));
+        }
         validate_plugin_dir_name(&manifest.name)?;
+        validate_manifest_component_bounds(manifest)?;
         Ok(())
     }
 
@@ -1003,6 +1255,7 @@ impl Plugin {
     fn load_hooks_file(path: &Path) -> Result<HooksDefinition, PluginError> {
         // Try wrapper format: { "description": "...", "hooks": { ... } }
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct HooksWrapper {
             #[serde(default)]
             description: Option<String>,
@@ -1031,23 +1284,14 @@ impl Plugin {
     /// `if let Ok(...)` chains with no `else`, which meant a plugin author who
     /// shipped a broken `.mcp.json` got zero diagnostic — the plugin loaded
     /// with the broken server silently absent.
-    fn resolve_mcp_servers(&mut self) {
+    fn resolve_mcp_servers(&mut self) -> Result<(), PluginError> {
         // Convention: .mcp.json at plugin root. Use the symlink-rejecting
         // reader so an attacker cannot swap .mcp.json for a symlink to
         // a sensitive file. See crosslink #347.
         let mcp_json = self.path.join(".mcp.json");
         if mcp_json.exists() {
-            match read_plugin_file(&mcp_json) {
-                Ok(content) => self.parse_mcp_json_file(&mcp_json, &content),
-                Err(e) => {
-                    warn!(
-                        path = ?mcp_json,
-                        plugin = %self.manifest.name,
-                        error = %e,
-                        "Plugin .mcp.json unreadable; skipping MCP servers from this file"
-                    );
-                }
-            }
+            let content = read_plugin_file(&mcp_json)?;
+            self.parse_mcp_json_file(&mcp_json, &content)?;
         }
 
         // Manifest-specified MCP servers — paths go through
@@ -1063,21 +1307,19 @@ impl Plugin {
             match mcp_spec {
                 McpServersSpec::Path(p) => match validate_plugin_path(&self.path, &p) {
                     Ok(resolved) if resolved.exists() => {
-                        self.load_mcp_servers_from_path(&p, &resolved);
+                        self.load_mcp_servers_from_path(&p, &resolved)?;
                     }
                     Ok(_) => {
-                        warn!(
-                            path = %p,
-                            plugin = %self.manifest.name,
-                            "Plugin manifest mcp_servers path does not exist"
-                        );
+                        return Err(PluginError::InvalidManifest(format!(
+                            "plugin manifest MCP path does not exist: {p}"
+                        )));
                     }
                     Err(e) => {
-                        warn!(path = %p, plugin = %self.manifest.name, error = %e, "Rejected unsafe mcp_servers path");
+                        return Err(e);
                     }
                 },
                 McpServersSpec::Map(map) => {
-                    self.mcp_configs.extend(map);
+                    self.insert_mcp_configs(map)?;
                 }
                 McpServersSpec::Array(entries) => {
                     for entry in entries {
@@ -1085,34 +1327,33 @@ impl Plugin {
                             McpServersSpecEntry::Path(p) => {
                                 match validate_plugin_path(&self.path, &p) {
                                     Ok(resolved) if resolved.exists() => {
-                                        self.load_mcp_servers_from_path(&p, &resolved);
+                                        self.load_mcp_servers_from_path(&p, &resolved)?;
                                     }
                                     Ok(_) => {
-                                        warn!(
-                                            path = %p,
-                                            plugin = %self.manifest.name,
-                                            "Plugin manifest mcp_servers path does not exist"
-                                        );
+                                        return Err(PluginError::InvalidManifest(format!(
+                                            "plugin manifest MCP path does not exist: {p}"
+                                        )));
                                     }
                                     Err(e) => {
-                                        warn!(path = %p, plugin = %self.manifest.name, error = %e, "Rejected unsafe mcp_servers path");
+                                        return Err(e);
                                     }
                                 }
                             }
                             McpServersSpecEntry::Map(map) => {
-                                self.mcp_configs.extend(map);
+                                self.insert_mcp_configs(map)?;
                             }
                         }
                     }
                 }
             }
         }
+        Ok(())
     }
 
     /// Parse a `.mcp.json` body (the convention file at the plugin root) and
     /// extend `self.mcp_configs`. Every parse failure logs a `warn!` with the
     /// plugin name and path so operators can spot a broken file (crosslink #799).
-    fn parse_mcp_json_file(&mut self, path: &Path, content: &str) {
+    fn parse_mcp_json_file(&mut self, path: &Path, content: &str) -> Result<(), PluginError> {
         // .mcp.json can be `{ "mcpServers": { ... } }` or a direct map.
         match serde_json::from_str::<HashMap<String, serde_json::Value>>(content) {
             Ok(wrapper) => {
@@ -1121,42 +1362,56 @@ impl Plugin {
                         servers_val.clone(),
                     ) {
                         Ok(servers) => {
-                            self.mcp_configs.extend(servers);
+                            self.insert_mcp_configs(servers)?;
                         }
                         Err(e) => {
-                            warn!(
-                                path = ?path,
-                                plugin = %self.manifest.name,
-                                error = %e,
-                                "Plugin .mcp.json `mcpServers` block could not be decoded as McpServerConfig map"
-                            );
+                            return Err(PluginError::InvalidManifest(format!(
+                                "plugin MCP file {} has an invalid mcpServers block: {e}",
+                                path.display()
+                            )));
                         }
                     }
                 } else {
                     match serde_json::from_str::<HashMap<String, McpServerConfig>>(content) {
                         Ok(servers) => {
-                            self.mcp_configs.extend(servers);
+                            self.insert_mcp_configs(servers)?;
                         }
                         Err(e) => {
-                            warn!(
-                                path = ?path,
-                                plugin = %self.manifest.name,
-                                error = %e,
-                                "Plugin .mcp.json (direct-map form) could not be decoded as McpServerConfig map"
-                            );
+                            return Err(PluginError::InvalidManifest(format!(
+                                "plugin MCP file {} is not a valid server map: {e}",
+                                path.display()
+                            )));
                         }
                     }
                 }
             }
             Err(e) => {
-                warn!(
-                    path = ?path,
-                    plugin = %self.manifest.name,
-                    error = %e,
-                    "Plugin .mcp.json is not valid JSON; skipping MCP servers from this file"
-                );
+                return Err(PluginError::InvalidManifest(format!(
+                    "plugin MCP file {} is not valid JSON: {e}",
+                    path.display()
+                )));
             }
         }
+        Ok(())
+    }
+
+    fn insert_mcp_configs(
+        &mut self,
+        servers: HashMap<String, McpServerConfig>,
+    ) -> Result<(), PluginError> {
+        if self.mcp_configs.len().saturating_add(servers.len()) > MAX_PLUGIN_COMPONENTS_PER_KIND {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin declares more than {MAX_PLUGIN_COMPONENTS_PER_KIND} MCP servers"
+            )));
+        }
+        for (name, config) in servers {
+            if self.mcp_configs.insert(name.clone(), config).is_some() {
+                return Err(PluginError::InvalidManifest(format!(
+                    "plugin declares duplicate MCP server '{name}'"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Read and parse a manifest-referenced MCP servers file. Logs every
@@ -1164,19 +1419,17 @@ impl Plugin {
     /// `{ "mcpServers": { ... } }` wrapper form and the bare-map form so
     /// manifest-Path branches and the convention `.mcp.json` branch agree
     /// on accepted shapes (crosslink #919).
-    fn load_mcp_servers_from_path(&mut self, declared: &str, resolved: &Path) {
-        match read_plugin_file(resolved) {
-            Ok(content) => self.parse_mcp_json_file(resolved, &content),
-            Err(e) => {
-                warn!(
-                    declared = %declared,
-                    resolved = ?resolved,
-                    plugin = %self.manifest.name,
-                    error = %e,
-                    "Plugin manifest mcp_servers file unreadable"
-                );
-            }
-        }
+    fn load_mcp_servers_from_path(
+        &mut self,
+        declared: &str,
+        resolved: &Path,
+    ) -> Result<(), PluginError> {
+        let content = read_plugin_file(resolved).map_err(|error| {
+            PluginError::InvalidManifest(format!(
+                "plugin manifest MCP path {declared} is unreadable: {error}"
+            ))
+        })?;
+        self.parse_mcp_json_file(resolved, &content)
     }
 
     /// Resolve plugin-declared LSP server registrations (CC parity with
@@ -1284,8 +1537,49 @@ impl Plugin {
         self.generation_receipt.as_ref()
     }
 
-    pub(crate) fn bind_generation_receipt(&mut self, receipt: ArtifactGenerationReceipt) {
+    /// Stable host-bound package identity used by activation and grants.
+    #[must_use]
+    pub const fn identity(&self) -> &PluginPackageIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn bind_host_identity(
+        &mut self,
+        scope: InstallScope,
+        owner: String,
+        canonical_source: String,
+    ) {
+        self.identity.host_scope = scope;
+        self.identity.owner = owner;
+        self.identity.canonical_source = canonical_source;
+    }
+
+    pub(crate) fn bind_generation_receipt(
+        &mut self,
+        scope: InstallScope,
+        receipt: ArtifactGenerationReceipt,
+    ) -> Result<(), PluginError> {
+        if receipt.plugin_id != self.id
+            || receipt.statement.package != self.manifest.name
+            || receipt.statement.version != self.manifest.version
+            || receipt.statement.artifact_digest != self.identity.artifact_digest
+            || receipt.statement.source_revision != receipt.source.resolved_revision
+            || receipt.source.resolved_revision.trim().is_empty()
+            || receipt.statement.publisher.trim().is_empty()
+        {
+            return Err(PluginError::InvalidManifest(format!(
+                "installed receipt does not bind the loaded package identity for {}",
+                self.manifest.name
+            )));
+        }
+        self.identity.host_scope = scope;
+        self.identity.owner.clone_from(&receipt.statement.publisher);
+        self.identity.canonical_source = canonical_artifact_source(&receipt.source)?;
+        self.identity
+            .source_revision
+            .clone_from(&receipt.source.resolved_revision);
         self.generation_receipt = Some(receipt);
+        Ok(())
     }
 
     /// Get environment variables to set when running plugin scripts
@@ -1400,7 +1694,7 @@ impl Plugin {
             // a "command" with no description, no body, and no flags — the
             // plugin author who shipped an unreadable file got zero signal.
             // Log and skip the entry so operators can grep for the warning.
-            let raw_content = match fs::read_to_string(path) {
+            let raw_content = match read_plugin_file(path) {
                 Ok(c) => c,
                 Err(e) => {
                     warn!(
@@ -2839,7 +3133,10 @@ Based on the above changes, create a single git commit.
 
         let err = read_plugin_file(&manifest_path).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("symlink"), "expected symlink rejection: {msg}");
+        assert!(
+            msg.contains("link"),
+            "expected linked-file rejection: {msg}"
+        );
         // Forensic: the secret contents MUST NOT appear in the error.
         assert!(
             !msg.contains("SUPER-SECRET"),
@@ -2868,8 +3165,8 @@ Based on the above changes, create a single git commit.
         assert!(result.is_err(), "symlinked manifest must be rejected");
         let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("symlink"),
-            "expected symlink error, got: {msg}"
+            msg.contains("link"),
+            "expected linked-file error, got: {msg}"
         );
         assert!(
             !msg.contains("OUTSIDE"),
@@ -2965,8 +3262,12 @@ Based on the above changes, create a single git commit.
                 "mcpServers": "../../../etc/passwd",
             }),
         );
-        let plugin = Plugin::load(&plugin_dir).unwrap();
-        assert!(plugin.mcp_configs.is_empty());
+        let error = Plugin::load(&plugin_dir)
+            .expect_err("unsafe MCP path must reject the complete plugin package");
+        assert!(
+            error.to_string().contains("traversal"),
+            "unexpected MCP path error: {error}"
+        );
     }
 
     #[test]

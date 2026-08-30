@@ -40,8 +40,10 @@ pub enum SandboxMode {
 #[derive(Debug, Deserialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct HookPolicy {
-    /// Allowlist of executable base-names (not full paths) that hook
-    /// commands may use as their first token.
+    /// Allowlist of executable identities that hook commands may use as their
+    /// first token. Bare names resolve through the run-bound search path;
+    /// project-local scripts should use an explicit path. Admission compares
+    /// canonical identities rather than trusting basename aliases.
     ///
     /// `None` → allow every executable (backwards-compatible legacy mode).
     /// `Some([])` → deny every command hook.

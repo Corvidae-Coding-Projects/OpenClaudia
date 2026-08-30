@@ -1,12 +1,36 @@
 # S-035: Make notebook editing transactional
 
-Status: Planned
+Status: Implemented and deterministically verified; artifact-bound VDD receipt not recorded
 Effort: Medium
 Primary findings: F-042
 Workstreams: W15
 Depends on: [S-031](./031-descriptor-safe-persistence.md), [S-032](./032-snapshot-bound-file-edits.md)
 
 Canonical sources: [full audit](../full-codebase-audit-2026-08-16.md) and [remediation design](../production-remediation-design.md).
+
+## Delivered — 2026-08-25
+
+Commit `30d70461` moved notebook edits onto the existing snapshot-bound atomic
+publication seam. Edits require and revalidate the reviewed generation, validate
+bounded nbformat 4 structure before mutation, preserve unrelated content,
+generate valid unique cell IDs, and leave the prior generation intact on
+conflict, interruption, validation failure, or publication failure.
+
+## Verification evidence
+
+Crosslink issue #1137 records Rust 1.98 formatting, all-target checking, strict
+all-target/all-feature Clippy, the serialized all-target/all-feature suite
+(2,937 library tests passed, one ignored), repository policy, and hygiene as
+passing. Focused real-filesystem evidence covered round trips, stale generations,
+malformed input, symlink refusal, and deterministic pre-publication failure and
+retry. Commits `1d1d28f5` and `2540288b` preserve the exact generated closure
+bookkeeping.
+
+## Residual boundary
+
+The transactional editing behavior is complete. The independent artifact-bound
+VDD receipt requested by the acceptance criteria was explicitly deferred and
+has not been recorded on #1137.
 
 ## Outcome
 
