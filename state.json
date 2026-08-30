@@ -22040,12 +22040,13 @@
       "display_id": 1202,
       "title": "Reconcile stale remediation slice status documents",
       "description": "The live remediation index has eight numbered slice files still marked Status: Planned although their delivery issues are closed and implementation evidence exists: S-033, S-034, S-035, S-059, S-062, S-086, S-100, and S-101. Reconcile each document from its exact commit, Crosslink result comments, and runner evidence. Do not mark any unverified claim complete, do not hand-edit generated changelog output, and keep implementation changes out of this documentation-only issue. Acceptance: the slice documents accurately distinguish implemented, independently verified, VDD-pending, and complete states, and the aggregate remaining-slice count is reproducible.",
-      "status": "open",
+      "status": "closed",
       "priority": "medium",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-28T15:47:09.132646546Z",
-      "updated_at": "2026-08-30T08:37:28.340236407Z",
+      "updated_at": "2026-08-30T08:37:32.950409491Z",
+      "closed_at": "2026-08-30T08:37:32.950403710Z",
       "labels": [
         "documentation"
       ],
@@ -49755,11 +49756,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2417,
       "timestamp": "2026-08-30T08:37:28.340236407Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2418,
+      "timestamp": "2026-08-30T08:37:32.950409491Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T08:37:28.340236407Z",
+    "timestamp": "2026-08-30T08:37:32.950409491Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2417
+    "agent_seq": 2418
   }
 }
