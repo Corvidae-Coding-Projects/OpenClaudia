@@ -1,6 +1,6 @@
 {
   "next_display_id": 1230,
-  "next_comment_id": 2005,
+  "next_comment_id": 2006,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -22615,12 +22615,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T19:24:23.788934530Z",
-      "updated_at": "2026-08-30T21:22:57.217870471Z",
+      "updated_at": "2026-08-30T21:24:16.421189898Z",
       "closed_at": "2026-08-30T21:22:57.217864632Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "2b8f9d9e-cbcd-4a51-b334-1f98743e7666": {
+          "display_id": 2005,
+          "author": "6Vw9",
+          "content": "Delivered in signed commit 982ea8838.",
+          "created_at": "2026-08-30T21:24:16.418656599Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAp9FsRocHWDWVK1NNIjtx86Qau1u27M5D6nendjz1/mMpcPO+06Mf0GUFw03fiFc3SZuVEAik7vQfbu38uhFRAA=="
+        },
         "922e1ff5-dd79-42d2-9d72-f05f3219506f": {
           "display_id": 2001,
           "author": "6Vw9",
@@ -50874,11 +50883,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2520,
       "timestamp": "2026-08-30T21:24:11.694191929Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2521,
+      "timestamp": "2026-08-30T21:24:16.421189898Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T21:24:11.694191929Z",
+    "timestamp": "2026-08-30T21:24:16.421189898Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2520
+    "agent_seq": 2521
   }
 }
