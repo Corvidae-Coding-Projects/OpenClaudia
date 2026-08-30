@@ -1,6 +1,6 @@
 {
   "next_display_id": 1233,
-  "next_comment_id": 2020,
+  "next_comment_id": 2021,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -24281,7 +24281,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T23:09:03.694117605Z",
-      "updated_at": "2026-08-30T23:09:24.087652412Z",
+      "updated_at": "2026-08-30T23:47:10.781617815Z",
       "labels": [
         "remediation"
       ],
@@ -24294,6 +24294,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAn1kPi5qYexKeVzVVY49iwHlaspFhasbS9AMn0LiXHMjm+iHtsHs30V38z4tNHcGZLYMdtUkWuOuPBUqKfFXkCA=="
+        },
+        "745815e5-da66-4c00-bc60-e734592059d0": {
+          "display_id": 2020,
+          "author": "6Vw9",
+          "content": "Implemented immutable versioned plan approval artifacts and an atomic session plus runtime capability transition. Approval now binds exact bounded plan bytes, canonical task graph generation, typed effect ceiling, prompt digests, budget snapshot, expiry, actor evidence, run identity, capability manifest and generation, and runtime mode generations. Admission fails closed on edits, drift, expiry, cancellation, mode changes, or successor runs; provider tool definitions hide denied effects and CLI/TUI show the proposed authority. Root manual review fixed provider-definition leakage, an unbounded reread, and a real nested-session-lock deadlock. Rust 1.98 fmt, all-target check, strict all-target Clippy, focused approval and invalidation tests, and the full all-target/all-feature serialized suite all pass. No independent alternate-model VDD receipt is claimed; post-finalization receipt publication remains #1201.",
+          "created_at": "2026-08-30T23:47:10.777798738Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABARqQD/u+dYt95r7Gbd3rlAur21/WX4bEe+PFd3rWT1KsPRXWxUE8X+sTm4sEA9vGzg13/F0bs8lsoI1+ungiZBg=="
         },
         "faf30432-3eaf-45d3-b265-6ac27661e059": {
           "display_id": 2019,
@@ -51219,11 +51228,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2550,
       "timestamp": "2026-08-30T23:09:24.087652412Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2551,
+      "timestamp": "2026-08-30T23:47:10.781617815Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T23:09:24.087652412Z",
+    "timestamp": "2026-08-30T23:47:10.781617815Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2550
+    "agent_seq": 2551
   }
 }
