@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1221,
+  "next_display_id": 1222,
   "next_comment_id": 1973,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -746,6 +746,7 @@
     "a8542ea0-14e8-4970-bc97-563a6d5d72c6": 931,
     "a8621c1d-106e-4ad8-b4c5-dfe95a2f4e24": 810,
     "a877ff2f-5388-486b-85b6-2334f81b37a5": 945,
+    "a890d7c5-3891-4285-b8e8-65a73dc66349": 1221,
     "a8d5c943-e9a1-436b-99f5-fe810fa757ba": 106,
     "a8e22d72-d7b8-48b5-921b-6c17152c0aa0": 408,
     "a9100a36-06d8-467e-9ade-f3d1317e8f06": 294,
@@ -25536,6 +25537,18 @@
         }
       }
     },
+    "a890d7c5-3891-4285-b8e8-65a73dc66349": {
+      "uuid": "a890d7c5-3891-4285-b8e8-65a73dc66349",
+      "display_id": 1221,
+      "title": "S-076: Make project initialization transactional",
+      "description": "Implement docs/remediation-slices/076-transactional-project-initialization.md as production behavior. Build a bounded typed init plan, reject every default collision, use descriptor-safe atomic staged publication with explicit recoverable force semantics, and generate only schema-valid inert configuration without rule injection or executable hook scaffolding. Worker scope is production Rust code only: no tests, builds, Cargo, rustfmt, Clippy, Git, Crosslink, documentation, network, cache, or runner commands. Root owns review, reconciliation, tests, docs, signed commit/push, CI, and cleanup.",
+      "status": "open",
+      "priority": "critical",
+      "parent_uuid": "5524064d-6721-4080-928b-959fe9661d77",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-30T11:01:21.170133736Z",
+      "updated_at": "2026-08-30T11:01:21.170133736Z"
+    },
     "a8d5c943-e9a1-436b-99f5-fe810fa757ba": {
       "uuid": "a8d5c943-e9a1-436b-99f5-fe810fa757ba",
       "display_id": 106,
@@ -50078,11 +50091,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2451,
       "timestamp": "2026-08-30T11:01:16.517308061Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2452,
+      "timestamp": "2026-08-30T11:01:21.170133736Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T11:01:16.517308061Z",
+    "timestamp": "2026-08-30T11:01:21.170133736Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2451
+    "agent_seq": 2452
   }
 }
