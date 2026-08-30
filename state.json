@@ -1,6 +1,6 @@
 {
   "next_display_id": 1216,
-  "next_comment_id": 1946,
+  "next_comment_id": 1947,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -23077,7 +23077,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T04:50:17.710061804Z",
-      "updated_at": "2026-08-30T05:50:43.849936285Z",
+      "updated_at": "2026-08-30T05:50:52.346818690Z",
       "labels": [
         "remediation"
       ],
@@ -23088,6 +23088,13 @@
           "content": "[action] Worker code-only handoff integrated and skeptically corrected by root; root owns verification and delivery.",
           "created_at": "2026-08-30T05:50:43.849926749Z",
           "kind": "note"
+        },
+        "577f5714-5883-4049-802c-19319cd4e3c0": {
+          "display_id": 1946,
+          "author": "s090-wave5",
+          "content": "Code-only S-090 handoff completed. Root integrated bounded ACP framing, queues, terminal validation, and provisional output with additional tests and compatibility fixes; no worker verification claim retained.",
+          "created_at": "2026-08-30T05:50:52.346811645Z",
+          "kind": "handoff"
         }
       }
     },
@@ -49375,11 +49382,16 @@
       "agent_id": "s090-wave5",
       "agent_seq": 3,
       "timestamp": "2026-08-30T05:50:48.278980263Z"
+    },
+    {
+      "agent_id": "s090-wave5",
+      "agent_seq": 4,
+      "timestamp": "2026-08-30T05:50:52.346818690Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T05:50:48.278980263Z",
+    "timestamp": "2026-08-30T05:50:52.346818690Z",
     "agent_id": "s090-wave5",
-    "agent_seq": 3
+    "agent_seq": 4
   }
 }
