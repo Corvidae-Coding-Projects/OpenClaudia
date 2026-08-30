@@ -1,6 +1,6 @@
 # S-078: Move print mode onto the canonical runtime
 
-Status: Planned
+Status: Implemented and deterministically verified; artifact-bound VDD receipt pending
 Effort: Medium
 Primary findings: F-109
 Workstreams: W3, W10, W12
@@ -27,3 +27,24 @@ Make noninteractive print a bounded runtime profile rather than a direct fourth 
 ## Handoff
 
 Record changed artifact generations, commands/tests run, typed evidence receipts, unresolved risks, and any newly proposed slice. Completion of this slice does not imply completion of its parent workstream.
+
+## Delivered implementation
+
+- Print mode now constructs the canonical `RuntimeKernel` with a bounded inference profile instead of entering the interactive chat loop. The profile carries no tool grants, persistence authority, MCP/process/secrets access, or workspace roots.
+- Provider requests reuse the established client configuration, request builders, stream decoders, native continuation state, terminal-state validation, hook execution, VDD finalization, cancellation, and token/turn/cost budget machinery.
+- Output remains buffered until the run reaches a valid committed terminal success. Refusal, partial output, length limits, cancellation, timeouts, malformed or missing terminal events, provider errors, and stdout delivery failures are returned as typed nonzero outcomes.
+- Missing provider usage remains unknown rather than being reconciled as fabricated zero-token usage. The bounded output and stream limits prevent unbounded buffering.
+- Both direct API transports and the supported SDK-backed provider routes retain their existing authentication and model-selection behavior.
+
+## Verification
+
+- `cargo +1.98.0 fmt --check`
+- `CARGO_BUILD_JOBS=2 cargo +1.98.0 check --locked --all-targets --all-features`
+- `CARGO_BUILD_JOBS=2 cargo +1.98.0 clippy --locked --all-targets --all-features -- -D warnings`
+- All 18 focused print-mode tests pass, including bounded output, broken-pipe delivery, timeout/cancellation, partial or absent terminal events, provider-native terminal handling, hooks, VDD, and unknown-usage accounting.
+- `CARGO_BUILD_JOBS=2 cargo +1.98.0 test --locked --all-targets --all-features -- --test-threads=1` passes.
+- Because this slice changes `src/main.rs`, the technical-memory retrieval artifacts were regenerated and rebound to the new source digest. Their nine focused evidence tests pass; the review receipt remains deliberately rejected until an independent reviewer is assigned.
+
+## Residual boundary
+
+The implementation is locally verified, but the independent alternate-model, artifact-bound VDD receipt remains pending. Print mode deliberately retains small provider-specific transport adapters while sharing the canonical request, decoding, runtime, and finalization contracts; replacing those working adapters is outside this slice.

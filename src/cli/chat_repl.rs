@@ -298,7 +298,23 @@ enum SlashOutcome {
     EditorInput(String),
     FallThrough,
     RewrittenPrompt,
+    SideQuestion(String),
     PluginAgent(Box<plugins::PluginAgentInvocation>),
+}
+
+#[allow(clippy::large_enum_variant)] // One local value; boxing adds an avoidable turn allocation.
+enum SideQuestionExecution {
+    Completed(Result<openclaudia::pipeline::TurnResult, String>),
+    ParentCancelled(openclaudia::runtime::CancellationReason),
+    TimedOut,
+}
+
+fn bounded_side_question_detail(detail: &str) -> String {
+    tui::safety::sanitize_terminal_text(
+        safe_truncate(detail, 8 * 1_024),
+        tui::safety::TextLimits::new(8 * 1_024, 8 * 1_024, 128, 2 * 1_024),
+    )
+    .into_string()
 }
 
 /// Per-turn transport bundle — the URL + headers needed to POST to
@@ -1053,6 +1069,11 @@ impl ChatRepl {
             SlashOutcome::RewrittenPrompt => {
                 skip_local_input_shortcuts = true;
             }
+            SlashOutcome::SideQuestion(question) => {
+                self.run_side_question(question).await;
+                self.clear_transient_prompt_options();
+                return Ok(Some(false));
+            }
             SlashOutcome::PluginAgent(invocation) => {
                 self.run_plugin_agent_invocation(*invocation, memory_db)
                     .await;
@@ -1218,22 +1239,452 @@ impl ChatRepl {
         Ok(if exit { Some(true) } else { None })
     }
 
-    /// Save a `#`-prefixed comment as a note message (not sent to AI).
+    /// Save a `#`-prefixed comment in the session's private local lane.
     fn save_note_message(&mut self, input: &str) {
         let note = input.trim_start_matches('#').trim();
         if note.is_empty() {
             return;
         }
-        self.chat_session.push_message(serde_json::json!({
-            "role": "system",
-            "content": format!("[Note: {}]", note),
-            "metadata": { "type": "note" }
-        }));
+        let note_id = match self.chat_session.add_private_note(note.to_string()) {
+            Ok(note_id) => note_id,
+            Err(error) => {
+                eprintln!("\n\x1b[31mPrivate note was not saved: {error}\x1b[0m\n");
+                return;
+            }
+        };
         self.chat_session.touch();
-        if let Err(e) = save_chat_session(&self.chat_session) {
-            tracing::warn!("Failed to save session: {}", e);
+        if let Err(error) = save_chat_session(&self.chat_session) {
+            tracing::warn!("Failed to save private note: {}", error);
+            if let Err(rollback_error) = self.chat_session.delete_private_note(note_id) {
+                tracing::warn!(
+                    "Failed to remove unpersisted private note from memory: {rollback_error}"
+                );
+            }
+            eprintln!("\n\x1b[31mPrivate note could not be persisted: {error}\x1b[0m\n");
+            return;
         }
-        println!("Note saved.\n");
+        println!("Private note saved as {note_id}.\n");
+    }
+
+    /// Execute `/btw` as one tool-less child turn over a detached parent
+    /// snapshot. Only the typed local result lane is updated; the parent
+    /// transcript and provider continuation are never installed from here.
+    #[allow(clippy::too_many_lines)]
+    async fn run_side_question(&mut self, question: String) {
+        use openclaudia::state::SideQuestionFailureCode;
+
+        let call_id = openclaudia::runtime::CallId::new();
+        let launch =
+            match self
+                .chat_session
+                .begin_side_question(&self.run_context, call_id, question)
+            {
+                Ok(launch) => launch,
+                Err(error) => {
+                    eprintln!("\n\x1b[31mSide question was not started: {error}\x1b[0m\n");
+                    return;
+                }
+            };
+        let attempt_id = launch.attempt_id;
+        if let Err(error) = self.persist_side_question_update("side-question admission") {
+            self.fail_side_question_attempt(
+                attempt_id,
+                SideQuestionFailureCode::Persistence,
+                &format!("could not persist admitted side question: {error}"),
+            );
+            eprintln!("\n\x1b[31mSide question failed before execution: {error}\x1b[0m\n");
+            return;
+        }
+
+        let child_run = match openclaudia::runtime::derive_side_question_run(&self.run_context) {
+            Ok(child) => child,
+            Err(error) => {
+                self.fail_side_question_attempt(
+                    attempt_id,
+                    SideQuestionFailureCode::Admission,
+                    &error,
+                );
+                eprintln!("\n\x1b[31mSide question admission failed: {error}\x1b[0m\n");
+                return;
+            }
+        };
+        if let Err(error) = self
+            .chat_session
+            .bind_side_question_child(attempt_id, child_run.run_id())
+        {
+            let _ = child_run.runtime().cancellation().cancel(
+                openclaudia::runtime::CancellationReason::RuntimeFailure {
+                    detail: "side-question state binding failed".to_string(),
+                },
+            );
+            openclaudia::tools::retire_run(&child_run);
+            self.fail_side_question_attempt(
+                attempt_id,
+                SideQuestionFailureCode::Admission,
+                &error.to_string(),
+            );
+            eprintln!("\n\x1b[31mSide question admission failed: {error}\x1b[0m\n");
+            return;
+        }
+        if let Err(error) = self.persist_side_question_update("side-question child binding") {
+            let _ = child_run.runtime().cancellation().cancel(
+                openclaudia::runtime::CancellationReason::RuntimeFailure {
+                    detail: "side-question persistence failed".to_string(),
+                },
+            );
+            openclaudia::tools::retire_run(&child_run);
+            self.fail_side_question_attempt(
+                attempt_id,
+                SideQuestionFailureCode::Persistence,
+                &error,
+            );
+            eprintln!("\n\x1b[31mSide question failed before execution: {error}\x1b[0m\n");
+            return;
+        }
+
+        let mut child_messages = launch.messages;
+        child_messages.push(serde_json::json!({
+            "role": "user",
+            "content": launch.question,
+            "metadata": {
+                "openclaudia_context_source": "side_question",
+                "side_question_attempt_id": attempt_id.to_string(),
+                "parent_event_generation": launch.parent_event.generation(),
+                "parent_event_digest": launch.parent_event.digest().to_string()
+            }
+        }));
+        if let Err(error) = check_provider_request_policy(
+            &child_run,
+            &self.policy_enforcer,
+            &self.model,
+            &child_messages,
+        ) {
+            openclaudia::tools::retire_run(&child_run);
+            self.fail_side_question_attempt(attempt_id, SideQuestionFailureCode::Policy, &error);
+            eprintln!("\n\x1b[31mSide question blocked by policy: {error}\x1b[0m\n");
+            return;
+        }
+
+        let prompt_blocks = prompt::build_prompt_context_with_items_for_run(
+            &self.chat_session.behavior_mode(),
+            &child_run,
+            Vec::new(),
+            openclaudia::context::ContextBudget::default(),
+        );
+        let assistant_ordinal =
+            match openclaudia::pipeline::next_assistant_message_ordinal(&child_messages) {
+                Ok(ordinal) => ordinal,
+                Err(error) => {
+                    openclaudia::tools::retire_run(&child_run);
+                    self.fail_side_question_attempt(
+                        attempt_id,
+                        SideQuestionFailureCode::RequestBuild,
+                        &error,
+                    );
+                    eprintln!("\n\x1b[31mSide question request failed: {error}\x1b[0m\n");
+                    return;
+                }
+            };
+        let effort = self.chat_session.effort_level();
+        let request_body =
+            match openclaudia::pipeline::build_request_for_wire_with_exact_tools_and_state(
+                openclaudia::pipeline::WireApi::ChatCompletions,
+                &self.config.proxy.target,
+                &self.model,
+                &child_messages,
+                effort.as_str(),
+                self.claude_code_token.as_ref(),
+                Some(&prompt_blocks),
+                &[],
+                None,
+            ) {
+                Ok(request) => request,
+                Err(error) => {
+                    openclaudia::tools::retire_run(&child_run);
+                    self.fail_side_question_attempt(
+                        attempt_id,
+                        SideQuestionFailureCode::RequestBuild,
+                        &error,
+                    );
+                    eprintln!("\n\x1b[31mSide question request failed: {error}\x1b[0m\n");
+                    return;
+                }
+            };
+        let provider = match active_provider_for_turn(&self.config) {
+            Ok(provider) => provider,
+            Err(error) => {
+                openclaudia::tools::retire_run(&child_run);
+                self.fail_side_question_attempt(
+                    attempt_id,
+                    SideQuestionFailureCode::RequestBuild,
+                    &error,
+                );
+                eprintln!("\n\x1b[31mSide question configuration failed: {error}\x1b[0m\n");
+                return;
+            }
+        };
+        let (endpoint, headers) = match build_chat_endpoint_and_headers(
+            &self.config.proxy.target,
+            &self.model,
+            provider,
+            self.adapter,
+            self.api_key.as_ref(),
+            self.claude_code_token.as_ref(),
+        ) {
+            Ok(transport) => transport,
+            Err(error) => {
+                openclaudia::tools::retire_run(&child_run);
+                self.fail_side_question_attempt(
+                    attempt_id,
+                    SideQuestionFailureCode::RequestBuild,
+                    &error,
+                );
+                eprintln!("\n\x1b[31mSide question authentication failed: {error}\x1b[0m\n");
+                return;
+            }
+        };
+        let task_manager = match session::TaskManager::for_run(&child_run) {
+            Ok(manager) => std::sync::Arc::new(std::sync::Mutex::new(manager)),
+            Err(error) => {
+                openclaudia::tools::retire_run(&child_run);
+                self.fail_side_question_attempt(
+                    attempt_id,
+                    SideQuestionFailureCode::Admission,
+                    &error,
+                );
+                eprintln!("\n\x1b[31mSide question admission failed: {error}\x1b[0m\n");
+                return;
+            }
+        };
+
+        eprintln!("\x1b[90m[/btw side question — parent conversation is unchanged]\x1b[0m");
+        let parent_cancellation = self.run_context.runtime().cancellation();
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        let event_drainer = match std::thread::Builder::new()
+            .name("openclaudia-btw-events".to_string())
+            .spawn(move || while events_rx.recv().is_ok() {})
+        {
+            Ok(drainer) => drainer,
+            Err(error) => {
+                openclaudia::tools::retire_run(&child_run);
+                self.fail_side_question_attempt(
+                    attempt_id,
+                    SideQuestionFailureCode::Admission,
+                    &format!("could not start the bounded event drain: {error}"),
+                );
+                eprintln!("\n\x1b[31mSide question admission failed: {error}\x1b[0m\n");
+                return;
+            }
+        };
+        let execution = {
+            let turn = openclaudia::pipeline::run_turn(openclaudia::pipeline::RunTurnParams {
+                run_context: std::sync::Arc::clone(&child_run),
+                client: &self.client,
+                endpoint: &endpoint,
+                headers: &headers,
+                claude_agent_sdk: None,
+                codex_agent_sdk: None,
+                effort_level: effort.as_str(),
+                request_body: &request_body,
+                provider: &self.config.proxy.target,
+                model_identity: &self.model,
+                provider_native_state: None,
+                assistant_message_ordinal: assistant_ordinal,
+                memory_db: None,
+                app_config: None,
+                permission_mgr: None,
+                transient_allowed_tool_rules: &[],
+                hook_engine: None,
+                policy_enforcer: None,
+                task_mgr: task_manager,
+                session_id: None,
+                tx: events_tx,
+            });
+            tokio::pin!(turn);
+            let deadline = tokio::time::sleep(openclaudia::runtime::SIDE_QUESTION_TIMEOUT);
+            tokio::pin!(deadline);
+            tokio::select! {
+                result = &mut turn => SideQuestionExecution::Completed(result),
+                receipt = parent_cancellation.cancelled() => {
+                    SideQuestionExecution::ParentCancelled(receipt.reason)
+                }
+                () = &mut deadline => SideQuestionExecution::TimedOut,
+            }
+        };
+        if event_drainer.join().is_err() {
+            tracing::warn!("Side-question event drain terminated unexpectedly");
+        }
+
+        match execution {
+            SideQuestionExecution::Completed(Ok(result)) => {
+                openclaudia::tools::retire_run(&child_run);
+                if result.needs_followup || !result.tool_calls.is_empty() {
+                    self.fail_side_question_attempt(
+                        attempt_id,
+                        SideQuestionFailureCode::UnexpectedToolContinuation,
+                        "provider attempted a tool continuation in a tool-less side question",
+                    );
+                    eprintln!("\n\x1b[31mSide question failed: provider requested a tool continuation.\x1b[0m\n");
+                    return;
+                }
+                if result.content.len() > openclaudia::state::MAX_SIDE_QUESTION_RESULT_BYTES {
+                    self.fail_side_question_attempt(
+                        attempt_id,
+                        SideQuestionFailureCode::ResultTooLarge,
+                        "provider response exceeded the retained side-question result limit",
+                    );
+                    eprintln!(
+                        "\n\x1b[31mSide question failed: result was too large to retain.\x1b[0m\n"
+                    );
+                    return;
+                }
+                match self
+                    .chat_session
+                    .succeed_side_question(attempt_id, result.content.clone())
+                {
+                    Ok(reference) => {
+                        if let Err(error) =
+                            self.persist_side_question_update("side-question success")
+                        {
+                            eprintln!("\n\x1b[31mSide question result could not be persisted: {error}\x1b[0m\n");
+                            return;
+                        }
+                        let rendered = tui::safety::sanitize_terminal_text(
+                            &result.content,
+                            tui::safety::STREAM_TEXT_LIMITS,
+                        );
+                        println!(
+                            "\n{}\n\n\x1b[90m[side result {} attached to parent event {}:{}]\x1b[0m\n",
+                            rendered.as_str(),
+                            reference.result_id,
+                            reference.parent_event.generation(),
+                            reference.parent_event.digest(),
+                        );
+                    }
+                    Err(error) => {
+                        self.fail_side_question_attempt(
+                            attempt_id,
+                            SideQuestionFailureCode::ResultTooLarge,
+                            &error.to_string(),
+                        );
+                        eprintln!(
+                            "\n\x1b[31mSide question result was not retained: {error}\x1b[0m\n"
+                        );
+                    }
+                }
+            }
+            SideQuestionExecution::Completed(Err(error)) => {
+                if let Some(receipt) = parent_cancellation.receipt() {
+                    let _ = child_run
+                        .runtime()
+                        .cancellation()
+                        .cancel(openclaudia::runtime::CancellationReason::ParentTerminated);
+                    openclaudia::tools::retire_run(&child_run);
+                    let detail = format!("parent run cancelled: {:?}", receipt.reason);
+                    if let Err(state_error) = self
+                        .chat_session
+                        .cancel_side_question(attempt_id, bounded_side_question_detail(&detail))
+                    {
+                        tracing::warn!(
+                            "Failed to record side-question cancellation: {state_error}"
+                        );
+                    }
+                    let _ = self.persist_side_question_update("side-question cancellation");
+                    eprintln!("\n\x1b[33mSide question cancelled with its parent run.\x1b[0m\n");
+                    return;
+                }
+                let normalized = error.to_ascii_lowercase();
+                if normalized.contains("timed out") || normalized.contains("deadline") {
+                    let _ = child_run
+                        .runtime()
+                        .cancellation()
+                        .cancel(openclaudia::runtime::CancellationReason::Deadline);
+                    openclaudia::tools::retire_run(&child_run);
+                    let timeout_millis =
+                        u64::try_from(openclaudia::runtime::SIDE_QUESTION_TIMEOUT.as_millis())
+                            .unwrap_or(u64::MAX);
+                    if let Err(state_error) = self
+                        .chat_session
+                        .timeout_side_question(attempt_id, timeout_millis)
+                    {
+                        tracing::warn!("Failed to record side-question timeout: {state_error}");
+                    }
+                    let _ = self.persist_side_question_update("side-question timeout");
+                    eprintln!("\n\x1b[33mSide question timed out after 30 seconds.\x1b[0m\n");
+                    return;
+                }
+                openclaudia::tools::retire_run(&child_run);
+                let redacted = headers.sanitize_diagnostic(&error).to_string();
+                let diagnostic = bounded_side_question_detail(&redacted);
+                self.fail_side_question_attempt(
+                    attempt_id,
+                    SideQuestionFailureCode::Provider,
+                    &diagnostic,
+                );
+                eprintln!("\n\x1b[31mSide question failed: {diagnostic}\x1b[0m\n");
+            }
+            SideQuestionExecution::ParentCancelled(reason) => {
+                let _ = child_run
+                    .runtime()
+                    .cancellation()
+                    .cancel(openclaudia::runtime::CancellationReason::ParentTerminated);
+                openclaudia::tools::retire_run(&child_run);
+                let detail = format!("parent run cancelled: {reason:?}");
+                if let Err(error) = self
+                    .chat_session
+                    .cancel_side_question(attempt_id, bounded_side_question_detail(&detail))
+                {
+                    tracing::warn!("Failed to record side-question cancellation: {error}");
+                }
+                let _ = self.persist_side_question_update("side-question cancellation");
+                eprintln!("\n\x1b[33mSide question cancelled with its parent run.\x1b[0m\n");
+            }
+            SideQuestionExecution::TimedOut => {
+                let _ = child_run
+                    .runtime()
+                    .cancellation()
+                    .cancel(openclaudia::runtime::CancellationReason::Deadline);
+                openclaudia::tools::retire_run(&child_run);
+                let timeout_millis =
+                    u64::try_from(openclaudia::runtime::SIDE_QUESTION_TIMEOUT.as_millis())
+                        .unwrap_or(u64::MAX);
+                if let Err(error) = self
+                    .chat_session
+                    .timeout_side_question(attempt_id, timeout_millis)
+                {
+                    tracing::warn!("Failed to record side-question timeout: {error}");
+                }
+                let _ = self.persist_side_question_update("side-question timeout");
+                eprintln!("\n\x1b[33mSide question timed out after 30 seconds.\x1b[0m\n");
+            }
+        }
+    }
+
+    fn persist_side_question_update(&mut self, reason: &str) -> Result<(), String> {
+        self.chat_session.touch();
+        save_chat_session(&self.chat_session).map_err(|error| {
+            tracing::warn!(
+                save_reason = reason,
+                "Failed to save side question: {error}"
+            );
+            error.to_string()
+        })
+    }
+
+    fn fail_side_question_attempt(
+        &mut self,
+        attempt_id: openclaudia::state::SideQuestionAttemptId,
+        code: openclaudia::state::SideQuestionFailureCode,
+        detail: &str,
+    ) {
+        let detail = bounded_side_question_detail(detail);
+        if let Err(error) = self
+            .chat_session
+            .fail_side_question(attempt_id, code, detail)
+        {
+            tracing::warn!("Failed to record side-question failure: {error}");
+        }
+        let _ = self.persist_side_question_update("side-question failure");
     }
 
     /// Dispatch a slash-prefixed input to the slash handler and act on
@@ -1441,15 +1892,7 @@ impl ChatRepl {
                 self.handle_add_working_dir(&path);
                 SlashOutcome::Continue
             }
-            SlashCommandResult::SideQuestion(question) => {
-                let saved = self.chat_session.messages_snapshot();
-                self.chat_session
-                    .replace_messages(vec![serde_json::json!({"role":"user","content":question})]);
-                eprintln!("\x1b[90m[/btw aside — main flow will be restored]\x1b[0m");
-                self.chat_session
-                    .update_messages(|messages| messages.extend(saved));
-                SlashOutcome::FallThrough
-            }
+            SlashCommandResult::SideQuestion(question) => SlashOutcome::SideQuestion(question),
             SlashCommandResult::Skill(invocation) => {
                 eprintln!("\x1b[36m⚡ Running skill...\x1b[0m");
                 self.apply_skill_invocation(input, *invocation);

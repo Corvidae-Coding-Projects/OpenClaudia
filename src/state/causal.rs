@@ -235,7 +235,19 @@ pub struct CausalEventRef {
 }
 
 impl CausalEventRef {
-    fn validate(&self) -> Result<(), CausalStateError> {
+    /// Monotonic generation of the referenced committed event.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Digest of the exact committed event payload.
+    #[must_use]
+    pub const fn digest(&self) -> ContentDigest {
+        self.digest
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), CausalStateError> {
         if self.generation == 0 {
             return Err(CausalStateError::InvalidIdentity {
                 detail: "causal event generation must be non-zero".to_string(),
@@ -556,7 +568,7 @@ impl SessionCausalState {
         Ok(())
     }
 
-    const fn current_event(&self) -> CausalEventRef {
+    pub(crate) const fn current_event(&self) -> CausalEventRef {
         CausalEventRef {
             logical_id: self.logical_id,
             generation: self.generation,

@@ -57,6 +57,7 @@ const STATE_KEYS: &[&str] = &[
     "budgets",
     "ide",
     "transcript",
+    "local",
 ];
 
 const IDENTITY_KEYS: &[&str] = &[
@@ -95,6 +96,7 @@ const IDE_KEYS: &[&str] = &["active_file", "recent_files", "selection", "diagnos
 const IDE_SELECTION_KEYS: &[&str] = &["file_path", "line_start", "line_count", "text"];
 const IDE_DIAGNOSTIC_KEYS: &[&str] = &["line", "severity", "message", "source"];
 const TRANSCRIPT_KEYS: &[&str] = &["watermark", "transcript_cwd"];
+const LOCAL_KEYS: &[&str] = &["private_notes", "side_questions"];
 const PERMISSION_KEYS: &[&str] = &["bypass_mode", "trust_accepted", "persistence_disabled"];
 const BEHAVIOR_MODE_KEYS: &[&str] = &["agency", "quality", "scope", "modifiers"];
 const BEHAVIOR_SCOPE_KEYS: &[&str] = &["explicit", "targets"];
@@ -379,6 +381,7 @@ fn validate_state_shape(value: &serde_json::Value) -> Result<(), PersistError> {
     validate_child_object_keys(value, "budgets", BUDGET_KEYS)?;
     validate_child_object_keys(value, "ide", IDE_KEYS)?;
     validate_child_object_keys(value, "transcript", TRANSCRIPT_KEYS)?;
+    validate_child_object_keys(value, "local", LOCAL_KEYS)?;
 
     if let Some(conversation) = value.get("conversation") {
         validate_child_object_keys(conversation, "behavior_mode", BEHAVIOR_MODE_KEYS)?;
@@ -618,6 +621,10 @@ fn validate_state(state: &SessionState) -> Result<(), PersistError> {
             "session IDE state exceeds the supported item limit",
         ));
     }
+    state
+        .local
+        .validate()
+        .map_err(|_| PersistError::InvalidRecord("invalid local session event"))?;
     Ok(())
 }
 

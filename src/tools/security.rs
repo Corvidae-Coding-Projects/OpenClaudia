@@ -218,9 +218,11 @@ pub struct ToolRunContextBuilder {
     provider: String,
     budget_limits: Option<BudgetLimits>,
     parent_budget: Option<crate::runtime::RunBudgetAuthority>,
+    parent_cancellation: Option<crate::runtime::CancellationHandle>,
     runtime_mode: crate::modes::RuntimeMode,
     behavior_scope_targets: crate::modes::BehaviorScopeTargets,
     background_job_storage: BackgroundJobStorage,
+    bounded_inference_profile: bool,
     isolated_workspace: Option<IsolatedWorkspaceDescriptor>,
     workspace_parent: Option<Arc<ToolRunContext>>,
     workspace_control: Option<Arc<ToolRunContext>>,
@@ -262,6 +264,7 @@ impl ToolRunContextBuilder {
             provider: "local".to_string(),
             budget_limits: None,
             parent_budget: None,
+            parent_cancellation: None,
             runtime_mode: crate::modes::RuntimeMode::default(),
             behavior_scope_targets: crate::modes::BehaviorScopeTargets::workspace_root(),
             background_job_storage: if cfg!(test) {
@@ -269,6 +272,7 @@ impl ToolRunContextBuilder {
             } else {
                 BackgroundJobStorage::Durable
             },
+            bounded_inference_profile: false,
             isolated_workspace: None,
             workspace_parent: None,
             workspace_control: None,
@@ -496,6 +500,16 @@ impl ToolRunContextBuilder {
         self
     }
 
+    /// Attach a derived run beneath its parent's live cancellation node.
+    #[must_use]
+    pub(crate) fn parent_cancellation(
+        mut self,
+        parent: crate::runtime::CancellationHandle,
+    ) -> Self {
+        self.parent_cancellation = Some(parent);
+        self
+    }
+
     /// Bind the initial host-enforced behavioral capability profile.
     #[must_use]
     pub fn runtime_mode(mut self, mode: crate::modes::RuntimeMode) -> Self {
@@ -517,6 +531,26 @@ impl ToolRunContextBuilder {
     pub const fn ephemeral_background_jobs(mut self) -> Self {
         self.background_job_storage = BackgroundJobStorage::Ephemeral;
         self
+    }
+
+    /// Select a bounded inference run's no-tools/no-persistence capability set.
+    ///
+    /// The profile keeps only context assembly, provider dispatch, hooks,
+    /// tracing, and explicitly requested network/secret grants. Project skill
+    /// discovery remains governed by its dedicated `SkillRunAccess`; it does
+    /// not widen the ordinary workspace, memory, MCP, process, or durable
+    /// background-job surfaces.
+    #[must_use]
+    pub const fn bounded_inference_profile(mut self) -> Self {
+        self.bounded_inference_profile = true;
+        self.background_job_storage = BackgroundJobStorage::Ephemeral;
+        self
+    }
+
+    /// Select the one-shot print frontend's bounded inference profile.
+    #[must_use]
+    pub const fn bounded_print_profile(self) -> Self {
+        self.bounded_inference_profile()
     }
 
     const fn background_job_storage(mut self, storage: BackgroundJobStorage) -> Self {
@@ -695,9 +729,11 @@ impl ToolRunContext {
             provider,
             budget_limits,
             parent_budget,
+            parent_cancellation,
             runtime_mode,
             behavior_scope_targets,
             background_job_storage,
+            bounded_inference_profile,
             isolated_workspace,
             workspace_parent,
             workspace_control,
@@ -819,6 +855,10 @@ impl ToolRunContext {
                 }
             }
         }
+        if bounded_inference_profile {
+            canonical_read_only.clear();
+            canonical_read_write.clear();
+        }
         let private_temp = PrivateTempDir::create()?;
         canonical_read_write.push(private_temp.path().to_path_buf());
         let project_secret_masks = match project_secret_masks {
@@ -916,16 +956,25 @@ impl ToolRunContext {
         let workspace_generation = WorkspaceGeneration::new(generation.get())
             .ok_or_else(|| "workspace generation must be non-zero".to_string())?;
         let run_id = run_id.unwrap_or_else(RunId::new);
-        let mut grants = BTreeSet::from([
-            CapabilityKind::ContextAssembly,
-            CapabilityKind::Provider,
-            CapabilityKind::WorkspaceRead,
-            CapabilityKind::Hooks,
-            CapabilityKind::Memory,
-            CapabilityKind::Mcp,
-            CapabilityKind::Trace,
-        ]);
-        if workspace_access == WorkspaceAccess::ReadWrite {
+        let mut grants = if bounded_inference_profile {
+            BTreeSet::from([
+                CapabilityKind::ContextAssembly,
+                CapabilityKind::Provider,
+                CapabilityKind::Hooks,
+                CapabilityKind::Trace,
+            ])
+        } else {
+            BTreeSet::from([
+                CapabilityKind::ContextAssembly,
+                CapabilityKind::Provider,
+                CapabilityKind::WorkspaceRead,
+                CapabilityKind::Hooks,
+                CapabilityKind::Memory,
+                CapabilityKind::Mcp,
+                CapabilityKind::Trace,
+            ])
+        };
+        if !bounded_inference_profile && workspace_access == WorkspaceAccess::ReadWrite {
             grants.insert(CapabilityKind::WorkspaceWrite);
         }
         if process {
@@ -959,7 +1008,10 @@ impl ToolRunContext {
             &evidence_session_key,
             isolated_workspace.as_ref(),
         );
-        let cancellation = crate::runtime::CancellationTree::new();
+        let cancellation = parent_cancellation.map_or_else(
+            || crate::runtime::CancellationTree::new().root(),
+            |parent| parent.child(),
+        );
         let descriptor = RunDescriptor::new(RunDescriptorParts {
             run_id,
             session_id,
@@ -993,12 +1045,12 @@ impl ToolRunContext {
         let runtime = Arc::new(if let Some(parent_budget) = parent_budget.as_ref() {
             RunContext::new_child(
                 descriptor,
-                cancellation.root(),
+                cancellation,
                 Arc::new(TracingTraceSink),
                 parent_budget,
             )?
         } else {
-            RunContext::new(descriptor, cancellation.root(), Arc::new(TracingTraceSink))
+            RunContext::new(descriptor, cancellation, Arc::new(TracingTraceSink))
                 .map_err(|error| error.to_string())?
         });
 
@@ -3339,6 +3391,42 @@ mod tests {
         assert!(context.permits_read(context.project_root()));
         assert!(!context.permits_write(context.project_root()));
         assert!(context.permits_write(context.private_temp_root()));
+    }
+
+    #[test]
+    fn bounded_print_profile_has_no_tool_or_durable_persistence_capabilities() {
+        let root = tempfile::tempdir().expect("project root");
+        let context = ToolRunContext::builder(SessionId::new(), root.path())
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::new())
+            .workspace_access(WorkspaceAccess::ReadOnly)
+            .process(false)
+            .network(true)
+            .secrets(true)
+            .provider("openai")
+            .bounded_print_profile()
+            .build()
+            .expect("bounded print context");
+        let grants = &context.runtime().descriptor().capabilities.grants;
+
+        assert!(grants.contains(&CapabilityKind::ContextAssembly));
+        assert!(grants.contains(&CapabilityKind::Provider));
+        assert!(grants.contains(&CapabilityKind::Hooks));
+        assert!(grants.contains(&CapabilityKind::Trace));
+        assert!(grants.contains(&CapabilityKind::Network));
+        assert!(grants.contains(&CapabilityKind::Secrets));
+        assert!(!grants.contains(&CapabilityKind::WorkspaceRead));
+        assert!(!grants.contains(&CapabilityKind::WorkspaceWrite));
+        assert!(!grants.contains(&CapabilityKind::Process));
+        assert!(!grants.contains(&CapabilityKind::Memory));
+        assert!(!grants.contains(&CapabilityKind::Mcp));
+        assert!(!context.permits_read(root.path()));
+        assert!(!context.permits_write(root.path()));
+        assert!(matches!(
+            context.background_job_storage,
+            BackgroundJobStorage::Ephemeral
+        ));
     }
 
     #[test]

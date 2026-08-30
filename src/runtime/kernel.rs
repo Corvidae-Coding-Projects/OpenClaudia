@@ -58,8 +58,11 @@ impl RunContext {
     ///
     /// # Errors
     ///
-    /// Returns an error when ordinary run bindings are invalid or the child
-    /// budget widens/exhausts its parent policy.
+    /// Returns an error when ordinary run bindings are invalid, the supplied
+    /// cancellation node belongs to a different tree, or the child budget
+    /// widens/exhausts its parent policy. A derived run may use a descendant
+    /// cancellation node so parent cancellation propagates through the same
+    /// tree.
     pub fn new_child(
         descriptor: RunDescriptor,
         cancellation: CancellationHandle,
@@ -67,9 +70,7 @@ impl RunContext {
         parent_budget: &RunBudgetAuthority,
     ) -> Result<Self, String> {
         descriptor.validate().map_err(|error| error.to_string())?;
-        if cancellation.id() != cancellation.root_id()
-            || descriptor.cancellation_root != cancellation.root_id()
-        {
+        if descriptor.cancellation_root != cancellation.root_id() {
             return Err(RunContextError::CancellationRootMismatch.to_string());
         }
         let budget = parent_budget
@@ -448,6 +449,25 @@ pub struct RuntimeKernel {
 }
 
 impl RuntimeKernel {
+    /// Start a kernel over an existing live run context.
+    ///
+    /// Frontend adapters normally receive a shared [`RunContext`] through a
+    /// concrete capability owner such as `ToolRunContext`. This constructor
+    /// preserves that context's exact descriptor, cancellation tree, and
+    /// trace sink instead of manufacturing a parallel runtime generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same replay, trace-budget, and sink errors as [`Self::start`].
+    pub async fn start_shared(context: &RunContext) -> Result<Self, KernelError> {
+        Self::start_parts(
+            context.descriptor.clone(),
+            context.cancellation.clone(),
+            Arc::clone(&context.trace),
+        )
+        .await
+    }
+
     /// Start a run and emit its identity/authority bindings as sequence zero.
     ///
     /// # Errors
@@ -455,22 +475,30 @@ impl RuntimeKernel {
     /// Returns an error when the descriptor cannot be replayed, its trace
     /// budget cannot hold the start event, or the sink rejects the event.
     pub async fn start(context: RunContext) -> Result<Self, KernelError> {
+        Self::start_parts(context.descriptor, context.cancellation, context.trace).await
+    }
+
+    async fn start_parts(
+        descriptor: RunDescriptor,
+        cancellation: CancellationHandle,
+        trace: Arc<dyn TraceSink>,
+    ) -> Result<Self, KernelError> {
         let event = RuntimeEvent::new(
-            context.descriptor.run_id,
+            descriptor.run_id,
             0,
-            context.descriptor.actor.clone(),
+            descriptor.actor.clone(),
             EventScope::Run,
             RuntimeEventKind::RunStarted {
-                descriptor: Box::new(context.descriptor.clone()),
+                descriptor: Box::new(descriptor),
             },
         );
         let snapshot = RunSnapshot::replay(std::slice::from_ref(&event))?;
-        context.trace.append(&event).await?;
+        trace.append(&event).await?;
         Ok(Self {
             snapshot,
             events: vec![event],
-            cancellation: context.cancellation,
-            trace: context.trace,
+            cancellation,
+            trace,
         })
     }
 

@@ -16,6 +16,7 @@ mod kernel;
 mod provider_state;
 mod reasoning;
 mod reference;
+mod side_question;
 mod trace;
 
 pub use budget::{
@@ -56,4 +57,7 @@ pub use reasoning::{
     MAX_REASONING_MONITORING_RETENTION, MAX_REASONING_SUMMARY_BYTES,
 };
 pub use reference::{ReferenceRunAdapter, ReferenceRunResult};
+pub use side_question::{
+    derive_side_question_run, SIDE_QUESTION_MAX_OUTPUT_TOKENS, SIDE_QUESTION_TIMEOUT,
+};
 pub use trace::{ReferenceTraceSink, TraceSink, TraceSinkError, TracingTraceSink};

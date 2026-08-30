@@ -99,7 +99,10 @@ impl SystemPromptBlocks {
         let projection = ContextProjector::extend(self.full_projection(), legacy_items);
         let mut prepared: Vec<Value> = messages
             .iter()
-            .filter(|message| message.get("role").and_then(Value::as_str) != Some("system"))
+            .filter(|message| {
+                message.get("role").and_then(Value::as_str) != Some("system")
+                    && !is_private_note_json(message)
+            })
             .cloned()
             .collect();
         let system = projection.combined_system();
@@ -134,7 +137,7 @@ impl SystemPromptBlocks {
         let projection = ContextProjector::extend(self.full_projection(), legacy_items);
         let mut prepared: Vec<crate::proxy::ChatMessage> = messages
             .iter()
-            .filter(|message| message.role != "system")
+            .filter(|message| message.role != "system" && !is_private_note_chat(message))
             .cloned()
             .collect();
         let system = projection.combined_system();
@@ -290,7 +293,10 @@ fn chat_system_context_item(
 }
 
 fn is_private_note_json(message: &Value) -> bool {
-    message.pointer("/metadata/type").and_then(Value::as_str) == Some("note")
+    message
+        .pointer("/metadata/type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| matches!(kind, "note" | "private_note" | "private_note_tombstone"))
 }
 
 fn is_private_note_chat(message: &crate::proxy::ChatMessage) -> bool {
@@ -299,7 +305,7 @@ fn is_private_note_chat(message: &crate::proxy::ChatMessage) -> bool {
         .get("metadata")
         .and_then(|metadata| metadata.get("type"))
         .and_then(Value::as_str)
-        == Some("note")
+        .is_some_and(|kind| matches!(kind, "note" | "private_note" | "private_note_tombstone"))
 }
 
 fn trace_request_projection(trace: &ContextTrace, transport: &'static str) {
@@ -600,5 +606,33 @@ mod tests {
             ContextSource::Reference(ReferenceSource::Session)
         );
         assert_eq!(receipt.lane, Some(ContextLane::Reference));
+    }
+
+    #[test]
+    fn legacy_private_note_bytes_are_omitted_for_every_historical_role() {
+        let prompt = build_prompt_context(&BehaviorMode::default(), None);
+        let messages = vec![
+            serde_json::json!({
+                "role": "system",
+                "content": "seed-private-system",
+                "metadata": {"type": "note"}
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": "seed-private-user",
+                "metadata": {"type": "private_note"}
+            }),
+            serde_json::json!({"role": "user", "content": "visible"}),
+        ];
+        let (prepared, trace) = prompt.prepare_json_messages_with_trace(&messages);
+        let serialized = serde_json::to_string(&prepared).expect("prepared messages");
+        assert!(!serialized.contains("seed-private-system"));
+        assert!(!serialized.contains("seed-private-user"));
+        assert!(!prompt.to_combined().contains("seed-private"));
+        assert!(!prompt.reference_context().contains("seed-private"));
+        assert!(trace
+            .entries
+            .iter()
+            .all(|entry| !entry.id.starts_with("history.system.0")));
     }
 }

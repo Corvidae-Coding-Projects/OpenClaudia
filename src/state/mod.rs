@@ -14,6 +14,7 @@
 
 pub mod categories;
 pub mod causal;
+mod local_events;
 pub mod persist;
 pub mod session;
 pub mod store;
@@ -25,6 +26,14 @@ pub use categories::{
 pub use causal::{
     decode_branch_proposal, BranchProposal, BranchSource, CausalStateError, PreparedBranch,
     SessionCausalState,
+};
+pub use local_events::{
+    LocalEventError, LocalEventRetention, LocalEventSensitivity, LocalEventStateError,
+    PrivateEventId, PrivateEventOwner, PrivateNoteDeletionReceipt, PrivateNoteEvent,
+    PrivateNoteProjection, PrivateNoteProjectionReceipt, PrivateProjectionAuthority,
+    PrivateProjectionConsentId, SessionLocalState, SideQuestionAttempt, SideQuestionAttemptId,
+    SideQuestionFailureCode, SideQuestionLaunch, SideQuestionOutcome, SideQuestionResultId,
+    SideQuestionResultRef, UserNoteProjectionConsent, MAX_SIDE_QUESTION_RESULT_BYTES,
 };
 pub use persist::{SessionDocument, SessionStateV1};
 pub use session::{validate_session_file, validate_session_id, Session};
@@ -51,6 +60,10 @@ pub struct SessionState {
     #[serde(default)]
     pub ide: IdeState,
     pub transcript: TranscriptState,
+    /// User-owned local events that are never projected into ordinary
+    /// conversation, provider-native continuation, exports, or memory.
+    #[serde(default, skip_serializing_if = "SessionLocalState::is_empty")]
+    pub local: SessionLocalState,
 }
 
 impl SessionState {
@@ -73,6 +86,7 @@ impl SessionState {
             budgets: BudgetsState::default(),
             ide: IdeState::default(),
             transcript,
+            local: SessionLocalState::default(),
         }
     }
 }
@@ -96,6 +110,7 @@ mod tests {
         assert!(!state.identity.session_id.as_str().is_empty());
         assert!(state.conversation.messages.is_empty());
         assert_eq!(state.transcript.watermark, 0);
+        assert!(state.local.is_empty());
     }
 
     #[test]
@@ -132,6 +147,7 @@ mod tests {
         assert_eq!(round.budgets.effort_level, state.budgets.effort_level);
         assert!(round.ui.plan_mode.has_exited);
         assert_eq!(round.ide.active_file, state.ide.active_file);
+        assert!(round.local.is_empty());
     }
 
     #[test]

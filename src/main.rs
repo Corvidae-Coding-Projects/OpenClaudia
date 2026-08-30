@@ -513,7 +513,8 @@ async fn main() -> anyhow::Result<()> {
             target_override: cli.target.clone(),
             prompt,
         })
-        .await;
+        .await
+        .map_err(anyhow::Error::from);
     }
 
     reject_ignored_root_flags_for_subcommand(&cli)?;

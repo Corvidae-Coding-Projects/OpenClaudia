@@ -1,17 +1,148 @@
 //! One-shot print mode for non-interactive use.
 //!
-//! This path intentionally does not reuse the legacy REPL loop: it sends one
-//! prompt, prints assistant text to stdout, and exits. Request shaping still
-//! goes through provider adapters so provider-specific envelopes stay aligned
-//! with the proxy and REPL paths.
+//! This frontend submits one no-tools/no-persistence request through the
+//! canonical run lifecycle, buffers provisional provider output until its
+//! native terminal state is validated, commits the candidate, then performs
+//! one checked stdout delivery.
 
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use openclaudia::providers::ProviderAdapter;
 use reqwest::header::CONTENT_TYPE;
-use std::io::Write as _;
 
 use crate::{resolve_chat_auth, resolve_model_name, ChatAuth, ChatAuthSelectionMode};
+
+const MAX_PRINT_PROMPT_BYTES: usize = 1024 * 1024;
+const MAX_PRINT_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_PRINT_OUTPUT_LINES: usize = 65_536;
+const MAX_PRINT_ERROR_BYTES: usize = 4096;
+const PRINT_STREAM_IDLE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(openclaudia::proxy::SSE_STREAM_TIMEOUT_SECS);
+
+/// Typed noninteractive failure. Every variant produces a nonzero CLI exit.
+#[derive(Debug, thiserror::Error)]
+pub enum PrintModeError {
+    #[error("print input exceeded the {limit}-byte limit")]
+    InputTooLarge { limit: usize },
+    #[error("print setup failed: {detail}")]
+    Setup { detail: String },
+    #[error("print request was blocked by policy: {detail}")]
+    Policy { detail: String },
+    #[error("print hook lifecycle failed: {detail}")]
+    Hook { detail: String },
+    #[error("provider refused the print request")]
+    Refused,
+    #[error("provider output exceeded a bounded print limit: {detail}")]
+    Length { detail: String },
+    #[error("print request was cancelled: {reason:?}")]
+    Cancelled {
+        reason: openclaudia::runtime::CancellationReason,
+    },
+    #[error("provider protocol failed: {detail}")]
+    Protocol { detail: String },
+    #[error("provider turn ended without a complete printable result: {detail}")]
+    Partial { detail: String },
+    #[error("provider request failed: {detail}")]
+    Provider { detail: String },
+    #[error("print finalization failed: {detail}")]
+    Finalization { detail: String },
+    #[error("stdout closed before committed print output was delivered")]
+    BrokenPipe,
+    #[error("stdout delivery failed: {detail}")]
+    Delivery { detail: String },
+    #[error("canonical print runtime failed: {detail}")]
+    Runtime { detail: String },
+}
+
+impl PrintModeError {
+    fn setup(error: impl std::fmt::Display) -> Self {
+        Self::Setup {
+            detail: bounded_error_detail(&error.to_string()),
+        }
+    }
+
+    fn policy(error: impl std::fmt::Display) -> Self {
+        Self::Policy {
+            detail: bounded_error_detail(&error.to_string()),
+        }
+    }
+
+    fn protocol(error: impl std::fmt::Display) -> Self {
+        Self::Protocol {
+            detail: bounded_error_detail(&error.to_string()),
+        }
+    }
+
+    fn partial(error: impl std::fmt::Display) -> Self {
+        Self::Partial {
+            detail: bounded_error_detail(&error.to_string()),
+        }
+    }
+
+    fn provider(error: impl std::fmt::Display) -> Self {
+        Self::Provider {
+            detail: bounded_error_detail(&error.to_string()),
+        }
+    }
+
+    fn finalization(error: impl std::fmt::Display) -> Self {
+        Self::Finalization {
+            detail: bounded_error_detail(&error.to_string()),
+        }
+    }
+
+    fn runtime(error: impl std::fmt::Display) -> Self {
+        Self::Runtime {
+            detail: bounded_error_detail(&error.to_string()),
+        }
+    }
+
+    fn run_failure(&self) -> openclaudia::runtime::RunFailure {
+        use openclaudia::runtime::RunFailureCode;
+
+        let code = match self {
+            Self::Policy { .. } => RunFailureCode::Policy,
+            Self::Hook { .. } => RunFailureCode::Hook,
+            Self::Protocol { .. } => RunFailureCode::Protocol,
+            Self::BrokenPipe | Self::Delivery { .. } => RunFailureCode::Frontend,
+            Self::Finalization { .. } | Self::InputTooLarge { .. } | Self::Setup { .. } => {
+                RunFailureCode::Invariant
+            }
+            Self::Runtime { .. } => RunFailureCode::Trace,
+            Self::Refused
+            | Self::Length { .. }
+            | Self::Partial { .. }
+            | Self::Provider { .. }
+            | Self::Cancelled { .. } => RunFailureCode::Provider,
+        };
+        openclaudia::runtime::RunFailure {
+            code,
+            detail: bounded_error_detail(&self.to_string()),
+        }
+    }
+
+    const fn failure_impact(&self) -> openclaudia::runtime::FailureImpact {
+        match self {
+            Self::Length { .. } | Self::Partial { .. } => {
+                openclaudia::runtime::FailureImpact::Partial
+            }
+            _ => openclaudia::runtime::FailureImpact::Fatal,
+        }
+    }
+}
+
+fn bounded_error_detail(detail: &str) -> String {
+    openclaudia::tui::safety::sanitize_terminal_text(
+        detail,
+        openclaudia::tui::safety::TextLimits::new(
+            MAX_PRINT_ERROR_BYTES,
+            MAX_PRINT_ERROR_BYTES,
+            64,
+            1024,
+        ),
+    )
+    .into_string()
+}
 
 /// Arguments for [`cmd_print`].
 pub struct PrintOptions {
@@ -55,6 +186,212 @@ impl PrintSseState {
             in_thinking_block: false,
             terminal: openclaudia::pipeline::ChatStreamTerminal::new(provider),
         }
+    }
+}
+
+struct PrintCandidate {
+    content: String,
+    usage: Option<openclaudia::session::TokenUsage>,
+    native_state_digest: Option<openclaudia::runtime::ContentDigest>,
+}
+
+fn reported_print_usage(
+    usage: openclaudia::session::TokenUsage,
+) -> Option<openclaudia::session::TokenUsage> {
+    (usage.input_tokens > 0
+        || usage.output_tokens > 0
+        || usage.cache_read_tokens > 0
+        || usage.cache_write_tokens > 0)
+        .then_some(usage)
+}
+
+impl PrintCandidate {
+    fn result_digest(&self) -> openclaudia::runtime::ContentDigest {
+        openclaudia::runtime::ContentDigest::sha256(self.content.as_bytes())
+    }
+
+    fn committed_state_digest(&self) -> openclaudia::runtime::ContentDigest {
+        let mut bound = Vec::with_capacity(self.content.len().saturating_add(80));
+        if let Some(digest) = self.native_state_digest {
+            bound.extend_from_slice(digest.to_string().as_bytes());
+        } else {
+            bound.extend_from_slice(b"provider-native-state:none");
+        }
+        bound.push(0);
+        bound.extend_from_slice(self.content.as_bytes());
+        openclaudia::runtime::ContentDigest::sha256(bound)
+    }
+}
+
+struct PrintRuntime {
+    kernel: openclaudia::runtime::RuntimeKernel,
+    actor: openclaudia::runtime::Actor,
+    cancellation: openclaudia::runtime::CancellationHandle,
+}
+
+impl PrintRuntime {
+    async fn start(run: &openclaudia::tools::ToolRunContext) -> Result<Self, PrintModeError> {
+        let actor = run.runtime().descriptor().actor.clone();
+        let cancellation = run.runtime().cancellation();
+        let kernel = openclaudia::runtime::RuntimeKernel::start_shared(run.runtime())
+            .await
+            .map_err(PrintModeError::runtime)?;
+        Ok(Self {
+            kernel,
+            actor,
+            cancellation,
+        })
+    }
+
+    async fn begin_call(
+        &mut self,
+        kind: openclaudia::runtime::CallKind,
+    ) -> Result<openclaudia::runtime::CallId, PrintModeError> {
+        let call_id = openclaudia::runtime::CallId::new();
+        self.kernel
+            .begin_call(&self.actor, call_id, kind)
+            .await
+            .map_err(PrintModeError::runtime)?;
+        Ok(call_id)
+    }
+
+    async fn finish_call_success(
+        &mut self,
+        call_id: openclaudia::runtime::CallId,
+        result: impl AsRef<[u8]>,
+    ) -> Result<(), PrintModeError> {
+        self.kernel
+            .finish_call(
+                &self.actor,
+                call_id,
+                openclaudia::runtime::CallOutcome::Succeeded {
+                    result_digest: openclaudia::runtime::ContentDigest::sha256(result),
+                },
+            )
+            .await
+            .map_err(PrintModeError::runtime)?;
+        Ok(())
+    }
+
+    async fn commit_candidate(&mut self, candidate: &PrintCandidate) -> Result<(), PrintModeError> {
+        let base = self.kernel.snapshot().committed_state().clone();
+        let generation = base
+            .generation
+            .get()
+            .checked_add(1)
+            .and_then(openclaudia::runtime::StateGeneration::new)
+            .ok_or_else(|| PrintModeError::runtime("print state generation overflow"))?;
+        let proposed = openclaudia::runtime::StateSnapshot {
+            generation,
+            digest: candidate.committed_state_digest(),
+        };
+        self.kernel
+            .propose_state(
+                &self.actor,
+                openclaudia::runtime::StateProposal {
+                    base,
+                    proposed: proposed.clone(),
+                },
+            )
+            .await
+            .map_err(PrintModeError::runtime)?;
+        self.kernel
+            .commit_state(&self.actor, proposed)
+            .await
+            .map_err(PrintModeError::runtime)?;
+        Ok(())
+    }
+
+    async fn terminate_call_failure(
+        &mut self,
+        call_id: openclaudia::runtime::CallId,
+        error: PrintModeError,
+    ) -> PrintModeError {
+        let result = if let PrintModeError::Cancelled { reason } = &error {
+            let cancellation_event = self
+                .kernel
+                .cancel(&self.actor, &self.cancellation, reason.clone())
+                .await;
+            match cancellation_event {
+                Ok(_) => {
+                    let receipt = self.cancellation.receipt().ok_or_else(|| {
+                        PrintModeError::runtime("cancelled print run produced no receipt")
+                    });
+                    match receipt {
+                        Ok(receipt) => {
+                            if let Err(runtime_error) = self
+                                .kernel
+                                .finish_call(
+                                    &self.actor,
+                                    call_id,
+                                    openclaudia::runtime::CallOutcome::Cancelled {
+                                        cancellation: receipt,
+                                    },
+                                )
+                                .await
+                            {
+                                Err(PrintModeError::runtime(runtime_error))
+                            } else {
+                                self.kernel
+                                    .finish_cancelled(&self.actor, self.cancellation.id())
+                                    .await
+                                    .map(|_| ())
+                                    .map_err(PrintModeError::runtime)
+                            }
+                        }
+                        Err(runtime_error) => Err(runtime_error),
+                    }
+                }
+                Err(runtime_error) => Err(PrintModeError::runtime(runtime_error)),
+            }
+        } else {
+            let failure = error.run_failure();
+            let impact = error.failure_impact();
+            if let Err(runtime_error) = self
+                .kernel
+                .finish_call(
+                    &self.actor,
+                    call_id,
+                    openclaudia::runtime::CallOutcome::Failed {
+                        failure: failure.clone(),
+                        impact,
+                    },
+                )
+                .await
+            {
+                Err(PrintModeError::runtime(runtime_error))
+            } else if impact == openclaudia::runtime::FailureImpact::Partial {
+                self.kernel
+                    .finish_partially_failed(&self.actor)
+                    .await
+                    .map(|_| ())
+                    .map_err(PrintModeError::runtime)
+            } else {
+                self.kernel
+                    .fail(&self.actor, failure)
+                    .await
+                    .map(|_| ())
+                    .map_err(PrintModeError::runtime)
+            }
+        };
+        result.err().unwrap_or(error)
+    }
+
+    async fn terminate_failure(&mut self, error: PrintModeError) -> PrintModeError {
+        let failure = error.run_failure();
+        self.kernel
+            .fail(&self.actor, failure)
+            .await
+            .err()
+            .map_or(error, PrintModeError::runtime)
+    }
+
+    async fn succeed(&mut self) -> Result<(), PrintModeError> {
+        self.kernel
+            .succeed(&self.actor)
+            .await
+            .map(|_| ())
+            .map_err(PrintModeError::runtime)
     }
 }
 
@@ -323,34 +660,193 @@ fn response_is_json(response: &reqwest::Response) -> bool {
         })
 }
 
+fn print_transport_error(
+    error: openclaudia::provider_transport::ProviderTransportError,
+) -> PrintModeError {
+    use openclaudia::provider_transport::ProviderTransportError;
+
+    match error {
+        ProviderTransportError::Deadline { .. }
+        | ProviderTransportError::Request { timeout: true, .. } => PrintModeError::Cancelled {
+            reason: openclaudia::runtime::CancellationReason::Deadline,
+        },
+        ProviderTransportError::ResponseTooLarge { limit } => PrintModeError::Length {
+            detail: format!("provider response exceeded the {limit}-byte transport limit"),
+        },
+        ProviderTransportError::InvalidJson(detail) => PrintModeError::protocol(detail),
+        other => PrintModeError::provider(other),
+    }
+}
+
+fn provider_terminal_error(detail: impl std::fmt::Display) -> PrintModeError {
+    let detail = detail.to_string();
+    let normalized = detail.to_ascii_lowercase();
+    if normalized.contains("timed out") || normalized.contains("deadline") {
+        PrintModeError::Cancelled {
+            reason: openclaudia::runtime::CancellationReason::Deadline,
+        }
+    } else if normalized.contains("output limit")
+        || normalized.contains("length_limited")
+        || normalized.contains("print output exceeded")
+        || normalized.contains("max_tokens")
+    {
+        PrintModeError::Length {
+            detail: bounded_error_detail(&detail),
+        }
+    } else if normalized.contains("refused")
+        || normalized.contains("filtered")
+        || normalized.contains("safety_blocked")
+    {
+        PrintModeError::Refused
+    } else if normalized.contains("ended before")
+        || normalized.contains("missing terminal")
+        || normalized.contains("without a valid terminal")
+        || normalized.contains("did not contain printable")
+    {
+        PrintModeError::partial(detail)
+    } else if normalized.contains("api error") || normalized.contains("stream error") {
+        PrintModeError::provider(detail)
+    } else {
+        PrintModeError::protocol(detail)
+    }
+}
+
+fn require_print_terminal(
+    terminal: openclaudia::pipeline::ProviderTerminalOutcome,
+    tool_call_count: usize,
+) -> Result<(), PrintModeError> {
+    use openclaudia::pipeline::ProviderTerminalOutcome;
+
+    match terminal {
+        ProviderTerminalOutcome::Completed if tool_call_count == 0 => Ok(()),
+        ProviderTerminalOutcome::Completed => Err(PrintModeError::protocol(format!(
+            "provider reported completion with {tool_call_count} tool call(s)"
+        ))),
+        ProviderTerminalOutcome::ToolCalls => Err(PrintModeError::partial(format!(
+            "provider requested {tool_call_count} tool continuation(s) in no-tools print mode"
+        ))),
+        ProviderTerminalOutcome::LengthLimited => Err(PrintModeError::Length {
+            detail: "provider stopped at its output limit".to_string(),
+        }),
+        ProviderTerminalOutcome::Refused | ProviderTerminalOutcome::ContentFiltered => {
+            Err(PrintModeError::Refused)
+        }
+    }
+}
+
+fn validate_print_content(content: String) -> Result<String, PrintModeError> {
+    if content.len() > MAX_PRINT_OUTPUT_BYTES {
+        return Err(PrintModeError::Length {
+            detail: format!("assistant text exceeded the {MAX_PRINT_OUTPUT_BYTES}-byte limit"),
+        });
+    }
+    if content.trim().is_empty() {
+        return Err(PrintModeError::partial(
+            "successful terminal state contained no printable assistant text",
+        ));
+    }
+    Ok(content)
+}
+
+fn prepare_print_output(content: &str) -> Result<String, PrintModeError> {
+    let rendered = openclaudia::tui::safety::sanitize_terminal_text(
+        content,
+        openclaudia::tui::safety::TextLimits::new(
+            MAX_PRINT_OUTPUT_BYTES,
+            MAX_PRINT_OUTPUT_BYTES,
+            MAX_PRINT_OUTPUT_LINES,
+            MAX_PRINT_OUTPUT_BYTES,
+        ),
+    );
+    if rendered.was_truncated() {
+        return Err(PrintModeError::Length {
+            detail: format!(
+                "terminal-safe output exceeded the {MAX_PRINT_OUTPUT_BYTES}-byte framing limit"
+            ),
+        });
+    }
+    Ok(rendered.into_string())
+}
+
+fn deliver_print_output(
+    writer: &mut impl std::io::Write,
+    content: &str,
+) -> Result<(), PrintModeError> {
+    writer
+        .write_all(content.as_bytes())
+        .map_err(|error| print_delivery_error(&error))?;
+    if !content.ends_with('\n') {
+        writer
+            .write_all(b"\n")
+            .map_err(|error| print_delivery_error(&error))?;
+    }
+    writer.flush().map_err(|error| print_delivery_error(&error))
+}
+
+fn print_delivery_error(error: &std::io::Error) -> PrintModeError {
+    if error.kind() == std::io::ErrorKind::BrokenPipe {
+        PrintModeError::BrokenPipe
+    } else {
+        PrintModeError::Delivery {
+            detail: bounded_error_detail(&error.to_string()),
+        }
+    }
+}
+
 async fn print_json_response(
     response: reqwest::Response,
     adapter: &dyn ProviderAdapter,
-) -> anyhow::Result<String> {
+    provider: &str,
+    model: &str,
+    assistant_message_ordinal: u64,
+) -> Result<PrintCandidate, PrintModeError> {
     let body = openclaudia::provider_transport::read_json_capped::<serde_json::Value>(
         response,
         openclaudia::provider_transport::MAX_JSON_RESPONSE_BYTES,
     )
-    .await?;
+    .await
+    .map_err(print_transport_error)?;
+    if matches!(
+        provider.trim().to_ascii_lowercase().as_str(),
+        "google" | "gemini" | "ollama"
+    ) {
+        let decoded = openclaudia::pipeline::decode_provider_native_json_turn(
+            provider,
+            model,
+            &body,
+            None,
+            assistant_message_ordinal,
+        )
+        .map_err(provider_terminal_error)?;
+        require_print_terminal(decoded.terminal_outcome, decoded.tool_calls.len())?;
+        let content = validate_print_content(decoded.content)?;
+        return Ok(PrintCandidate {
+            content,
+            usage: reported_print_usage(decoded.usage),
+            native_state_digest: Some(decoded.provider_native_state.digest()),
+        });
+    }
+
     let normalized = adapter
         .transform_response(body.clone(), false)
-        .map_err(|error| anyhow::anyhow!("provider response transform failed: {error}"))?;
+        .map_err(|error| PrintModeError::protocol(format!("response transform failed: {error}")))?;
     let terminal = openclaudia::pipeline::validate_chat_completion_terminal(&normalized)
-        .map_err(anyhow::Error::msg)?;
-    if terminal != openclaudia::pipeline::ProviderTerminalOutcome::Completed {
-        anyhow::bail!("provider requested tools in no-tools print mode");
-    }
+        .map_err(provider_terminal_error)?;
+    require_print_terminal(terminal, 0)?;
     let text = adapter.extract_response_text(&body).ok_or_else(|| {
-        anyhow::anyhow!("provider response did not contain printable assistant text")
+        PrintModeError::partial("response did not contain printable assistant text")
     })?;
-    Ok(text)
+    Ok(PrintCandidate {
+        content: validate_print_content(text)?,
+        usage: None,
+        native_state_digest: None,
+    })
 }
 
 async fn print_sse_response(
     response: reqwest::Response,
     provider: &str,
-    emit_live: bool,
-) -> anyhow::Result<String> {
+) -> Result<PrintCandidate, PrintModeError> {
     let mut stream = openclaudia::provider_transport::bounded_byte_stream(
         response,
         openclaudia::provider_transport::MAX_STREAM_RESPONSE_BYTES,
@@ -360,45 +856,54 @@ async fn print_sse_response(
     let mut emitted_text = false;
     let mut full_text = String::new();
     let mut response_text_truncated = false;
-    let mut live_display_bytes = 0usize;
-    let mut live_display_truncated = false;
+    let mut usage = openclaudia::session::TokenUsage::default();
+    let mut usage_observed = false;
 
-    while let Some(event) = stream.next().await {
-        let event = event.map_err(|err| anyhow::anyhow!("SSE stream error: {err}"))?;
+    loop {
+        let event = tokio::time::timeout(PRINT_STREAM_IDLE_TIMEOUT, stream.next())
+            .await
+            .map_err(|_| PrintModeError::Cancelled {
+                reason: openclaudia::runtime::CancellationReason::Deadline,
+            })?;
+        let Some(event) = event else {
+            break;
+        };
+        let event = event.map_err(|error| {
+            let detail = bounded_error_detail(&error.to_string());
+            if emitted_text {
+                return PrintModeError::Partial { detail };
+            }
+            match error {
+                eventsource_stream::EventStreamError::Transport(error) => {
+                    print_transport_error(error)
+                }
+                eventsource_stream::EventStreamError::Utf8(_)
+                | eventsource_stream::EventStreamError::Parser(_) => {
+                    PrintModeError::protocol(detail)
+                }
+            }
+        })?;
         if event.data == "[DONE]" {
             state.terminal.observe_done();
             break;
         }
         let json = serde_json::from_str::<serde_json::Value>(&event.data)
-            .map_err(|err| anyhow::anyhow!("invalid SSE data JSON: {err}"))?;
-        state.terminal.observe(&json).map_err(anyhow::Error::msg)?;
+            .map_err(|error| PrintModeError::protocol(format!("invalid SSE data JSON: {error}")))?;
+        state
+            .terminal
+            .observe(&json)
+            .map_err(provider_terminal_error)?;
+        if let Some(event_usage) = openclaudia::proxy::extract_usage_from_sse_event(&json) {
+            usage_observed = true;
+            usage.accumulate(&event_usage);
+        }
         if let Some(text) = extract_print_sse_text(&json, &mut state) {
             emitted_text |= !text.is_empty();
             response_text_truncated |= openclaudia::tui::safety::append_raw_bounded(
                 &mut full_text,
                 &text,
-                openclaudia::tui::safety::STREAM_TEXT_LIMITS.max_input_bytes,
+                MAX_PRINT_OUTPUT_BYTES,
             );
-            if emit_live && !live_display_truncated {
-                let remaining = openclaudia::tui::safety::STREAM_TEXT_LIMITS
-                    .max_output_bytes
-                    .saturating_sub(live_display_bytes);
-                let display = openclaudia::tui::safety::sanitize_terminal_text(
-                    &text,
-                    openclaudia::tui::safety::TextLimits::new(
-                        remaining,
-                        remaining,
-                        openclaudia::tui::safety::STREAM_TEXT_LIMITS.max_lines,
-                        openclaudia::tui::safety::STREAM_TEXT_LIMITS.max_line_bytes,
-                    ),
-                );
-                print!("{}", display.as_str());
-                live_display_bytes = live_display_bytes.saturating_add(display.as_str().len());
-                live_display_truncated = display.was_truncated()
-                    || live_display_bytes
-                        >= openclaudia::tui::safety::STREAM_TEXT_LIMITS.max_output_bytes;
-                std::io::stdout().flush()?;
-            }
         }
     }
 
@@ -406,37 +911,34 @@ async fn print_sse_response(
         state
             .anthropic_accumulator
             .finalize_tool_calls_checked()
-            .map_err(anyhow::Error::msg)?
+            .map_err(PrintModeError::protocol)?
             .len()
     } else {
         state
             .tool_accumulator
             .finalize_checked()
-            .map_err(anyhow::Error::msg)?
+            .map_err(PrintModeError::protocol)?
             .len()
     };
-    let terminal = state.terminal.finish().map_err(anyhow::Error::msg)?;
-    if tool_call_count > 0 {
-        anyhow::bail!("provider returned {tool_call_count} tool call(s) to no-tools print mode");
-    }
-    openclaudia::pipeline::ensure_provider_turn_succeeded(terminal, tool_call_count)
-        .map_err(anyhow::Error::msg)?;
+    let terminal = state.terminal.finish().map_err(provider_terminal_error)?;
+    require_print_terminal(terminal, tool_call_count)?;
 
     if response_text_truncated {
-        anyhow::bail!(
-            "provider assistant text exceeded the {}-byte print rendering limit",
-            openclaudia::tui::safety::STREAM_TEXT_LIMITS.max_input_bytes
-        );
+        return Err(PrintModeError::Length {
+            detail: format!("assistant text exceeded the {MAX_PRINT_OUTPUT_BYTES}-byte limit"),
+        });
     }
 
     if !emitted_text {
-        anyhow::bail!("provider stream did not contain printable assistant text");
+        return Err(PrintModeError::partial(
+            "provider stream did not contain printable assistant text",
+        ));
     }
-
-    if emit_live {
-        println!();
-    }
-    Ok(full_text)
+    Ok(PrintCandidate {
+        content: validate_print_content(full_text)?,
+        usage: usage_observed.then_some(usage),
+        native_state_digest: None,
+    })
 }
 
 fn print_message_values(
@@ -457,7 +959,8 @@ async fn print_responses_stream(
     provider: &str,
     model: &str,
     assistant_message_ordinal: u64,
-) -> anyhow::Result<String> {
+) -> Result<PrintCandidate, PrintModeError> {
+    let mut observed_output_bytes = 0usize;
     let decoded = openclaudia::pipeline::decode_openai_responses_stream(
         openclaudia::pipeline::OpenAiResponsesStreamParams {
             response,
@@ -467,28 +970,29 @@ async fn print_responses_stream(
             provider_native_state: None,
             assistant_message_ordinal,
         },
-        |_| Ok(()),
+        |text| {
+            observed_output_bytes = observed_output_bytes
+                .checked_add(text.len())
+                .ok_or_else(|| "print output byte accounting overflow".to_string())?;
+            if observed_output_bytes > MAX_PRINT_OUTPUT_BYTES {
+                return Err(format!(
+                    "print output exceeded the {MAX_PRINT_OUTPUT_BYTES}-byte limit"
+                ));
+            }
+            Ok(())
+        },
         |_| Ok(()),
         |_, _| Ok(()),
     )
     .await
-    .map_err(anyhow::Error::msg)?;
+    .map_err(provider_terminal_error)?;
 
-    if !decoded.tool_calls.is_empty() {
-        anyhow::bail!(
-            "Responses provider returned {} tool call(s) to no-tools print mode",
-            decoded.tool_calls.len()
-        );
-    }
-    openclaudia::pipeline::ensure_provider_turn_succeeded(
-        decoded.terminal_outcome,
-        decoded.tool_calls.len(),
-    )
-    .map_err(anyhow::Error::msg)?;
-    if decoded.content.is_empty() {
-        anyhow::bail!("Responses stream did not contain printable assistant text");
-    }
-    Ok(decoded.content)
+    require_print_terminal(decoded.terminal_outcome, decoded.tool_calls.len())?;
+    Ok(PrintCandidate {
+        content: validate_print_content(decoded.content)?,
+        usage: reported_print_usage(decoded.usage),
+        native_state_digest: Some(decoded.provider_native_state.digest()),
+    })
 }
 
 async fn finalize_print_candidate(
@@ -497,27 +1001,56 @@ async fn finalize_print_candidate(
     engine: Option<&openclaudia::vdd::VddEngine>,
     request: &openclaudia::proxy::ChatCompletionRequest,
     api_key: Option<&openclaudia::providers::ApiKey>,
-    content: String,
-) -> anyhow::Result<()> {
-    let messages = print_message_values(request)?;
-    let (content, _observation) = crate::run_vdd_review(
-        engine,
-        &config.vdd,
-        run,
-        content,
-        &messages,
-        &config.proxy.target,
-        &request.model,
-        api_key,
-    )
-    .await
-    .map_err(anyhow::Error::msg)?;
-    let content = openclaudia::tui::safety::sanitize_terminal_text(
-        &content,
-        openclaudia::tui::safety::MARKDOWN_TEXT_LIMITS,
-    );
-    println!("{}", content.as_str());
-    Ok(())
+    mut candidate: PrintCandidate,
+) -> Result<PrintCandidate, PrintModeError> {
+    let messages = print_message_values(request).map_err(PrintModeError::setup)?;
+    let policy = openclaudia::vdd::VddFinalizationPolicy::from_config(&config.vdd);
+    if policy.requirement() != openclaudia::vdd::VddFinalizationRequirement::Disabled {
+        let user_task = messages
+            .iter()
+            .rev()
+            .find(|message| message.get("role").and_then(|role| role.as_str()) == Some("user"))
+            .and_then(|message| message.get("content").and_then(|content| content.as_str()))
+            .unwrap_or("");
+        let builder = openclaudia::vdd::BuilderProvider::new(&config.proxy.target, api_key)
+            .with_model(&request.model);
+        let scope = format!(
+            "print:{}:{user_task}",
+            run.runtime().descriptor().session_id
+        );
+        let content = std::mem::take(&mut candidate.content);
+        let finalization = openclaudia::vdd::finalize_text_candidate(
+            engine, run, &policy, content, &scope, user_task, builder,
+        )
+        .await;
+        let (publication, _observation) = finalization.into_parts();
+        candidate.content = match publication {
+            openclaudia::vdd::VddPublication::Publish(published) => {
+                tracing::info!(
+                    outcome = ?published.outcome(),
+                    "VDD finalization admitted print output"
+                );
+                published.into_candidate()
+            }
+            openclaudia::vdd::VddPublication::Withhold(withheld) => {
+                if withheld.outcome() == openclaudia::vdd::VddNonPassOutcome::Cancelled {
+                    return Err(PrintModeError::Cancelled {
+                        reason: run.runtime().cancellation().receipt().map_or(
+                            openclaudia::runtime::CancellationReason::ParentTerminated,
+                            |receipt| receipt.reason,
+                        ),
+                    });
+                }
+                return Err(PrintModeError::finalization(format!(
+                    "VDD withheld assistant success ({:?}): {}",
+                    withheld.outcome(),
+                    withheld.detail()
+                )));
+            }
+        };
+    }
+    candidate.content = prepare_print_output(&candidate.content)?;
+    Ok(candidate)
 }
 
 struct PreparedPrintTransport {
@@ -525,7 +1058,7 @@ struct PreparedPrintTransport {
     endpoint: String,
     headers: openclaudia::secrets::SensitiveHeaders,
     wire_api: openclaudia::pipeline::WireApi,
-    responses_assistant_ordinal: Option<u64>,
+    assistant_message_ordinal: u64,
 }
 
 struct PreparePrintTransport<'a> {
@@ -545,40 +1078,35 @@ fn prepare_print_transport(
     } else {
         openclaudia::pipeline::WireApi::ChatCompletions
     };
-    let (request_body, responses_assistant_ordinal) = if wire_api.is_responses() {
-        let messages = print_message_values(p.chat_request)?;
-        let ordinal = openclaudia::pipeline::next_assistant_message_ordinal(&messages)
+    let messages = print_message_values(p.chat_request)?;
+    let assistant_message_ordinal =
+        openclaudia::pipeline::next_assistant_message_ordinal(&messages)
             .map_err(anyhow::Error::msg)?;
-        (
-            openclaudia::pipeline::build_request_for_wire_with_exact_tools_and_state(
-                wire_api,
-                &p.config.proxy.target,
-                p.model,
-                &messages,
-                p.provider
-                    .thinking
-                    .reasoning_effort
-                    .as_deref()
-                    .unwrap_or("medium"),
-                None,
-                None,
-                &[],
-                None,
-            )
-            .map_err(anyhow::Error::msg)?,
-            Some(ordinal),
-        )
-    } else {
-        (
-            build_print_request(
-                p.adapter,
-                p.chat_request,
-                &p.provider.thinking,
-                p.auth.claude_code_token.as_ref(),
-            )
-            .map_err(anyhow::Error::msg)?,
+    let request_body = if wire_api.is_responses() {
+        openclaudia::pipeline::build_request_for_wire_with_exact_tools_and_state(
+            wire_api,
+            &p.config.proxy.target,
+            p.model,
+            &messages,
+            p.provider
+                .thinking
+                .reasoning_effort
+                .as_deref()
+                .unwrap_or("medium"),
+            None,
+            None,
+            &[],
             None,
         )
+        .map_err(anyhow::Error::msg)?
+    } else {
+        build_print_request(
+            p.adapter,
+            p.chat_request,
+            &p.provider.thinking,
+            p.auth.claude_code_token.as_ref(),
+        )
+        .map_err(anyhow::Error::msg)?
     };
     let extra_headers = p.provider.headers.clone();
     let (endpoint, headers) = if p.auth.codex_agent_sdk.is_some() {
@@ -614,8 +1142,100 @@ fn prepare_print_transport(
         endpoint,
         headers,
         wire_api,
-        responses_assistant_ordinal,
+        assistant_message_ordinal,
     })
+}
+
+fn codex_sdk_error(error: openclaudia::codex_agent_sdk::CodexAgentSdkError) -> PrintModeError {
+    use openclaudia::codex_agent_sdk::CodexAgentSdkError;
+
+    match error {
+        CodexAgentSdkError::Timeout(_) | CodexAgentSdkError::Deadline => {
+            PrintModeError::Cancelled {
+                reason: openclaudia::runtime::CancellationReason::Deadline,
+            }
+        }
+        CodexAgentSdkError::Cancelled(reason) => PrintModeError::Cancelled { reason },
+        CodexAgentSdkError::OutputTooLarge(limit) => PrintModeError::Length {
+            detail: format!("Codex SDK output exceeded its {limit}-byte limit"),
+        },
+        invalid @ (CodexAgentSdkError::InvalidOutput(_)
+        | CodexAgentSdkError::InvalidRequest(_)
+        | CodexAgentSdkError::NativeToolUse(_)) => PrintModeError::protocol(invalid),
+        other => PrintModeError::provider(other),
+    }
+}
+
+fn claude_sdk_error(error: openclaudia::claude_agent_sdk::ClaudeAgentSdkError) -> PrintModeError {
+    use openclaudia::claude_agent_sdk::ClaudeAgentSdkError;
+
+    match error {
+        ClaudeAgentSdkError::Timeout(_) | ClaudeAgentSdkError::Deadline => {
+            PrintModeError::Cancelled {
+                reason: openclaudia::runtime::CancellationReason::Deadline,
+            }
+        }
+        ClaudeAgentSdkError::Cancelled(reason) => PrintModeError::Cancelled { reason },
+        ClaudeAgentSdkError::OutputTooLarge(limit) => PrintModeError::Length {
+            detail: format!("Claude Agent SDK output exceeded its {limit}-byte limit"),
+        },
+        invalid @ (ClaudeAgentSdkError::InvalidOutput(_)
+        | ClaudeAgentSdkError::InvalidRequest(_)) => PrintModeError::protocol(invalid),
+        other => PrintModeError::provider(other),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_print_http(
+    provider: &str,
+    model: &str,
+    adapter: &dyn ProviderAdapter,
+    headers: &openclaudia::secrets::SensitiveHeaders,
+    wire_api: openclaudia::pipeline::WireApi,
+    assistant_message_ordinal: u64,
+    endpoint: String,
+    request_body: &serde_json::Value,
+) -> Result<PrintCandidate, PrintModeError> {
+    let client = openclaudia::provider_transport::shared_client().map_err(print_transport_error)?;
+    let request = headers
+        .apply(client.post(endpoint).json(request_body))
+        .map_err(PrintModeError::provider)?;
+    let response = openclaudia::provider_transport::send(request)
+        .await
+        .map_err(print_transport_error)?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = openclaudia::secrets::read_bounded_diagnostic_body(response)
+            .await
+            .unwrap_or_else(|_| zeroize::Zeroizing::new(String::new()));
+        let diagnostic = headers.sanitize_diagnostic(&body);
+        return Err(PrintModeError::provider(format!(
+            "API error {}: {diagnostic}",
+            status.as_u16()
+        )));
+    }
+
+    if wire_api.is_responses() {
+        print_responses_stream(
+            response,
+            headers,
+            provider,
+            model,
+            assistant_message_ordinal,
+        )
+        .await
+    } else if response_is_json(&response) {
+        print_json_response(
+            response,
+            adapter,
+            provider,
+            model,
+            assistant_message_ordinal,
+        )
+        .await
+    } else {
+        print_sse_response(response, provider).await
+    }
 }
 
 /// Run one-shot print mode.
@@ -625,7 +1245,7 @@ fn prepare_print_transport(
 /// Returns an error when configuration/auth cannot be resolved, the provider
 /// rejects the request, or the response stream cannot be decoded.
 #[allow(clippy::too_many_lines)] // One-shot mode owns setup, budgeted transport, and terminal output.
-pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
+pub async fn cmd_print(options: PrintOptions) -> Result<(), PrintModeError> {
     crate::chdir_to_git_root();
 
     let PrintOptions {
@@ -633,13 +1253,26 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
         target_override,
         prompt,
     } = options;
+    if prompt.len() > MAX_PRINT_PROMPT_BYTES {
+        return Err(PrintModeError::InputTooLarge {
+            limit: MAX_PRINT_PROMPT_BYTES,
+        });
+    }
     let explicit_model_override = model_override.is_some();
-    let config = load_print_config(model_override.as_deref(), target_override.as_deref())?;
+    let config = load_print_config(model_override.as_deref(), target_override.as_deref())
+        .map_err(PrintModeError::setup)?;
     let print_root = std::env::current_dir()
-        .map_err(|error| anyhow::anyhow!("could not resolve print-mode project root: {error}"))?;
+        .map_err(|error| PrintModeError::setup(format!("project root unavailable: {error}")))?;
     let host_home = dirs::home_dir().and_then(|path| path.canonicalize().ok());
     let skill_access =
         openclaudia::skills::SkillRunAccess::capture(&print_root, host_home.as_deref());
+    let remote_actions = config
+        .remote_actions
+        .build_registry()
+        .map_err(PrintModeError::setup)?;
+    let web_egress_grants = config
+        .build_web_egress_grants()
+        .map_err(PrintModeError::setup)?;
     let print_run = openclaudia::tools::ToolRunContext::builder(
         openclaudia::state::SessionId::new(),
         &print_root,
@@ -649,17 +1282,8 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
     .read_write_roots(Vec::new())
     .environment_grants(std::collections::HashMap::new())
     .skill_access(skill_access)
-    .remote_actions(
-        config
-            .remote_actions
-            .build_registry()
-            .map_err(anyhow::Error::msg)?,
-    )
-    .web_egress_grants(
-        config
-            .build_web_egress_grants()
-            .map_err(anyhow::Error::msg)?,
-    )
+    .remote_actions(remote_actions)
+    .web_egress_grants(web_egress_grants)
     .workspace_access(openclaudia::tools::WorkspaceAccess::ReadOnly)
     .process(false)
     .network(true)
@@ -671,257 +1295,335 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
             .run_budget
             .limits_for_session(&config.session),
     )
+    .bounded_print_profile()
     .build()
-    .map_err(anyhow::Error::msg)?;
-    let mut print_turn = resolve_print_turn(prompt, &print_run)?;
+    .map_err(PrintModeError::setup)?;
+    let mut runtime = PrintRuntime::start(&print_run).await?;
+    let mut print_turn = match resolve_print_turn(prompt, &print_run) {
+        Ok(turn) => turn,
+        Err(error) => {
+            let error = runtime
+                .terminate_failure(PrintModeError::setup(error))
+                .await;
+            openclaudia::tools::retire_run(&print_run);
+            return Err(error);
+        }
+    };
     let mut hook_engine = crate::build_hook_engine(&config);
     if let Some(skill_hooks) = print_turn.skill_hooks.take() {
         hook_engine = hook_engine.with_scoped_hooks(skill_hooks);
     }
     let session_id = print_run.session_id().to_string();
-    let start_input = openclaudia::hooks::HookInput::for_run(
-        &print_run,
-        openclaudia::hooks::HookEvent::SessionStart,
-    )
-    .with_session_id(&session_id);
-    let start_receipt = hook_engine
-        .run_lifecycle(openclaudia::hooks::HookEvent::SessionStart, &start_input)
-        .await;
-    if let Some(reason) = start_receipt.blocking_reason() {
-        openclaudia::tools::retire_run(&print_run);
-        anyhow::bail!("SessionStart hook blocked print request: {reason}");
-    }
+    let outcome: Result<(), PrintModeError> = async {
+        let start_call = runtime
+            .begin_call(openclaudia::runtime::CallKind::Hook)
+            .await?;
+        let start_input = openclaudia::hooks::HookInput::for_run(
+            &print_run,
+            openclaudia::hooks::HookEvent::SessionStart,
+        )
+        .with_session_id(&session_id);
+        let start_receipt = hook_engine
+            .run_lifecycle(openclaudia::hooks::HookEvent::SessionStart, &start_input)
+            .await;
+        if let Some(reason) = start_receipt.blocking_reason() {
+            return Err(runtime
+                .terminate_call_failure(
+                    start_call,
+                    PrintModeError::Hook {
+                        detail: bounded_error_detail(&reason),
+                    },
+                )
+                .await);
+        }
+        runtime
+            .finish_call_success(start_call, format!("{:?}", start_receipt.status))
+            .await?;
 
-    let outcome: anyhow::Result<()> = async {
-    let hook_input = openclaudia::hooks::HookInput::for_run(
-        &print_run,
-        openclaudia::hooks::HookEvent::UserPromptSubmit,
-    )
-    .with_session_id(&session_id)
-    .with_prompt(&print_turn.prompt);
-    let prompt_receipt = hook_engine
-        .run_lifecycle(
+        let prompt_call = runtime
+            .begin_call(openclaudia::runtime::CallKind::Hook)
+            .await?;
+        let hook_input = openclaudia::hooks::HookInput::for_run(
+            &print_run,
             openclaudia::hooks::HookEvent::UserPromptSubmit,
-            &hook_input,
         )
-        .await;
-    if let Some(reason) = prompt_receipt.blocking_reason() {
-        anyhow::bail!("UserPromptSubmit hook blocked print request: {reason}");
-    }
-    print_turn
-        .context_items
-        .extend(openclaudia::context::hook_result_reference_items(
-            &prompt_receipt.into_result(),
-            "print_user_prompt_submit",
-            500,
-        ));
-
-    let mut provider = config.active_provider().cloned().ok_or_else(|| {
-        anyhow::anyhow!(
-            "no provider configured for target '{}'",
-            config.proxy.target
-        )
-    })?;
-    let Some(chat_auth) = resolve_chat_auth(
-        &config.proxy.target,
-        &provider,
-        ChatAuthSelectionMode::Automatic,
-    )
-    .await?
-    else {
-        anyhow::bail!(
-            "could not resolve authentication for target '{}'",
-            config.proxy.target
-        );
-    };
-    let mut model =
-        resolve_model_name(model_override, provider.model.clone(), &config.proxy.target)
-            .map_err(anyhow::Error::msg)?;
-    if !explicit_model_override {
-        if let Some(skill_model) = print_turn.skill_model.as_deref() {
-            if print_provider_accepts_model(&config, skill_model) {
-                model = skill_model.to_string();
-            } else {
-                tracing::debug!(
-                    model = %skill_model,
-                    provider = %config.proxy.target,
-                    "ignoring skill model hint for a different provider in print mode"
-                );
-            }
+        .with_session_id(&session_id)
+        .with_prompt(&print_turn.prompt);
+        let prompt_receipt = hook_engine
+            .run_lifecycle(openclaudia::hooks::HookEvent::UserPromptSubmit, &hook_input)
+            .await;
+        if let Some(reason) = prompt_receipt.blocking_reason() {
+            return Err(runtime
+                .terminate_call_failure(
+                    prompt_call,
+                    PrintModeError::Hook {
+                        detail: bounded_error_detail(&reason),
+                    },
+                )
+                .await);
         }
-    }
-    if let Some(skill_effort) = print_turn.skill_effort.take() {
-        provider.thinking.reasoning_effort = Some(skill_effort);
-    }
-    let adapter = openclaudia::providers::get_adapter(&config.proxy.target)?;
-    let mut chat_request = build_print_chat_request_with_items(
-        adapter,
-        &model,
-        print_turn.prompt,
-        &print_run,
-        print_turn.context_items,
-    );
-    if config.vdd.enabled {
-        chat_request.stream = Some(false);
-    }
-    enforce_print_request_policy(&config, &chat_request)?;
-    let vdd_engine = crate::init_vdd_engine_if_enabled(&config);
-    let prepared = prepare_print_transport(&PreparePrintTransport {
-        config: &config,
-        provider: &provider,
-        adapter,
-        model: &model,
-        chat_request: &chat_request,
-        auth: &chat_auth,
-    })?;
-    let PreparedPrintTransport {
-        mut request_body,
-        endpoint,
-        headers,
-        wire_api,
-        responses_assistant_ordinal,
-    } = prepared;
-    let provider_budget = openclaudia::provider_budget::reserve_provider_call(
-        &print_run,
-        &config.proxy.target,
-        &model,
-        &mut request_body,
-        u64::from(config.session.token_tracking.max_output_tokens),
-    )
-    .map_err(|error| anyhow::anyhow!("Run budget denied provider call: {error}"))?;
-    if let Some(sdk) = chat_auth.codex_agent_sdk.as_ref() {
-        let effort = provider
-            .thinking
-            .reasoning_effort
-            .as_deref()
-            .unwrap_or("medium");
-        let turn = match sdk.complete_turn(&request_body, effort).await {
-            Ok(turn) => turn,
-            Err(error) => {
-                provider_budget.finish_unknown().map_err(|budget_error| {
-                    anyhow::anyhow!(
-                        "Codex SDK request failed: {error}; budget reconciliation failed: {budget_error}"
-                    )
-                })?;
-                return Err(anyhow::anyhow!("Codex SDK request failed: {error}"));
-            }
+        runtime
+            .finish_call_success(prompt_call, format!("{:?}", prompt_receipt.status))
+            .await?;
+        print_turn
+            .context_items
+            .extend(openclaudia::context::hook_result_reference_items(
+                &prompt_receipt.into_result(),
+                "print_user_prompt_submit",
+                500,
+            ));
+
+        let Some(mut provider) = config.active_provider().cloned() else {
+            return Err(runtime
+                .terminate_failure(PrintModeError::setup(format!(
+                    "no provider configured for target '{}'",
+                    config.proxy.target
+                )))
+                .await);
         };
-        provider_budget
-            .reconcile(&turn.usage)
-            .map_err(|error| anyhow::anyhow!("Provider budget reconciliation failed: {error}"))?;
-        if !turn.tool_calls.is_empty() {
-            anyhow::bail!(
-                "Codex SDK returned {} tool call(s) to no-tools print mode",
-                turn.tool_calls.len()
-            );
-        }
-        if turn.content.trim().is_empty() {
-            anyhow::bail!("Codex SDK returned no printable assistant text");
-        }
-        return finalize_print_candidate(
-            &config,
-            &print_run,
-            vdd_engine.as_ref(),
-            &chat_request,
-            chat_auth.api_key.as_ref(),
-            turn.content,
-        )
-        .await;
-    }
-
-    if let Some(sdk) = chat_auth.claude_agent_sdk.as_ref() {
-        let effort = provider
-            .thinking
-            .reasoning_effort
-            .as_deref()
-            .unwrap_or("medium");
-        let turn = match sdk.complete_turn(&request_body, effort).await {
-            Ok(turn) => turn,
-            Err(error) => {
-                provider_budget.finish_unknown().map_err(|budget_error| {
-                    anyhow::anyhow!(
-                        "Claude Agent SDK request failed: {error}; budget reconciliation failed: {budget_error}"
-                    )
-                })?;
-                return Err(anyhow::anyhow!("Claude Agent SDK request failed: {error}"));
-            }
-        };
-        provider_budget
-            .reconcile(&turn.usage)
-            .map_err(|error| anyhow::anyhow!("Provider budget reconciliation failed: {error}"))?;
-        if !turn.tool_calls.is_empty() {
-            anyhow::bail!(
-                "Claude Agent SDK returned {} tool call(s) to no-tools print mode",
-                turn.tool_calls.len()
-            );
-        }
-        if turn.content.trim().is_empty() {
-            anyhow::bail!("Claude Agent SDK returned no printable assistant text");
-        }
-        return finalize_print_candidate(
-            &config,
-            &print_run,
-            vdd_engine.as_ref(),
-            &chat_request,
-            chat_auth.api_key.as_ref(),
-            turn.content,
-        )
-        .await;
-    }
-
-    let client = openclaudia::provider_transport::shared_client()
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let request = headers.apply(client.post(endpoint).json(&request_body))?;
-
-    let response = openclaudia::provider_transport::send(request).await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = openclaudia::secrets::read_bounded_diagnostic_body(response)
-            .await
-            .unwrap_or_else(|_| zeroize::Zeroizing::new(String::new()));
-        let diagnostic = headers.sanitize_diagnostic(&body);
-        anyhow::bail!("API error {}: {diagnostic}", status.as_u16());
-    }
-
-    let (result, emitted_live) = if wire_api.is_responses() {
-        (
-            print_responses_stream(
-                response,
-                &headers,
-                &config.proxy.target,
-                &model,
-                responses_assistant_ordinal
-                    .ok_or_else(|| anyhow::anyhow!("Responses request ordinal is missing"))?,
-            )
-            .await,
-            false,
-        )
-    } else if response_is_json(&response) {
-        (print_json_response(response, adapter).await, false)
-    } else {
-        let emitted_live = !config.vdd.enabled;
-        (
-            print_sse_response(response, &config.proxy.target, emitted_live).await,
-            emitted_live,
-        )
-    };
-    provider_budget
-        .finish_unknown()
-        .map_err(|error| anyhow::anyhow!("Provider budget reconciliation failed: {error}"))?;
-    let content = result?;
-    if emitted_live {
-        Ok(())
-    } else {
-        finalize_print_candidate(
-            &config,
-            &print_run,
-            vdd_engine.as_ref(),
-            &chat_request,
-            chat_auth.api_key.as_ref(),
-            content,
+        let chat_auth = match resolve_chat_auth(
+            &config.proxy.target,
+            &provider,
+            ChatAuthSelectionMode::Automatic,
         )
         .await
-    }
+        {
+            Ok(Some(auth)) => auth,
+            Ok(None) => {
+                return Err(runtime
+                    .terminate_failure(PrintModeError::setup(format!(
+                        "authentication unavailable for target '{}'",
+                        config.proxy.target
+                    )))
+                    .await);
+            }
+            Err(error) => {
+                return Err(runtime
+                    .terminate_failure(PrintModeError::setup(error))
+                    .await);
+            }
+        };
+        let mut model = match resolve_model_name(
+            model_override,
+            provider.model.clone(),
+            &config.proxy.target,
+        ) {
+            Ok(model) => model,
+            Err(error) => {
+                return Err(runtime
+                    .terminate_failure(PrintModeError::setup(error))
+                    .await);
+            }
+        };
+        if !explicit_model_override {
+            if let Some(skill_model) = print_turn.skill_model.as_deref() {
+                if print_provider_accepts_model(&config, skill_model) {
+                    model = skill_model.to_string();
+                } else {
+                    tracing::debug!(
+                        model = %skill_model,
+                        provider = %config.proxy.target,
+                        "ignoring skill model hint for a different provider in print mode"
+                    );
+                }
+            }
+        }
+        if let Some(skill_effort) = print_turn.skill_effort.take() {
+            provider.thinking.reasoning_effort = Some(skill_effort);
+        }
+        let adapter = match openclaudia::providers::get_adapter(&config.proxy.target) {
+            Ok(adapter) => adapter,
+            Err(error) => {
+                return Err(runtime
+                    .terminate_failure(PrintModeError::setup(error))
+                    .await);
+            }
+        };
+        let mut chat_request = build_print_chat_request_with_items(
+            adapter,
+            &model,
+            print_turn.prompt,
+            &print_run,
+            print_turn.context_items,
+        );
+        if config.vdd.enabled {
+            chat_request.stream = Some(false);
+        }
+        if let Err(error) = enforce_print_request_policy(&config, &chat_request) {
+            return Err(runtime
+                .terminate_failure(PrintModeError::policy(error))
+                .await);
+        }
+        let vdd_engine = crate::init_vdd_engine_if_enabled(&config);
+        let prepared = match prepare_print_transport(&PreparePrintTransport {
+            config: &config,
+            provider: &provider,
+            adapter,
+            model: &model,
+            chat_request: &chat_request,
+            auth: &chat_auth,
+        }) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Err(runtime
+                    .terminate_failure(PrintModeError::setup(error))
+                    .await);
+            }
+        };
+        let PreparedPrintTransport {
+            mut request_body,
+            endpoint,
+            headers,
+            wire_api,
+            assistant_message_ordinal,
+        } = prepared;
+        let provider_budget = match openclaudia::provider_budget::reserve_provider_call(
+            &print_run,
+            &config.proxy.target,
+            &model,
+            &mut request_body,
+            u64::from(config.session.token_tracking.max_output_tokens),
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                return Err(runtime
+                    .terminate_failure(PrintModeError::policy(format!(
+                        "run budget denied provider call: {error}"
+                    )))
+                    .await);
+            }
+        };
+        let provider_call = runtime
+            .begin_call(openclaudia::runtime::CallKind::Provider)
+            .await?;
+        let effort = provider
+            .thinking
+            .reasoning_effort
+            .as_deref()
+            .unwrap_or("medium");
+        let provider_result = if let Some(sdk) = chat_auth.codex_agent_sdk.as_ref() {
+            sdk.complete_turn(&request_body, effort)
+                .await
+                .map_err(codex_sdk_error)
+                .and_then(|turn| {
+                    require_print_terminal(
+                        if turn.tool_calls.is_empty() {
+                            openclaudia::pipeline::ProviderTerminalOutcome::Completed
+                        } else {
+                            openclaudia::pipeline::ProviderTerminalOutcome::ToolCalls
+                        },
+                        turn.tool_calls.len(),
+                    )?;
+                    Ok(PrintCandidate {
+                        content: validate_print_content(turn.content)?,
+                        usage: reported_print_usage(turn.usage),
+                        native_state_digest: None,
+                    })
+                })
+        } else if let Some(sdk) = chat_auth.claude_agent_sdk.as_ref() {
+            sdk.complete_turn(&request_body, effort)
+                .await
+                .map_err(claude_sdk_error)
+                .and_then(|turn| {
+                    require_print_terminal(
+                        if turn.tool_calls.is_empty() {
+                            openclaudia::pipeline::ProviderTerminalOutcome::Completed
+                        } else {
+                            openclaudia::pipeline::ProviderTerminalOutcome::ToolCalls
+                        },
+                        turn.tool_calls.len(),
+                    )?;
+                    Ok(PrintCandidate {
+                        content: validate_print_content(turn.content)?,
+                        usage: reported_print_usage(turn.usage),
+                        native_state_digest: None,
+                    })
+                })
+        } else {
+            dispatch_print_http(
+                &config.proxy.target,
+                &model,
+                adapter,
+                &headers,
+                wire_api,
+                assistant_message_ordinal,
+                endpoint,
+                &request_body,
+            )
+            .await
+        };
+        let candidate = match provider_result {
+            Ok(candidate) => {
+                let budget_result = match candidate.usage.as_ref() {
+                    Some(usage) => provider_budget.reconcile(usage),
+                    None => provider_budget.finish_unknown(),
+                };
+                if let Err(error) = budget_result {
+                    return Err(runtime
+                        .terminate_call_failure(
+                            provider_call,
+                            PrintModeError::provider(format!(
+                                "budget reconciliation failed: {error}"
+                            )),
+                        )
+                        .await);
+                }
+                candidate
+            }
+            Err(error) => {
+                let error = match provider_budget.finish_unknown() {
+                    Ok(_) => error,
+                    Err(budget_error) => PrintModeError::provider(format!(
+                        "{error}; budget reconciliation failed: {budget_error}"
+                    )),
+                };
+                return Err(runtime.terminate_call_failure(provider_call, error).await);
+            }
+        };
+        runtime
+            .finish_call_success(provider_call, candidate.result_digest().to_string())
+            .await?;
+
+        let review_call = runtime
+            .begin_call(openclaudia::runtime::CallKind::Review)
+            .await?;
+        let candidate = match finalize_print_candidate(
+            &config,
+            &print_run,
+            vdd_engine.as_ref(),
+            &chat_request,
+            chat_auth.api_key.as_ref(),
+            candidate,
+        )
+        .await
+        {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                return Err(runtime.terminate_call_failure(review_call, error).await);
+            }
+        };
+        runtime
+            .finish_call_success(review_call, candidate.result_digest().to_string())
+            .await?;
+        if let Err(error) = runtime.commit_candidate(&candidate).await {
+            return Err(runtime.terminate_failure(error).await);
+        }
+
+        let delivery_call = runtime
+            .begin_call(openclaudia::runtime::CallKind::Frontend)
+            .await?;
+        let delivery = {
+            let stdout = std::io::stdout();
+            let mut locked = stdout.lock();
+            deliver_print_output(&mut locked, &candidate.content)
+        };
+        if let Err(error) = delivery {
+            return Err(runtime.terminate_call_failure(delivery_call, error).await);
+        }
+        runtime
+            .finish_call_success(delivery_call, candidate.result_digest().to_string())
+            .await?;
+        Ok(())
     }
     .await;
 
@@ -930,9 +1632,31 @@ pub async fn cmd_print(options: PrintOptions) -> anyhow::Result<()> {
         openclaudia::hooks::HookEvent::SessionEnd,
     )
     .with_session_id(session_id);
-    let _receipt = hook_engine
-        .run_lifecycle(openclaudia::hooks::HookEvent::SessionEnd, &end_input)
-        .await;
+    let outcome = if outcome.is_ok() {
+        match runtime
+            .begin_call(openclaudia::runtime::CallKind::Hook)
+            .await
+        {
+            Ok(end_call) => {
+                let receipt = hook_engine
+                    .run_lifecycle(openclaudia::hooks::HookEvent::SessionEnd, &end_input)
+                    .await;
+                match runtime
+                    .finish_call_success(end_call, format!("{:?}", receipt.status))
+                    .await
+                {
+                    Ok(()) => runtime.succeed().await,
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    } else {
+        let _receipt = hook_engine
+            .run_lifecycle(openclaudia::hooks::HookEvent::SessionEnd, &end_input)
+            .await;
+        outcome
+    };
     openclaudia::tools::retire_run(&print_run);
     outcome
 }
@@ -1003,6 +1727,68 @@ mod tests {
             policy,
             managed_settings_path: None,
         }
+    }
+
+    #[test]
+    fn print_terminal_outcomes_remain_typed_and_fail_closed() {
+        assert!(matches!(
+            require_print_terminal(openclaudia::pipeline::ProviderTerminalOutcome::Refused, 0),
+            Err(PrintModeError::Refused)
+        ));
+        assert!(matches!(
+            require_print_terminal(
+                openclaudia::pipeline::ProviderTerminalOutcome::LengthLimited,
+                0
+            ),
+            Err(PrintModeError::Length { .. })
+        ));
+        assert!(matches!(
+            require_print_terminal(openclaudia::pipeline::ProviderTerminalOutcome::ToolCalls, 1),
+            Err(PrintModeError::Partial { .. })
+        ));
+    }
+
+    #[test]
+    fn absent_print_usage_remains_unknown_instead_of_zero() {
+        assert!(reported_print_usage(openclaudia::session::TokenUsage::default()).is_none());
+        let usage = openclaudia::session::TokenUsage {
+            input_tokens: 11,
+            output_tokens: 7,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        };
+        let reported = reported_print_usage(usage).expect("reported usage");
+        assert_eq!(reported.input_tokens, 11);
+        assert_eq!(reported.output_tokens, 7);
+    }
+
+    #[test]
+    fn print_output_limit_is_an_error_instead_of_truncation() {
+        let oversized = "x".repeat(MAX_PRINT_OUTPUT_BYTES + 1);
+        assert!(matches!(
+            validate_print_content(oversized),
+            Err(PrintModeError::Length { .. })
+        ));
+    }
+
+    #[test]
+    fn broken_pipe_is_a_typed_delivery_failure() {
+        struct BrokenPipeWriter;
+
+        impl std::io::Write for BrokenPipeWriter {
+            fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        assert!(matches!(
+            deliver_print_output(&mut BrokenPipeWriter, "committed"),
+            Err(PrintModeError::BrokenPipe)
+        ));
     }
 
     #[test]
