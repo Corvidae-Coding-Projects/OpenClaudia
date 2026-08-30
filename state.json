@@ -1,6 +1,6 @@
 {
   "next_display_id": 1219,
-  "next_comment_id": 1969,
+  "next_comment_id": 1970,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9614,7 +9614,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-30T09:55:13.599259361Z",
+      "updated_at": "2026-08-30T10:21:54.305253798Z",
       "labels": [
         "remediation"
       ],
@@ -10767,6 +10767,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA8WvQKODqK0aYpavoVYdhRbhC0tfwn/MJ1MhGrdQxGmDiUuOaKJjh1FM+YPwYRfUqyZC3p76TR5opJpJkA0/YBw=="
+        },
+        "b2a5db0e-e702-4eb0-a395-cdfe9d193f76": {
+          "display_id": 1969,
+          "author": "6Vw9",
+          "content": "[action] Published signed wave 6 commit f595cabc to draft PR #66; all five exact-head runners green; S-060/S-061/S-098 and doc-drift #1202 closed; Cargo targets, wave worktrees, and temporary swap removed; stale closed-issue locks persist due existing #1058",
+          "created_at": "2026-08-30T10:21:54.301740550Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAzIo7ahWj4wcCFKc2sK/2YOzXziogGkbmbJDtjlI5pmQ04MeCyayyPW3CiwgkHDblVTzkPT+oo3OORx4dnDN5Cg=="
         },
         "b3ff8e92-1383-4442-9549-e5b78dc9dee2": {
           "display_id": 1526,
@@ -49937,11 +49946,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2437,
       "timestamp": "2026-08-30T10:21:24.699656630Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2438,
+      "timestamp": "2026-08-30T10:21:54.305253798Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T10:21:24.699656630Z",
+    "timestamp": "2026-08-30T10:21:54.305253798Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2437
+    "agent_seq": 2438
   }
 }
