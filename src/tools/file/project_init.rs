@@ -1288,7 +1288,7 @@ mod unix {
         })
     }
 
-    fn mkdir_new(parent: &File, name: impl AsRef<CStr>, mode: u32) -> io::Result<()> {
+    fn mkdir_new(parent: &File, name: impl AsRef<CStr>, mode: libc::mode_t) -> io::Result<()> {
         let name = name.as_ref();
         // SAFETY: `parent` is a live directory and `name` is NUL-terminated.
         let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode) };
