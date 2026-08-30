@@ -1820,6 +1820,12 @@ pub fn extract_gemini_text_content(parts: &[Value]) -> Result<String, ProviderEr
     let mut content = String::new();
 
     for (index, part) in parts.iter().enumerate() {
+        // Gemini marks raw thought text explicitly. It remains eligible for
+        // provider-native compatibility redaction, but is never projected as
+        // visible assistant content or a user-facing reasoning summary.
+        if part.get("thought").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
         if let Some(text_value) = part.get("text") {
             let text = text_value.as_str().ok_or_else(|| {
                 ProviderError::InvalidResponse(format!(

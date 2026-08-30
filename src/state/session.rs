@@ -11,9 +11,18 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
-#[cfg(test)]
 use super::SessionId;
 use super::{AgentMode, EffortLevel, SessionDocument, SessionState, StateEvent, StateStore};
+
+fn sanitize_conversation_reasoning(state: &mut SessionState) {
+    for message in &mut state.conversation.messages {
+        crate::runtime::sanitize_portable_reasoning(message);
+    }
+    for (user, assistant) in &mut state.conversation.undo_stack {
+        crate::runtime::sanitize_portable_reasoning(user);
+        crate::runtime::sanitize_portable_reasoning(assistant);
+    }
+}
 
 /// Validate an interactive-session id before using it as a file name.
 ///
@@ -93,6 +102,16 @@ impl Session {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let mut state = SessionState::new(cwd);
         state.conversation.behavior_mode = behavior_mode;
+        if let Ok(causal) = super::SessionCausalState::initialize(
+            &state.identity.session_id,
+            provider,
+            model,
+            &state.conversation.messages,
+            None,
+            super::causal::SessionProvenance::HostCreated,
+        ) {
+            state.identity.causal = causal;
+        }
         Self {
             title: "New conversation".to_string(),
             created_at: now,
@@ -109,10 +128,21 @@ impl Session {
             .inspect(|state| state.identity.session_id.to_string())
     }
 
-    #[cfg(test)]
+    /// Replace the session identity and rebuild its causal envelope. This is
+    /// used when a host protocol allocates the canonical id after constructing
+    /// the in-memory session.
     pub fn set_id(&self, id: String) {
         self.state.update(|state, _| {
             state.identity.session_id = SessionId::from_raw_unchecked(id);
+            state.identity.causal =
+                super::SessionCausalState::uninitialized(&state.identity.session_id);
+            let _ = state.identity.causal.reinitialize_identity(
+                &state.identity.session_id,
+                &self.provider,
+                &self.model,
+                &state.conversation.messages,
+                state.conversation.provider_native_state.as_ref(),
+            );
         });
     }
 
@@ -127,15 +157,195 @@ impl Session {
 
     /// Publish the exact active run root and optional isolated-workspace
     /// descriptor into resumable session identity.
-    pub fn bind_workspace_run(&self, run: &crate::tools::ToolRunContext) {
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal when the run belongs to another session or its
+    /// provider/workspace/capability binding is inconsistent.
+    pub fn bind_workspace_run(
+        &self,
+        run: &crate::tools::ToolRunContext,
+    ) -> Result<(), super::CausalStateError> {
+        if run.session_id() != self.id() {
+            return Err(super::CausalStateError::IdentityConflict {
+                detail: "tool run belongs to another logical session".to_string(),
+            });
+        }
+        let provider = self.provider.clone();
+        let model = self.model.clone();
         self.state.update(|state, _| {
+            let mut proposed = state.clone();
             let root = run.project_root().to_path_buf();
-            state.identity.cwd = run.working_directory().to_path_buf();
-            state.identity.project_root.clone_from(&root);
-            state.identity.session_project_dir = root;
-            state.identity.active_workspace = run.isolated_workspace().cloned();
-            state.transcript.transcript_cwd = run.working_directory().to_path_buf();
-        });
+            proposed.identity.cwd = run.working_directory().to_path_buf();
+            proposed.identity.project_root.clone_from(&root);
+            proposed.identity.session_project_dir = root;
+            proposed.identity.active_workspace = run.isolated_workspace().cloned();
+            proposed.transcript.transcript_cwd = run.working_directory().to_path_buf();
+            proposed.identity.causal.refresh(
+                &proposed.identity.session_id,
+                &provider,
+                &model,
+                &proposed.conversation.messages,
+                proposed.conversation.provider_native_state.as_ref(),
+                Some(run),
+            )?;
+            *state = proposed;
+            Ok(())
+        })
+    }
+
+    /// Capture an immutable, causally bound source for `/branch`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal when current state or runtime bindings are
+    /// incomplete, stale, or inconsistent.
+    pub fn branch_source(
+        &self,
+        run: &crate::tools::ToolRunContext,
+    ) -> Result<super::BranchSource, super::CausalStateError> {
+        let mut state = self.state_snapshot();
+        state.identity.causal.refresh(
+            &state.identity.session_id,
+            &self.provider,
+            &self.model,
+            &state.conversation.messages,
+            state.conversation.provider_native_state.as_ref(),
+            Some(run),
+        )?;
+        state.identity.causal.validate_document(
+            &state.identity.session_id,
+            &self.provider,
+            &self.model,
+            &state.conversation.messages,
+            state.conversation.provider_native_state.as_ref(),
+        )?;
+        super::BranchSource::from_session(
+            state.identity.session_id,
+            &state.identity.causal,
+            state.conversation.messages,
+            state.conversation.provider_native_state,
+            run,
+        )
+    }
+
+    /// Record the exact project-owned branch proposal in canonical session
+    /// state. The proposal remains unselectable if this atomic step fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed conflict for stale, duplicate, or cross-run proposals.
+    pub fn register_branch(
+        &self,
+        prepared: &super::PreparedBranch,
+        run: &crate::tools::ToolRunContext,
+    ) -> Result<(), super::CausalStateError> {
+        let provider = self.provider.clone();
+        let model = self.model.clone();
+        self.state.update(|state, _| {
+            let mut proposed = state.clone();
+            super::causal::register_branch(
+                &mut proposed.identity.causal,
+                prepared,
+                &provider,
+                &model,
+                &proposed.conversation.messages,
+                proposed.conversation.provider_native_state.as_ref(),
+                run,
+            )?;
+            *state = proposed;
+            Ok(())
+        })
+    }
+
+    /// Atomically select one validated and host-anchored branch proposal.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal without replacing either transcript lane when
+    /// the proposal is forged, stale, foreign, cyclic, or unavailable.
+    pub fn select_branch(
+        &self,
+        proposal: &super::BranchProposal,
+        run: &crate::tools::ToolRunContext,
+    ) -> Result<(), super::CausalStateError> {
+        let provider = self.provider.clone();
+        let model = self.model.clone();
+        self.state.update(|state, events| {
+            let mut proposed = state.clone();
+            super::causal::select_branch(
+                &mut proposed.identity.causal,
+                &proposed.identity.session_id,
+                &provider,
+                &model,
+                &proposed.conversation.messages,
+                proposed.conversation.provider_native_state.as_ref(),
+                proposal,
+                run,
+            )?;
+            let previous_len = proposed.conversation.messages.len();
+            let (messages, provider_state) = super::causal::proposal_state(proposal);
+            proposed.conversation.messages = messages;
+            proposed.conversation.provider_native_state = provider_state;
+            proposed.conversation.undo_stack.clear();
+            if previous_len > 0 && proposed.conversation.messages.is_empty() {
+                events.push(StateEvent::Cleared);
+            }
+            *state = proposed;
+            Ok(())
+        })
+    }
+
+    /// Validate one causally closed transcript and provider/tool state against
+    /// the host-authorized successor run.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed conflict/unavailable result for forged, stale,
+    /// cross-provider, or cross-workspace state.
+    pub fn validate_resume_against_run(
+        &self,
+        run: &crate::tools::ToolRunContext,
+    ) -> Result<(), super::CausalStateError> {
+        let state = self.state_snapshot();
+        state.identity.causal.validate_resume(
+            &state.identity.session_id,
+            &self.provider,
+            &self.model,
+            &state.conversation.messages,
+            state.conversation.provider_native_state.as_ref(),
+            run,
+        )
+    }
+
+    /// Validate a current causal binding or admit an unbound host-created or
+    /// migrated session once against the trusted host-selected run.
+    /// Project-owned state cannot call this boundary or choose the run it
+    /// binds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal before modifying state when identity, provider,
+    /// workspace, or persisted causal history is inconsistent.
+    pub fn prepare_resume_against_run(
+        &self,
+        run: &crate::tools::ToolRunContext,
+    ) -> Result<(), super::CausalStateError> {
+        let provider = self.provider.clone();
+        let model = self.model.clone();
+        self.state.update(|state, _| {
+            let mut proposed = state.clone();
+            proposed.identity.causal.prepare_resume(
+                &proposed.identity.session_id,
+                &provider,
+                &model,
+                &proposed.conversation.messages,
+                proposed.conversation.provider_native_state.as_ref(),
+                run,
+            )?;
+            *state = proposed;
+            Ok(())
+        })
     }
 
     pub fn update_state<R>(
@@ -149,6 +359,7 @@ impl Session {
                 .as_ref()
                 .map(|_| state.conversation.messages.clone());
             let result = update(state, events);
+            sanitize_conversation_reasoning(state);
             if native_history_prefix
                 .as_ref()
                 .is_some_and(|prefix| !state.conversation.messages.starts_with(prefix.as_slice()))
@@ -172,8 +383,26 @@ impl Session {
         self.provider.clone_from(&loaded.provider);
         let live_permissions = self.state.inspect(|state| state.permissions.clone());
         let mut loaded_state = loaded.state_snapshot();
+        sanitize_conversation_reasoning(&mut loaded_state);
         loaded_state.permissions = live_permissions;
         self.state.replace(loaded_state);
+    }
+
+    /// Validate and install a loaded session as one atomic frontend boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed causal refusal before any active state is replaced.
+    pub fn apply_loaded_for_run(
+        &mut self,
+        loaded: &Self,
+        run: &crate::tools::ToolRunContext,
+    ) -> Result<(), super::CausalStateError> {
+        let prepared = loaded.detached_clone();
+        prepared.prepare_resume_against_run(run)?;
+        prepared.bind_workspace_run(run)?;
+        self.apply_loaded(&prepared);
+        Ok(())
     }
 
     #[must_use]
@@ -209,8 +438,9 @@ impl Session {
     /// Returns an error when the state belongs to another provider or model.
     pub fn install_provider_native_state(
         &self,
-        provider_state: crate::runtime::ProviderNativeState,
+        mut provider_state: crate::runtime::ProviderNativeState,
     ) -> Result<(), crate::runtime::ProviderStateError> {
+        provider_state.sanitize_plaintext_reasoning()?;
         provider_state.validate_identity(&self.provider, &self.model)?;
         self.state.update(|state, _| {
             let Some(current) = &state.conversation.provider_native_state else {
@@ -286,7 +516,8 @@ impl Session {
             .inspect(|state| state.conversation.messages.len())
     }
 
-    pub fn push_message(&self, message: Value) {
+    pub fn push_message(&self, mut message: Value) {
+        crate::runtime::sanitize_portable_reasoning(&mut message);
         let role = message
             .get("role")
             .and_then(Value::as_str)
@@ -298,7 +529,10 @@ impl Session {
         });
     }
 
-    pub fn replace_messages(&self, messages: Vec<Value>) {
+    pub fn replace_messages(&self, mut messages: Vec<Value>) {
+        for message in &mut messages {
+            crate::runtime::sanitize_portable_reasoning(message);
+        }
         self.state.update(|state, events| {
             let preserves_native_state = state
                 .conversation
@@ -340,10 +574,14 @@ impl Session {
     /// generation, or digest continuity is invalid.
     pub fn replace_messages_and_provider_native_state(
         &self,
-        messages: Vec<Value>,
-        provider_state: Option<crate::runtime::ProviderNativeState>,
+        mut messages: Vec<Value>,
+        mut provider_state: Option<crate::runtime::ProviderNativeState>,
     ) -> Result<(), crate::runtime::ProviderStateError> {
-        if let Some(next) = &provider_state {
+        for message in &mut messages {
+            crate::runtime::sanitize_portable_reasoning(message);
+        }
+        if let Some(next) = &mut provider_state {
+            next.sanitize_plaintext_reasoning()?;
             next.validate()?;
             next.validate_identity(&self.provider, &self.model)?;
         }
@@ -421,6 +659,9 @@ impl Session {
                 .as_ref()
                 .map(|_| state.conversation.messages.clone());
             let result = update(&mut state.conversation.messages);
+            for message in &mut state.conversation.messages {
+                crate::runtime::sanitize_portable_reasoning(message);
+            }
             if native_history_prefix
                 .as_ref()
                 .is_some_and(|prefix| !state.conversation.messages.starts_with(prefix.as_slice()))
@@ -652,7 +893,8 @@ impl Session {
         let updated_at = document.updated_at;
         let model = document.model.clone();
         let provider = document.provider.clone();
-        let state = document.into_state()?;
+        let mut state = document.into_state()?;
+        sanitize_conversation_reasoning(&mut state);
         Ok(Self {
             title,
             created_at,
@@ -671,6 +913,29 @@ impl Serialize for Session {
     {
         use serde::ser::Error as _;
 
+        self.state
+            .update(|state, _| {
+                let mut proposed = state.clone();
+                sanitize_conversation_reasoning(&mut proposed);
+                proposed.identity.causal.refresh(
+                    &proposed.identity.session_id,
+                    &self.provider,
+                    &self.model,
+                    &proposed.conversation.messages,
+                    proposed.conversation.provider_native_state.as_ref(),
+                    None,
+                )?;
+                proposed.identity.causal.validate_document(
+                    &proposed.identity.session_id,
+                    &self.provider,
+                    &self.model,
+                    &proposed.conversation.messages,
+                    proposed.conversation.provider_native_state.as_ref(),
+                )?;
+                *state = proposed;
+                Ok::<(), super::CausalStateError>(())
+            })
+            .map_err(S::Error::custom)?;
         let state = self.state_snapshot();
         if let Some(native) = &state.conversation.provider_native_state {
             native
@@ -989,6 +1254,78 @@ mod tests {
             assert!(!state.permissions.trust_accepted);
             assert!(state.permissions.persistence_disabled);
         });
+    }
+
+    #[test]
+    fn anchored_branch_selection_restores_both_state_lanes_atomically() {
+        let root = tempfile::tempdir().expect("workspace");
+        let session = Session::new("model", "provider");
+        let session_id = session.inspect_state(|state| state.identity.session_id.clone());
+        let run = crate::tools::ToolRunContext::builder(session_id, root.path())
+            .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(std::collections::HashMap::new())
+            .process(false)
+            .network(false)
+            .secrets(false)
+            .provider("provider")
+            .build()
+            .expect("run");
+        session.bind_workspace_run(&run).expect("initial binding");
+        session.push_message(json!({"role": "user", "content": "branch source"}));
+
+        let prepared = session
+            .branch_source(&run)
+            .expect("branch source")
+            .prepare("snapshot")
+            .expect("proposal");
+        session
+            .register_branch(&prepared, &run)
+            .expect("host anchor");
+        session.push_message(json!({"role": "assistant", "content": "later state"}));
+        session
+            .select_branch(prepared.proposal(), &run)
+            .expect("anchored selection");
+
+        assert_eq!(
+            session.messages_snapshot(),
+            vec![json!({"role": "user", "content": "branch source"})]
+        );
+        session
+            .validate_resume_against_run(&run)
+            .expect("selected state remains causally valid");
+    }
+
+    #[test]
+    fn resume_rejects_a_different_workspace_before_state_replacement() {
+        let root = tempfile::tempdir().expect("workspace");
+        let foreign_root = tempfile::tempdir().expect("foreign workspace");
+        let session = Session::new("model", "provider");
+        let session_id = session.inspect_state(|state| state.identity.session_id.clone());
+        let build_run = |root: &Path| {
+            crate::tools::ToolRunContext::builder(session_id.clone(), root)
+                .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(std::collections::HashMap::new())
+                .process(false)
+                .network(false)
+                .secrets(false)
+                .provider("provider")
+                .build()
+                .expect("run")
+        };
+        let run = build_run(root.path());
+        session.bind_workspace_run(&run).expect("initial binding");
+        let before = session.messages_snapshot();
+        let foreign = build_run(foreign_root.path());
+
+        assert!(matches!(
+            session.validate_resume_against_run(&foreign),
+            Err(crate::state::CausalStateError::WorkspaceConflict { .. })
+        ));
+        assert_eq!(session.messages_snapshot(), before);
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub struct SlashCtx<'a> {
     pub provider: &'a str,
     pub current_model: &'a str,
     pub run_context: Option<&'a openclaudia::tools::ToolRunContext>,
+    pub branch_source: Option<&'a openclaudia::state::BranchSource>,
     pub app_config: Option<&'a openclaudia::config::AppConfig>,
     pub doctor_runtime: Option<&'a openclaudia::doctor::DoctorRuntimeSnapshot>,
 }
@@ -199,7 +200,14 @@ fn dispatch_proposed(proposal: &ProposedCommand, ctx: &mut SlashCtx<'_>) -> Slas
             SlashCommandResult::Handled
         }
         CommandId::AddDir => slash_add_dir(args, ctx.run_context),
-        CommandId::Branch => slash_branch(args, ctx.messages, ctx.run_context),
+        CommandId::Branch => slash_branch(
+            args,
+            ctx.messages,
+            ctx.provider,
+            ctx.current_model,
+            ctx.run_context,
+            ctx.branch_source,
+        ),
         CommandId::Btw => slash_btw(args),
         CommandId::DynamicPlugin => SlashCommandResult::Plugin(PluginAction::RunCommand {
             plugin_name: proposal.namespace().unwrap_or_default().to_string(),

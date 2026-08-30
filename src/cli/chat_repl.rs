@@ -290,12 +290,12 @@ struct PendingManualCompaction {
 }
 
 /// Slash-command dispatch outcome — tells `process_line` whether to
-/// short-circuit the iteration, exit, fall through to model send, or
-/// note that the editor already pushed the user message.
+/// short-circuit the iteration, exit, fall through to model send, or route
+/// reviewed external-editor bytes through ordinary user-input preparation.
 enum SlashOutcome {
     Continue,
     Break,
-    EditorMessageAdded,
+    EditorInput(String),
     FallThrough,
     RewrittenPrompt,
     PluginAgent(Box<plugins::PluginAgentInvocation>),
@@ -372,10 +372,16 @@ fn fresh_repl_session_in_run(current: &Session, model: &str, provider: &str) -> 
     let behavior_mode = current.behavior_mode();
     let identity = current.inspect_state(|state| state.identity.clone());
     let fresh = Session::new_with_behavior_mode(model, provider, behavior_mode);
-    let fresh_id = fresh.inspect_state(|state| state.identity.session_id.clone());
+    let (fresh_id, fresh_causal) = fresh.inspect_state(|state| {
+        (
+            state.identity.session_id.clone(),
+            state.identity.causal.clone(),
+        )
+    });
     fresh.update_state(|state, _| {
         state.identity = identity;
         state.identity.session_id = fresh_id;
+        state.identity.causal = fresh_causal;
         state.identity.parent_session_id = None;
         state.transcript.transcript_cwd = state.identity.cwd.clone();
     });
@@ -385,7 +391,7 @@ fn fresh_repl_session_in_run(current: &Session, model: &str, provider: &str) -> 
 /// Mutable state carried through the OpenAI-compatible tool loop.
 struct OpenAiLoopState {
     current_content: String,
-    current_reasoning_content: String,
+    current_reasoning_content: zeroize::Zeroizing<String>,
     cancelled: bool,
 }
 
@@ -394,7 +400,7 @@ struct OpenAiLoopState {
 /// clippy's argument-count ceiling.
 struct SseFrameCtx<'a> {
     full_content: &'a mut String,
-    reasoning_content: &'a mut String,
+    provider_reasoning_continuation: &'a mut String,
     tool_accumulator: &'a mut tools::ToolCallAccumulator,
     anthropic_accumulator: &'a mut tools::AnthropicToolAccumulator,
     stream_usage: &'a mut openclaudia::session::TokenUsage,
@@ -416,11 +422,23 @@ fn active_provider_for_turn(config: &config::AppConfig) -> Result<&config::Provi
 }
 
 fn latest_user_message_content(messages: &[serde_json::Value]) -> Option<&str> {
-    messages
+    let message = messages
         .iter()
         .rev()
-        .find(|message| message.get("role").and_then(|role| role.as_str()) == Some("user"))
-        .and_then(|message| message.get("content").and_then(|content| content.as_str()))
+        .find(|message| message.get("role").and_then(|role| role.as_str()) == Some("user"))?;
+    let content = message.get("content")?;
+    if let Some(text) = content.as_str() {
+        return Some(text);
+    }
+    let index = message
+        .pointer("/metadata/instruction_part_index")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())?;
+    content
+        .as_array()?
+        .get(index)?
+        .get("text")
+        .and_then(serde_json::Value::as_str)
 }
 
 fn observe_cli_user_task(
@@ -640,7 +658,9 @@ impl ChatRepl {
         self.permission_mgr =
             init_permission_manager(&self.config, permission_bypass, &self.run_context);
         self.permissions = openclaudia::permissions::LocalApprovalCache::for_run(&self.run_context);
-        self.chat_session.bind_workspace_run(&self.run_context);
+        if let Err(error) = self.chat_session.bind_workspace_run(&self.run_context) {
+            rebind_errors.push(format!("cannot bind causal workspace state: {error}"));
+        }
         let task_messages = self.chat_session.messages_snapshot();
         self.current_task_obs = latest_user_message_content(&task_messages).and_then(|content| {
             observe_cli_user_task(
@@ -730,7 +750,8 @@ impl ChatRepl {
             &config.proxy.target,
             initial_behavior_mode.clone(),
         );
-        maybe_resume_session(&mut chat_session, args.resume, args.session_id.as_deref());
+        let resumed =
+            maybe_resume_session(&mut chat_session, args.resume, args.session_id.as_deref());
         if behavior_mode_explicit || !args.scope_target_values.is_empty() {
             let identity = chat_session.inspect_state(|state| state.identity.clone());
             let project_root = std::fs::canonicalize(&identity.project_root).map_err(|error| {
@@ -830,6 +851,14 @@ impl ChatRepl {
         } else {
             base_run
         };
+        if resumed {
+            chat_session
+                .prepare_resume_against_run(&run_context)
+                .map_err(|error| anyhow::anyhow!("cannot resume causal session: {error}"))?;
+        }
+        chat_session
+            .bind_workspace_run(&run_context)
+            .map_err(|error| anyhow::anyhow!("cannot bind causal session state: {error}"))?;
         let memory_db = Some(init_memory_with_banner(&run_context, &config)?);
         let task_manager = std::sync::Mutex::new(
             session::TaskManager::open_for_run(&run_context).map_err(anyhow::Error::msg)?,
@@ -1001,7 +1030,7 @@ impl ChatRepl {
         memory_db: Option<&memory::MemoryDb>,
     ) -> anyhow::Result<Option<bool>> {
         let mut input = line.trim().to_string();
-        let mut editor_message_added = false;
+        let mut prompt_origin = "legacy_terminal";
         let mut skip_local_input_shortcuts = false;
         self.current_task_obs = None;
 
@@ -1015,7 +1044,11 @@ impl ChatRepl {
         match self.dispatch_slash(&mut input, memory_db) {
             SlashOutcome::Continue => return Ok(Some(false)),
             SlashOutcome::Break => return Ok(Some(true)),
-            SlashOutcome::EditorMessageAdded => editor_message_added = true,
+            SlashOutcome::EditorInput(editor_content) => {
+                input = editor_content;
+                prompt_origin = "external_editor";
+                skip_local_input_shortcuts = true;
+            }
             SlashOutcome::FallThrough => {}
             SlashOutcome::RewrittenPrompt => {
                 skip_local_input_shortcuts = true;
@@ -1045,7 +1078,7 @@ impl ChatRepl {
             }
         }
 
-        if !editor_message_added && !self.prepare_user_message(&input).await {
+        if !self.prepare_user_message(&input, prompt_origin).await {
             self.clear_transient_prompt_options();
             return Ok(Some(false));
         }
@@ -1224,15 +1257,33 @@ impl ChatRepl {
             }
             snapshot
         });
+        let branch_source = if input
+            .split_whitespace()
+            .next()
+            .is_some_and(|command| command.eq_ignore_ascii_case("/branch"))
+        {
+            match self.chat_session.branch_source(&self.run_context) {
+                Ok(source) => Some(source),
+                Err(error) => {
+                    eprintln!("Cannot prepare branch: {error}");
+                    return SlashOutcome::Continue;
+                }
+            }
+        } else {
+            None
+        };
         let result = self.chat_session.update_messages(|messages| {
             handle_slash_command_for_runtime(
                 input,
-                messages,
-                &self.config.proxy.target,
-                &self.model,
-                &self.run_context,
-                &self.config,
-                doctor_runtime.as_ref(),
+                crate::cli::repl::command_registry::SlashCtx {
+                    messages,
+                    provider: &self.config.proxy.target,
+                    current_model: &self.model,
+                    run_context: Some(&self.run_context),
+                    branch_source: branch_source.as_ref(),
+                    app_config: Some(&self.config),
+                    doctor_runtime: doctor_runtime.as_ref(),
+                },
             )
         });
         let Some(result) = result else {
@@ -1250,14 +1301,14 @@ impl ChatRepl {
                     &self.model,
                     &self.config.proxy.target,
                 );
-                if let Err(error) = self.apply_session_transition(&fresh) {
+                if let Err(error) = self.apply_session_transition(&fresh, true) {
                     eprintln!("Could not start a new session: {error}");
                 }
                 SlashOutcome::Continue
             }
             SlashCommandResult::LoadSession(sid) => {
                 match load_chat_session(&sid) {
-                    Ok(Some(loaded)) => match self.apply_session_transition(&loaded) {
+                    Ok(Some(loaded)) => match self.apply_session_transition(&loaded, false) {
                         Ok(()) => println!(
                             "Loaded {} messages from previous session.\n",
                             self.chat_session.message_count()
@@ -1295,13 +1346,26 @@ impl ChatRepl {
         }
     }
 
-    fn apply_session_transition(&mut self, loaded: &Session) -> Result<(), String> {
+    fn apply_session_transition(
+        &mut self,
+        loaded: &Session,
+        initialize_fresh: bool,
+    ) -> Result<(), String> {
         let next_run = derive_repl_session_run(
             &self.run_context,
             loaded,
             &self.config.proxy.target,
             self.coordinator,
         )?;
+        if initialize_fresh {
+            loaded
+                .bind_workspace_run(&next_run)
+                .map_err(|error| format!("cannot initialize causal session: {error}"))?;
+        } else {
+            loaded
+                .prepare_resume_against_run(&next_run)
+                .map_err(|error| format!("cannot resume causal session: {error}"))?;
+        }
         let next_audit = openclaudia::session::AuditLogger::new(&loaded.id())
             .map_err(|error| format!("cannot initialize session audit log: {error}"))?;
         let next_tasks = session::TaskManager::open_for_run(&next_run)
@@ -1319,7 +1383,9 @@ impl ChatRepl {
 
         self.clear_transient_prompt_options();
         tools::retire_run(&self.run_context);
-        self.chat_session.apply_loaded(loaded);
+        self.chat_session
+            .apply_loaded_for_run(loaded, &next_run)
+            .map_err(|error| format!("cannot activate causal session: {error}"))?;
         self.chat_session.set_permission_bypass(permission_bypass);
         self.model.clone_from(&loaded.model);
         self.run_context = next_run;
@@ -1345,7 +1411,7 @@ impl ChatRepl {
     ) -> SlashOutcome {
         match result {
             SlashCommandResult::EditorInput(editor_content) => {
-                self.handle_editor_input(editor_content)
+                SlashOutcome::EditorInput(editor_content)
             }
             SlashCommandResult::Undo => {
                 self.handle_history_action(true);
@@ -1359,8 +1425,12 @@ impl ChatRepl {
                 self.handle_rewind(turns);
                 SlashOutcome::Continue
             }
-            SlashCommandResult::TeleportSession { name, messages } => {
-                self.handle_teleport(&name, messages);
+            SlashCommandResult::TeleportSession { name, proposal } => {
+                self.handle_teleport(&name, &proposal);
+                SlashOutcome::Continue
+            }
+            SlashCommandResult::BranchSession(prepared) => {
+                self.register_branch(&prepared);
                 SlashOutcome::Continue
             }
             SlashCommandResult::Rename(new_title) => {
@@ -1430,6 +1500,22 @@ impl ChatRepl {
                 }
             }
             other => self.dispatch_slash_simple(other, memory_db),
+        }
+    }
+
+    fn register_branch(&self, prepared: &openclaudia::state::PreparedBranch) {
+        match self
+            .chat_session
+            .register_branch(prepared, &self.run_context)
+        {
+            Ok(()) => {
+                if let Err(error) = save_chat_session(&self.chat_session) {
+                    tracing::warn!("Failed to persist branch anchor: {error}");
+                }
+            }
+            Err(error) => {
+                eprintln!("Branch proposal '{prepared}' was written but not activated: {error}");
+            }
         }
     }
 
@@ -1720,24 +1806,6 @@ impl ChatRepl {
         println!("{message}");
     }
 
-    /// Push an `EditorInput` payload (possibly with `@file` references) as
-    /// a fresh user message and reset undo state.
-    fn handle_editor_input(&mut self, editor_content: String) -> SlashOutcome {
-        let expanded = if editor_content.contains('@') {
-            expand_file_references(&self.run_context, &editor_content)
-        } else {
-            editor_content
-        };
-        self.chat_session.push_message(serde_json::json!({
-            "role": "user",
-            "content": expanded
-        }));
-        self.chat_session.update_title();
-        self.chat_session.touch();
-        self.chat_session.clear_undo_stack();
-        SlashOutcome::EditorMessageAdded
-    }
-
     /// Apply an Undo (`is_undo = true`) or Redo (`is_undo = false`) on the
     /// chat session and persist on success.
     fn handle_history_action(&mut self, is_undo: bool) {
@@ -1779,9 +1847,11 @@ impl ChatRepl {
     }
 
     /// Replace the active transcript with a named `/branch` snapshot.
-    fn handle_teleport(&mut self, name: &str, messages: Vec<serde_json::Value>) {
-        self.chat_session.replace_messages(messages);
-        self.chat_session.clear_undo_stack();
+    fn handle_teleport(&mut self, name: &str, proposal: &openclaudia::state::BranchProposal) {
+        if let Err(error) = self.chat_session.select_branch(proposal, &self.run_context) {
+            eprintln!("\nTeleport refused: {error}\n");
+            return;
+        }
         self.chat_session.update_title();
         self.chat_session.touch();
 
@@ -1933,28 +2003,84 @@ impl ChatRepl {
         println!("\n\u{2713} Effort set to {label}\n");
     }
 
-    /// Push the user message (with `@file` expansion) and run
+    /// Push a user instruction plus separately-authorized `@file` evidence and run
     /// `UserPromptSubmit` hooks. Returns `false` if a hook blocked the
     /// turn (caller should `continue` the outer loop).
-    async fn prepare_user_message(&mut self, input: &str) -> bool {
+    async fn prepare_user_message(&mut self, input: &str, prompt_origin: &'static str) -> bool {
         use openclaudia::hooks::{HookEvent, HookInput};
 
-        let expanded_input = if input.contains('@') {
-            expand_file_references(&self.run_context, input)
-        } else {
-            input.to_string()
+        let prepared = match expand_file_references(&self.run_context, input) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                tracing::warn!(
+                    event = "legacy_repl.attachment_refused",
+                    error = %error,
+                    "Refused legacy input before conversation mutation"
+                );
+                eprintln!("\nAttachment refused: {error}\n");
+                return false;
+            }
         };
+        let (instruction, attachment_projection) = prepared.into_parts();
+        let instruction_bytes = instruction.len();
+        let instruction_digest =
+            openclaudia::runtime::ContentDigest::sha256(instruction.as_bytes()).to_string();
 
-        self.chat_session.push_message(serde_json::json!({
-            "role": "user",
-            "content": expanded_input.clone()
-        }));
+        self.chat_session.update_messages(|messages| {
+            if let Some(projection) = attachment_projection {
+                if !projection.reference.is_empty() {
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": projection.reference},
+                            {"type": "text", "text": instruction.clone()}
+                        ],
+                        "metadata": {
+                            "openclaudia_context_source": prompt_origin,
+                            "authority": "user_instruction",
+                            "encoding": "utf-8",
+                            "sensitivity": "internal",
+                            "reviewed": prompt_origin == "external_editor",
+                            "snapshot_digest": instruction_digest,
+                            "byte_len": instruction_bytes,
+                            "truncation": "none",
+                            "instruction_part_index": 1,
+                            "reference_part_indices": [0],
+                            "reference_authority": "reference",
+                            "attachment_trace": projection.trace
+                        }
+                    }));
+                    return;
+                }
+            }
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": instruction.clone(),
+                "metadata": {
+                    "openclaudia_context_source": prompt_origin,
+                    "authority": "user_instruction",
+                    "encoding": "utf-8",
+                    "sensitivity": "internal",
+                    "reviewed": prompt_origin == "external_editor",
+                    "snapshot_digest": instruction_digest,
+                    "byte_len": instruction_bytes,
+                    "truncation": "none"
+                }
+            }));
+        });
         self.chat_session.update_title();
+        if self.chat_session.title == "New conversation" {
+            self.chat_session.title = if instruction.len() > 50 {
+                format!("{}...", tools::safe_truncate(&instruction, 47))
+            } else {
+                instruction.clone()
+            };
+        }
         self.chat_session.touch();
         self.chat_session.clear_undo_stack();
 
         let hook_input = HookInput::for_run(&self.run_context, HookEvent::UserPromptSubmit)
-            .with_prompt(&expanded_input);
+            .with_prompt(&instruction);
         let hook_receipt = self
             .active_hook_engine()
             .run_lifecycle(HookEvent::UserPromptSubmit, &hook_input)
@@ -2564,7 +2690,7 @@ impl ChatRepl {
 
             let openclaudia::pipeline::ProviderNativeJsonDecodedTurn {
                 content,
-                reasoning_content: _,
+                reasoning_summary: _,
                 tool_calls,
                 usage: _,
                 terminal_outcome: _,
@@ -3251,7 +3377,7 @@ impl ChatRepl {
         use futures::StreamExt;
 
         let mut full_content = String::new();
-        let mut reasoning_content = String::new();
+        let mut reasoning_content = zeroize::Zeroizing::new(String::new());
         let mut stream = openclaudia::provider_transport::bounded_byte_stream(
             response,
             openclaudia::provider_transport::MAX_STREAM_RESPONSE_BYTES,
@@ -3307,7 +3433,7 @@ impl ChatRepl {
             }
             let mut ctx = SseFrameCtx {
                 full_content: &mut full_content,
-                reasoning_content: &mut reasoning_content,
+                provider_reasoning_continuation: &mut reasoning_content,
                 tool_accumulator,
                 anthropic_accumulator,
                 stream_usage,
@@ -3424,33 +3550,17 @@ impl ChatRepl {
                 }
                 ctx.full_content.push_str(&text);
             }
-            openclaudia::pipeline::SseAction::Thinking(text) => {
-                tui::print_thinking_chunk(&text);
-            }
-            openclaudia::pipeline::SseAction::Reasoning(text) => {
-                let display_text =
-                    openclaudia::pipeline::merge_reasoning_delta(ctx.reasoning_content, &text);
-                if !display_text.is_empty() {
-                    if !*ctx.reasoning_started {
-                        *ctx.reasoning_started = true;
-                        *ctx.thinking_start_time = Some(std::time::Instant::now());
-                        tui::print_thinking_start();
-                    }
-                    tui::print_thinking_chunk(&display_text);
-                }
+            openclaudia::pipeline::SseAction::PrivateReasoning(text) => {
+                let _ = openclaudia::pipeline::merge_reasoning_delta(
+                    ctx.provider_reasoning_continuation,
+                    &text,
+                );
             }
             openclaudia::pipeline::SseAction::ThinkingStart => {
                 *ctx.in_thinking_block = true;
-                *ctx.thinking_start_time = Some(std::time::Instant::now());
-                tui::print_thinking_start();
             }
             openclaudia::pipeline::SseAction::ThinkingEnd => {
-                let elapsed = ctx
-                    .thinking_start_time
-                    .map_or(0.0, |started| started.elapsed().as_secs_f64());
-                tui::print_thinking_end(elapsed);
                 *ctx.in_thinking_block = false;
-                *ctx.thinking_start_time = None;
             }
             openclaudia::pipeline::SseAction::None => {}
         }
@@ -3817,7 +3927,10 @@ impl ChatRepl {
     ) -> Result<serde_json::Value, String> {
         let grounded = self.request_messages_with_grounding()?;
         let (catalog_messages, _) = self.project_request_messages(grounded, None).await?;
-        let request_messages = prompt_blocks.prepare_json_messages(&catalog_messages);
+        let mut request_messages = prompt_blocks.prepare_json_messages(&catalog_messages);
+        for message in &mut request_messages {
+            openclaudia::runtime::redact_reasoning_for_provider_request(message);
+        }
         let anthropic_messages =
             convert_messages_to_anthropic_checked(&request_messages).map_err(|e| e.to_string())?;
         let openai_tools =
@@ -3970,7 +4083,10 @@ impl ChatRepl {
                 .await;
 
             println!("\n\x1b[90mContinuing with tool results...\x1b[0m\n");
-            let request_body = match self.build_openai_followup_request(prompt_blocks).await {
+            let request_body = match self
+                .build_openai_followup_request(prompt_blocks, &state.current_reasoning_content)
+                .await
+            {
                 Ok(req) => req,
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to build OpenAI follow-up request");
@@ -4035,13 +4151,13 @@ impl ChatRepl {
         current_content: &str,
         reasoning_content: &str,
     ) {
-        let mut message = openclaudia::pipeline::build_assistant_message_with_tools(
+        let message = openclaudia::pipeline::build_assistant_message_with_tools(
             current_content,
             None,
             tool_calls,
             "openai",
         );
-        attach_reasoning_content(&mut message, reasoning_content);
+        let _ = reasoning_content;
         push_chat_session_message_and_persist(
             &mut self.chat_session,
             message,
@@ -4095,11 +4211,10 @@ impl ChatRepl {
                 }
             };
             println!("{rendered}");
-            let mut message = serde_json::json!({
+            let message = serde_json::json!({
                 "role": "assistant",
                 "content": rendered
             });
-            attach_reasoning_content(&mut message, reasoning_content);
             push_chat_session_message_and_persist(
                 &mut self.chat_session,
                 message,
@@ -4125,10 +4240,14 @@ impl ChatRepl {
     async fn build_openai_followup_request(
         &self,
         prompt_blocks: &prompt::SystemPromptBlocks,
+        reasoning_content: &str,
     ) -> Result<serde_json::Value, String> {
         let grounded = self.request_messages_with_grounding()?;
         let (catalog_messages, _) = self.project_request_messages(grounded, None).await?;
-        let request_messages = prompt_blocks.prepare_json_messages(&catalog_messages);
+        let mut request_messages = prompt_blocks.prepare_json_messages(&catalog_messages);
+        for message in &mut request_messages {
+            openclaudia::runtime::redact_reasoning_for_provider_request(message);
+        }
         let openai_tools =
             tools::get_progressive_tool_definitions(&self.run_context, &catalog_messages, true)?
                 .definitions_value();
@@ -4155,6 +4274,18 @@ impl ChatRepl {
                 "tools": openai_tools
             })
         };
+        if !self.config.proxy.target.eq_ignore_ascii_case("anthropic") {
+            if let Some(continuation) =
+                openclaudia::runtime::ProviderReasoningContinuation::try_from_provider(
+                    reasoning_content.to_string(),
+                )
+                .map_err(|error| error.to_string())?
+            {
+                continuation
+                    .apply_to_openai_chat_request(&mut request)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
         self.apply_provider_native_state_to_followup(&mut request)?;
         Ok(request)
     }
@@ -4237,34 +4368,17 @@ impl ChatRepl {
                     }
                     current_content.push_str(&text);
                 }
-                openclaudia::pipeline::SseAction::Thinking(text) => {
-                    tui::print_thinking_chunk(&text);
-                }
-                openclaudia::pipeline::SseAction::Reasoning(text) => {
-                    let display_text = openclaudia::pipeline::merge_reasoning_delta(
+                openclaudia::pipeline::SseAction::PrivateReasoning(text) => {
+                    let _ = openclaudia::pipeline::merge_reasoning_delta(
                         current_reasoning_content,
                         &text,
                     );
-                    if !display_text.is_empty() {
-                        if !reasoning_started {
-                            reasoning_started = true;
-                            thinking_start_time = Some(std::time::Instant::now());
-                            tui::print_thinking_start();
-                        }
-                        tui::print_thinking_chunk(&display_text);
-                    }
                 }
                 openclaudia::pipeline::SseAction::ThinkingStart => {
                     in_thinking_block = true;
-                    thinking_start_time = Some(std::time::Instant::now());
-                    tui::print_thinking_start();
                 }
                 openclaudia::pipeline::SseAction::ThinkingEnd => {
-                    let elapsed =
-                        thinking_start_time.map_or(0.0, |started| started.elapsed().as_secs_f64());
-                    tui::print_thinking_end(elapsed);
                     in_thinking_block = false;
-                    thinking_start_time = None;
                 }
                 openclaudia::pipeline::SseAction::None => {}
             }
@@ -4565,7 +4679,7 @@ impl Drop for ChatRepl {
 /// streaming path to act on (cancel flag, deferred keybinding, etc.).
 struct InitialStreamResult {
     full_content: String,
-    reasoning_content: String,
+    reasoning_content: zeroize::Zeroizing<String>,
     cancelled: bool,
     pending_action: Option<SlashCommandResult>,
     transport_failure: Option<String>,
@@ -4607,12 +4721,6 @@ fn gemini_tool_error_response(tool_call: &tools::ToolCall, message: &str) -> ser
             "response": {"error": message}
         }
     })
-}
-
-fn attach_reasoning_content(message: &mut serde_json::Value, reasoning_content: &str) {
-    if !reasoning_content.is_empty() {
-        message["reasoning_content"] = serde_json::Value::String(reasoning_content.to_string());
-    }
 }
 
 fn persist_chat_session_update(session: &mut Session, reason: &str) {

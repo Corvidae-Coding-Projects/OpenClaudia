@@ -287,17 +287,12 @@ mod tests {
     #[test]
     fn apply_loaded_keeps_subscribers_and_emits_session_boundary() {
         let mut current = test_session();
-        current.update_state(|state, _| {
-            state.identity.session_id =
-                openclaudia::state::SessionId::from_raw_unchecked("current");
-        });
+        current.set_id("current".to_string());
         current.push_message(serde_json::json!({"role": "user"}));
         let mut subscription = current.state_store().subscribe_log_lag();
 
         let loaded = test_session();
-        loaded.update_state(|state, _| {
-            state.identity.session_id = openclaudia::state::SessionId::from_raw_unchecked("loaded");
-        });
+        loaded.set_id("loaded".to_string());
         current.apply_loaded(&loaded);
 
         assert!(matches!(
@@ -347,9 +342,7 @@ mod tests {
         let valid_path = tmp.path().join("valid.json");
         let corrupt_path = tmp.path().join("corrupt.json");
         let valid = test_session();
-        valid.update_state(|state, _| {
-            state.identity.session_id = openclaudia::state::SessionId::from_raw_unchecked("valid");
-        });
+        valid.set_id("valid".to_string());
         fs::write(&valid_path, serde_json::to_string(&valid).unwrap()).unwrap();
         fs::write(&corrupt_path, "{not-json").unwrap();
 
@@ -376,9 +369,7 @@ mod tests {
         let target = tmp.path().join("target");
         let link = tmp.path().join("linked.json");
         let session = test_session();
-        session.update_state(|state, _| {
-            state.identity.session_id = openclaudia::state::SessionId::from_raw_unchecked("linked");
-        });
+        session.set_id("linked".to_string());
         fs::write(&target, serde_json::to_vec(&session).unwrap()).unwrap();
         symlink(target, &link).unwrap();
 

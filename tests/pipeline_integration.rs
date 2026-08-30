@@ -675,7 +675,7 @@ fn b3_process_sse_event_thinking_end() {
     );
 }
 
-/// B3 — `process_sse_event` returns `SseAction::Thinking` for delta inside thinking block.
+/// B3 — raw Anthropic thinking is classified as private provider material.
 #[test]
 fn b3_process_sse_event_thinking_delta() {
     use openclaudia::pipeline::{process_sse_event, SseAction};
@@ -690,8 +690,8 @@ fn b3_process_sse_event_thinking_delta() {
 
     let action = process_sse_event(&event, true, &mut ant, &mut oai);
     match action {
-        SseAction::Thinking(text) => assert_eq!(text, "pondering..."),
-        other => panic!("expected SseAction::Thinking, got {other:?}"),
+        SseAction::PrivateReasoning(text) => assert_eq!(text, "pondering..."),
+        other => panic!("expected private reasoning, got {other:?}"),
     }
 }
 
@@ -728,8 +728,8 @@ fn b3_process_sse_event_openai_reasoning_content_delta() {
 
     let action = process_sse_event(&event, false, &mut ant, &mut oai);
     match action {
-        SseAction::Reasoning(text) => assert_eq!(text, "thinking"),
-        other => panic!("expected SseAction::Reasoning, got {other:?}"),
+        SseAction::PrivateReasoning(text) => assert_eq!(text, "thinking"),
+        other => panic!("expected private reasoning, got {other:?}"),
     }
 }
 
@@ -754,7 +754,7 @@ fn b3_process_sse_event_reasoning_details_delta() {
 
     let action = process_sse_event(&event, false, &mut ant, &mut oai);
     match action {
-        SseAction::Reasoning(text) => assert_eq!(text, "first second"),
-        other => panic!("expected SseAction::Reasoning, got {other:?}"),
+        SseAction::PrivateReasoning(text) => assert_eq!(text, "first second"),
+        other => panic!("expected private reasoning, got {other:?}"),
     }
 }

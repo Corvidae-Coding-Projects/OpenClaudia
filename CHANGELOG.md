@@ -206,6 +206,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-079: Route legacy attachments and editor input through capabilities (#1228)
+- S-049: Separate reasoning continuation from display (#1227)
+- S-039: Bind resume and branches to causal state (#1226)
 - S-083: Make terminal rendering bounded and inert (#1223)
 - S-077: Bind Git review and commit to exact generations (#1222)
 - S-076: Make project initialization transactional (#1221)

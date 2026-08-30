@@ -224,10 +224,17 @@ impl ProviderNativeItem {
     /// Returns an error when `payload` is not an object or exceeds the per-item
     /// bound.
     pub fn new(
-        facet: ProviderStateFacet,
+        mut facet: ProviderStateFacet,
         purpose: ProviderNativeItemPurpose,
-        payload: Value,
+        mut payload: Value,
     ) -> Result<Self, ProviderStateError> {
+        redact_plaintext_reasoning(&mut payload);
+        if purpose == ProviderNativeItemPurpose::Continuation
+            && facet == ProviderStateFacet::Reasoning
+            && !contains_opaque_reasoning(&payload)
+        {
+            facet = ProviderStateFacet::NativeMessage;
+        }
         let item = Self {
             sequence: 0,
             facet,
@@ -260,6 +267,20 @@ impl ProviderNativeItem {
     #[must_use]
     pub const fn payload(&self) -> &Value {
         &self.payload
+    }
+
+    /// Privacy channel represented by this item, when it is a reasoning
+    /// continuation. User summaries and protected monitoring never inhabit
+    /// provider-native items.
+    #[must_use]
+    pub const fn reasoning_channel(&self) -> Option<super::ReasoningChannel> {
+        if matches!(self.facet, ProviderStateFacet::Reasoning)
+            && matches!(self.purpose, ProviderNativeItemPurpose::Continuation)
+        {
+            Some(super::ReasoningChannel::ProviderContinuation)
+        } else {
+            None
+        }
     }
 
     fn validate_payload(&self) -> Result<usize, ProviderStateError> {
@@ -612,6 +633,28 @@ impl<'de> Deserialize<'de> for ProviderNativeState {
     }
 }
 
+impl ProviderNativeState {
+    /// Remove legacy plaintext reasoning after the persisted envelope has
+    /// passed its original digest/causal validation.
+    pub(crate) fn sanitize_plaintext_reasoning(&mut self) -> Result<bool, ProviderStateError> {
+        let mut redacted = false;
+        for item in &mut self.items {
+            redacted |= redact_plaintext_reasoning(&mut item.payload);
+            if item.purpose == ProviderNativeItemPurpose::Continuation
+                && item.facet == ProviderStateFacet::Reasoning
+                && !contains_opaque_reasoning(&item.payload)
+            {
+                item.facet = ProviderStateFacet::NativeMessage;
+            }
+        }
+        if redacted {
+            self.validate_shape()?;
+            self.digest = self.calculate_digest()?;
+        }
+        Ok(redacted)
+    }
+}
+
 /// Provider-native state validation failure.
 #[derive(Debug, Error)]
 pub enum ProviderStateError {
@@ -731,6 +774,88 @@ fn canonical_json(value: &Value) -> Value {
     }
 }
 
+/// Remove provider plaintext chain-of-thought spellings while retaining
+/// encrypted continuation, signatures, visible output, and tool protocol.
+///
+/// This is deliberately structural instead of provider-name based so legacy
+/// OpenAI-compatible aliases receive the same compatibility redaction. Gemini
+/// thought parts are removed as units; their ordinary visible text siblings
+/// and any signatures attached to function-call parts remain intact.
+fn redact_plaintext_reasoning(value: &mut Value) -> bool {
+    match value {
+        Value::Array(values) => {
+            let mut removed = false;
+            for value in values {
+                removed |= redact_plaintext_reasoning(value);
+            }
+            removed
+        }
+        Value::Object(object) => {
+            let mut removed = false;
+            let thinking_block = object.get("type").and_then(Value::as_str) == Some("thinking");
+            let reasoning_block = object.get("type").and_then(Value::as_str) == Some("reasoning");
+            let assistant_message = object.get("role").and_then(Value::as_str) == Some("assistant");
+            if assistant_message {
+                for key in [
+                    "reasoning_content",
+                    "reasoning",
+                    "thinking",
+                    "reasoning_details",
+                ] {
+                    if object.get(key).is_some_and(|value| {
+                        value.is_string() || value.is_array() || value.is_object()
+                    }) {
+                        object.remove(key);
+                        removed = true;
+                    }
+                }
+            }
+            if thinking_block {
+                for key in ["thinking", "text"] {
+                    removed |= object.remove(key).is_some();
+                }
+            } else if reasoning_block {
+                for key in ["content", "text", "reasoning"] {
+                    removed |= object.remove(key).is_some();
+                }
+            }
+            if let Some(parts) = object.get_mut("parts").and_then(Value::as_array_mut) {
+                let before = parts.len();
+                parts.retain(|part| {
+                    !(part.get("thought").and_then(Value::as_bool) == Some(true)
+                        && part.get("text").is_some()
+                        && part.get("functionCall").is_none())
+                });
+                removed |= parts.len() != before;
+            }
+            let mut nested_removed = false;
+            for value in object.values_mut() {
+                nested_removed |= redact_plaintext_reasoning(value);
+            }
+            removed || nested_removed
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
+    }
+}
+
+fn contains_opaque_reasoning(value: &Value) -> bool {
+    match value {
+        Value::Array(values) => values.iter().any(contains_opaque_reasoning),
+        Value::Object(object) => {
+            let local = ["encrypted_content", "thoughtSignature", "signature"]
+                .into_iter()
+                .any(|key| {
+                    object
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.is_empty())
+                });
+            local || object.values().any(contains_opaque_reasoning)
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -818,6 +943,62 @@ mod tests {
             decoded.items()[3].payload()["previous_response_id"],
             "resp_native_1"
         );
+        assert!(decoded.items()[0].payload().get("thinking").is_none());
+        assert_eq!(
+            decoded.items()[0].payload()["signature"],
+            "signature-secret"
+        );
+        assert_eq!(decoded.items()[1].payload()["data"], "redacted-secret");
+        assert_eq!(
+            decoded.items()[2].payload()["thoughtSignature"],
+            "gemini-signature"
+        );
+    }
+
+    #[test]
+    fn reasoning_redaction_does_not_rewrite_tool_arguments() {
+        let item = ProviderNativeItem::new(
+            ProviderStateFacet::ToolCalls,
+            ProviderNativeItemPurpose::Continuation,
+            json!({
+                "role": "assistant",
+                "reasoning_content": "private",
+                "tool_calls": [{
+                    "function": {
+                        "name": "record",
+                        "arguments": {"thinking": "keep", "reasoning": "keep too"}
+                    }
+                }]
+            }),
+        )
+        .expect("tool continuation");
+
+        assert!(item.payload().get("reasoning_content").is_none());
+        assert_eq!(
+            item.payload()["tool_calls"][0]["function"]["arguments"]["thinking"],
+            "keep"
+        );
+        assert_eq!(
+            item.payload()["tool_calls"][0]["function"]["arguments"]["reasoning"],
+            "keep too"
+        );
+    }
+
+    #[test]
+    fn plaintext_reasoning_is_removed_from_evidence_items_too() {
+        let item = ProviderNativeItem::new(
+            ProviderStateFacet::NativeMessage,
+            ProviderNativeItemPurpose::Evidence,
+            json!({
+                "role": "assistant",
+                "content": "visible answer",
+                "reasoning_content": "private reasoning"
+            }),
+        )
+        .expect("evidence item");
+
+        assert_eq!(item.payload()["content"], "visible answer");
+        assert!(item.payload().get("reasoning_content").is_none());
     }
 
     #[test]

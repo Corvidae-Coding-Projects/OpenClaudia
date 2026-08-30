@@ -528,16 +528,65 @@ pub fn read_capability_text_attachment(
     run: &super::security::ToolRunContext,
     user_path: &str,
 ) -> Result<(PathBuf, String), String> {
-    let (resolved, mut file) = open_capability_regular_read(run, user_path)?;
-    let bytes = secure_fs::read_stable_bounded_bytes(
-        &mut file,
-        &resolved,
+    read_bounded_capability_text_attachment(
+        run,
+        user_path,
         usize::try_from(read::MAX_FILE_SIZE_BYTES).unwrap_or(usize::MAX),
-    )?;
+    )
+}
+
+/// Read one stable UTF-8 attachment snapshot under a caller-selected ceiling.
+///
+/// Frontends use this narrower form to reserve their own aggregate context
+/// budgets without first admitting a larger file through the general file
+/// tool limit. The descriptor is opened once through the immutable run and is
+/// read twice before the snapshot is accepted.
+///
+/// # Errors
+///
+/// Returns an error for the same capability and encoding failures as
+/// [`read_capability_text_attachment`], and when the file exceeds
+/// `maximum_bytes` or changes while being read.
+pub fn read_bounded_capability_text_attachment(
+    run: &super::security::ToolRunContext,
+    user_path: &str,
+    maximum_bytes: usize,
+) -> Result<(PathBuf, String), String> {
+    let (resolved, mut file) = open_capability_regular_read(run, user_path)?;
+    let bytes = secure_fs::read_stable_bounded_bytes(&mut file, &resolved, maximum_bytes)?;
     let content = String::from_utf8(bytes)
         .map_err(|error| format!("File '{}' is not valid UTF-8: {error}", resolved.display()))?;
     READ_TRACKER.mark_snapshot(run, &resolved, content.as_bytes());
     Ok((resolved, content))
+}
+
+/// Replace one already-observed capability file generation atomically.
+///
+/// This lifecycle boundary is used when a user-origin process edits a staged
+/// copy of an exact run-owned file. It cannot create a new target and refuses
+/// to overwrite a generation that changed after staging.
+pub(super) fn replace_capability_text_generation(
+    run: &super::security::ToolRunContext,
+    path: &Path,
+    expected: crate::runtime::ContentDigest,
+    content: &str,
+    maximum_bytes: usize,
+) -> Result<(), String> {
+    let resolved = resolve_path(run, &path.to_string_lossy())?;
+    secure_fs::write_atomic_generation(
+        run,
+        &resolved,
+        Some(expected),
+        content.as_bytes(),
+        maximum_bytes,
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        format!(
+            "Failed to publish capability file '{}': {error}",
+            resolved.display()
+        )
+    })
 }
 
 /// Create one UTF-8 frontend-owned file without ever overwriting an existing

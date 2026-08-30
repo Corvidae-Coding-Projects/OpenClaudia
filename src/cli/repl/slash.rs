@@ -138,11 +138,11 @@ pub enum SlashCommandResult {
     // The snapshot is already persisted by `slash_branch`; the inner name is
     // retained for tests and future UI affordances.
     #[allow(dead_code)]
-    BranchSession(String),
+    BranchSession(openclaudia::state::PreparedBranch),
     /// Restore a named branch snapshot into the active conversation (#657).
     TeleportSession {
         name: String,
-        messages: Vec<serde_json::Value>,
+        proposal: Box<openclaudia::state::BranchProposal>,
     },
     /// Ask a side question without disturbing main conversation flow (#179)
     SideQuestion(String),
@@ -1727,17 +1727,15 @@ pub fn slash_rewind(args: &str, messages: &[serde_json::Value]) -> SlashCommandR
     }
 }
 
-fn latest_assistant_reasoning_content(messages: &[serde_json::Value]) -> Option<&str> {
+fn latest_assistant_reasoning_summary(
+    messages: &[serde_json::Value],
+) -> Option<openclaudia::runtime::ReasoningSummary> {
     let latest_assistant = messages
         .iter()
         .rev()
         .find(|msg| msg.get("role").and_then(|role| role.as_str()) == Some("assistant"))?;
 
-    latest_assistant
-        .get("reasoning_content")
-        .and_then(|content| content.as_str())
-        .map(str::trim)
-        .filter(|content| !content.is_empty())
+    openclaudia::runtime::message_reasoning_summary(latest_assistant)
 }
 
 pub fn slash_thinkback(args: &str, messages: &[serde_json::Value]) -> SlashCommandResult {
@@ -1746,14 +1744,14 @@ pub fn slash_thinkback(args: &str, messages: &[serde_json::Value]) -> SlashComma
         return SlashCommandResult::Handled;
     }
 
-    match latest_assistant_reasoning_content(messages) {
-        Some(reasoning) => {
-            println!("\nLast assistant thinking block:\n");
-            println!("{reasoning}");
+    match latest_assistant_reasoning_summary(messages) {
+        Some(summary) => {
+            println!("\nLast provider-sanctioned reasoning summary:\n");
+            println!("{}", summary.as_str());
             println!();
         }
         None => {
-            println!("\nNo saved thinking block for the latest assistant turn.\n");
+            println!("\nNo provider-sanctioned reasoning summary is saved for the latest assistant turn.\n");
         }
     }
 
@@ -2020,7 +2018,10 @@ pub fn slash_add_dir(
 pub fn slash_branch(
     args: &str,
     messages: &[serde_json::Value],
+    provider: &str,
+    model: &str,
     run: Option<&openclaudia::tools::ToolRunContext>,
+    branch_source: Option<&openclaudia::state::BranchSource>,
 ) -> SlashCommandResult {
     let Some(run) = run else {
         println!("\nBranch snapshots are unavailable without a run context.\n");
@@ -2042,13 +2043,30 @@ pub fn slash_branch(
         return SlashCommandResult::Handled;
     }
 
+    let fallback_source;
+    let source = if let Some(source) = branch_source {
+        source
+    } else {
+        fallback_source = match openclaudia::state::BranchSource::from_untracked_messages(
+            messages, provider, model, run,
+        ) {
+            Ok(source) => source,
+            Err(error) => {
+                println!("\nError: cannot bind branch proposal: {error}\n");
+                return SlashCommandResult::Handled;
+            }
+        };
+        &fallback_source
+    };
+    let prepared = match source.prepare(&name) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            println!("\nError: cannot prepare branch proposal: {error}\n");
+            return SlashCommandResult::Handled;
+        }
+    };
     let branch_path = branch_snapshot_path(run, &name);
-    let snapshot = serde_json::json!({
-        "name": name,
-        "created_at": chrono::Utc::now().to_rfc3339(),
-        "messages": messages,
-    });
-    match serde_json::to_string_pretty(&snapshot) {
+    match serde_json::to_string_pretty(prepared.proposal()) {
         Ok(json) => match openclaudia::tools::create_run_control_text_file(
             run,
             &branch_path.to_string_lossy(),
@@ -2059,7 +2077,7 @@ pub fn slash_branch(
                     "\nBranched session as {name}; snapshot saved to {}\n",
                     branch_path.display()
                 );
-                SlashCommandResult::BranchSession(name)
+                SlashCommandResult::BranchSession(prepared)
             }
             Err(error) if error.ends_with("already exists") => {
                 println!("\nError: branch '{name}' already exists. Choose a different name.\n");
@@ -2105,7 +2123,7 @@ fn validate_branch_snapshot_name(name: &str) -> Result<(), &'static str> {
 fn load_branch_snapshot(
     run: &openclaudia::tools::ToolRunContext,
     name: &str,
-) -> Result<Vec<serde_json::Value>, String> {
+) -> Result<openclaudia::state::BranchProposal, String> {
     validate_branch_snapshot_name(name)
         .map_err(|reason| format!("invalid branch name: {reason}"))?;
 
@@ -2119,14 +2137,17 @@ fn load_branch_snapshot(
             }
         })?;
 
-    let snapshot: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|err| format!("could not parse {}: {err}", path.display()))?;
-    let messages = snapshot
-        .get("messages")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| format!("{} does not contain a messages array", path.display()))?;
-
-    Ok(messages.clone())
+    let proposal = openclaudia::state::decode_branch_proposal(&raw)
+        .map_err(|err| format!("could not validate {}: {err}", path.display()))?;
+    if proposal.name() != name {
+        return Err(format!(
+            "{} contains branch name {:?}, expected {:?}",
+            path.display(),
+            proposal.name(),
+            name
+        ));
+    }
+    Ok(proposal)
 }
 
 pub fn slash_teleport(
@@ -2144,9 +2165,9 @@ pub fn slash_teleport(
         return SlashCommandResult::Handled;
     };
     match load_branch_snapshot(run, name) {
-        Ok(messages) => SlashCommandResult::TeleportSession {
+        Ok(proposal) => SlashCommandResult::TeleportSession {
             name: name.to_string(),
-            messages,
+            proposal: Box::new(proposal),
         },
         Err(reason) => {
             println!("\nError: {reason}\n");
@@ -2177,7 +2198,18 @@ pub fn handle_slash_command(
     provider: &str,
     current_model: &str,
 ) -> Option<SlashCommandResult> {
-    handle_slash_command_scoped(input, messages, provider, current_model, None, None, None)
+    handle_slash_command_scoped(
+        input,
+        super::command_registry::SlashCtx {
+            messages,
+            provider,
+            current_model,
+            run_context: None,
+            branch_source: None,
+            app_config: None,
+            doctor_runtime: None,
+        },
+    )
 }
 
 /// Handle slash commands with one immutable run available to commands that
@@ -2192,12 +2224,15 @@ pub fn handle_slash_command_for_run(
 ) -> Option<SlashCommandResult> {
     handle_slash_command_scoped(
         input,
-        messages,
-        provider,
-        current_model,
-        Some(run),
-        None,
-        None,
+        super::command_registry::SlashCtx {
+            messages,
+            provider,
+            current_model,
+            run_context: Some(run),
+            branch_source: None,
+            app_config: None,
+            doctor_runtime: None,
+        },
     )
 }
 
@@ -2205,49 +2240,22 @@ pub fn handle_slash_command_for_run(
 /// already composed by the production legacy frontend.
 pub fn handle_slash_command_for_runtime(
     input: &str,
-    messages: &mut Vec<serde_json::Value>,
-    provider: &str,
-    current_model: &str,
-    run: &openclaudia::tools::ToolRunContext,
-    app_config: &openclaudia::config::AppConfig,
-    doctor_runtime: Option<&openclaudia::doctor::DoctorRuntimeSnapshot>,
+    context: super::command_registry::SlashCtx<'_>,
 ) -> Option<SlashCommandResult> {
-    handle_slash_command_scoped(
-        input,
-        messages,
-        provider,
-        current_model,
-        Some(run),
-        Some(app_config),
-        doctor_runtime,
-    )
+    handle_slash_command_scoped(input, context)
 }
 
 fn handle_slash_command_scoped(
     input: &str,
-    messages: &mut Vec<serde_json::Value>,
-    provider: &str,
-    current_model: &str,
-    run_context: Option<&openclaudia::tools::ToolRunContext>,
-    app_config: Option<&openclaudia::config::AppConfig>,
-    doctor_runtime: Option<&openclaudia::doctor::DoctorRuntimeSnapshot>,
+    mut context: super::command_registry::SlashCtx<'_>,
 ) -> Option<SlashCommandResult> {
     if !input.starts_with('/') {
         return None;
     }
 
-    let mut ctx = super::command_registry::SlashCtx {
-        messages,
-        provider,
-        current_model,
-        run_context,
-        app_config,
-        doctor_runtime,
-    };
-
     Some(
         super::command_registry::registry()
-            .parse_and_dispatch(input, &mut ctx)
+            .parse_and_dispatch(input, &mut context)
             .unwrap_or_else(|error| {
                 eprintln!("{error}\n");
                 SlashCommandResult::Handled
@@ -4406,39 +4414,39 @@ mod tests {
 
     #[test]
     fn latest_assistant_reasoning_uses_newest_assistant_only() {
+        let older = openclaudia::runtime::ReasoningSummary::try_from_provider("older summary")
+            .expect("older summary");
+        let newer = openclaudia::runtime::ReasoningSummary::try_from_provider("newest summary")
+            .expect("newer summary");
+        let mut older_message = serde_json::json!({"role": "assistant", "content": "older"});
+        openclaudia::runtime::attach_reasoning_summary(&mut older_message, &older);
+        let mut newer_message = serde_json::json!({"role": "assistant", "content": "newer"});
+        openclaudia::runtime::attach_reasoning_summary(&mut newer_message, &newer);
         let messages = vec![
-            serde_json::json!({
-                "role": "assistant",
-                "content": "older",
-                "reasoning_content": "older thinking"
-            }),
+            older_message,
             serde_json::json!({"role": "user", "content": "next"}),
-            serde_json::json!({
-                "role": "assistant",
-                "content": "newer",
-                "reasoning_content": "  newest thinking  "
-            }),
+            newer_message,
         ];
 
         assert_eq!(
-            super::latest_assistant_reasoning_content(&messages),
-            Some("newest thinking")
+            super::latest_assistant_reasoning_summary(&messages),
+            Some(newer)
         );
     }
 
     #[test]
     fn latest_assistant_reasoning_does_not_skip_back_past_latest_assistant() {
+        let summary = openclaudia::runtime::ReasoningSummary::try_from_provider("older summary")
+            .expect("summary");
+        let mut older = serde_json::json!({"role": "assistant", "content": "older"});
+        openclaudia::runtime::attach_reasoning_summary(&mut older, &summary);
         let messages = vec![
-            serde_json::json!({
-                "role": "assistant",
-                "content": "older",
-                "reasoning_content": "older thinking"
-            }),
+            older,
             serde_json::json!({"role": "user", "content": "next"}),
             serde_json::json!({"role": "assistant", "content": "newer"}),
         ];
 
-        assert_eq!(super::latest_assistant_reasoning_content(&messages), None);
+        assert_eq!(super::latest_assistant_reasoning_summary(&messages), None);
     }
 
     #[test]
@@ -4449,13 +4457,13 @@ mod tests {
                 .is_some(),
             "/thinkback must be registered, not unknown-command fallback"
         );
+        let summary = openclaudia::runtime::ReasoningSummary::try_from_provider("safe summary")
+            .expect("summary");
+        let mut assistant = serde_json::json!({"role": "assistant", "content": "answer"});
+        openclaudia::runtime::attach_reasoning_summary(&mut assistant, &summary);
         let result = handle_slash_command(
             "/thinkback",
-            &mut vec![serde_json::json!({
-                "role": "assistant",
-                "content": "answer",
-                "reasoning_content": "private reasoning"
-            })],
+            &mut vec![assistant],
             "anthropic",
             "claude-sonnet",
         );
@@ -4943,8 +4951,8 @@ mod tests {
         let teleport_result =
             handle_slash_command_for_run(&teleport_input, &mut ctx(), "anthropic", "claude", &run);
         match teleport_result {
-            Some(SlashCommandResult::TeleportSession { messages, .. }) => {
-                assert_eq!(messages, branched_messages);
+            Some(SlashCommandResult::TeleportSession { proposal, .. }) => {
+                assert_eq!(proposal.messages(), branched_messages);
             }
             _ => panic!("/teleport must load branch snapshot"),
         }

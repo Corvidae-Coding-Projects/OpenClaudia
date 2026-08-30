@@ -1,6 +1,6 @@
 # S-039: Bind resume and branches to causal state
 
-Status: Planned
+Status: Implemented and deterministically verified; artifact-bound VDD receipt pending
 Effort: Medium
 Primary findings: F-072, F-117
 Workstreams: W12, W15
@@ -27,3 +27,39 @@ Prevent project-controlled snapshots or ambiguous transcript IDs from replacing 
 ## Handoff
 
 Record changed artifact generations, commands/tests run, typed evidence receipts, unresolved risks, and any newly proposed slice. Completion of this slice does not imply completion of its parent workstream.
+
+## Delivered implementation
+
+- Sessions now carry a versioned causal envelope with an immutable logical
+  identity, ordered event digests, parent generations, provider/model binding,
+  workspace and capability generations, provenance, branch anchors, and
+  selected-branch receipts.
+- Session schema version 2 migrates version 0/1 state without silently
+  inventing repeatable authority. A legacy session receives one explicit
+  resume binding; subsequent resumes must match its established causal run.
+- TUI, legacy REPL, ACP, session loading, fresh-session transitions, and
+  subagent restoration prepare and validate resume state before activating the
+  loaded transcript. Provider, project, workspace, or run-generation drift is
+  returned as a typed refusal.
+- `/branch` writes a bounded untrusted proposal bound to the source event and
+  `/teleport` validates and atomically selects that proposal. Cycles, stale
+  sources, forged messages, cross-session identities, and mismatched run
+  bindings cannot replace the active conversation.
+
+## Verification
+
+- Rust 1.98 format and strict all-target/all-feature Clippy gates pass.
+- The complete locked all-target/all-feature suite passes with 3,126 library
+  tests passed and one intentional ignore, 208 binary tests passed, and every
+  integration target green under one test thread.
+- Focused migration, startup resume, provider-history, branch validation, and
+  session serialization tests pass. Test fixtures that need a chosen ID now
+  use the causal `Session::set_id` transition instead of manufacturing
+  internally inconsistent state.
+
+## Residual boundary
+
+The implementation and deterministic integration evidence are complete. An
+artifact-bound alternate-model VDD receipt is still required before this slice
+can claim the repository's final `Verified` status; no receipt is fabricated
+here.

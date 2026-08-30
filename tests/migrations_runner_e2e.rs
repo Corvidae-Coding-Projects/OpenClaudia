@@ -180,7 +180,7 @@ fn restart_reconciles_a_preexisting_partial_migration_prefix() {
     let migrated: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&legacy_path).expect("migrated legacy session"))
             .expect("valid migrated JSON");
-    assert_eq!(migrated["session_state"]["version"], 1);
+    assert_eq!(migrated["session_state"]["version"], 2);
     assert!(migrated.get("messages").is_none());
 
     let restart = run_all(&context);
@@ -218,7 +218,7 @@ fn foreign_marker_is_never_modified_and_only_owned_metadata_is_published() {
     .expect("valid owned schema manifest");
     assert_eq!(manifest["producer"], "openclaudia");
     assert_eq!(manifest["session_documents"]["minimum"], 0);
-    assert_eq!(manifest["session_documents"]["current"], 1);
+    assert_eq!(manifest["session_documents"]["current"], 2);
     assert_eq!(
         manifest["foreign_transcript_import"]["status"],
         "claimed_compatible"
@@ -233,7 +233,7 @@ fn future_session_schema_blocks_startup_without_modification() {
     let path = session_path(&context, "future");
     let mut document: serde_json::Value =
         serde_json::from_slice(&canonical_session(&context, "future")).expect("canonical fixture");
-    document["session_state"]["version"] = serde_json::json!(2);
+    document["session_state"]["version"] = serde_json::json!(3);
     let original = serde_json::to_vec_pretty(&document).expect("future fixture");
     std::fs::write(&path, &original).expect("future session");
 

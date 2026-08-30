@@ -14,6 +14,7 @@ mod event;
 mod ids;
 mod kernel;
 mod provider_state;
+mod reasoning;
 mod reference;
 mod trace;
 
@@ -44,6 +45,15 @@ pub use provider_state::{
     ProviderWireProtocol, MAX_PROVIDER_NATIVE_ITEMS, MAX_PROVIDER_NATIVE_ITEM_BYTES,
     MAX_PROVIDER_NATIVE_ITEM_DEPTH, MAX_PROVIDER_NATIVE_MODEL_BYTES,
     MAX_PROVIDER_NATIVE_STATE_BYTES, PROVIDER_NATIVE_STATE_SCHEMA_VERSION,
+};
+pub use reasoning::{
+    attach_reasoning_summary, message_reasoning_summary, redact_legacy_portable_reasoning,
+    redact_reasoning_for_provider_request, sanitize_portable_reasoning,
+    ProtectedReasoningObservation, ProviderReasoningContinuation, ReasoningAccess,
+    ReasoningChannel, ReasoningConsent, ReasoningExport, ReasoningMonitoringGrant, ReasoningPolicy,
+    ReasoningPrivacyError, ReasoningRendering, ReasoningRetention, ReasoningStorage,
+    ReasoningSummary, MAX_PROVIDER_REASONING_CONTINUATION_BYTES,
+    MAX_REASONING_MONITORING_RETENTION, MAX_REASONING_SUMMARY_BYTES,
 };
 pub use reference::{ReferenceRunAdapter, ReferenceRunResult};
 pub use trace::{ReferenceTraceSink, TraceSink, TraceSinkError, TracingTraceSink};

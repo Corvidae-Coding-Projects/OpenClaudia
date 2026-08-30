@@ -1579,6 +1579,11 @@ impl App {
             remote_actions,
             web_egress_grants,
         );
+        if let Ok(run) = &run_context {
+            if let Err(error) = chat_session.bind_workspace_run(run) {
+                tracing::warn!("Failed to bind initial causal session state: {error}");
+            }
+        }
         let task_manager = run_context
             .as_ref()
             .ok()
@@ -1964,6 +1969,13 @@ impl App {
         };
         let next_run = derive_session_run_context(&current_run, loaded, &current_binding.provider)
             .map_err(ProviderTransitionError::Preparation)?;
+        loaded
+            .prepare_resume_against_run(&next_run)
+            .map_err(|error| {
+                ProviderTransitionError::Preparation(format!(
+                    "cannot resume causal session state: {error}"
+                ))
+            })?;
         let durable_tasks = self
             .task_mgr
             .lock()
@@ -2033,7 +2045,13 @@ impl App {
         // Flush the old snapshot before replacement. Subscribers stay attached
         // because `apply_loaded` replaces the shared store in place.
         self.transcript_subscriber.flush_now();
-        self.chat_session.apply_loaded(loaded);
+        self.chat_session
+            .apply_loaded_for_run(loaded, &next_run)
+            .map_err(|error| {
+                ProviderTransitionError::Preparation(format!(
+                    "cannot activate causal session state: {error}"
+                ))
+            })?;
         self.chat_session.set_permission_bypass(permission_bypass);
         self.run_context = Ok(std::sync::Arc::clone(&next_run));
         self.task_mgr = std::sync::Arc::new(std::sync::Mutex::new(next_task_manager));
@@ -2079,6 +2097,14 @@ impl App {
                 kind,
                 content: content.to_string(),
             });
+            if role == super::messages::Role::Assistant {
+                if let Some(summary) = crate::runtime::message_reasoning_summary(&msg) {
+                    self.messages.add(DisplayMessage {
+                        kind: MessageKind::ReasoningSummary,
+                        content: summary.as_str().to_string(),
+                    });
+                }
+            }
         }
         self.drain_state_subscribers();
         Ok(())
@@ -2239,7 +2265,13 @@ impl App {
             }
         };
         self.task_mgr = std::sync::Arc::new(std::sync::Mutex::new(manager));
-        self.chat_session.bind_workspace_run(run);
+        if let Err(error) = self.chat_session.bind_workspace_run(run) {
+            self.messages.add(DisplayMessage::error(format!(
+                "Workspace changed, but causal session binding failed: {error}"
+            )));
+            self.should_quit = true;
+            return;
+        }
         self.rebind_permission_manager(run);
         self.refresh_prompt_context_for_run();
         self.rebind_mcp_runtime(run);
@@ -2284,15 +2316,21 @@ impl App {
     /// with a user-visible system message when no match is found.
     fn resume_session_by_id(&mut self, id: &str) {
         let sessions = list_sessions();
-        let Some(loaded) = sessions
+        let mut matches = sessions
             .into_iter()
-            .find(|session| session.id().starts_with(id))
-        else {
+            .filter(|session| session.id().starts_with(id));
+        let Some(loaded) = matches.next() else {
             self.messages.add(DisplayMessage::error(format!(
                 "No session found with id prefix '{id}'.",
             )));
             return;
         };
+        if matches.next().is_some() {
+            self.messages.add(DisplayMessage::error(format!(
+                "Session id prefix '{id}' is ambiguous; provide the complete id.",
+            )));
+            return;
+        }
         let _ = self.apply_loaded_session(&loaded);
     }
 
@@ -2324,9 +2362,15 @@ impl App {
         scope_target_values: &[String],
     ) -> Result<(), String> {
         let mut selected = if let Some(id) = session_id {
-            let session = list_sessions()
+            let mut matches = list_sessions()
                 .into_iter()
-                .find(|session| session.id().starts_with(id));
+                .filter(|session| session.id().starts_with(id));
+            let session = matches.next();
+            if matches.next().is_some() {
+                return Err(format!(
+                    "session id prefix '{id}' is ambiguous; provide the complete id"
+                ));
+            }
             if session.is_none() {
                 self.messages.add(DisplayMessage::error(format!(
                     "No session found with id prefix '{id}'.",
@@ -3383,12 +3427,12 @@ impl App {
                 self.handle_keybinding_timeout();
             }
             Ok(AppEvent::StreamText(text)) => {
-                self.messages.finish_thinking();
+                self.messages.finish_reasoning_summary();
                 self.append_streaming_for_display(&text);
                 self.messages.scroll_to_bottom();
             }
-            Ok(AppEvent::StreamThinking(text)) => {
-                self.messages.push_thinking(&text);
+            Ok(AppEvent::StreamReasoningSummary(text)) => {
+                self.messages.push_reasoning_summary(&text);
                 self.messages.scroll_to_bottom();
             }
             Ok(AppEvent::ToolStart { name, description }) => {
@@ -3646,7 +3690,7 @@ impl App {
 
     fn finish_response_state(&mut self) {
         self.cancel_pending_keybinding();
-        self.messages.finish_thinking();
+        self.messages.finish_reasoning_summary();
         self.prepare_streaming_final_for_display();
         self.messages.finish_streaming();
         self.streaming_raw_text.clear();
@@ -3721,7 +3765,7 @@ impl App {
 
     fn preserve_failed_stream_for_display(&mut self) {
         let partial = std::mem::take(&mut self.streaming_raw_text);
-        self.messages.finish_thinking();
+        self.messages.finish_reasoning_summary();
         self.messages.finish_streaming();
         if partial.trim().is_empty() {
             return;
@@ -4793,6 +4837,15 @@ impl App {
                     continue;
                 }
                 let _ = write!(md, "**{role}:**\n{content}\n\n");
+                if role == "assistant" {
+                    if let Some(summary) = crate::runtime::message_reasoning_summary(&msg) {
+                        let _ = write!(
+                            md,
+                            "**Provider reasoning summary:**\n{}\n\n",
+                            summary.as_str()
+                        );
+                    }
+                }
             }
             let export_path = format!(
                 "conversation-{}.md",
@@ -7507,7 +7560,7 @@ fn describe_event(event: &super::events::AppEvent) -> String {
             format!("StreamTimeout({elapsed_secs}/{timeout_secs}s)")
         }
         super::events::AppEvent::StreamText(_) => "StreamText".to_string(),
-        super::events::AppEvent::StreamThinking(_) => "StreamThinking".to_string(),
+        super::events::AppEvent::StreamReasoningSummary(_) => "StreamReasoningSummary".to_string(),
         super::events::AppEvent::ToolStart { name, .. } => format!("ToolStart({name})"),
         super::events::AppEvent::ToolDone { name, success, .. } => {
             format!("ToolDone({name}, ok={success})")
@@ -7671,6 +7724,7 @@ async fn run_agentic_loop(
     ctx: &AgenticCtx<'_>,
     session_messages: &mut Vec<serde_json::Value>,
     provider_native_state: &mut Option<crate::runtime::ProviderNativeState>,
+    mut provider_reasoning_continuation: Option<crate::runtime::ProviderReasoningContinuation>,
 ) -> Result<std::sync::Arc<crate::tools::ToolRunContext>, String> {
     const MAX_ITER: u32 = 25;
     let mut iteration = 0u32;
@@ -7728,6 +7782,7 @@ async fn run_agentic_loop(
             claude_code_token: ctx.claude_code_token,
             prompt_blocks: ctx.prompt_blocks,
             provider_native_state: provider_native_state.as_ref(),
+            provider_reasoning_continuation: provider_reasoning_continuation.as_ref(),
             hook_engine: ctx.hook_engine.as_deref(),
             mcp_manager,
         })
@@ -7832,18 +7887,17 @@ async fn run_agentic_loop(
                 if followup.needs_followup {
                     let asst = crate::pipeline::build_assistant_message_with_tools(
                         &followup.content,
-                        followup.reasoning_content.as_deref(),
+                        followup.reasoning_summary.as_ref(),
                         &followup.tool_calls,
                         ctx.provider,
                     );
                     session_messages.push(asst);
                     session_messages.extend(followup.tool_results.iter().cloned());
                     *provider_native_state = next_provider_state;
+                    provider_reasoning_continuation =
+                        followup.provider_reasoning_continuation.take();
                 } else {
-                    let reasoning = followup
-                        .reasoning_content
-                        .as_deref()
-                        .filter(|text| !text.is_empty());
+                    let reasoning_summary = followup.reasoning_summary.as_ref();
                     if followup.content.is_empty() {
                         let error = "Provider completed the follow-up without assistant content";
                         send_or_warn(
@@ -7875,9 +7929,8 @@ async fn run_agentic_loop(
                         "role": "assistant",
                         "content": rendered_content
                     });
-                    if let Some(reasoning) = reasoning {
-                        message["reasoning_content"] =
-                            serde_json::Value::String(reasoning.to_string());
+                    if let Some(summary) = reasoning_summary {
+                        crate::runtime::attach_reasoning_summary(&mut message, summary);
                     }
                     session_messages.push(message);
                     *provider_native_state = next_provider_state;
@@ -7938,6 +7991,7 @@ async fn build_initial_turn_request(p: &InitialTurnRequest<'_>) -> Option<Prepar
         claude_code_token: p.claude_code_token,
         prompt_blocks: p.prompt_blocks,
         provider_native_state: p.provider_native_state,
+        provider_reasoning_continuation: None,
         hook_engine: p.hook_engine,
         mcp_manager: p.mcp_manager,
     })
@@ -7968,6 +8022,7 @@ struct LiveMcpRequest<'a> {
     claude_code_token: Option<&'a crate::secrets::OAuthToken>,
     prompt_blocks: Option<&'a crate::prompt::SystemPromptBlocks>,
     provider_native_state: Option<&'a crate::runtime::ProviderNativeState>,
+    provider_reasoning_continuation: Option<&'a crate::runtime::ProviderReasoningContinuation>,
     hook_engine: Option<&'a crate::hooks::HookEngine>,
     mcp_manager: Option<&'a std::sync::Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
 }
@@ -8080,7 +8135,7 @@ async fn build_request_with_live_mcp(
         .map(serde_json::to_value)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Cannot encode compacted context: {error}"))?;
-    crate::pipeline::build_request_for_wire_with_exact_tools_and_state(
+    let mut body = crate::pipeline::build_request_for_wire_with_exact_tools_and_state(
         request.wire_api,
         request.provider,
         request.model,
@@ -8090,7 +8145,24 @@ async fn build_request_with_live_mcp(
         request.prompt_blocks,
         &catalog.definitions,
         request.provider_native_state,
-    )
+    )?;
+    if let Some(continuation) = request.provider_reasoning_continuation {
+        if request.wire_api != crate::pipeline::WireApi::ChatCompletions
+            || matches!(
+                request.provider.to_ascii_lowercase().as_str(),
+                "anthropic" | "google" | "gemini" | "ollama"
+            )
+        {
+            return Err(
+                "raw reasoning continuation was supplied to an incompatible provider protocol"
+                    .to_string(),
+            );
+        }
+        continuation
+            .apply_to_openai_chat_request(&mut body)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(body)
 }
 
 /// Run a complete API turn: pre-turn hooks, first `run_turn`, and an agentic
@@ -8323,9 +8395,10 @@ async fn handle_followup_turn(
     } else {
         ctx.task_obs
     };
+    let provider_reasoning_continuation = turn_result.provider_reasoning_continuation.take();
     let assistant = crate::pipeline::build_assistant_message_with_tools(
         &turn_result.content,
-        turn_result.reasoning_content.as_deref(),
+        turn_result.reasoning_summary.as_ref(),
         &turn_result.tool_calls,
         ctx.provider,
     );
@@ -8362,8 +8435,13 @@ async fn handle_followup_turn(
         task_obs: followup_task_obs,
         tx: ctx.tx,
     };
-    let Ok(final_run) =
-        run_agentic_loop(&agentic, &mut session_messages, &mut provider_native_state).await
+    let Ok(final_run) = run_agentic_loop(
+        &agentic,
+        &mut session_messages,
+        &mut provider_native_state,
+        provider_reasoning_continuation,
+    )
+    .await
     else {
         send_or_warn(
             ctx.tx,
@@ -8455,12 +8533,8 @@ async fn handle_direct_turn(
             }
         };
     let mut message = serde_json::json!({ "role": "assistant", "content": rendered_content });
-    if let Some(reasoning) = turn_result
-        .reasoning_content
-        .as_deref()
-        .filter(|text| !text.is_empty())
-    {
-        message["reasoning_content"] = serde_json::Value::String(reasoning.to_string());
+    if let Some(summary) = turn_result.reasoning_summary.as_ref() {
+        crate::runtime::attach_reasoning_summary(&mut message, summary);
     }
     session_messages.push(message);
     append_tui_vdd_observation(&mut session_messages, vdd_observation);
@@ -9424,7 +9498,8 @@ mod tests {
     fn direct_turn_result(content: String) -> crate::pipeline::TurnResult {
         crate::pipeline::TurnResult {
             content,
-            reasoning_content: None,
+            reasoning_summary: None,
+            provider_reasoning_continuation: None,
             tool_calls: Vec::new(),
             tool_results: Vec::new(),
             usage: crate::session::TokenUsage::default(),

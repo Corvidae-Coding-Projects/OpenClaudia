@@ -367,7 +367,7 @@ fn foreign_marker_is_preserved_and_import_observation_is_owned() {
     .expect("valid owned manifest");
     assert_eq!(owned["producer"], "openclaudia");
     assert_eq!(owned["session_documents"]["minimum"], 0);
-    assert_eq!(owned["session_documents"]["current"], 1);
+    assert_eq!(owned["session_documents"]["current"], 2);
     assert_eq!(
         owned["foreign_transcript_import"]["status"],
         "claimed_compatible"

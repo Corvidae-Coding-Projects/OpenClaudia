@@ -33,7 +33,7 @@
         "observation": "A second runner lesson repeats the same fail-closed trace.",
         "guidance": "After one runner trace is selected, prefer an independent startup-gate check.",
         "applicability": {"paths": ["src/migrations/mod.rs"], "components": ["startup-migrations"], "tags": ["testing"]},
-        "citations": [{"kind": "test", "locator": "tests/migrations_runner_e2e.rs", "source_version": "worktree:s038", "digest": "sha256:7e7b32ad2f79201241441b66583f43b3baf9fecb3a62b2d33cc4884551e18f71"}],
+        "citations": [{"kind": "test", "locator": "tests/migrations_runner_e2e.rs", "source_version": "worktree:s039", "digest": "sha256:cf6eadf69452ca72e4ddd275350f94ecb3acc04c5ff362101a98f76014bc056d"}],
         "confidence": "verified_by_test",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}
@@ -51,7 +51,7 @@
         "observation": "The binary startup gate independently blocks agent surfaces on a fail-closed state.",
         "guidance": "Retain startup-gate coverage alongside the runner trace.",
         "applicability": {"paths": ["src/main.rs"], "components": ["startup-gate"], "tags": ["verify"]},
-        "citations": [{"kind": "test", "locator": "tests/migrations_runner_e2e.rs", "source_version": "worktree:s038", "digest": "sha256:7e7b32ad2f79201241441b66583f43b3baf9fecb3a62b2d33cc4884551e18f71"}],
+        "citations": [{"kind": "test", "locator": "tests/migrations_runner_e2e.rs", "source_version": "worktree:s039", "digest": "sha256:cf6eadf69452ca72e4ddd275350f94ecb3acc04c5ff362101a98f76014bc056d"}],
         "confidence": "verified_by_test",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}
@@ -177,7 +177,7 @@
         "observation": "Doctor diagnostics must not acquire a migration lock or repair persistent state.",
         "guidance": "Keep health inspection read-only and separate from the migration runner.",
         "applicability": {"paths": ["src/main.rs"], "components": ["doctor"], "tags": ["doctor", "lock", "migration"]},
-        "citations": [{"kind": "source_file", "locator": "src/main.rs", "source_version": "worktree:s076", "digest": "sha256:354422a4fa0ebfb801cff0f7d190765bfee59961d6b87cb96101d63362bd49ba"}],
+        "citations": [{"kind": "source_file", "locator": "src/main.rs", "source_version": "worktree:s079", "digest": "sha256:132910844b00c9079a9810dd1ba55b543d21f0ac30160735fe19d81242d5eee4"}],
         "confidence": "verified_by_test",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}
@@ -195,7 +195,7 @@
         "observation": "A startup migration lock must cover complete preflight and publication.",
         "guidance": "Acquire the bounded global migration lock before inspecting artifacts.",
         "applicability": {"paths": ["src/migrations/mod.rs"], "symbols": ["MigrationRunner::run_all"], "components": ["startup-migrations"], "tags": ["operate"]},
-        "citations": [{"kind": "test", "locator": "tests/migrations_runner_e2e.rs", "source_version": "worktree:s038", "digest": "sha256:7e7b32ad2f79201241441b66583f43b3baf9fecb3a62b2d33cc4884551e18f71"}],
+        "citations": [{"kind": "test", "locator": "tests/migrations_runner_e2e.rs", "source_version": "worktree:s039", "digest": "sha256:cf6eadf69452ca72e4ddd275350f94ecb3acc04c5ff362101a98f76014bc056d"}],
         "confidence": "verified_by_test",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}

@@ -2035,7 +2035,7 @@ mod tests {
     }
 
     #[test]
-    fn native_state_replays_two_parallel_tool_rounds_exactly() {
+    fn native_state_replays_two_parallel_tool_rounds_without_private_reasoning() {
         let first_message = json!({
             "role": "assistant",
             "content": "checking",
@@ -2100,8 +2100,18 @@ mod tests {
 
         assert!(body.get(OLLAMA_HISTORY_KEY).is_none());
         let messages = body["messages"].as_array().expect("Ollama messages");
-        assert_eq!(messages[1], first_message);
-        assert_eq!(messages[4], second_message);
+        let mut safe_first_message = first_message;
+        safe_first_message
+            .as_object_mut()
+            .expect("first native message object")
+            .remove("thinking");
+        let mut safe_second_message = second_message;
+        safe_second_message
+            .as_object_mut()
+            .expect("second native message object")
+            .remove("thinking");
+        assert_eq!(messages[1], safe_first_message);
+        assert_eq!(messages[4], safe_second_message);
         assert_eq!(messages[2]["role"], "tool");
         assert_eq!(messages[2]["tool_name"], "bash");
         assert_eq!(messages[3]["tool_name"], "read");

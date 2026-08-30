@@ -4151,8 +4151,11 @@ async fn run_subagent_core(
                 };
             }
         };
-        let prepared_request_messages =
+        let mut prepared_request_messages =
             subagent_prompt_blocks.prepare_json_messages(&request_messages);
+        for message in &mut prepared_request_messages {
+            crate::runtime::redact_reasoning_for_provider_request(message);
+        }
         let progressive_tools = match subagent_run.tool_catalog().snapshot(
             &subagent_run,
             &request_messages,
@@ -5829,14 +5832,18 @@ fn parse_response(response: &Value) -> Result<Value, String> {
     if let Some(choices) = response.get("choices").and_then(|c| c.as_array()) {
         if let Some(first) = choices.first() {
             if let Some(message) = first.get("message") {
-                return Ok(message.clone());
+                let mut message = message.clone();
+                crate::runtime::sanitize_portable_reasoning(&mut message);
+                return Ok(message);
             }
         }
     }
 
     // Direct message (already transformed)
     if response.get("role").is_some() {
-        return Ok(response.clone());
+        let mut message = response.clone();
+        crate::runtime::sanitize_portable_reasoning(&mut message);
+        return Ok(message);
     }
 
     Err("Could not parse response".to_string())
@@ -8320,7 +8327,7 @@ memory:
     fn responses_child_projection_preserves_exact_tool_call_identity() {
         let decoded = crate::pipeline::OpenAiResponsesDecodedTurn {
             content: String::new(),
-            reasoning_content: None,
+            reasoning_summary: None,
             tool_calls: vec![ToolCall {
                 id: "call_native_7".to_string(),
                 call_type: "function".to_string(),

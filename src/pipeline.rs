@@ -430,9 +430,12 @@ pub fn validate_chat_completion_terminal(
 pub struct TurnResult {
     /// Full response text accumulated during streaming.
     pub content: String,
-    /// Provider reasoning content accumulated during streaming, when the
-    /// upstream exposes it separately from visible text.
-    pub reasoning_content: Option<String>,
+    /// Provider-sanctioned reasoning summary, when the upstream explicitly
+    /// distinguishes it from raw reasoning and continuation state.
+    pub reasoning_summary: Option<crate::runtime::ReasoningSummary>,
+    /// Raw, memory-only provider continuation for the next compatible
+    /// tool-loop hop. This value is never part of portable session state.
+    pub provider_reasoning_continuation: Option<crate::runtime::ProviderReasoningContinuation>,
     /// Structured tool calls returned by the model.
     pub tool_calls: Vec<ToolCall>,
     /// Tool result messages to append to the conversation history.
@@ -1476,10 +1479,17 @@ fn build_request_for_wire_with_tools(
     // does the same in `resolveAppliedEffort`). If env says `unset` /
     // `auto`, `medium` flows through as the request builders' no-op
     // effort level, omitting provider effort hints.
-    let resolved = crate::thinking::resolve_effort(effort_level, messages);
+    let mut portable_messages = messages.to_vec();
+    for message in &mut portable_messages {
+        crate::runtime::redact_reasoning_for_provider_request(message);
+    }
+    let resolved = crate::thinking::resolve_effort(effort_level, &portable_messages);
     let effective = resolved.as_deref().unwrap_or("medium");
-    let prepared_messages = prompt_blocks.map(|context| context.prepare_json_messages(messages));
-    let effective_messages = prepared_messages.as_deref().unwrap_or(messages);
+    let prepared_messages =
+        prompt_blocks.map(|context| context.prepare_json_messages(&portable_messages));
+    let effective_messages = prepared_messages
+        .as_deref()
+        .unwrap_or(portable_messages.as_slice());
     let mut body = if wire_api == WireApi::OpenAiResponses {
         build_openai_responses_request_draft_with_tools(
             model,
@@ -2076,7 +2086,8 @@ pub(crate) async fn run_turn_with_speculation(
         .await;
         return Ok(TurnResult {
             content: sdk_turn.content,
-            reasoning_content: None,
+            reasoning_summary: None,
+            provider_reasoning_continuation: None,
             tool_calls: sdk_turn.tool_calls,
             tool_results: tool_batch.results,
             usage: sdk_turn.usage,
@@ -2134,7 +2145,8 @@ pub(crate) async fn run_turn_with_speculation(
         .await;
         return Ok(TurnResult {
             content: sdk_turn.content,
-            reasoning_content: None,
+            reasoning_summary: None,
+            provider_reasoning_continuation: None,
             tool_calls: sdk_turn.tool_calls,
             tool_results: tool_batch.results,
             usage: sdk_turn.usage,
@@ -2388,7 +2400,7 @@ fn extract_google_usage(gemini_json: &Value) -> (u64, u64) {
 /// provider-private reasoning material.
 pub struct ProviderNativeJsonDecodedTurn {
     pub content: String,
-    pub reasoning_content: Option<String>,
+    pub reasoning_summary: Option<crate::runtime::ReasoningSummary>,
     pub tool_calls: Vec<ToolCall>,
     pub usage: TokenUsage,
     pub terminal_outcome: ProviderTerminalOutcome,
@@ -2452,7 +2464,7 @@ pub fn decode_provider_native_json_turn(
             let (input_tokens, output_tokens) = extract_google_usage(response);
             Ok(ProviderNativeJsonDecodedTurn {
                 content,
-                reasoning_content: None,
+                reasoning_summary: None,
                 tool_calls,
                 usage: TokenUsage {
                     input_tokens,
@@ -2515,7 +2527,7 @@ pub fn decode_provider_native_json_turn(
             };
             Ok(ProviderNativeJsonDecodedTurn {
                 content: output.text().to_string(),
-                reasoning_content: None,
+                reasoning_summary: None,
                 tool_calls,
                 usage: TokenUsage {
                     input_tokens: response
@@ -2595,7 +2607,7 @@ async fn handle_provider_native_json_response(
 
     let ProviderNativeJsonDecodedTurn {
         content,
-        reasoning_content,
+        reasoning_summary,
         tool_calls,
         usage,
         terminal_outcome,
@@ -2627,7 +2639,8 @@ async fn handle_provider_native_json_response(
 
     Ok(TurnResult {
         content,
-        reasoning_content,
+        reasoning_summary,
+        provider_reasoning_continuation: None,
         tool_calls,
         tool_results: tool_batch.results,
         usage,
@@ -2767,7 +2780,7 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
     )
     .eventsource();
     let mut full_content = String::new();
-    let mut reasoning_content = String::new();
+    let mut provider_reasoning_continuation = String::new();
     let mut tool_accumulator = ToolCallAccumulator::new();
     let mut anthropic_accumulator = AnthropicToolAccumulator::new();
     let mut stream_usage = TokenUsage::default();
@@ -2822,7 +2835,7 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
             action,
             SseActionDispatch {
                 full_content: &mut full_content,
-                reasoning_content: &mut reasoning_content,
+                provider_reasoning_continuation: &mut provider_reasoning_continuation,
                 in_thinking_block: &mut in_thinking_block,
                 emit_live_assistant_text,
                 tx,
@@ -2841,7 +2854,7 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
         provider,
         model_identity,
         full_content,
-        reasoning_content,
+        provider_reasoning_continuation,
         tool_accumulator,
         anthropic_accumulator,
         terminal_outcome,
@@ -2861,7 +2874,7 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
 
 struct SseActionDispatch<'a> {
     full_content: &'a mut String,
-    reasoning_content: &'a mut String,
+    provider_reasoning_continuation: &'a mut String,
     in_thinking_block: &'a mut bool,
     emit_live_assistant_text: bool,
     tx: &'a mpsc::Sender<AppEvent>,
@@ -2870,7 +2883,7 @@ struct SseActionDispatch<'a> {
 fn dispatch_sse_action(action: SseAction, ctx: SseActionDispatch<'_>) -> Result<(), String> {
     let SseActionDispatch {
         full_content,
-        reasoning_content,
+        provider_reasoning_continuation,
         in_thinking_block,
         emit_live_assistant_text,
         tx,
@@ -2882,18 +2895,11 @@ fn dispatch_sse_action(action: SseAction, ctx: SseActionDispatch<'_>) -> Result<
             }
             full_content.push_str(&text);
         }
-        SseAction::Thinking(text) => {
-            send_event!(tx, AppEvent::StreamThinking(text));
-        }
-        SseAction::Reasoning(text) => {
-            let display_text = merge_reasoning_delta(reasoning_content, &text);
-            if !display_text.is_empty() {
-                send_event!(tx, AppEvent::StreamThinking(display_text));
-            }
+        SseAction::PrivateReasoning(text) => {
+            let _ = merge_reasoning_delta(provider_reasoning_continuation, &text);
         }
         SseAction::ThinkingStart => {
             *in_thinking_block = true;
-            send_event!(tx, AppEvent::StreamThinking(String::new(),));
         }
         SseAction::ThinkingEnd => {
             *in_thinking_block = false;
@@ -2916,7 +2922,7 @@ struct SseFinalize<'a> {
     provider: &'a str,
     model_identity: &'a str,
     full_content: String,
-    reasoning_content: String,
+    provider_reasoning_continuation: String,
     tool_accumulator: ToolCallAccumulator,
     anthropic_accumulator: AnthropicToolAccumulator,
     terminal_outcome: ProviderTerminalOutcome,
@@ -2969,17 +2975,25 @@ async fn finalize_sse_stream(f: SseFinalize<'_>) -> Result<TurnResult, String> {
     )
     .await;
 
+    let provider_reasoning_continuation = if tool_batch.has_tools && f.provider != "anthropic" {
+        crate::runtime::ProviderReasoningContinuation::try_from_provider(
+            f.provider_reasoning_continuation,
+        )
+        .map_err(|error| error.to_string())?
+    } else {
+        None
+    };
+
     Ok(TurnResult {
         content: f.full_content,
-        reasoning_content: (!f.reasoning_content.is_empty()).then_some(f.reasoning_content),
+        reasoning_summary: None,
+        provider_reasoning_continuation,
         tool_calls,
         tool_results: tool_batch.results,
         usage: f.stream_usage,
         needs_followup: tool_batch.has_tools,
         terminal_outcome: f.terminal_outcome,
         // The typed terminal outcome above carries the normalized state.
-        // This legacy string field remains `None` for Anthropic/OpenAI SSE;
-        // only the native JSON path populates it today (crosslink #788).
         finish_reason: None,
         provider_native_state: None,
         execution_bindings: Some(tool_batch.bindings),
@@ -2991,10 +3005,9 @@ async fn finalize_sse_stream(f: SseFinalize<'_>) -> Result<TurnResult, String> {
 pub enum SseAction {
     /// Emit text to the streaming output
     Text(String),
-    /// Emit thinking text
-    Thinking(String),
-    /// Emit OpenAI-compatible reasoning text.
-    Reasoning(String),
+    /// Raw provider reasoning was observed and deliberately withheld from
+    /// normal frontend and transcript channels.
+    PrivateReasoning(String),
     /// Start a thinking block
     ThinkingStart,
     /// End a thinking block
@@ -3037,14 +3050,14 @@ pub fn process_sse_event(
                 .and_then(|d| d.get("thinking"))
                 .and_then(|t| t.as_str())
             {
-                return SseAction::Thinking(text.to_string());
+                return SseAction::PrivateReasoning(text.to_string());
             }
             if let Some(text) = json
                 .get("delta")
                 .and_then(|d| d.get("text"))
                 .and_then(|t| t.as_str())
             {
-                return SseAction::Thinking(text.to_string());
+                return SseAction::PrivateReasoning(text.to_string());
             }
         }
     }
@@ -3061,7 +3074,7 @@ pub fn process_sse_event(
         .and_then(|c| c.get("delta"))
     {
         if let Some(reasoning) = openai_reasoning_delta_text(delta) {
-            return SseAction::Reasoning(reasoning);
+            return SseAction::PrivateReasoning(reasoning);
         }
         if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
             return SseAction::Text(content.to_string());
@@ -3074,7 +3087,8 @@ pub fn process_sse_event(
 
 enum ResponsesSseAction {
     Text(String),
-    Reasoning(String),
+    ReasoningSummary(String),
+    PrivateReasoning,
     Created(String),
     OutputItem(Value),
     Completed {
@@ -3340,12 +3354,13 @@ fn process_responses_sse_event(json: &Value) -> Result<ResponsesSseAction, Strin
             .map_or(ResponsesSseAction::None, |delta| {
                 ResponsesSseAction::Text(delta.to_string())
             })),
-        "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => Ok(json
+        "response.reasoning_text.delta" => Ok(ResponsesSseAction::PrivateReasoning),
+        "response.reasoning_summary_text.delta" => Ok(json
             .get("delta")
             .and_then(Value::as_str)
             .filter(|delta| !delta.is_empty())
             .map_or(ResponsesSseAction::None, |delta| {
-                ResponsesSseAction::Reasoning(delta.to_string())
+                ResponsesSseAction::ReasoningSummary(delta.to_string())
             })),
         "response.output_item.done" => {
             let item = json
@@ -3400,23 +3415,24 @@ fn process_responses_sse_event(json: &Value) -> Result<ResponsesSseAction, Strin
 fn dispatch_responses_action(
     action: ResponsesSseAction,
     full_content: &mut String,
-    reasoning_content: &mut String,
+    reasoning_summary: &mut String,
     capture: &mut ResponsesStreamCapture,
     usage: &mut TokenUsage,
     on_text: &mut impl FnMut(&str) -> Result<(), String>,
-    on_reasoning: &mut impl FnMut(&str) -> Result<(), String>,
+    on_reasoning_summary: &mut impl FnMut(&str) -> Result<(), String>,
 ) -> Result<bool, String> {
     match action {
         ResponsesSseAction::Text(text) => {
             on_text(&text)?;
             full_content.push_str(&text);
         }
-        ResponsesSseAction::Reasoning(text) => {
-            let display_text = merge_reasoning_delta(reasoning_content, &text);
+        ResponsesSseAction::ReasoningSummary(text) => {
+            let display_text = merge_reasoning_delta(reasoning_summary, &text);
             if !display_text.is_empty() {
-                on_reasoning(&display_text)?;
+                on_reasoning_summary(&display_text)?;
             }
         }
+        ResponsesSseAction::PrivateReasoning | ResponsesSseAction::None => {}
         ResponsesSseAction::Created(response_id) => capture.observe_response_id(response_id)?,
         ResponsesSseAction::OutputItem(item) => capture.observe_output_item(item)?,
         ResponsesSseAction::Completed {
@@ -3442,7 +3458,6 @@ fn dispatch_responses_action(
             return Ok(true);
         }
         ResponsesSseAction::Error(message) => return Err(message),
-        ResponsesSseAction::None => {}
     }
     Ok(false)
 }
@@ -3523,7 +3538,7 @@ pub struct OpenAiResponsesStreamParams<'a> {
 /// can contain protected provider material.
 pub struct OpenAiResponsesDecodedTurn {
     pub content: String,
-    pub reasoning_content: Option<String>,
+    pub reasoning_summary: Option<crate::runtime::ReasoningSummary>,
     pub tool_calls: Vec<ToolCall>,
     pub usage: TokenUsage,
     pub terminal_outcome: ProviderTerminalOutcome,
@@ -3547,7 +3562,7 @@ pub struct OpenAiResponsesDecodedTurn {
 pub async fn decode_openai_responses_stream(
     p: OpenAiResponsesStreamParams<'_>,
     mut on_text: impl FnMut(&str) -> Result<(), String>,
-    mut on_reasoning: impl FnMut(&str) -> Result<(), String>,
+    mut on_reasoning_summary: impl FnMut(&str) -> Result<(), String>,
     mut on_timeout: impl FnMut(u64, usize) -> Result<(), String>,
 ) -> Result<OpenAiResponsesDecodedTurn, String> {
     let OpenAiResponsesStreamParams {
@@ -3564,7 +3579,7 @@ pub async fn decode_openai_responses_stream(
     )
     .eventsource();
     let mut full_content = String::new();
-    let mut reasoning_content = String::new();
+    let mut reasoning_summary = String::new();
     let mut capture = ResponsesStreamCapture::default();
     let mut stream_usage = TokenUsage::default();
     let mut last_data_time = std::time::Instant::now();
@@ -3597,11 +3612,11 @@ pub async fn decode_openai_responses_stream(
         let done = dispatch_responses_action(
             action,
             &mut full_content,
-            &mut reasoning_content,
+            &mut reasoning_summary,
             &mut capture,
             &mut stream_usage,
             &mut on_text,
-            &mut on_reasoning,
+            &mut on_reasoning_summary,
         )
         .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
         if done {
@@ -3632,9 +3647,17 @@ pub async fn decode_openai_responses_stream(
     )
     .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
 
+    let reasoning_summary = if reasoning_summary.is_empty() {
+        None
+    } else {
+        Some(
+            crate::runtime::ReasoningSummary::try_from_provider(reasoning_summary)
+                .map_err(|error| error.to_string())?,
+        )
+    };
     Ok(OpenAiResponsesDecodedTurn {
         content: full_content,
-        reasoning_content: (!reasoning_content.is_empty()).then_some(reasoning_content),
+        reasoning_summary,
         tool_calls,
         usage: stream_usage,
         terminal_outcome,
@@ -3681,8 +3704,8 @@ async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnRes
             }
             Ok(())
         },
-        |reasoning| {
-            send_event!(tx, AppEvent::StreamThinking(reasoning.to_string()));
+        |summary| {
+            send_event!(tx, AppEvent::StreamReasoningSummary(summary.to_string()));
             Ok(())
         },
         |elapsed_secs, content_bytes| {
@@ -3710,7 +3733,7 @@ async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnRes
 
     let OpenAiResponsesDecodedTurn {
         content,
-        reasoning_content,
+        reasoning_summary,
         tool_calls,
         usage,
         terminal_outcome,
@@ -3738,7 +3761,8 @@ async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnRes
     .await;
     Ok(TurnResult {
         content,
-        reasoning_content,
+        reasoning_summary,
+        provider_reasoning_continuation: None,
         tool_calls,
         tool_results: tool_batch.results,
         usage,
@@ -3769,7 +3793,7 @@ fn openai_reasoning_delta_text(delta: &Value) -> Option<String> {
 /// Append a reasoning delta to `buffer` and return only the newly-displayable text.
 ///
 /// Some OpenAI-compatible providers send cumulative reasoning text instead of
-/// incremental chunks. This keeps persisted reasoning complete while avoiding
+/// incremental chunks. This keeps transient continuation or typed summaries complete while avoiding
 /// duplicate display output.
 #[must_use]
 pub fn merge_reasoning_delta(buffer: &mut String, text: &str) -> String {
@@ -5002,7 +5026,7 @@ async fn resolve_tui_plan_follow_up(
 #[must_use]
 pub fn build_assistant_message_with_tools(
     content: &str,
-    reasoning_content: Option<&str>,
+    reasoning_summary: Option<&crate::runtime::ReasoningSummary>,
     tool_calls: &[ToolCall],
     _provider: &str,
 ) -> Value {
@@ -5026,8 +5050,8 @@ pub fn build_assistant_message_with_tools(
         "content": Value::String(content.to_string()),
         "tool_calls": tool_calls_json
     });
-    if let Some(reasoning) = reasoning_content.filter(|text| !text.is_empty()) {
-        message["reasoning_content"] = Value::String(reasoning.to_string());
+    if let Some(summary) = reasoning_summary {
+        crate::runtime::attach_reasoning_summary(&mut message, summary);
     }
     message
 }
@@ -6428,7 +6452,12 @@ memory:
             Some(&decoded.provider_native_state),
         )
         .expect("canonical Ollama request replays state");
-        assert_eq!(ollama_request["messages"][1], exact_message);
+        let mut safe_message = exact_message;
+        safe_message
+            .as_object_mut()
+            .expect("native message object")
+            .remove("thinking");
+        assert_eq!(ollama_request["messages"][1], safe_message);
         assert_eq!(ollama_request["stream"], false);
         assert!(ollama_request
             .get("_openclaudia_ollama_portable_history")
@@ -7376,9 +7405,15 @@ memory:
     }
 
     #[test]
-    fn build_assistant_message_with_tools_preserves_reasoning_content() {
-        let msg = build_assistant_message_with_tools("hello", Some("thought"), &[], "kimi");
-        assert_eq!(msg["reasoning_content"], "thought");
+    fn build_assistant_message_with_tools_preserves_reasoning_summary() {
+        let summary =
+            crate::runtime::ReasoningSummary::try_from_provider("summary").expect("valid summary");
+        let msg = build_assistant_message_with_tools("hello", Some(&summary), &[], "kimi");
+        assert_eq!(
+            crate::runtime::message_reasoning_summary(&msg),
+            Some(summary)
+        );
+        assert!(msg.get("reasoning_content").is_none());
     }
 
     #[test]

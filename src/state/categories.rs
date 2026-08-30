@@ -88,6 +88,10 @@ impl std::fmt::Display for SessionId {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Identity {
     pub session_id: SessionId,
+    /// Immutable logical identity, causal ancestry, and exact runtime bindings
+    /// used to validate resume and project-owned branch proposals.
+    #[serde(default)]
+    pub causal: super::causal::SessionCausalState,
     /// Parent session id when this session was forked from another
     /// (e.g. the coordinator spawning a teammate). `None` for the
     /// primary user-started session.
@@ -122,8 +126,10 @@ impl Identity {
     /// starts equal to `cwd`, no parent session, no extra dirs.
     #[must_use]
     pub fn rooted_at(cwd: PathBuf) -> Self {
+        let session_id = SessionId::new();
         Self {
-            session_id: SessionId::new(),
+            causal: super::causal::SessionCausalState::uninitialized(&session_id),
+            session_id,
             parent_session_id: None,
             original_cwd: cwd.clone(),
             cwd: cwd.clone(),

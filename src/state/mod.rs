@@ -13,6 +13,7 @@
 //! them out of [`SessionState`] keeps the serde shape bounded.
 
 pub mod categories;
+pub mod causal;
 pub mod persist;
 pub mod session;
 pub mod store;
@@ -20,6 +21,10 @@ pub mod store;
 pub use categories::{
     AgentMode, BudgetsState, Conversation, EffortLevel, IdeDiagnostic, IdeSelection, IdeState,
     Identity, ModesState, PermissionsState, SessionId, TranscriptState, UiState,
+};
+pub use causal::{
+    decode_branch_proposal, BranchProposal, BranchSource, CausalStateError, PreparedBranch,
+    SessionCausalState,
 };
 pub use persist::{SessionDocument, SessionStateV1};
 pub use session::{validate_session_file, validate_session_id, Session};

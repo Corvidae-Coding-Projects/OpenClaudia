@@ -124,8 +124,8 @@ pub enum AppEvent {
     Tick,
     /// Streaming text delta from API
     StreamText(String),
-    /// Streaming thinking text
-    StreamThinking(String),
+    /// Streaming provider-sanctioned reasoning-summary text.
+    StreamReasoningSummary(String),
     /// Tool execution started
     ToolStart { name: String, description: String },
     /// Tool execution completed

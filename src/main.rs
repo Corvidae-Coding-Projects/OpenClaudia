@@ -1396,16 +1396,25 @@ fn init_permission_manager(
 /// Prints a user-facing status line in either case.
 ///
 /// Extracted from `cmd_chat` per crosslink #262.
-fn maybe_resume_session(chat_session: &mut Session, resume: bool, session_id: Option<&str>) {
+fn maybe_resume_session(
+    chat_session: &mut Session,
+    resume: bool,
+    session_id: Option<&str>,
+) -> bool {
     if !resume && session_id.is_none() {
-        return;
+        return false;
     }
     let sessions = list_chat_sessions();
     let target = if let Some(id) = session_id {
-        sessions
-            .iter()
-            .find(|session| session.id().starts_with(id))
-            .cloned()
+        let mut matches = sessions
+            .into_iter()
+            .filter(|session| session.id().starts_with(id));
+        let first = matches.next();
+        if matches.next().is_some() {
+            eprintln!("Session id prefix '{id}' is ambiguous; provide the complete session id.");
+            return false;
+        }
+        first
     } else {
         sessions.into_iter().next()
     };
@@ -1416,8 +1425,10 @@ fn maybe_resume_session(chat_session: &mut Session, resume: bool, session_id: Op
             safe_truncate(&loaded.id(), 8)
         );
         *chat_session = loaded;
+        true
     } else {
         eprintln!("No session found to resume. Starting new session.");
+        false
     }
 }
 

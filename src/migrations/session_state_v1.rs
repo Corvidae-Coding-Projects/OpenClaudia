@@ -78,7 +78,8 @@ impl MigrateSessionStateV1 {
             | crate::state::persist::PersistError::InvalidMigrationContext
             | crate::state::persist::PersistError::InvalidRecord(_)
             | crate::state::persist::PersistError::InconsistentSessionId { .. }
-            | crate::state::persist::PersistError::InvalidProviderNativeState(_) => {
+            | crate::state::persist::PersistError::InvalidProviderNativeState(_)
+            | crate::state::persist::PersistError::InvalidCausalState(_) => {
                 MigrationFailureKind::InvalidPersistentState
             }
         };
@@ -368,7 +369,7 @@ mod tests {
 
         let raw = std::fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(value["session_state"]["version"], 1);
+        assert_eq!(value["session_state"]["version"], 2);
         for duplicate in [
             "id",
             "mode",
@@ -407,9 +408,7 @@ mod tests {
         let (_root, context) = context();
         let path = session_path(&context, "transitional");
         let session = Session::new("model", "provider");
-        session.update_state(|state, _| {
-            state.identity.session_id = crate::state::SessionId::from_raw_unchecked("transitional");
-        });
+        session.set_id("transitional".to_string());
         session.push_message(serde_json::json!({"role": "user", "content": "canonical"}));
         let mut value = serde_json::to_value(&session).unwrap();
         let object = value.as_object_mut().unwrap();

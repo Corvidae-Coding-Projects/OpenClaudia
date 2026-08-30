@@ -6,9 +6,10 @@
 //! fields remain read-only input handled by the migration decoder; new writes
 //! never duplicate identity or conversation state.
 //!
-//! Schema numbers are an exact contract. Version zero is accepted only by the
-//! bounded migration decoder with an explicit trusted workspace; version one
-//! is the only directly loadable shape, and future versions fail closed.
+//! Schema numbers are an exact contract. Versions zero and one are accepted
+//! only by the bounded migration decoder with an explicit trusted workspace;
+//! version two is the only directly loadable shape, and future versions fail
+//! closed.
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -60,6 +61,7 @@ const STATE_KEYS: &[&str] = &[
 
 const IDENTITY_KEYS: &[&str] = &[
     "session_id",
+    "causal",
     "parent_session_id",
     "original_cwd",
     "cwd",
@@ -156,14 +158,26 @@ impl Serialize for SessionDocument {
 impl SessionDocument {
     /// Build a compatibility document from canonical session state.
     #[must_use]
-    pub const fn from_state(
+    pub fn from_state(
         title: String,
         created_at: chrono::DateTime<chrono::Utc>,
         updated_at: chrono::DateTime<chrono::Utc>,
         model: String,
         provider: String,
-        state: SessionState,
+        mut state: SessionState,
     ) -> Self {
+        if !state.identity.causal.is_initialized() {
+            if let Ok(causal) = super::SessionCausalState::initialize(
+                &state.identity.session_id,
+                &provider,
+                &model,
+                &state.conversation.messages,
+                state.conversation.provider_native_state.as_ref(),
+                super::causal::SessionProvenance::HostCreated,
+            ) {
+                state.identity.causal = causal;
+            }
+        }
         Self {
             title,
             created_at,
@@ -194,7 +208,7 @@ impl SessionDocument {
                 });
             }
         }
-        let state = self.session_state.into_state();
+        let mut state = self.session_state.into_state();
         if let Some(legacy) = self.compatibility_id {
             if state.identity.session_id.as_str() != legacy {
                 return Err(PersistError::InconsistentSessionId {
@@ -216,6 +230,44 @@ impl SessionDocument {
             &self.provider,
         )?;
         validate_state(&state)?;
+        state
+            .identity
+            .causal
+            .validate_document(
+                &state.identity.session_id,
+                &self.provider,
+                &self.model,
+                &state.conversation.messages,
+                state.conversation.provider_native_state.as_ref(),
+            )
+            .map_err(|error| PersistError::InvalidCausalState(error.to_string()))?;
+        let mut redacted = false;
+        for message in &mut state.conversation.messages {
+            redacted |= crate::runtime::sanitize_portable_reasoning(message);
+        }
+        for (user, assistant) in &mut state.conversation.undo_stack {
+            redacted |= crate::runtime::sanitize_portable_reasoning(user);
+            redacted |= crate::runtime::sanitize_portable_reasoning(assistant);
+        }
+        if let Some(native) = &mut state.conversation.provider_native_state {
+            redacted |= native
+                .sanitize_plaintext_reasoning()
+                .map_err(|error| PersistError::InvalidProviderNativeState(error.to_string()))?;
+        }
+        if redacted {
+            state
+                .identity
+                .causal
+                .refresh(
+                    &state.identity.session_id,
+                    &self.provider,
+                    &self.model,
+                    &state.conversation.messages,
+                    state.conversation.provider_native_state.as_ref(),
+                    None,
+                )
+                .map_err(|error| PersistError::InvalidCausalState(error.to_string()))?;
+        }
         Ok(state)
     }
 }
@@ -257,6 +309,15 @@ impl LegacySessionDocument {
         state.conversation.plan_mode = self.plan_mode;
         state.conversation.behavior_mode = self.behavior_mode;
         state.modes.agent_mode = self.mode;
+        state.identity.causal = super::SessionCausalState::initialize(
+            &state.identity.session_id,
+            &self.provider,
+            &self.model,
+            &state.conversation.messages,
+            state.conversation.provider_native_state.as_ref(),
+            super::causal::SessionProvenance::MigratedLegacy,
+        )
+        .map_err(|error| PersistError::InvalidCausalState(error.to_string()))?;
         // `working_dirs` selected prompt inputs in the originating process.
         // It is parsed for exact compatibility but never imported as live
         // filesystem authority. The trusted workspace is supplied by the
@@ -579,6 +640,24 @@ fn validate_document(document: &SessionDocument) -> Result<(), PersistError> {
         &document.provider,
     )?;
     validate_state(&document.session_state.state)?;
+    document
+        .session_state
+        .state
+        .identity
+        .causal
+        .validate_document(
+            &document.session_state.state.identity.session_id,
+            &document.provider,
+            &document.model,
+            &document.session_state.state.conversation.messages,
+            document
+                .session_state
+                .state
+                .conversation
+                .provider_native_state
+                .as_ref(),
+        )
+        .map_err(|error| PersistError::InvalidCausalState(error.to_string()))?;
     if let Some(native) = &document
         .session_state
         .state
@@ -682,6 +761,15 @@ fn decode_document_value_with_policy(
                     }
                 }
                 strip_imported_authority(&mut state, workspace_root);
+                state.identity.causal = super::SessionCausalState::initialize(
+                    &state.identity.session_id,
+                    &provider,
+                    &model,
+                    &state.conversation.messages,
+                    state.conversation.provider_native_state.as_ref(),
+                    super::causal::SessionProvenance::MigratedLegacy,
+                )
+                .map_err(|error| PersistError::InvalidCausalState(error.to_string()))?;
                 let canonical = SessionDocument::from_state(
                     title, created_at, updated_at, model, provider, state,
                 );
@@ -747,13 +835,15 @@ pub fn decode_document_for_migration(
     ))
 }
 
-/// Schema version 1 — matches [`super::SessionState`] field-for-field.
+/// Canonical session-state envelope — matches [`super::SessionState`]
+/// field-for-field. The historical type name remains stable for callers;
+/// `version` is the actual on-disk contract.
+///
 /// Shipping the version tag from day one gives future migrations a
 /// sentinel to dispatch on (see crosslink #506 migrations framework).
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionStateV1 {
-    /// Schema version number. Always `1` for this type — a future
-    /// `SessionStateV2` would have `version: 2` and its own struct.
+    /// Schema version number. New writes use [`Self::CURRENT_VERSION`].
     pub version: u32,
     /// The actual payload.
     #[serde(flatten)]
@@ -799,12 +889,12 @@ impl SessionStateV1 {
     /// that read on-disk files compare the decoded `version` field
     /// against this before deserializing the rest — a mismatch
     /// triggers the migration path.
-    pub const CURRENT_VERSION: u32 = 1;
+    pub const CURRENT_VERSION: u32 = 2;
 
     const fn classify(version: u32) -> Result<SessionSchema, PersistError> {
         if version == Self::CURRENT_VERSION {
             Ok(SessionSchema::Current)
-        } else if version == Self::MIN_SUPPORTED_VERSION {
+        } else if version < Self::CURRENT_VERSION {
             Ok(SessionSchema::Legacy)
         } else {
             Err(PersistError::FutureSchema {
@@ -864,6 +954,8 @@ pub enum PersistError {
     InconsistentSessionId { legacy: String, canonical: String },
     #[error("invalid provider-native session state: {0}")]
     InvalidProviderNativeState(String),
+    #[error("invalid causal session state: {0}")]
+    InvalidCausalState(String),
 }
 
 /// Encode a [`SessionState`] as pretty-printed JSON ready to write.
@@ -968,7 +1060,7 @@ mod tests {
             encoded.contains("\"version\""),
             "encoded payload should include the version tag: {encoded}"
         );
-        assert!(encoded.contains("\"version\": 1"));
+        assert!(encoded.contains("\"version\": 2"));
         assert!(
             !encoded.contains("\"permissions\""),
             "persisted state must omit live permission authority: {encoded}"
@@ -1036,7 +1128,7 @@ mod tests {
         match decode(&payload) {
             Err(PersistError::FutureSchema { found, supported }) => {
                 assert_eq!(found, 999);
-                assert_eq!(supported, 1);
+                assert_eq!(supported, 2);
             }
             other => panic!("expected FutureSchema, got {other:?}"),
         }
@@ -1069,7 +1161,7 @@ mod tests {
             Err(PersistError::MigrationRequired {
                 found: 0,
                 minimum: 0,
-                current: 1
+                current: 2
             })
         ));
     }
@@ -1182,7 +1274,7 @@ mod tests {
             Err(PersistError::MigrationRequired {
                 found: 0,
                 minimum: 0,
-                current: 1
+                current: 2
             })
         ));
     }
@@ -1258,6 +1350,54 @@ mod tests {
         assert!(migrated.modes.coordinator);
         assert!(migrated.identity.active_workspace.is_none());
         assert_eq!(migrated.transcript.watermark, 0);
+    }
+
+    #[test]
+    fn version_one_session_without_causal_state_migrates_and_resumes_once() {
+        let root = tempfile::tempdir().expect("workspace");
+        let state = SessionState::new(root.path().to_path_buf());
+        let document = SessionDocument::from_state(
+            "legacy v1".to_string(),
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+            "model".to_string(),
+            "provider".to_string(),
+            state,
+        );
+        let mut value = serde_json::to_value(document).expect("document value");
+        value["session_state"]["version"] = serde_json::json!(1);
+        value["session_state"]["identity"]
+            .as_object_mut()
+            .expect("identity")
+            .remove("causal");
+
+        let (migrated, already_canonical) = decode_document_for_migration(
+            &serde_json::to_string(&value).expect("legacy encoding"),
+            root.path(),
+        )
+        .expect("v1 migration");
+        assert!(!already_canonical);
+        assert_eq!(migrated.session_state.version, 2);
+
+        let session = super::super::Session::from_document(migrated).expect("migrated session");
+        let session_id = session.inspect_state(|state| state.identity.session_id.clone());
+        let run = crate::tools::ToolRunContext::builder(session_id, root.path())
+            .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(std::collections::HashMap::new())
+            .process(false)
+            .network(false)
+            .secrets(false)
+            .provider("provider")
+            .build()
+            .expect("trusted resume run");
+        session
+            .prepare_resume_against_run(&run)
+            .expect("legacy admission");
+        session
+            .validate_resume_against_run(&run)
+            .expect("admitted causal binding");
     }
 
     #[test]

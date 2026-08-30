@@ -35,6 +35,8 @@ pub enum MessageKind {
     Assistant,
     /// A collapsed thinking summary (e.g. "Thought for 1.2s").
     Thinking,
+    /// Provider-sanctioned reasoning summary shown separately from the answer.
+    ReasoningSummary,
     /// An informational system message (no error).
     SystemInfo,
     /// An error-level system message.
@@ -273,6 +275,8 @@ pub struct MessageList {
     /// True while thinking/reasoning deltas are arriving for the current
     /// response, before any regular text has streamed in.
     pub is_thinking_now: bool,
+    /// Whether the current private-text buffer contains a sanctioned summary.
+    pub is_reasoning_summary_now: bool,
     /// When the current thinking block started. Used to render elapsed
     /// seconds next to the `∴ Thinking…` indicator.
     thinking_start: Option<Instant>,
@@ -305,6 +309,7 @@ impl MessageList {
             streaming_text: String::new(),
             is_streaming: false,
             is_thinking_now: false,
+            is_reasoning_summary_now: false,
             thinking_start: None,
             thinking_buffer: String::new(),
             retained_message_bytes: 0,
@@ -318,6 +323,7 @@ impl MessageList {
     /// Record a thinking-delta chunk. The text is accumulated and rendered
     /// under the live `∴ Thinking…` indicator until the block finalizes.
     pub fn push_thinking(&mut self, text: &str) {
+        self.is_reasoning_summary_now = false;
         if self.thinking_start.is_none() {
             self.thinking_start = Some(Instant::now());
         }
@@ -337,6 +343,47 @@ impl MessageList {
         }
     }
 
+    /// Record a provider-sanctioned reasoning-summary delta. This uses the
+    /// existing bounded transient buffer but labels the completed projection
+    /// as a summary rather than raw model thinking.
+    pub fn push_reasoning_summary(&mut self, text: &str) {
+        self.is_reasoning_summary_now = true;
+        self.is_thinking_now = true;
+        if self.truncation.thinking {
+            return;
+        }
+        let admitted = sanitize_terminal_text(text, EVENT_TEXT_LIMITS);
+        let content_limit = THINKING_TEXT_LIMITS
+            .max_output_bytes
+            .saturating_sub(RENDER_TRUNCATION_MARKER.len());
+        if append_raw_bounded(&mut self.thinking_buffer, admitted.as_str(), content_limit)
+            || admitted.was_truncated()
+        {
+            self.thinking_buffer.push_str(RENDER_TRUNCATION_MARKER);
+            self.truncation.thinking = true;
+        }
+    }
+
+    /// Finalize the current provider-sanctioned summary into one bounded
+    /// display message.
+    pub fn finish_reasoning_summary(&mut self) {
+        if !self.is_thinking_now {
+            return;
+        }
+        let summary = std::mem::take(&mut self.thinking_buffer);
+        self.is_thinking_now = false;
+        self.is_reasoning_summary_now = false;
+        self.thinking_start = None;
+        self.truncation.thinking = false;
+        if !summary.trim().is_empty() {
+            self.add(DisplayMessage {
+                kind: MessageKind::ReasoningSummary,
+                content: summary,
+            });
+        }
+        self.scroll_to_bottom();
+    }
+
     /// Finalize the current thinking block: replace the live indicator
     /// with a collapsed `∴ Thought for X.Xs` header message and reset
     /// the timer. Safe to call repeatedly — no-op when not thinking.
@@ -352,6 +399,7 @@ impl MessageList {
             content: format!("Thought for {duration:.1}s"),
         });
         self.is_thinking_now = false;
+        self.is_reasoning_summary_now = false;
         self.thinking_start = None;
         self.thinking_buffer.clear();
         self.truncation.thinking = false;
@@ -392,6 +440,7 @@ impl MessageList {
             MessageKind::User
             | MessageKind::Assistant
             | MessageKind::Thinking
+            | MessageKind::ReasoningSummary
             | MessageKind::SystemInfo
             | MessageKind::SystemError => {}
         }
@@ -562,6 +611,21 @@ impl MessageList {
                 )));
                 out.push(Line::from(""));
             }
+            MessageKind::ReasoningSummary => {
+                out.push(Line::from(Span::styled(
+                    "  Reasoning summary",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                )));
+                for line in msg.content.lines() {
+                    out.push(Line::from(Span::styled(
+                        format!("    {line}"),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                out.push(Line::from(""));
+            }
             MessageKind::ToolStart { .. }
             | MessageKind::ToolOk { .. }
             | MessageKind::ToolErr { .. } => {
@@ -600,14 +664,19 @@ impl MessageList {
 
         // Live thinking indicator (while thinking deltas are arriving)
         if self.is_thinking_now {
-            let elapsed = self
-                .thinking_start
-                .map_or(0.0, |s| s.elapsed().as_secs_f64());
             let thinking_style = Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC);
+            let label = if self.is_reasoning_summary_now {
+                "Provider reasoning summary…".to_string()
+            } else {
+                let elapsed = self
+                    .thinking_start
+                    .map_or(0.0, |s| s.elapsed().as_secs_f64());
+                format!("∴ Thinking… ({elapsed:.1}s)")
+            };
             lines.push(Line::from(Span::styled(
-                format!("  \u{2234} Thinking\u{2026} ({elapsed:.1}s)"),
+                format!("  {label}"),
                 thinking_style,
             )));
             for line in self.thinking_buffer.lines() {

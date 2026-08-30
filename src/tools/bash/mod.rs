@@ -1,4 +1,5 @@
 mod direct;
+mod editor;
 mod job;
 mod kill;
 mod output;
@@ -15,6 +16,7 @@ pub use direct::{
     execute_direct_shell, execute_direct_shell_async, DirectShellAction, DirectShellError,
     DirectShellExecution,
 };
+pub use editor::{execute_user_editor, UserEditorError, UserEditorExecution};
 pub use kill::pause_sandbox_process_tree;
 pub use kill::terminate_sandbox_process_tree;
 pub use kill::{execute_kill_shell, execute_kill_shells_for_agent, terminate_process_tree};

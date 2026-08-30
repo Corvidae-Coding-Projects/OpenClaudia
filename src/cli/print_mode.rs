@@ -292,8 +292,7 @@ fn extract_print_sse_text(json: &serde_json::Value, state: &mut PrintSseState) -
             state.in_thinking_block = false;
             None
         }
-        openclaudia::pipeline::SseAction::Thinking(_)
-        | openclaudia::pipeline::SseAction::Reasoning(_)
+        openclaudia::pipeline::SseAction::PrivateReasoning(_)
         | openclaudia::pipeline::SseAction::None => None,
     }
 }

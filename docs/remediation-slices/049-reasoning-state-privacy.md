@@ -1,6 +1,6 @@
 # S-049: Separate reasoning continuation from display
 
-Status: Planned
+Status: Implemented and deterministically verified; artifact-bound VDD receipt pending
 Effort: Medium
 Primary findings: F-118
 Workstreams: W3, W12
@@ -27,3 +27,39 @@ Preserve reasoning needed for provider correctness without flattening or exposin
 ## Handoff
 
 Record changed artifact generations, commands/tests run, typed evidence receipts, unresolved risks, and any newly proposed slice. Completion of this slice does not imply completion of its parent workstream.
+
+## Delivered implementation
+
+- Reasoning is represented by distinct typed channels: opaque provider
+  continuation, provider-sanctioned user-visible summaries, and protected
+  monitoring observations. Raw continuation is not represented as ordinary
+  assistant transcript text.
+- OpenAI Responses summary events are rendered through the summary channel;
+  private reasoning deltas are ignored. Generic OpenAI-compatible raw
+  continuation is held in zeroizing memory only for the immediate tool
+  follow-up request and is never inserted into portable history.
+- Provider-native state structurally removes plaintext `thinking`,
+  `reasoning`, and `reasoning_content` from continuation and evidence items
+  while preserving encrypted/signature continuations, visible output, and
+  tool arguments that merely use those words as domain keys.
+- Persisted legacy native state is validated against its original digest and
+  causal envelope before privacy sanitization produces the replacement
+  generation. Provider switches and portable exports cannot inherit raw
+  reasoning bytes.
+
+## Verification
+
+- Rust 1.98 format and strict all-target/all-feature Clippy gates pass.
+- All 10 provider-state unit tests pass, including evidence-item redaction,
+  opaque continuation round trips, tamper rejection, and preservation of tool
+  argument objects.
+- The complete locked all-target/all-feature suite passes with 3,126 library
+  tests passed and one intentional ignore, 208 binary tests passed, and every
+  integration target green under one test thread.
+
+## Residual boundary
+
+Provider APIs may require opaque continuation tokens for correct immediate
+follow-up behavior; those tokens remain provider-bound and are not presented
+as user-visible reasoning. An artifact-bound alternate-model VDD receipt is
+still required for final `Verified` status.

@@ -572,6 +572,8 @@ enum AcpSessionStoreError {
     UnsupportedSchema { session_id: String, found: u32 },
     #[error("ACP session {session_id} has inconsistent canonical ownership")]
     OwnershipMismatch { session_id: String },
+    #[error("ACP session {session_id} has invalid causal state: {detail}")]
+    InvalidCausalState { session_id: String, detail: String },
     #[error("ACP session {session_id} generation is exhausted")]
     GenerationExhausted { session_id: String },
     #[error("cannot serialize ACP session {session_id}: {source}")]
@@ -1912,18 +1914,30 @@ impl AcpServer {
             || crate::state::Session::new(&self.model, &self.config.proxy.target),
             |envelope| envelope.session.clone(),
         );
+        if previous.is_none() {
+            canonical.set_id(canonical_session_id.clone());
+        }
         canonical.set_provider_and_model(&self.config.proxy.target, &self.model);
         let mut snapshot = self.state.snapshot();
         snapshot.identity.session_id = crate::state::SessionId::from_raw(&canonical_session_id)
             .map_err(|error| {
                 AcpSessionStoreError::InvalidSessionId(format!("{canonical_session_id}: {error}"))
             })?;
+        snapshot.identity.causal = canonical.inspect_state(|state| state.identity.causal.clone());
         snapshot.conversation.messages.clone_from(&self.messages);
         snapshot
             .conversation
             .provider_native_state
             .clone_from(&self.provider_native_state);
         canonical.update_state(|state, _| *state = snapshot);
+        if let Some(run) = self.run_context_for_acp(acp_session_id) {
+            canonical.bind_workspace_run(run).map_err(|error| {
+                AcpSessionStoreError::InvalidCausalState {
+                    session_id: acp_session_id.to_string(),
+                    detail: error.to_string(),
+                }
+            })?;
+        }
         canonical.touch();
         let runtime_mode = self
             .run_context_for_acp(acp_session_id)
@@ -2409,6 +2423,13 @@ impl AcpServer {
         let mut replacement = crate::state::SessionState::new(self.launch_root.clone());
         if let Ok(session_id) = crate::state::SessionId::from_raw(session_id) {
             replacement.identity.session_id = session_id;
+            let _ = replacement.identity.causal.reinitialize_identity(
+                &replacement.identity.session_id,
+                &self.config.proxy.target,
+                &self.model,
+                &replacement.conversation.messages,
+                replacement.conversation.provider_native_state.as_ref(),
+            );
         }
         self.state.replace(replacement);
     }
@@ -4566,7 +4587,7 @@ impl AcpServer {
     #[allow(clippy::too_many_lines)]
     async fn stream_provider_response(
         &self,
-        acp_session_id: &str,
+        _acp_session_id: &str,
         response: reqwest::Response,
     ) -> StreamResult {
         use eventsource_stream::Eventsource as _;
@@ -4719,47 +4740,35 @@ impl AcpServer {
                             .and_then(|value| value.as_str())
                             .unwrap_or("");
 
-                        match block_type {
-                            "thinking" => {
-                                self.send_session_update(
-                                    acp_session_id,
-                                    "thinking",
-                                    &json!({"type": "thinking", "status": "started"}),
+                        if block_type == "tool_use" {
+                            if tool_calls.len() >= MAX_ACP_TOOL_CALLS_PER_TURN {
+                                return failed_acp_stream(
+                                    format!(
+                                        "Provider returned more than {MAX_ACP_TOOL_CALLS_PER_TURN} ACP tool calls"
+                                    ),
+                                    &full_content,
                                 );
                             }
-                            "tool_use" => {
-                                if tool_calls.len() >= MAX_ACP_TOOL_CALLS_PER_TURN {
-                                    return failed_acp_stream(
-                                        format!(
-                                            "Provider returned more than {MAX_ACP_TOOL_CALLS_PER_TURN} ACP tool calls"
-                                        ),
-                                        &full_content,
-                                    );
-                                }
-                                let name = content_block
-                                    .get("name")
-                                    .and_then(|value| value.as_str())
-                                    .unwrap_or("");
-                                let tc_id = content_block
-                                    .get("id")
-                                    .and_then(|value| value.as_str())
-                                    .unwrap_or("");
-                                if name.len() > MAX_ACP_METHOD_BYTES
-                                    || tc_id.len() > MAX_ACP_ID_BYTES
-                                {
-                                    return failed_acp_stream(
-                                        "Provider tool identity exceeded ACP limits".to_string(),
-                                        &full_content,
-                                    );
-                                }
-                                tool_calls.push(AccumulatedToolCall {
-                                    id: tc_id.to_string(),
-                                    name: name.to_string(),
-                                    arguments: String::new(),
-                                });
-                                current_tool_index = Some(tool_calls.len() - 1);
+                            let name = content_block
+                                .get("name")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("");
+                            let tc_id = content_block
+                                .get("id")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("");
+                            if name.len() > MAX_ACP_METHOD_BYTES || tc_id.len() > MAX_ACP_ID_BYTES {
+                                return failed_acp_stream(
+                                    "Provider tool identity exceeded ACP limits".to_string(),
+                                    &full_content,
+                                );
                             }
-                            _ => {}
+                            tool_calls.push(AccumulatedToolCall {
+                                id: tc_id.to_string(),
+                                name: name.to_string(),
+                                arguments: String::new(),
+                            });
+                            current_tool_index = Some(tool_calls.len() - 1);
                         }
                     }
                     "content_block_delta" => {
@@ -4780,15 +4789,6 @@ impl AcpServer {
                                     ) {
                                         return failed_acp_stream(error, &full_content);
                                     }
-                                }
-                            }
-                            "thinking_delta" => {
-                                if let Some(text) = delta.get("thinking").and_then(|t| t.as_str()) {
-                                    self.send_session_update(
-                                        acp_session_id,
-                                        "thinking",
-                                        &json!({"type": "thinking", "text": text}),
-                                    );
                                 }
                             }
                             "input_json_delta" => {
@@ -6013,7 +6013,8 @@ fn decode_acp_messages(messages: &[Value]) -> Result<Vec<crate::proxy::ChatMessa
         .iter()
         .cloned()
         .enumerate()
-        .map(|(index, message)| {
+        .map(|(index, mut message)| {
+            crate::runtime::redact_reasoning_for_provider_request(&mut message);
             serde_json::from_value(message)
                 .map_err(|err| format!("message at index {index} is invalid: {err}"))
         })
@@ -7309,7 +7310,7 @@ mod stream_tool_call_tests {
         .expect("Responses state");
         let decoded = crate::pipeline::OpenAiResponsesDecodedTurn {
             content: String::new(),
-            reasoning_content: None,
+            reasoning_summary: None,
             tool_calls: vec![crate::tools::ToolCall {
                 id: "call_acp_1".to_string(),
                 call_type: "function".to_string(),

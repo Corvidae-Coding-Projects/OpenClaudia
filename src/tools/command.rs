@@ -470,6 +470,7 @@ pub struct ProcessLimits {
     stderr_bytes: usize,
     stdin_bytes: usize,
     allow_stdin_early_close: bool,
+    inherit_terminal_stdio: bool,
     stdout_truncated_marker: &'static [u8],
     stderr_truncated_marker: &'static [u8],
 }
@@ -483,6 +484,7 @@ impl ProcessLimits {
             stderr_bytes: MAX_CAPTURE_BYTES_PER_STREAM,
             stdin_bytes: MAX_STDIN_BYTES,
             allow_stdin_early_close: false,
+            inherit_terminal_stdio: false,
             stdout_truncated_marker: OUTPUT_TRUNCATED_MARKER,
             stderr_truncated_marker: OUTPUT_TRUNCATED_MARKER,
         }
@@ -508,6 +510,16 @@ impl ProcessLimits {
     #[must_use]
     pub const fn with_stdin_early_close_allowed(mut self) -> Self {
         self.allow_stdin_early_close = true;
+        self
+    }
+
+    /// Keep the caller's terminal attached while retaining supervisor
+    /// ownership of the child lifecycle. Interactive user-origin processes
+    /// use this mode; their terminal bytes are deliberately not captured as
+    /// model-visible output.
+    #[must_use]
+    pub(crate) const fn with_inherited_terminal_stdio(mut self) -> Self {
+        self.inherit_terminal_stdio = true;
         self
     }
 }
@@ -798,13 +810,15 @@ async fn supervise_prepared_process(
 
     let deadline = tokio::time::Instant::now() + limits.timeout;
     #[cfg(unix)]
-    {
+    if !limits.inherit_terminal_stdio {
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
     }
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    if stdin_input.is_some() {
-        command.stdin(Stdio::piped());
+    if !limits.inherit_terminal_stdio {
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        if stdin_input.is_some() {
+            command.stdin(Stdio::piped());
+        }
     }
     let mut command = tokio::process::Command::from(command);
     command.kill_on_drop(true);
@@ -841,44 +855,46 @@ async fn supervise_prepared_process(
     )));
     let mut io_tasks = tokio::task::JoinSet::new();
 
-    let Some(stdout) = child.stdout.take() else {
-        let status = terminate_and_reap(&mut child, pid, None, &mut io_tasks).await;
-        return Err(CommandError::WaitFailed {
-            program,
-            source: "stdout pipe unavailable after spawn".to_string(),
-            partial: Box::new(process_snapshot(
-                status,
-                &stdout_state,
-                &stderr_state,
-                &stdin_state,
-            )),
-        });
-    };
-    io_tasks.spawn(read_bounded_stream(
-        stdout,
-        Arc::clone(&stdout_state),
-        limits.stdout_bytes,
-        "stdout",
-    ));
-    let Some(stderr) = child.stderr.take() else {
-        let status = terminate_and_reap(&mut child, pid, None, &mut io_tasks).await;
-        return Err(CommandError::WaitFailed {
-            program,
-            source: "stderr pipe unavailable after spawn".to_string(),
-            partial: Box::new(process_snapshot(
-                status,
-                &stdout_state,
-                &stderr_state,
-                &stdin_state,
-            )),
-        });
-    };
-    io_tasks.spawn(read_bounded_stream(
-        stderr,
-        Arc::clone(&stderr_state),
-        limits.stderr_bytes,
-        "stderr",
-    ));
+    if !limits.inherit_terminal_stdio {
+        let Some(stdout) = child.stdout.take() else {
+            let status = terminate_and_reap(&mut child, pid, None, &mut io_tasks).await;
+            return Err(CommandError::WaitFailed {
+                program,
+                source: "stdout pipe unavailable after spawn".to_string(),
+                partial: Box::new(process_snapshot(
+                    status,
+                    &stdout_state,
+                    &stderr_state,
+                    &stdin_state,
+                )),
+            });
+        };
+        io_tasks.spawn(read_bounded_stream(
+            stdout,
+            Arc::clone(&stdout_state),
+            limits.stdout_bytes,
+            "stdout",
+        ));
+        let Some(stderr) = child.stderr.take() else {
+            let status = terminate_and_reap(&mut child, pid, None, &mut io_tasks).await;
+            return Err(CommandError::WaitFailed {
+                program,
+                source: "stderr pipe unavailable after spawn".to_string(),
+                partial: Box::new(process_snapshot(
+                    status,
+                    &stdout_state,
+                    &stderr_state,
+                    &stdin_state,
+                )),
+            });
+        };
+        io_tasks.spawn(read_bounded_stream(
+            stderr,
+            Arc::clone(&stderr_state),
+            limits.stderr_bytes,
+            "stderr",
+        ));
+    }
     if let Some(input) = stdin_input {
         let Some(stdin) = child.stdin.take() else {
             let status = terminate_and_reap(&mut child, pid, None, &mut io_tasks).await;

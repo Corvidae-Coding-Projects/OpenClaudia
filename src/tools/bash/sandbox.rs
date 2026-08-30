@@ -57,6 +57,7 @@ enum ControlPathAccess {
 #[derive(Clone, Copy, Debug)]
 pub enum SandboxProfile {
     Shell,
+    UserEditor,
     RepositoryHook,
     LanguageServer,
     StaticAnalyzer,
@@ -107,6 +108,16 @@ impl SandboxProfile {
                 environment: EnvironmentPolicy::RunGrants,
                 permits_explicit_environment: false,
                 permits_project_path: true,
+                permits_child_processes: true,
+            },
+            Self::UserEditor => SandboxProfilePolicy {
+                // A composed message is staged in per-run scratch. The editor
+                // receives terminal and non-secret usability settings, but no
+                // project, secret, or network view.
+                workspace: WorkspaceMountPolicy::ScratchOnly,
+                environment: EnvironmentPolicy::NonSecretRunGrants,
+                permits_explicit_environment: false,
+                permits_project_path: false,
                 permits_child_processes: true,
             },
             Self::RepositoryHook => SandboxProfilePolicy {
@@ -706,7 +717,11 @@ fn linux_bubblewrap_command(
     }
     let mut metadata_bind_fds = Vec::new();
     let mut cmd = Command::new(&backend.path);
-    cmd.args(["--die-with-parent", "--new-session", "--unshare-all"]);
+    cmd.arg("--die-with-parent");
+    if !matches!(profile, SandboxProfile::UserEditor) {
+        cmd.arg("--new-session");
+    }
+    cmd.arg("--unshare-all");
     if backend.share_network_namespace {
         cmd.arg("--share-net");
     }

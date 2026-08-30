@@ -364,7 +364,7 @@ fn summarize_sse(events: &[Value]) -> SseSummary {
     for event in events {
         let action = process_sse_event(event, thinking_open, &mut anthropic, &mut openai);
         match action {
-            SseAction::Text(text) | SseAction::Thinking(text) | SseAction::Reasoning(text) => {
+            SseAction::Text(text) | SseAction::PrivateReasoning(text) => {
                 action_bytes = action_bytes.saturating_add(text.len());
             }
             SseAction::ThinkingStart => thinking_open = true,

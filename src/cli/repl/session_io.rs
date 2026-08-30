@@ -49,6 +49,11 @@ pub fn export_chat_session(session: &Session) {
                 content.push_str("## Assistant\n\n");
                 content.push_str(msg_content);
                 content.push_str("\n\n");
+                if let Some(summary) = openclaudia::runtime::message_reasoning_summary(msg) {
+                    content.push_str("### Provider reasoning summary\n\n");
+                    content.push_str(summary.as_str());
+                    content.push_str("\n\n");
+                }
             }
             _ => {
                 let _ = writeln!(content, "## {role}\n");
