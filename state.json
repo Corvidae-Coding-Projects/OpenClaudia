@@ -1,6 +1,6 @@
 {
   "next_display_id": 1219,
-  "next_comment_id": 1968,
+  "next_comment_id": 1969,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9614,7 +9614,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-30T09:52:38.893638260Z",
+      "updated_at": "2026-08-30T09:55:13.599259361Z",
       "labels": [
         "remediation"
       ],
@@ -10185,6 +10185,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAPn/Fj7X/6B9AQKbOf3ASYEVKg5dAjeKXftXvmdVM9/vU9lsYwN4ZGimFgs+peKyKtxy8jnGmQb9bWkA3fFsPBA=="
+        },
+        "4555efcd-3c9f-4c64-a3b2-6dab956fde8a": {
+          "display_id": 1968,
+          "author": "6Vw9",
+          "content": "Wave 6 commit f595cabc (feat(runtime): bind hook plugin and TUI state) completes S-060, S-061, and S-098 and reconciles eight stale remediation status documents. Verification: Rust 1.98 fmt/check/strict Clippy; full 3,102-test all-target/all-feature suite; 27 Python policy tests; repository hygiene; root and fuzz cargo-deny; fuzz metadata/check/Clippy/4 tests.",
+          "created_at": "2026-08-30T09:55:13.596829526Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAFRdPnWAiqYC7wllSTkxe9gb5T8C1Eiun/7RKPQJLCUaVrekFcuoaUA/zlN+sBHT+2QHPCrdQ+rqegHShhFHwDg=="
         },
         "457c1674-8819-45a5-b651-7b23a298eaad": {
           "display_id": 1453,
@@ -49903,11 +49912,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2432,
       "timestamp": "2026-08-30T09:54:24.007497845Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2433,
+      "timestamp": "2026-08-30T09:55:13.599259361Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T09:54:24.007497845Z",
+    "timestamp": "2026-08-30T09:55:13.599259361Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2432
+    "agent_seq": 2433
   }
 }
