@@ -1,6 +1,6 @@
 {
   "next_display_id": 1232,
-  "next_comment_id": 2009,
+  "next_comment_id": 2010,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -19180,10 +19180,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T21:59:44.675158710Z",
-      "updated_at": "2026-08-30T21:59:50.577158649Z",
+      "updated_at": "2026-08-30T22:01:35.859994980Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "6c669f11-a06c-4426-b889-cd7858bc31fb": {
+          "display_id": 2009,
+          "author": "6Vw9",
+          "content": "Launching a code-only Sol 5.6 xhigh worker. Worker may inspect and edit production code and focused test code, but must not run Cargo/tests/formatting, use Git/Crosslink, modify documentation, or publish. Root owns architecture reconciliation, changed-test review, verification, documentation, issue closure, signed commit, push, and CI.",
+          "created_at": "2026-08-30T22:01:35.857192846Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAiyMztPRGvpatbErwQGtK9HkyooKPk/dk87BeEEpa5McAQMtfbZIR5QBOppOs3RzUlj724Nd8b+OzhkGru9OCAQ=="
+        }
+      }
     },
     "7b7677f6-2896-4c57-bc57-cd7566fff977": {
       "uuid": "7b7677f6-2896-4c57-bc57-cd7566fff977",
@@ -51010,11 +51021,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2532,
       "timestamp": "2026-08-30T22:00:18.834481996Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2533,
+      "timestamp": "2026-08-30T22:01:35.859994980Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T22:00:18.834481996Z",
+    "timestamp": "2026-08-30T22:01:35.859994980Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2532
+    "agent_seq": 2533
   }
 }
