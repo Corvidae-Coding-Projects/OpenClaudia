@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1231,
+  "next_display_id": 1232,
   "next_comment_id": 2009,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -992,6 +992,7 @@
     "dcfeb3e1-6d66-47ed-89d2-10f75228c280": 21,
     "dd7d263e-1fe2-4121-abe9-88fed251cb39": 336,
     "de0664ef-1b3e-4647-984e-eaf374c7c1df": 763,
+    "de0e9607-d4ea-4e44-b7c6-43fa6e803c6f": 1231,
     "de21a015-5991-49f7-954e-09a74bf3af91": 348,
     "de7bcc7b-4b06-4f10-b96e-86f00ae85425": 344,
     "deab8e8a-f516-4bf9-8b03-9389fa8d42fa": 632,
@@ -33033,6 +33034,18 @@
         "qa-review"
       ]
     },
+    "de0e9607-d4ea-4e44-b7c6-43fa6e803c6f": {
+      "uuid": "de0e9607-d4ea-4e44-b7c6-43fa6e803c6f",
+      "display_id": 1231,
+      "title": "S-082: Give private notes and side questions correct semantics",
+      "description": "Implement docs/remediation-slices/082-private-notes-and-side-questions.md. Keep private notes outside provider-visible and ordinary export/memory projections unless explicitly consented, and execute side questions as bounded causal child attempts over immutable parent snapshots without stealing or reordering parent continuation state.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-30T22:00:04.275917276Z",
+      "updated_at": "2026-08-30T22:00:04.275917276Z"
+    },
     "de21a015-5991-49f7-954e-09a74bf3af91": {
       "uuid": "de21a015-5991-49f7-954e-09a74bf3af91",
       "display_id": 348,
@@ -50975,11 +50988,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2529,
       "timestamp": "2026-08-30T21:59:58.499829402Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2530,
+      "timestamp": "2026-08-30T22:00:04.275917276Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T21:59:58.499829402Z",
+    "timestamp": "2026-08-30T22:00:04.275917276Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2529
+    "agent_seq": 2530
   }
 }
