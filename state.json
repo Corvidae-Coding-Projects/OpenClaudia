@@ -1,6 +1,6 @@
 {
   "next_display_id": 1230,
-  "next_comment_id": 2002,
+  "next_comment_id": 2003,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9625,7 +9625,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-30T19:26:16.685128697Z",
+      "updated_at": "2026-08-30T21:24:00.664137287Z",
       "labels": [
         "remediation"
       ],
@@ -9999,6 +9999,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAWl3vlFit4fJqpc5/8rSw2aUa+4IoskmBb2alzaiYYsfOi3Z+BUX9yaL+KSZ9qc0z690nZO6HZlw3VQtg+tlSBQ=="
+        },
+        "242786f2-c4ce-4c59-b0f9-5d9012777669": {
+          "display_id": 2002,
+          "author": "6Vw9",
+          "content": "Commit 982ea8838 (feat(agent): complete causal, reasoning, and input wiring) completes verified wave S-039, S-049, and S-079. Verification: Rust 1.98 format; all-target/all-feature Clippy with warnings denied; full serialized test suite; focused migration, causal-resume, reasoning-privacy, attachment/editor, TUI, provider-state, and retrieval evidence tests; root and fuzz CI-shaped checks; cargo-deny; policy/hygiene gates; manual code and changed-test review.",
+          "created_at": "2026-08-30T21:24:00.661559276Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA7gI6ORKUuLm8OOV8GKSDZCirxa6IK8BM/cKZQ7uDWq9IiwTanOIcvY5WU0ohIXEbOT3m97ztYsiY5Yg0eUJ4DQ=="
         },
         "24746f93-2a57-48b6-bc5c-0968a1aad6cd": {
           "display_id": 1321,
@@ -50832,11 +50841,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2517,
       "timestamp": "2026-08-30T21:22:57.217870471Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2518,
+      "timestamp": "2026-08-30T21:24:00.664137287Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T21:22:57.217870471Z",
+    "timestamp": "2026-08-30T21:24:00.664137287Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2517
+    "agent_seq": 2518
   }
 }
