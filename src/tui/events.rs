@@ -198,7 +198,7 @@ pub enum AppEvent {
     /// REPL flow in `cli::repl::input::handle_user_questions` so the
     /// agent-facing contract is identical across both front-ends.
     UserQuestion {
-        questions: Vec<serde_json::Value>,
+        questions: Vec<crate::tools::ToolQuestion>,
         reply: tokio::sync::oneshot::Sender<String>,
     },
     /// A typed plan-mode handler needs the TUI-owned session and runtime

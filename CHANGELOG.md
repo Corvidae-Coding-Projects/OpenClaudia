@@ -205,6 +205,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-083: Make terminal rendering bounded and inert (#1223)
+- S-077: Bind Git review and commit to exact generations (#1222)
+- S-076: Make project initialization transactional (#1221)
 - S-098: Make TUI provider switching and resume atomic (#1218)
 - S-061: Bind plugin identity and discovery to trusted scope (#1217)
 - S-060: Sandbox and budget hook execution (#1216)

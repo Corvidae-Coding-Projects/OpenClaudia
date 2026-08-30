@@ -4937,10 +4937,7 @@ async fn resolve_tui_follow_up(
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     if tx
         .send(AppEvent::UserQuestion {
-            questions: questions
-                .iter()
-                .map(tools::ToolQuestion::widget_value)
-                .collect(),
+            questions,
             reply: reply_tx,
         })
         .is_err()

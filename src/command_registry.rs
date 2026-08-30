@@ -250,6 +250,12 @@ const READ: &[ToolResource] = &[ToolResource::WorkspaceRead];
 const WRITE: &[ToolResource] = &[ToolResource::WorkspaceWrite];
 const PROCESS_READ: &[ToolResource] = &[ToolResource::Process, ToolResource::WorkspaceRead];
 const PROCESS_WRITE: &[ToolResource] = &[ToolResource::Process, ToolResource::WorkspaceWrite];
+const PROCESS_WRITE_NETWORK_SECRETS: &[ToolResource] = &[
+    ToolResource::Process,
+    ToolResource::WorkspaceWrite,
+    ToolResource::Network,
+    ToolResource::Secrets,
+];
 const NETWORK_SECRETS: &[ToolResource] = &[ToolResource::Network, ToolResource::Secrets];
 const SECRETS: &[ToolResource] = &[ToolResource::Secrets];
 const MCP: &[ToolResource] = &[ToolResource::Mcp];
@@ -1162,7 +1168,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
         &[],
         CommandArgumentSchema::Ignored,
         ExternalMutation,
-        PROCESS_WRITE,
+        PROCESS_WRITE_NETWORK_SECRETS,
         FrontendSet::LEGACY,
         Command,
         [help(

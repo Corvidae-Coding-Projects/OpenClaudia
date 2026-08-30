@@ -11,6 +11,10 @@ use super::{
 /// Matches `ASK_USER_QUESTION_TOOL_CHIP_WIDTH` in
 /// `claude-code/tools/AskUserQuestionTool/prompt.ts`.
 const HEADER_CHIP_WIDTH: usize = 12;
+const MAX_QUESTION_BYTES: usize = 2048;
+const MAX_OPTION_LABEL_BYTES: usize = 512;
+const MAX_OPTION_DESCRIPTION_BYTES: usize = 2048;
+const MAX_OPTION_PREVIEW_BYTES: usize = 4096;
 
 /// Pull the `questions` array out of the raw tool arguments and apply the
 /// outer 1-4 count bound.  Returns the borrowed slice on success.
@@ -53,23 +57,40 @@ fn validate_option(
         || format!("Question {i} option {j} missing 'label'"),
         || format!("Question {i} option {j} 'label' must be a string"),
     )?;
+    if label.len() > MAX_OPTION_LABEL_BYTES {
+        return Err(format!(
+            "Question {i} option {j} label exceeds {MAX_OPTION_LABEL_BYTES} bytes"
+        ));
+    }
     if !seen.insert(label.to_string()) {
         return Err(format!(
             "Question {i} option labels must be unique; '{label}' appears more than once"
         ));
     }
-    let _description = required_string_field(
+    let description = required_string_field(
         opt,
         "description",
         || format!("Question {i} option {j} missing 'description'"),
         || format!("Question {i} option {j} 'description' must be a string"),
     )?;
+    if description.len() > MAX_OPTION_DESCRIPTION_BYTES {
+        return Err(format!(
+            "Question {i} option {j} description exceeds {MAX_OPTION_DESCRIPTION_BYTES} bytes"
+        ));
+    }
     // `preview` is optional (CC parity).  When present it must be a string —
     // fail loudly rather than silently dropping it.
     if let Some(v) = opt.get("preview") {
         if !v.is_string() {
             return Err(format!(
                 "Question {i} option {j} 'preview' must be a string"
+            ));
+        }
+        if v.as_str()
+            .is_some_and(|preview| preview.len() > MAX_OPTION_PREVIEW_BYTES)
+        {
+            return Err(format!(
+                "Question {i} option {j} preview exceeds {MAX_OPTION_PREVIEW_BYTES} bytes"
             ));
         }
     }
@@ -86,6 +107,11 @@ fn validate_question(i: usize, q: &Value) -> Result<&str, String> {
         || format!("Question {i} missing 'question' field"),
         || format!("Question {i} 'question' must be a string"),
     )?;
+    if question_text.len() > MAX_QUESTION_BYTES {
+        return Err(format!(
+            "Question {i} text exceeds {MAX_QUESTION_BYTES} bytes"
+        ));
+    }
 
     let header = required_string_field(
         q,

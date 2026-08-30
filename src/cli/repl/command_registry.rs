@@ -136,7 +136,7 @@ fn dispatch_proposed(proposal: &ProposedCommand, ctx: &mut SlashCtx<'_>) -> Slas
             SlashCommandResult::Handled
         }
         CommandId::Review => {
-            review_git_changes(args);
+            review_git_changes(ctx.run_context, args);
             SlashCommandResult::Handled
         }
         CommandId::Status => SlashCommandResult::Status,

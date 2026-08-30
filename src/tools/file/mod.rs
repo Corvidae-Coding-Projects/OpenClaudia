@@ -4,6 +4,7 @@ mod glob;
 mod grep;
 mod list;
 mod notebook;
+mod project_init;
 mod read;
 pub mod secure_fs;
 pub mod workspace_projection;
@@ -19,6 +20,12 @@ pub use list::execute_list_files_typed;
 pub use notebook::execute_notebook_edit;
 pub use notebook::execute_notebook_edit_typed;
 pub use notebook::source_to_line_array;
+pub use project_init::{
+    commit_project_initialization, initialize_project_for_run, plan_project_initialization,
+    ProjectInitAction, ProjectInitCollision, ProjectInitCommitState, ProjectInitEffect,
+    ProjectInitEntryKind, ProjectInitError, ProjectInitOutcome, ProjectInitPlan, ProjectInitPolicy,
+    ProjectInitReceipt, DEFAULT_PROJECT_CONFIG,
+};
 pub use read::{detect_file_type, FileType};
 #[cfg(test)]
 pub use read::{parse_page_range, read_notebook_file, ImageKind};
@@ -656,35 +663,6 @@ pub fn create_run_control_directory(
     let resolved = resolve_host_control_path(run, user_path)?;
     secure_fs::create_host_control_directories(run, &resolved)?;
     Ok(resolved)
-}
-
-/// Result of initializing the run's project-owned `OpenClaudia` control state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProjectInitOutcome {
-    Created,
-    AlreadyExists,
-}
-
-/// Initialize `.openclaudia/config.yaml` and the project skill directory
-/// through the exact run's pinned host-control capability.
-#[doc(hidden)]
-pub fn initialize_project_for_run(
-    run: &super::security::ToolRunContext,
-) -> Result<ProjectInitOutcome, String> {
-    let config_path = run.project_root().join(".openclaudia/config.yaml");
-    match read_run_control_text(run, &config_path.to_string_lossy()) {
-        Ok(_) => return Ok(ProjectInitOutcome::AlreadyExists),
-        Err(error) if error.starts_with("NOT_FOUND:") => {}
-        Err(error) => return Err(error),
-    }
-    let skills_path = run.project_root().join(".openclaudia/skills");
-    create_run_control_directory(run, &skills_path.to_string_lossy())?;
-    let default_config = "# OpenClaudia Configuration\nproxy:\n  port: 8080\n  host: \"127.0.0.1\"\n  target: anthropic\n\nproviders:\n  anthropic:\n    base_url: https://api.anthropic.com\n\nsession:\n  timeout_minutes: 30\n  persist_path: .openclaudia/session\n";
-    match create_run_control_text_file(run, &config_path.to_string_lossy(), default_config) {
-        Ok(_) => Ok(ProjectInitOutcome::Created),
-        Err(error) if error.ends_with("already exists") => Ok(ProjectInitOutcome::AlreadyExists),
-        Err(error) => Err(error),
-    }
 }
 
 /// Canonicalise a path that may not yet exist by walking the deepest

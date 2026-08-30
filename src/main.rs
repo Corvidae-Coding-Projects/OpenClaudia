@@ -137,7 +137,7 @@ struct Cli {
 enum Commands {
     /// Initialize `OpenClaudia` configuration in the current directory
     Init {
-        /// Force overwrite existing configuration
+        /// Replace colliding scaffold paths and retain a recoverable backup
         #[arg(short, long)]
         force: bool,
     },

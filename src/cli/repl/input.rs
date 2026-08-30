@@ -64,128 +64,140 @@ pub fn run_external_editor(
 /// Display structured questions to the user and collect answers.
 /// Returns a JSON string mapping question text to selected answer(s).
 #[allow(clippy::too_many_lines)]
-pub fn handle_user_questions(questions: &[serde_json::Value]) -> String {
+pub fn handle_user_questions(questions: &[openclaudia::tools::ToolQuestion]) -> String {
     use std::io::{self, Write};
 
+    const MAX_ANSWER_BYTES: usize = 4096;
+
     let mut answers: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    let stdin = io::stdin();
+    let mut stdin = stdin.lock();
 
     for q in questions {
-        let question_text = q.get("question").and_then(|v| v.as_str()).unwrap_or("?");
-        let header = q.get("header").and_then(|v| v.as_str()).unwrap_or("");
-        let options = q
-            .get("options")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        // crosslink #585: the validator in `tools::ask_user` canonicalises
-        // the input key to `multiSelect` (CC's spelling). Read that first;
-        // fall back to the legacy `multi_select` only for callers that bypass
-        // the validator (back-compat). Without this fix the flag is silently
-        // dropped whenever `ask_user_question` normalises a `multiSelect`
-        // input, leaving the renderer stuck in single-select mode.
-        let multi_select = q
-            .get("multiSelect")
-            .or_else(|| q.get("multi_select"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        let question_text = openclaudia::tui::safety::sanitize_terminal_text(
+            &q.question,
+            openclaudia::tui::safety::EVENT_TEXT_LIMITS,
+        );
+        let header = openclaudia::tui::safety::sanitize_terminal_label(&q.header);
 
         // Display the question
-        println!("\n\x1b[1;36m?\x1b[0m {question_text}  \x1b[90m[{header}]\x1b[0m");
+        println!(
+            "\n\x1b[1;36m?\x1b[0m {}  \x1b[90m[{}]\x1b[0m",
+            question_text.as_str(),
+            header.as_str()
+        );
 
         // Display options
-        for (i, opt) in options.iter().enumerate() {
-            let label = opt.get("label").and_then(|v| v.as_str()).unwrap_or("?");
-            let desc = opt
-                .get("description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+        for (i, opt) in q.options.iter().enumerate() {
+            let label = openclaudia::tui::safety::sanitize_terminal_label(&opt.label);
+            let desc = openclaudia::tui::safety::sanitize_terminal_text(
+                &opt.description,
+                openclaudia::tui::safety::EVENT_TEXT_LIMITS,
+            );
             println!(
                 "  \x1b[1m{}.\x1b[0m {} \x1b[90m- {}\x1b[0m",
                 i + 1,
-                label,
-                desc
+                label.as_str(),
+                desc.as_str()
             );
         }
         // Always append "Other" option
-        let other_num = options.len() + 1;
+        let other_num = q.options.len() + 1;
         println!("  \x1b[1m{other_num}.\x1b[0m Other \x1b[90m(type your answer)\x1b[0m");
 
-        if multi_select {
+        if q.multi_select {
             print!("\x1b[36m> \x1b[0m\x1b[90m(comma-separated numbers) \x1b[0m");
         } else {
             print!("\x1b[36m> \x1b[0m");
         }
         io::stdout().flush().ok();
 
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_err() {
+        let Ok(input) = read_bounded_terminal_line(&mut stdin, MAX_ANSWER_BYTES) else {
             answers.insert(
-                question_text.to_string(),
+                q.question.clone(),
                 serde_json::Value::String("(no input)".to_string()),
             );
             continue;
-        }
+        };
         let input = input.trim();
 
-        if multi_select {
+        if q.multi_select {
             let mut selected: Vec<serde_json::Value> = Vec::new();
             for part in input.split(',') {
                 let part = part.trim();
                 if let Ok(num) = part.parse::<usize>() {
-                    if num >= 1 && num <= options.len() {
-                        if let Some(opt) = options.get(num - 1) {
-                            let label = opt.get("label").and_then(|v| v.as_str()).unwrap_or("?");
-                            selected.push(serde_json::Value::String(label.to_string()));
+                    if num >= 1 && num <= q.options.len() {
+                        if let Some(opt) = q.options.get(num - 1) {
+                            selected.push(serde_json::Value::String(opt.label.clone()));
                         }
                     } else if num == other_num {
                         print!("  \x1b[36mYour answer: \x1b[0m");
                         io::stdout().flush().ok();
-                        let mut other_input = String::new();
-                        if io::stdin().read_line(&mut other_input).is_ok() {
+                        if let Ok(other_input) =
+                            read_bounded_terminal_line(&mut stdin, MAX_ANSWER_BYTES)
+                        {
                             selected
                                 .push(serde_json::Value::String(other_input.trim().to_string()));
                         }
                     }
                 }
             }
-            answers.insert(
-                question_text.to_string(),
-                serde_json::Value::Array(selected),
-            );
+            answers.insert(q.question.clone(), serde_json::Value::Array(selected));
         } else if let Ok(num) = input.parse::<usize>() {
-            if num >= 1 && num <= options.len() {
-                if let Some(opt) = options.get(num - 1) {
-                    let label = opt.get("label").and_then(|v| v.as_str()).unwrap_or("?");
+            if num >= 1 && num <= q.options.len() {
+                if let Some(opt) = q.options.get(num - 1) {
                     answers.insert(
-                        question_text.to_string(),
-                        serde_json::Value::String(label.to_string()),
+                        q.question.clone(),
+                        serde_json::Value::String(opt.label.clone()),
                     );
                 }
             } else if num == other_num {
                 print!("  \x1b[36mYour answer: \x1b[0m");
                 io::stdout().flush().ok();
-                let mut other_input = String::new();
-                if io::stdin().read_line(&mut other_input).is_ok() {
+                if let Ok(other_input) = read_bounded_terminal_line(&mut stdin, MAX_ANSWER_BYTES) {
                     answers.insert(
-                        question_text.to_string(),
+                        q.question.clone(),
                         serde_json::Value::String(other_input.trim().to_string()),
                     );
                 }
             } else {
                 answers.insert(
-                    question_text.to_string(),
+                    q.question.clone(),
                     serde_json::Value::String(input.to_string()),
                 );
             }
         } else {
             answers.insert(
-                question_text.to_string(),
+                q.question.clone(),
                 serde_json::Value::String(input.to_string()),
             );
         }
     }
 
     serde_json::Value::Object(answers).to_string()
+}
+
+fn read_bounded_terminal_line<R: std::io::BufRead>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> std::io::Result<String> {
+    let mut bytes = Vec::with_capacity(max_bytes.min(1024));
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+        let line_end = available.iter().position(|byte| *byte == b'\n');
+        let consumed = line_end.map_or(available.len(), |position| position + 1);
+        let content_end = line_end.unwrap_or(available.len());
+        let remaining = max_bytes.saturating_sub(bytes.len());
+        bytes.extend_from_slice(&available[..content_end.min(remaining)]);
+        reader.consume(consumed);
+        if line_end.is_some() {
+            break;
+        }
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Open external editor for composing a message

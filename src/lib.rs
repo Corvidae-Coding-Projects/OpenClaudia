@@ -28,6 +28,7 @@ mod evidence_freshness;
 pub mod file_error;
 mod file_types;
 pub mod final_gate;
+pub mod git_transaction;
 pub mod grounded_loop;
 pub mod guardrails;
 pub mod hooks;

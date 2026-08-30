@@ -1,5 +1,18 @@
 //! Text input widget for the TUI.
 
+use ratatui::{buffer::CellWidth, style::Style, text::Line};
+
+use super::safety::{sanitize_terminal_text, TextLimits};
+
+const MAX_INPUT_BYTES: usize = 16 * 1024;
+const MAX_INPUT_LINES: usize = 128;
+const INPUT_DISPLAY_LIMITS: TextLimits = TextLimits::new(
+    MAX_INPUT_BYTES,
+    256 * 1024,
+    MAX_INPUT_LINES,
+    MAX_INPUT_BYTES,
+);
+
 /// Text input with cursor tracking.
 pub struct TextInput {
     pub content: String,
@@ -24,6 +37,11 @@ impl TextInput {
     }
 
     pub fn insert(&mut self, ch: char) {
+        if self.content.len().saturating_add(ch.len_utf8()) > MAX_INPUT_BYTES
+            || (ch == '\n' && self.content.matches('\n').count() + 1 >= MAX_INPUT_LINES)
+        {
+            return;
+        }
         self.content.insert(self.cursor_pos, ch);
         self.cursor_pos += ch.len_utf8();
     }
@@ -33,53 +51,61 @@ impl TextInput {
     }
 
     pub fn insert_str(&mut self, text: &str) {
+        let remaining_bytes = MAX_INPUT_BYTES.saturating_sub(self.content.len());
+        let remaining_newlines = MAX_INPUT_LINES
+            .saturating_sub(1)
+            .saturating_sub(self.content.matches('\n').count());
+        let mut accepted = String::with_capacity(text.len().min(remaining_bytes));
+        let mut newlines = 0usize;
         let mut chars = text.chars().peekable();
         while let Some(ch) = chars.next() {
-            if ch == '\r' {
+            let normalized = if ch == '\r' {
                 if matches!(chars.peek(), Some('\n')) {
                     let _ = chars.next();
                 }
-                self.insert_newline();
+                '\n'
             } else {
-                self.insert(ch);
+                ch
+            };
+            if normalized == '\n' {
+                if newlines >= remaining_newlines {
+                    break;
+                }
+                newlines += 1;
             }
+            if accepted.len().saturating_add(normalized.len_utf8()) > remaining_bytes {
+                break;
+            }
+            accepted.push(normalized);
         }
+        self.content.insert_str(self.cursor_pos, &accepted);
+        self.cursor_pos += accepted.len();
     }
 
     pub fn backspace(&mut self) {
         if self.cursor_pos > 0 {
-            let prev = self.content[..self.cursor_pos]
-                .chars()
-                .last()
-                .map_or(1, char::len_utf8);
-            self.cursor_pos -= prev;
-            self.content.remove(self.cursor_pos);
+            let previous = previous_grapheme_boundary(&self.content, self.cursor_pos);
+            self.content.drain(previous..self.cursor_pos);
+            self.cursor_pos = previous;
         }
     }
 
     pub fn delete(&mut self) {
         if self.cursor_pos < self.content.len() {
-            self.content.remove(self.cursor_pos);
+            let next = next_grapheme_boundary(&self.content, self.cursor_pos);
+            self.content.drain(self.cursor_pos..next);
         }
     }
 
     pub fn move_left(&mut self) {
         if self.cursor_pos > 0 {
-            let prev = self.content[..self.cursor_pos]
-                .chars()
-                .last()
-                .map_or(1, char::len_utf8);
-            self.cursor_pos -= prev;
+            self.cursor_pos = previous_grapheme_boundary(&self.content, self.cursor_pos);
         }
     }
 
     pub fn move_right(&mut self) {
         if self.cursor_pos < self.content.len() {
-            let next = self.content[self.cursor_pos..]
-                .chars()
-                .next()
-                .map_or(1, char::len_utf8);
-            self.cursor_pos += next;
+            self.cursor_pos = next_grapheme_boundary(&self.content, self.cursor_pos);
         }
     }
 
@@ -94,10 +120,10 @@ impl TextInput {
     #[must_use]
     pub fn visual_line_count(&self, content_width: u16) -> u16 {
         let width = usize::from(content_width.max(1));
-        let rows = self
-            .content
+        let display = self.rendered_content();
+        let rows = display
             .split('\n')
-            .map(|line| wrapped_rows(line.chars().count(), width))
+            .map(|line| visual_rows(line, width))
             .sum::<usize>();
         u16::try_from(rows).unwrap_or(u16::MAX)
     }
@@ -106,16 +132,16 @@ impl TextInput {
     pub fn visual_cursor_position(&self, content_width: u16) -> (u16, u16) {
         let width = usize::from(content_width.max(1));
         let before_cursor = &self.content[..self.cursor_pos];
+        let before_cursor = sanitize_terminal_text(before_cursor, INPUT_DISPLAY_LIMITS);
         let mut row = 0usize;
-        let mut lines = before_cursor.split('\n').peekable();
+        let mut lines = before_cursor.as_str().split('\n').peekable();
 
         while let Some(line) = lines.next() {
-            let col = line.chars().count();
             if lines.peek().is_some() {
-                row = row.saturating_add(wrapped_rows(col, width));
+                row = row.saturating_add(visual_rows(line, width));
             } else {
-                row = row.saturating_add(col / width);
-                let col = col % width;
+                let (wrapped, col) = visual_cursor(line, width);
+                row = row.saturating_add(wrapped);
                 return (
                     u16::try_from(row).unwrap_or(u16::MAX),
                     u16::try_from(col).unwrap_or(u16::MAX),
@@ -137,13 +163,73 @@ impl TextInput {
     pub const fn is_empty(&self) -> bool {
         self.content.is_empty()
     }
+
+    /// Inert display projection of the editable value.
+    #[must_use]
+    pub fn rendered_content(&self) -> String {
+        sanitize_terminal_text(&self.content, INPUT_DISPLAY_LIMITS).into_string()
+    }
 }
 
-const fn wrapped_rows(char_count: usize, width: usize) -> usize {
-    if char_count == 0 {
-        1
+fn previous_grapheme_boundary(text: &str, cursor: usize) -> usize {
+    let line = Line::raw(&text[..cursor]);
+    let mut offset = 0usize;
+    let mut previous = 0usize;
+    for grapheme in line.styled_graphemes(Style::default()) {
+        previous = offset;
+        offset += grapheme.symbol.len();
+    }
+    previous
+}
+
+fn next_grapheme_boundary(text: &str, cursor: usize) -> usize {
+    let line = Line::raw(&text[cursor..]);
+    let boundary = line
+        .styled_graphemes(Style::default())
+        .next()
+        .map_or(text.len(), |grapheme| cursor + grapheme.symbol.len());
+    boundary
+}
+
+pub(crate) fn pop_last_grapheme(text: &mut String) {
+    if text.is_empty() {
+        return;
+    }
+    let previous = previous_grapheme_boundary(text, text.len());
+    text.truncate(previous);
+}
+
+fn visual_rows(text: &str, width: usize) -> usize {
+    let line = Line::raw(text);
+    let mut rows = 1usize;
+    let mut column = 0usize;
+    for grapheme in line.styled_graphemes(Style::default()) {
+        let cells = usize::from(grapheme.symbol.cell_width()).min(width);
+        if cells > 0 && column.saturating_add(cells) > width {
+            rows = rows.saturating_add(1);
+            column = 0;
+        }
+        column = column.saturating_add(cells);
+    }
+    rows
+}
+
+fn visual_cursor(text: &str, width: usize) -> (usize, usize) {
+    let line = Line::raw(text);
+    let mut rows = 0usize;
+    let mut column = 0usize;
+    for grapheme in line.styled_graphemes(Style::default()) {
+        let cells = usize::from(grapheme.symbol.cell_width()).min(width);
+        if cells > 0 && column.saturating_add(cells) > width {
+            rows = rows.saturating_add(1);
+            column = 0;
+        }
+        column = column.saturating_add(cells);
+    }
+    if column >= width {
+        (rows.saturating_add(column / width), column % width)
     } else {
-        char_count.saturating_add(width - 1) / width
+        (rows, column)
     }
 }
 

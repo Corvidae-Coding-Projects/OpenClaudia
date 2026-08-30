@@ -923,55 +923,75 @@ pub fn slash_commit(
     run_context: Option<&openclaudia::tools::ToolRunContext>,
 ) -> SlashCommandResult {
     use crate::cli::commit_pipeline::{
-        execute_commit_pipeline, CommitError, CommitOptions, CommitOutcome, RealGitRunner,
-        StdioPrompt,
+        execute_generation_bound_commit, CommitOptions, GenerationBoundCommitError,
+        GenerationBoundCommitOutcome, StdioPrompt,
     };
-    let mut git = RealGitRunner;
+    let Some(run) = run_context else {
+        println!("\nCommit is unavailable without an active run capability.\n");
+        return SlashCommandResult::Handled;
+    };
     let mut prompt = StdioPrompt;
-    match execute_commit_pipeline(&mut git, &mut prompt, CommitOptions::interactive(), || {
+    match execute_generation_bound_commit(run, &mut prompt, CommitOptions::interactive(), || {
         enforce_on_commit_quality_gate(run_context)
     }) {
-        Ok(CommitOutcome::Committed { message }) => println!("\n✓ Committed: {message}"),
-        Ok(CommitOutcome::NothingToCommit) => println!("\nNo changes to commit.\n"),
-        Ok(CommitOutcome::Cancelled) => println!("Commit cancelled."),
-        Err(CommitError::NotARepo) => println!("\nNot inside a git repository.\n"),
-        Err(CommitError::CommitFailed(stderr)) => println!("\n✗ {stderr}"),
-        Err(CommitError::QualityGateBlocked(reason)) => println!("\n✗ {reason}"),
+        Ok(GenerationBoundCommitOutcome::Committed(receipt)) => println!(
+            "\n✓ Local commit verified: {} -> {}",
+            receipt.commit_id, receipt.destination
+        ),
+        Ok(GenerationBoundCommitOutcome::NothingToCommit) => {
+            println!("\nNo changes to commit.\n");
+        }
+        Ok(GenerationBoundCommitOutcome::Cancelled(receipt)) => println!(
+            "Commit cancelled; review {} was not published.",
+            receipt.review_digest
+        ),
+        Err(GenerationBoundCommitError::Git(error)) => println!("\n✗ {error}"),
+        Err(GenerationBoundCommitError::QualityGateBlocked(reason)) => {
+            println!("\n✗ Commit blocked: {reason}");
+        }
     }
     SlashCommandResult::Handled
 }
 
-/// Auto-stage + auto-commit step for `/commit-push-pr`. Returns `false` when
-/// the caller should bail out (commit failed). `NothingToCommit` is treated
-/// as success so the push step can still run.
+/// Auto-message + explicitly reviewed local commit step for
+/// `/commit-push-pr`. Publication cannot start without its verified receipt.
 fn commit_push_pr_stage_and_commit(
     run_context: Option<&openclaudia::tools::ToolRunContext>,
-) -> bool {
+) -> Option<openclaudia::git_transaction::LocalCommitReceipt> {
     use crate::cli::commit_pipeline::{
-        execute_commit_pipeline, CommitError, CommitOptions, CommitOutcome, RealGitRunner,
-        StdioPrompt,
+        execute_generation_bound_commit, CommitOptions, GenerationBoundCommitError,
+        GenerationBoundCommitOutcome, StdioPrompt,
     };
-    let mut git = RealGitRunner;
+    let Some(run) = run_context else {
+        println!("\nCommit/push/PR is unavailable without an active run capability.\n");
+        return None;
+    };
     let mut prompt = StdioPrompt;
-    match execute_commit_pipeline(&mut git, &mut prompt, CommitOptions::automatic(), || {
+    match execute_generation_bound_commit(run, &mut prompt, CommitOptions::automatic(), || {
         enforce_on_commit_quality_gate(run_context)
     }) {
-        Ok(CommitOutcome::Committed { message }) => {
-            println!("✓ Committed: {message}");
-            true
+        Ok(GenerationBoundCommitOutcome::Committed(receipt)) => {
+            println!("✓ Local commit verified: {}", receipt.commit_id);
+            Some(*receipt)
         }
-        Ok(CommitOutcome::NothingToCommit | CommitOutcome::Cancelled) => true,
-        Err(CommitError::NotARepo) => {
-            println!("\nNot inside a git repository.\n");
-            false
+        Ok(GenerationBoundCommitOutcome::NothingToCommit) => {
+            println!("No reviewed local commit was created; push and PR were not attempted.");
+            None
         }
-        Err(CommitError::CommitFailed(stderr)) => {
-            println!("✗ Commit failed: {stderr}");
-            false
+        Ok(GenerationBoundCommitOutcome::Cancelled(receipt)) => {
+            println!(
+                "Commit cancelled; review {} was not published.",
+                receipt.review_digest
+            );
+            None
         }
-        Err(CommitError::QualityGateBlocked(reason)) => {
+        Err(GenerationBoundCommitError::Git(error)) => {
+            println!("✗ Commit failed: {error}");
+            None
+        }
+        Err(GenerationBoundCommitError::QualityGateBlocked(reason)) => {
             println!("✗ Commit blocked: {reason}");
-            false
+            None
         }
     }
 }
@@ -988,40 +1008,81 @@ fn prompt_confirm_line(prompt: &str) -> String {
     line.trim().to_lowercase()
 }
 
-/// Returns the current branch name, or an empty string when `git` is
-/// unavailable / not in a repo.  Pure git-status probe — no I/O on stdin.
-fn current_branch() -> String {
-    git_command()
-        .and_then(|mut cmd| {
-            cmd.args(["rev-parse", "--abbrev-ref", "HEAD"])
-                .output()
-                .map_err(|e| e.to_string())
-        })
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
+#[derive(Clone, Debug)]
+struct GitPublicationReceipt {
+    local: openclaudia::git_transaction::LocalCommitReceipt,
+    remote: String,
+    remote_ref: String,
 }
 
-/// Returns true when the user agrees to push (or the branch is not
-/// protected and no confirmation is needed).  Encapsulates the entire
-/// stdin-reading dance for the protected-branch case (#791).
-fn confirm_push_to_branch(branch: &str) -> bool {
-    if branch == "main" || branch == "master" {
-        let answer = prompt_confirm_line(&format!(
-            "\n\u{26a0} You're on '{branch}'. Push anyway? [y/n] "
-        ));
-        if !answer.starts_with('y') {
-            println!("Push cancelled.");
-            return false;
-        }
+/// Ask separately for network publication after the local receipt exists.
+fn confirm_publication(receipt: &openclaudia::git_transaction::LocalCommitReceipt) -> bool {
+    let branch = receipt
+        .destination
+        .strip_prefix("refs/heads/")
+        .unwrap_or(&receipt.destination);
+    let warning = if matches!(branch, "main" | "master") {
+        " PROTECTED BRANCH"
+    } else {
+        ""
+    };
+    let answer = prompt_confirm_line(&format!(
+        "\nPublish verified commit {} to origin/{} and create a PR?{} [y/N] ",
+        receipt.commit_id, branch, warning
+    ));
+    if !answer.starts_with('y') {
+        println!(
+            "Publication cancelled; local commit {} remains.",
+            receipt.commit_id
+        );
+        return false;
     }
     true
 }
 
-/// Push the current branch to origin, asking for confirmation when on a
-/// protected branch. Returns the branch name on success, or `None` to bail.
-fn commit_push_pr_push() -> Option<String> {
-    let branch = current_branch();
-    if !confirm_push_to_branch(&branch) {
+/// Push exactly the receipt-bound object and destination. This produces a
+/// publication receipt distinct from the local commit receipt.
+fn commit_push_pr_push(
+    receipt: openclaudia::git_transaction::LocalCommitReceipt,
+) -> Option<GitPublicationReceipt> {
+    if !confirm_publication(&receipt) {
+        return None;
+    }
+    let branch = receipt.destination.strip_prefix("refs/heads/")?;
+    let remote = "origin".to_string();
+    let remote_ref = format!("refs/heads/{branch}");
+    let refspec = format!("{}:{remote_ref}", receipt.commit_id);
+    let local_ref = match git_command().and_then(|mut cmd| {
+        cmd.current_dir(&receipt.repository_root)
+            .args([
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                receipt.destination.as_str(),
+            ])
+            .output()
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        Ok(output) => {
+            println!(
+                "\u{2717} Publication refused: local receipt destination could not be verified: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            return None;
+        }
+        Err(error) => {
+            println!("\u{2717} Publication refused: {error}");
+            return None;
+        }
+    };
+    if local_ref != receipt.commit_id {
+        println!(
+            "\u{2717} Publication refused: {} moved from receipt commit {} to {}",
+            receipt.destination, receipt.commit_id, local_ref
+        );
         return None;
     }
     let mut cmd = match git_command() {
@@ -1031,10 +1092,21 @@ fn commit_push_pr_push() -> Option<String> {
             return None;
         }
     };
-    match cmd.args(["push", "-u", "origin", &branch]).output() {
+    match cmd
+        .current_dir(&receipt.repository_root)
+        .args(["push", "-u", remote.as_str(), refspec.as_str()])
+        .output()
+    {
         Ok(o) if o.status.success() => {
-            println!("\u{2713} Pushed to origin/{branch}");
-            Some(branch)
+            println!(
+                "\u{2713} Published {} to {remote}/{branch}",
+                receipt.commit_id
+            );
+            Some(GitPublicationReceipt {
+                local: receipt,
+                remote,
+                remote_ref,
+            })
         }
         Ok(o) => {
             println!(
@@ -1050,23 +1122,33 @@ fn commit_push_pr_push() -> Option<String> {
     }
 }
 
-/// Create a GitHub pull request via the `gh` CLI using the last commit subject
-/// as the title. No-ops with a hint when `gh` is not installed.
-fn commit_push_pr_create_pr(branch: String) {
+/// Create a GitHub pull request for an already receipt-bound publication.
+fn commit_push_pr_create_pr(publication: &GitPublicationReceipt) {
     let Ok(mut gh) = gh_command() else {
-        println!("(gh CLI not found — install it to auto-create PRs)");
+        println!(
+            "Push receipt retained for {}/{} at {}; gh CLI is unavailable, so no PR receipt was created.",
+            publication.remote, publication.remote_ref, publication.local.commit_id
+        );
         return;
     };
     let last_msg = git_command()
         .and_then(|mut cmd| {
-            cmd.args(["log", "-1", "--format=%s"])
+            cmd.current_dir(&publication.local.repository_root)
+                .args([
+                    "log",
+                    "-1",
+                    "--format=%s",
+                    publication.local.commit_id.as_str(),
+                ])
                 .output()
                 .map_err(|e| e.to_string())
         })
-        .map_or(branch, |o| {
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        });
+        .map_or_else(
+            |_| publication.local.commit_id.clone(),
+            |o| String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        );
     match gh
+        .current_dir(&publication.local.repository_root)
         .args(["pr", "create", "--title", &last_msg, "--body", ""])
         .output()
     {
@@ -1091,14 +1173,10 @@ fn commit_push_pr_create_pr(branch: String) {
 pub fn slash_commit_push_pr(
     run_context: Option<&openclaudia::tools::ToolRunContext>,
 ) -> SlashCommandResult {
-    // Repo check is performed inside `commit_push_pr_stage_and_commit`
-    // (via the shared commit pipeline, #476). Bailing here would re-shell
-    // out to git for no benefit.
-    if !commit_push_pr_stage_and_commit(run_context) {
-        return SlashCommandResult::Handled;
-    }
-    if let Some(branch) = commit_push_pr_push() {
-        commit_push_pr_create_pr(branch);
+    if let Some(receipt) = commit_push_pr_stage_and_commit(run_context) {
+        if let Some(publication) = commit_push_pr_push(receipt) {
+            commit_push_pr_create_pr(&publication);
+        }
     }
     SlashCommandResult::Handled
 }
@@ -1108,15 +1186,30 @@ pub fn slash_init(run: Option<&openclaudia::tools::ToolRunContext>) {
         println!("\n\u{2717} Initialization is unavailable without a run context.\n");
         return;
     };
-    match openclaudia::tools::initialize_project_for_run(run) {
-        Ok(openclaudia::tools::ProjectInitOutcome::AlreadyExists) => {
-            println!("\n\u{26a0} Configuration already exists at .openclaudia/config.yaml");
-            println!("Use /config to view, or delete the file to reinitialize.\n");
+    let plan = match openclaudia::tools::plan_project_initialization(
+        run,
+        openclaudia::tools::ProjectInitPolicy::RefuseCollisions,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            println!("\n\u{2717} Failed to inspect project initialization: {error}\n");
+            return;
         }
-        Ok(openclaudia::tools::ProjectInitOutcome::Created) => {
+    };
+    println!("\nInitialization preview:");
+    for line in plan.preview_lines() {
+        println!("  {line}");
+    }
+    match openclaudia::tools::commit_project_initialization(run, &plan) {
+        Ok(receipt)
+            if receipt.state() == openclaudia::tools::ProjectInitCommitState::AlreadyCurrent =>
+        {
+            println!("\n\u{26a0} Configuration is already current.\n");
+        }
+        Ok(_) => {
             println!("\n\u{2713} Created .openclaudia/config.yaml");
             println!("\u{2713} Created .openclaudia/skills/");
-            println!("\nEdit .openclaudia/config.yaml to configure providers and API keys.\n");
+            println!("\nEdit .openclaudia/config.yaml to configure provider targets.\n");
         }
         Err(error) => println!("\n\u{2717} Failed to initialize project: {error}\n"),
     }

@@ -19,6 +19,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
+    buffer::CellWidth,
     prelude::*,
     widgets::{Block, Borders, Paragraph},
 };
@@ -629,7 +630,7 @@ struct PendingPermission {
 struct PendingUserQuestion {
     /// Full question set as supplied by the tool call. Each entry has
     /// `question`, `header`, `options[]`, and an optional `multiSelect`.
-    questions: Vec<serde_json::Value>,
+    questions: Vec<crate::tools::ToolQuestion>,
     /// Index of the question currently shown (0-based).
     current_index: usize,
     /// Text the user is typing for the active question. Numeric
@@ -3522,8 +3523,12 @@ impl App {
             }) => {
                 self.cancel_pending_keybinding();
                 self.pending_permission = Some(PendingPermission {
-                    tool_name,
-                    tool_args,
+                    tool_name: super::safety::sanitize_terminal_label(&tool_name).into_string(),
+                    tool_args: super::safety::sanitize_terminal_text(
+                        &tool_args,
+                        super::safety::TextLimits::new(4096, 8192, 64, 4096),
+                    )
+                    .into_string(),
                     reply,
                 });
             }
@@ -3755,7 +3760,15 @@ impl App {
     }
 
     fn append_streaming_for_display(&mut self, text: &str) {
-        self.streaming_raw_text.push_str(text);
+        let stream_limit = super::safety::STREAM_TEXT_LIMITS.max_input_bytes;
+        let already_full = self.streaming_raw_text.len() >= stream_limit;
+        let truncated =
+            super::safety::append_raw_bounded(&mut self.streaming_raw_text, text, stream_limit);
+        if truncated && !already_full {
+            self.messages.add(DisplayMessage::error(format!(
+                "Response display stopped after {stream_limit} bytes; remaining streamed text was omitted"
+            )));
+        }
         // Terminal-vs-tool-bearing output is unknown during streaming. Buffer
         // it until ResponseDone can run the evidence gate; ToolStart discards
         // text from a non-terminal iteration.
@@ -4425,12 +4438,14 @@ impl App {
         match key.code {
             KeyCode::Char(c) => {
                 if let Some(pq) = self.pending_user_question.as_mut() {
-                    pq.input_buffer.push(c);
+                    if pq.input_buffer.len().saturating_add(c.len_utf8()) <= 4096 {
+                        pq.input_buffer.push(c);
+                    }
                 }
             }
             KeyCode::Backspace => {
                 if let Some(pq) = self.pending_user_question.as_mut() {
-                    pq.input_buffer.pop();
+                    super::input::pop_last_grapheme(&mut pq.input_buffer);
                 }
             }
             KeyCode::Enter => self.finalise_current_question(),
@@ -4451,23 +4466,9 @@ impl App {
         let Some(q) = pq.questions.get(pq.current_index).cloned() else {
             return;
         };
-        let question_text = q
-            .get("question")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?")
-            .to_string();
-        let options = q
-            .get("options")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        // Canonicalised key — `ask_user::normalize_question` already
-        // rewrites the legacy `multi_select` to `multiSelect`.
-        let multi_select = q
-            .get("multiSelect")
-            .or_else(|| q.get("multi_select"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        let question_text = q.question;
+        let options = q.options;
+        let multi_select = q.multi_select;
         let other_num = options.len() + 1;
 
         let input = std::mem::take(&mut pq.input_buffer);
@@ -4503,8 +4504,7 @@ impl App {
                 if let Ok(num) = part.parse::<usize>() {
                     if num >= 1 && num <= options.len() {
                         if let Some(opt) = options.get(num - 1) {
-                            let label = opt.get("label").and_then(|v| v.as_str()).unwrap_or("?");
-                            selected.push(serde_json::Value::String(label.to_string()));
+                            selected.push(serde_json::Value::String(opt.label.clone()));
                         }
                     } else if num == other_num {
                         other_pending = true;
@@ -4520,9 +4520,8 @@ impl App {
         } else if let Ok(num) = input.trim().parse::<usize>() {
             if num >= 1 && num <= options.len() {
                 if let Some(opt) = options.get(num - 1) {
-                    let label = opt.get("label").and_then(|v| v.as_str()).unwrap_or("?");
                     pq.answers
-                        .insert(question_text, serde_json::Value::String(label.to_string()));
+                        .insert(question_text, serde_json::Value::String(opt.label.clone()));
                 }
             } else if num == other_num {
                 pq.other_mode = true;
@@ -5957,14 +5956,33 @@ impl App {
         let content = match self.run_context.as_deref() {
             Ok(run) => match run.admit_runtime_mode_direct_operation("initialize project") {
                 Err(error) => error,
-                Ok(()) => match crate::tools::initialize_project_for_run(run) {
-                    Ok(crate::tools::ProjectInitOutcome::Created) => {
-                        "Initialized OpenClaudia configuration in .openclaudia/".to_string()
+                Ok(()) => match crate::tools::plan_project_initialization(
+                    run,
+                    crate::tools::ProjectInitPolicy::RefuseCollisions,
+                ) {
+                    Err(error) => format!("Init failed during preview: {error}"),
+                    Ok(plan) => {
+                        let preview = plan
+                            .preview_lines()
+                            .into_iter()
+                            .map(|line| format!("  {line}"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        match crate::tools::commit_project_initialization(run, &plan) {
+                            Ok(receipt)
+                                if receipt.state()
+                                    == crate::tools::ProjectInitCommitState::AlreadyCurrent =>
+                            {
+                                format!("Initialization preview:\n{preview}\nConfig is already current.")
+                            }
+                            Ok(_) => format!(
+                                "Initialization preview:\n{preview}\nInitialized OpenClaudia configuration in .openclaudia/"
+                            ),
+                            Err(error) => {
+                                format!("Initialization preview:\n{preview}\nInit failed: {error}")
+                            }
+                        }
                     }
-                    Ok(crate::tools::ProjectInitOutcome::AlreadyExists) => {
-                        "Config already exists. Use /doctor to check it.".to_string()
-                    }
-                    Err(error) => format!("Init failed: {error}"),
                 },
             },
             Err(error) => format!("Init failed: no valid run capability: {error}"),
@@ -6610,7 +6628,10 @@ impl App {
         } else {
             "\u{203A} ".to_string()
         };
-        let display_text = format!("{prompt_text}{}", self.input.content.replace('\n', "\n  "));
+        let display_text = format!(
+            "{prompt_text}{}",
+            self.input.rendered_content().replace('\n', "\n  ")
+        );
 
         let input_para = Paragraph::new(display_text)
             .block(input_block)
@@ -6637,12 +6658,15 @@ impl App {
         } else {
             "? for shortcuts".to_string()
         };
+        let left_text = super::safety::sanitize_terminal_label(&left_text).into_string();
         let effort = self.chat_session.effort_level();
         let effort_symbol = effort.symbol();
         let right_text = format!("{effort_symbol} {effort} \u{00B7} /effort");
 
-        let bar_width = chunks[3].width as usize;
-        let content_len = left_text.len() + right_text.len() + 2;
+        let bar_width = usize::from(chunks[3].width);
+        let content_len = usize::from(left_text.cell_width())
+            .saturating_add(usize::from(right_text.cell_width()))
+            .saturating_add(2);
         let padding = bar_width.saturating_sub(content_len);
         let status_text = format!(" {left_text}{}{right_text} ", " ".repeat(padding));
 
@@ -6685,26 +6709,34 @@ impl App {
         let dialog_area = Rect::new(x, y, dialog_width, dialog_height);
         let clear = Paragraph::new("").style(Style::default().bg(Color::Black));
         frame.render_widget(clear, dialog_area);
-        let args_preview = if perm.tool_args.len() > 50 {
-            format!("{}...", crate::tools::safe_truncate(&perm.tool_args, 47))
+        let tool_name = super::safety::sanitize_terminal_label(&perm.tool_name);
+        let args_preview = if perm.tool_args.len() > 512 {
+            format!("{}…", crate::tools::safe_truncate(&perm.tool_args, 509))
         } else {
             perm.tool_args.clone()
         };
+        let args_preview = super::safety::sanitize_terminal_text(
+            &args_preview,
+            super::safety::TextLimits::new(512, 1024, 4, 512),
+        );
         let prompt_text = vec![
             Line::from(Span::styled(
-                format!("  Tool: {}", perm.tool_name),
+                format!("  Tool: {}", tool_name.as_str()),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
-                format!("  Args: {args_preview}"),
+                format!("  Args: {}", args_preview.as_str()),
                 Style::default().fg(Color::DarkGray),
             )),
             Line::from(Span::styled(
                 format!(
                     "  Scope: {}",
-                    crate::tools::permission_scope_summary(&perm.tool_name)
+                    super::safety::sanitize_terminal_label(crate::tools::permission_scope_summary(
+                        &perm.tool_name
+                    ))
+                    .as_str()
                 ),
                 Style::default().fg(Color::DarkGray),
             )),
@@ -6749,22 +6781,12 @@ impl App {
         let Some(q) = pq.questions.get(pq.current_index) else {
             return;
         };
-        let options = q
-            .get("options")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let multi_select = q
-            .get("multiSelect")
-            .or_else(|| q.get("multi_select"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
 
         let area = frame.area();
         // Reserve room for header + question + each option + Other + blank
         // + prompt + status footer (8 + N lines).
         let dialog_width = area.width.min(78);
-        let dialog_height = u16::try_from(options.len() + 8)
+        let dialog_height = u16::try_from(q.options.len() + 8)
             .unwrap_or(u16::MAX)
             .min(area.height.saturating_sub(2));
         let x = (area.width.saturating_sub(dialog_width)) / 2;
@@ -6773,9 +6795,9 @@ impl App {
         // Blank the underlying region.
         frame.render_widget(ratatui::widgets::Clear, dialog_area);
 
-        let lines = build_user_question_lines(pq, q, &options, multi_select);
+        let lines = build_user_question_lines(pq, q);
 
-        let title = if multi_select {
+        let title = if q.multi_select {
             " Ask User (multi-select) "
         } else {
             " Ask User "
@@ -6799,16 +6821,25 @@ impl App {
         };
         let area = super::components::centered_rect(88, 82, frame.area());
         frame.render_widget(ratatui::widgets::Clear, area);
-        let mut body = format!(
-            "Digest: {}\n\n{}",
-            plan.prepared.plan_digest(),
-            plan.prepared.plan_content()
+        let digest = super::safety::sanitize_terminal_label(plan.prepared.plan_digest());
+        let plan_content = super::safety::sanitize_terminal_text(
+            plan.prepared.plan_content(),
+            super::safety::EVENT_TEXT_LIMITS,
         );
+        let mut body = format!("Digest: {}\n\n{}", digest.as_str(), plan_content.as_str());
         if !plan.allowed_prompts.is_empty() {
             body.push_str("\n\nProposed allowed operations:\n");
-            for prompt in &plan.allowed_prompts {
+            for prompt in plan.allowed_prompts.iter().take(64) {
                 use std::fmt::Write as _;
-                let _ = writeln!(body, "- {}: {}", prompt.tool, prompt.prompt);
+                let tool = super::safety::sanitize_terminal_label(&prompt.tool);
+                let prompt = super::safety::sanitize_terminal_text(
+                    &prompt.prompt,
+                    super::safety::TextLimits::new(2048, 4096, 8, 2048),
+                );
+                let _ = writeln!(body, "- {}: {}", tool.as_str(), prompt.as_str());
+            }
+            if plan.allowed_prompts.len() > 64 {
+                body.push_str("… [additional allowed operations omitted]\n");
             }
         }
         let dialog = Paragraph::new(body)
@@ -6859,10 +6890,11 @@ impl App {
         let username = std::env::var("USER")
             .or_else(|_| std::env::var("USERNAME"))
             .unwrap_or_default();
-        let greeting = if username.is_empty() {
+        let username = super::safety::sanitize_terminal_label(&username);
+        let greeting = if username.as_str().is_empty() {
             "Welcome to OpenClaudia!".to_string()
         } else {
-            format!("Welcome back, {username}!")
+            format!("Welcome back, {}!", username.as_str())
         };
         let cwd = self.run_context.as_ref().map_or_else(
             |_| ".".to_string(),
@@ -6877,6 +6909,9 @@ impl App {
             },
         );
 
+        let provider = super::safety::sanitize_terminal_label(&self.provider);
+        let model = super::safety::sanitize_terminal_label(&self.model);
+        let cwd = super::safety::sanitize_terminal_label(&cwd);
         let left = Paragraph::new(vec![
             Line::from(Span::styled(
                 greeting,
@@ -6886,14 +6921,17 @@ impl App {
             )),
             Line::from(""),
             Line::from(Span::styled(
-                format!("Provider: {}", super::capitalize_first(&self.provider)),
+                format!("Provider: {}", super::capitalize_first(provider.as_str())),
                 Style::default().fg(PURPLE),
             )),
             Line::from(Span::styled(
-                format!("Model: {}", self.model),
+                format!("Model: {}", model.as_str()),
                 Style::default().fg(GOLD),
             )),
-            Line::from(Span::styled(cwd, Style::default().fg(Color::DarkGray))),
+            Line::from(Span::styled(
+                cwd.into_string(),
+                Style::default().fg(Color::DarkGray),
+            )),
         ])
         .wrap(Wrap { trim: true });
         frame.render_widget(left, cols[0]);
@@ -7295,29 +7333,29 @@ fn send_api_error(
 /// clippy `too_many_lines` threshold while still rendering the full
 /// REPL-parity option list (question header + numbered options +
 /// synthetic "Other" row + prompt buffer + footer hint).
-fn build_user_question_lines<'a>(
-    pq: &'a PendingUserQuestion,
-    q: &'a serde_json::Value,
-    options: &'a [serde_json::Value],
-    multi_select: bool,
-) -> Vec<Line<'a>> {
-    let question_text = q.get("question").and_then(|v| v.as_str()).unwrap_or("?");
-    let header = q.get("header").and_then(|v| v.as_str()).unwrap_or("");
-    let other_num = options.len() + 1;
+fn build_user_question_lines(
+    pq: &PendingUserQuestion,
+    q: &crate::tools::ToolQuestion,
+) -> Vec<Line<'static>> {
+    let question_text =
+        super::safety::sanitize_terminal_text(&q.question, super::safety::EVENT_TEXT_LIMITS);
+    let header = super::safety::sanitize_terminal_label(&q.header);
+    let other_num = q.options.len() + 1;
 
-    let mut lines: Vec<Line<'a>> = Vec::with_capacity(options.len() + 8);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(q.options.len() + 8);
 
     // Question header line.
-    let header_span = if header.is_empty() {
+    let header_span = if header.as_str().is_empty() {
         String::new()
     } else {
-        format!("[{header}] ")
+        format!("[{}] ", header.as_str())
     };
     lines.push(Line::from(Span::styled(
         format!(
-            "  Question {}/{}: {header_span}{question_text}",
+            "  Question {}/{}: {header_span}{}",
             pq.current_index + 1,
-            pq.questions.len()
+            pq.questions.len(),
+            question_text.as_str()
         ),
         Style::default()
             .fg(Color::White)
@@ -7326,12 +7364,12 @@ fn build_user_question_lines<'a>(
     lines.push(Line::from(""));
 
     // Numbered options.
-    for (i, opt) in options.iter().enumerate() {
-        let label = opt.get("label").and_then(|v| v.as_str()).unwrap_or("?");
-        let desc = opt
-            .get("description")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+    for (i, opt) in q.options.iter().enumerate() {
+        let label = super::safety::sanitize_terminal_label(&opt.label);
+        let desc = super::safety::sanitize_terminal_text(
+            &opt.description,
+            super::safety::EVENT_TEXT_LIMITS,
+        );
         lines.push(Line::from(vec![
             Span::styled(
                 format!("  [{}] ", i + 1),
@@ -7339,8 +7377,8 @@ fn build_user_question_lines<'a>(
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(format!("{label}  ")),
-            Span::styled(desc.to_string(), Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{}  ", label.as_str())),
+            Span::styled(desc.into_string(), Style::default().fg(Color::DarkGray)),
         ]));
     }
 
@@ -7363,7 +7401,7 @@ fn build_user_question_lines<'a>(
     // Prompt line — show what the user is typing right now.
     let prompt_label = if pq.other_mode {
         "  Your answer: "
-    } else if multi_select {
+    } else if q.multi_select {
         "  > (comma-separated numbers) "
     } else {
         "  > "
@@ -7375,7 +7413,13 @@ fn build_user_question_lines<'a>(
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(pq.input_buffer.clone()),
+        Span::raw(
+            super::safety::sanitize_terminal_text(
+                &pq.input_buffer,
+                super::safety::EVENT_TEXT_LIMITS,
+            )
+            .into_string(),
+        ),
         Span::styled("_", Style::default().fg(Color::Green)),
     ]));
 

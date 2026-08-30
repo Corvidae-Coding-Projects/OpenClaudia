@@ -3205,16 +3205,18 @@ fn init_refuses_overwrite_unless_force_and_creates_documented_tree() {
     );
 
     let config_dir = cwd.path().join(".openclaudia");
-    for path in ["config.yaml", "hooks/session-start.py", "plugins"] {
+    for path in ["config.yaml", "skills"] {
         assert!(
             config_dir.join(path).exists(),
             "init should create documented path .openclaudia/{path}"
         );
     }
-    assert!(
-        !config_dir.join("rules").exists(),
-        "init must not recreate the removed repository rule-injector path"
-    );
+    for absent in ["hooks", "rules", "plugins"] {
+        assert!(
+            !config_dir.join(absent).exists(),
+            "init must not create authority-bearing or unsupported path .openclaudia/{absent}"
+        );
+    }
 
     fs::write(config_dir.join("config.yaml"), "sentinel: true\n").expect("replace config");
     let output = isolated_command(&cwd, &home)
@@ -3254,9 +3256,10 @@ fn init_refuses_overwrite_unless_force_and_creates_documented_tree() {
     );
     let config = fs::read_to_string(config_dir.join("config.yaml"))
         .expect("forced init should write config");
-    assert!(
-        config.contains("OpenClaudia Configuration") && !config.contains("sentinel"),
-        "init --force must replace the previous config contents"
+    assert_eq!(
+        config,
+        openclaudia::tools::DEFAULT_PROJECT_CONFIG,
+        "init --force must install the exact schema-valid inert configuration"
     );
 
     let output = isolated_command(&cwd, &home)
@@ -3358,14 +3361,15 @@ fn init_force_replaces_broken_config_symlink_with_project_file() {
         "forced init should replace the symlink with a regular project file"
     );
     let config = fs::read_to_string(&config_path).expect("config should be readable");
-    assert!(
-        config.contains("OpenClaudia Configuration"),
-        "forced init should write the default config template"
+    assert_eq!(
+        config,
+        openclaudia::tools::DEFAULT_PROJECT_CONFIG,
+        "forced init should write the exact default configuration"
     );
 }
 
 #[test]
-fn init_template_marks_keybindings_as_legacy_repl_specific() {
+fn init_template_is_schema_valid_and_inert() {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
     let output = isolated_command(&cwd, &home)
@@ -3382,56 +3386,17 @@ fn init_template_marks_keybindings_as_legacy_repl_specific() {
 
     let config = fs::read_to_string(cwd.path().join(".openclaudia/config.yaml"))
         .expect("init should write config.yaml");
-    assert!(
-        config.contains("https://github.com/dollspace-gay/OpenClaudia"),
-        "init template must point at the real upstream repository"
-    );
-    assert!(
-        !config.contains("github.com/yourusername/openclaudia"),
-        "init template must not contain placeholder repository URLs"
-    );
-    for model in [
-        "claude-opus-4-7",
-        "gpt-5.5",
-        "gemini-3.5-flash",
-        "gemini-3.1-pro-preview-customtools",
-        "MiniMax-M3",
-    ] {
+    assert_eq!(config, openclaudia::tools::DEFAULT_PROJECT_CONFIG);
+    serde_yaml::from_str::<openclaudia::config::AppConfig>(&config)
+        .expect("init must emit configuration accepted by the current schema");
+    let document: serde_yaml::Value =
+        serde_yaml::from_str(&config).expect("init must emit valid YAML");
+    for forbidden in ["hooks", "rules", "plugins", "credentials", "keybindings"] {
         assert!(
-            config.contains(model),
-            "init template should advertise representative current model {model}"
+            document.get(forbidden).is_none(),
+            "minimal init configuration must not grant {forbidden} authority"
         );
     }
-    for provider in openclaudia::providers::SUPPORTED_PROVIDERS {
-        assert!(
-            config.contains(provider),
-            "init template provider inventory must mention supported target {provider}"
-        );
-    }
-    for provider in [
-        "ollama:",
-        "local:",
-        "lmstudio:",
-        "localai:",
-        "text-generation-webui:",
-    ] {
-        assert!(
-            config.contains(provider),
-            "init template must include advertised local provider {provider}"
-        );
-    }
-    assert!(
-        config.contains("Legacy line REPL keybindings (`openclaudia --tui-mode`)"),
-        "init template must label keybindings as legacy REPL-specific"
-    );
-    assert!(
-        config.contains("uses its built-in shortcuts; type /help there to view them"),
-        "init template must point default-TUI users at /help"
-    );
-    assert!(
-        !config.contains("# Keyboard shortcuts - map key combinations to actions"),
-        "init template must not imply keybindings customize the default TUI"
-    );
 }
 
 #[test]

@@ -12,6 +12,7 @@ pub mod components;
 pub mod events;
 pub mod input;
 pub mod messages;
+pub mod safety;
 mod supervision;
 
 use crossterm::{
@@ -30,6 +31,11 @@ use ratatui::{
 };
 use std::io::{self, stdout, Write};
 use std::path::PathBuf;
+
+use self::safety::{
+    append_raw_bounded, sanitize_terminal_label, sanitize_terminal_text, EVENT_TEXT_LIMITS,
+    MARKDOWN_TEXT_LIMITS, RENDER_TRUNCATION_MARKER,
+};
 
 /// Maximum accumulated fenced-code source reparsed for contextual highlighting.
 ///
@@ -84,6 +90,13 @@ impl CodeHighlighter {
             self.disabled = true;
             return None;
         }
+        let line = sanitize_terminal_text(line, safety::TextLimits::new(4096, 6144, 1, 4096));
+        if line.was_truncated() {
+            self.source.clear();
+            self.disabled = true;
+            return None;
+        }
+        let line = line.as_str();
         let separator_bytes = usize::from(!self.source.is_empty());
         let next_size = self
             .source
@@ -343,12 +356,13 @@ pub fn render_markdown(text: &str) {
 
 /// Render markdown with a specific theme
 pub fn render_markdown_themed(text: &str, theme: &Theme) {
+    let text = sanitize_terminal_text(text, MARKDOWN_TEXT_LIMITS);
     let mut stdout = io::stdout();
     let mut in_code_block = false;
     let mut code_lang = String::new();
     let mut highlighter: Option<CodeHighlighter> = None;
 
-    for line in text.lines() {
+    for line in text.as_str().lines() {
         if line.starts_with("```") {
             if in_code_block {
                 // End code block
@@ -425,6 +439,7 @@ pub fn render_markdown_themed(text: &str, theme: &Theme) {
         // Horizontal rule
         if line.trim() == "---" || line.trim() == "***" || line.trim() == "___" {
             let (cols, _) = terminal::size().unwrap_or((80, 24));
+            let cols = cols.clamp(1, MAX_STREAMING_MARKDOWN_COLUMNS);
             let _ = stdout.execute(SetForegroundColor(CtColor::DarkGrey));
             println!("{}", "\u{2500}".repeat(cols as usize));
             let _ = stdout.execute(ResetColor);
@@ -489,11 +504,18 @@ fn render_inline_to<W: io::Write>(writer: &mut W, text: &str, theme: &Theme) -> 
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
     let mut i = 0;
+    let mut scan_budget = InlineScanBudget::new(len.saturating_mul(4).max(1));
 
     while i < len {
+        if scan_budget.exhausted() {
+            for character in &chars[i..] {
+                write!(writer, "{character}")?;
+            }
+            break;
+        }
         // Bold: **text**
         if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*' {
-            if let Some(end) = find_closing(&chars, i + 2, "**") {
+            if let Some(end) = find_closing_bounded(&chars, i + 2, "**", &mut scan_budget) {
                 writer.execute(SetAttribute(Attribute::Bold))?;
                 let inner: String = chars[i + 2..end].iter().collect();
                 write!(writer, "{inner}")?;
@@ -505,7 +527,7 @@ fn render_inline_to<W: io::Write>(writer: &mut W, text: &str, theme: &Theme) -> 
 
         // Italic: *text* (but not **)
         if chars[i] == '*' && (i + 1 >= len || chars[i + 1] != '*') {
-            if let Some(end) = find_closing_char(&chars, i + 1, '*') {
+            if let Some(end) = find_closing_char_bounded(&chars, i + 1, '*', &mut scan_budget) {
                 writer.execute(SetAttribute(Attribute::Italic))?;
                 let inner: String = chars[i + 1..end].iter().collect();
                 write!(writer, "{inner}")?;
@@ -517,7 +539,7 @@ fn render_inline_to<W: io::Write>(writer: &mut W, text: &str, theme: &Theme) -> 
 
         // Inline code: `text`
         if chars[i] == '`' {
-            if let Some(end) = find_closing_char(&chars, i + 1, '`') {
+            if let Some(end) = find_closing_char_bounded(&chars, i + 1, '`', &mut scan_budget) {
                 writer.execute(SetForegroundColor(theme.code_color))?;
                 let inner: String = chars[i + 1..end].iter().collect();
                 write!(writer, "{inner}")?;
@@ -529,7 +551,8 @@ fn render_inline_to<W: io::Write>(writer: &mut W, text: &str, theme: &Theme) -> 
 
         // Link: [text](url)
         if chars[i] == '[' {
-            if let Some((link_text, url, end_pos)) = parse_link(&chars, i) {
+            if let Some((link_text, url, end_pos)) = parse_link_bounded(&chars, i, &mut scan_budget)
+            {
                 writer.execute(SetAttribute(Attribute::Underlined))?;
                 write!(writer, "{link_text}")?;
                 writer.execute(SetAttribute(Attribute::NoUnderline))?;
@@ -548,7 +571,83 @@ fn render_inline_to<W: io::Write>(writer: &mut W, text: &str, theme: &Theme) -> 
     Ok(())
 }
 
+struct InlineScanBudget {
+    remaining: usize,
+}
+
+impl InlineScanBudget {
+    const fn new(remaining: usize) -> Self {
+        Self { remaining }
+    }
+
+    const fn exhausted(&self) -> bool {
+        self.remaining == 0
+    }
+
+    const fn observe(&mut self) -> bool {
+        if self.remaining == 0 {
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+}
+
+fn find_closing_bounded(
+    chars: &[char],
+    start: usize,
+    delim: &str,
+    budget: &mut InlineScanBudget,
+) -> Option<usize> {
+    let delim_chars: Vec<char> = delim.chars().collect();
+    let dlen = delim_chars.len();
+    if dlen == 0 {
+        return None;
+    }
+    let mut i = start;
+    while i + dlen <= chars.len() && budget.observe() {
+        if chars[i..i + dlen] == delim_chars[..] {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+const fn find_closing_char_bounded(
+    chars: &[char],
+    start: usize,
+    delim: char,
+    budget: &mut InlineScanBudget,
+) -> Option<usize> {
+    let mut i = start;
+    while i < chars.len() && budget.observe() {
+        if chars[i] == delim {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_link_bounded(
+    chars: &[char],
+    start: usize,
+    budget: &mut InlineScanBudget,
+) -> Option<(String, String, usize)> {
+    let text_end = find_closing_char_bounded(chars, start + 1, ']', budget)?;
+    let paren_start = text_end + 1;
+    if paren_start >= chars.len() || chars[paren_start] != '(' {
+        return None;
+    }
+    let url_end = find_closing_char_bounded(chars, paren_start + 1, ')', budget)?;
+    let link_text = chars[start + 1..text_end].iter().collect();
+    let url = chars[paren_start + 1..url_end].iter().collect();
+    Some((link_text, url, url_end + 1))
+}
+
 /// Find closing delimiter in char slice (e.g., "**")
+#[cfg(test)]
 fn find_closing(chars: &[char], start: usize, delim: &str) -> Option<usize> {
     let delim_chars: Vec<char> = delim.chars().collect();
     let dlen = delim_chars.len();
@@ -566,11 +665,13 @@ fn find_closing(chars: &[char], start: usize, delim: &str) -> Option<usize> {
 }
 
 /// Find closing single character delimiter
+#[cfg(test)]
 fn find_closing_char(chars: &[char], start: usize, delim: char) -> Option<usize> {
     (start..chars.len()).find(|&i| chars[i] == delim)
 }
 
 /// Parse a markdown link [text](url) starting at position i ('[')
+#[cfg(test)]
 fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
     // Find closing ']'
     let text_end = find_closing_char(chars, start + 1, ']')?;
@@ -623,6 +724,9 @@ fn strip_ordered_list_prefix(s: &str) -> Option<&str> {
 /// Uses `·` separator matching Claude Code's byline style.
 pub fn draw_status_bar(model: &str, tokens: usize, cost: Option<f64>, mode: &str, duration: &str) {
     let mut stdout = io::stdout();
+    let model = sanitize_terminal_label(model);
+    let mode = sanitize_terminal_label(mode);
+    let duration = sanitize_terminal_label(duration);
 
     let cost_str = match cost {
         Some(c) if c >= 0.01 => format!("${c:.2}"),
@@ -641,13 +745,13 @@ pub fn draw_status_bar(model: &str, tokens: usize, cost: Option<f64>, mode: &str
 
     // Build parts with · separator (Claude Code style)
     let sep = " \u{00B7} ";
-    let mut parts = vec![model.to_string()];
+    let mut parts = vec![model.into_string()];
     if !cost_str.is_empty() {
         parts.push(cost_str);
     }
     parts.push(format!("In: {token_str}"));
-    parts.push(mode.to_string());
-    parts.push(duration.to_string());
+    parts.push(mode.into_string());
+    parts.push(duration.into_string());
 
     let status = parts.join(sep);
 
@@ -674,6 +778,9 @@ pub struct StreamingMarkdownRenderer {
     code_lang: String,
     /// Syntax highlighter for the current code block
     highlighter: Option<CodeHighlighter>,
+    /// The current physical line exceeded its pre-parse byte ceiling; bytes
+    /// are discarded until the next newline.
+    line_truncated: bool,
     /// The theme to use for rendering
     theme: Theme,
 }
@@ -692,6 +799,7 @@ pub struct MarkdownRenderState {
     line_buffer: String,
     in_code_block: bool,
     code_lang: String,
+    line_truncated: bool,
     theme: Theme,
 }
 
@@ -713,6 +821,7 @@ impl StreamingMarkdownRenderer {
             in_code_block: false,
             code_lang: String::new(),
             highlighter: None,
+            line_truncated: false,
             theme,
         }
     }
@@ -728,6 +837,7 @@ impl StreamingMarkdownRenderer {
             line_buffer: self.line_buffer,
             in_code_block: self.in_code_block,
             code_lang: self.code_lang,
+            line_truncated: self.line_truncated,
             theme: self.theme,
         }
     }
@@ -748,6 +858,7 @@ impl StreamingMarkdownRenderer {
             in_code_block: state.in_code_block,
             code_lang: state.code_lang,
             highlighter,
+            line_truncated: state.line_truncated,
             theme: state.theme,
         }
     }
@@ -775,14 +886,25 @@ impl StreamingMarkdownRenderer {
         writer: &mut W,
         terminal_columns: u16,
     ) -> io::Result<()> {
-        self.line_buffer.push_str(text);
-
-        // Render all complete lines
-        while let Some(newline_pos) = self.line_buffer.find('\n') {
-            let line = self.line_buffer[..newline_pos].to_string();
-            self.line_buffer = self.line_buffer[newline_pos + 1..].to_string();
-            self.render_line_to(&line, writer, terminal_columns)?;
-            writeln!(writer)?;
+        const MAX_STREAMING_LINE_BYTES: usize = 4096;
+        let admitted = sanitize_terminal_text(text, EVENT_TEXT_LIMITS);
+        for segment in admitted.as_str().split_inclusive('\n') {
+            let complete = segment.ends_with('\n');
+            let fragment = segment.strip_suffix('\n').unwrap_or(segment);
+            if !self.line_truncated {
+                let content_limit =
+                    MAX_STREAMING_LINE_BYTES.saturating_sub(RENDER_TRUNCATION_MARKER.len());
+                if append_raw_bounded(&mut self.line_buffer, fragment, content_limit) {
+                    self.line_buffer.push_str(RENDER_TRUNCATION_MARKER);
+                    self.line_truncated = true;
+                }
+            }
+            if complete {
+                let line = std::mem::take(&mut self.line_buffer);
+                self.line_truncated = false;
+                self.render_line_to(&line, writer, terminal_columns)?;
+                writeln!(writer)?;
+            }
         }
 
         // Flush stdout after each push so partial output appears immediately
@@ -939,11 +1061,12 @@ impl Default for StreamingMarkdownRenderer {
 
 /// Print a thinking/reasoning chunk in dim styling (indented under the header)
 pub fn print_thinking_chunk(text: &str) {
+    let text = sanitize_terminal_text(text, EVENT_TEXT_LIMITS);
     let mut stdout = io::stdout();
     let _ = stdout.execute(SetAttribute(Attribute::Dim));
     let _ = stdout.execute(SetAttribute(Attribute::Italic));
     let _ = stdout.execute(SetForegroundColor(CtColor::DarkGrey));
-    print!("{text}");
+    print!("{}", text.as_str());
     let _ = stdout.execute(SetAttribute(Attribute::Reset));
     let _ = stdout.execute(ResetColor);
     stdout.flush().ok();
@@ -1076,12 +1199,21 @@ impl WelcomeScreen {
         let area = Rect::new(x_offset, 0, box_width, box_height);
 
         // Version in the box title (purple branding)
+        let version = sanitize_terminal_label(&self.version);
+        let provider = sanitize_terminal_label(&self.provider);
+        let model = sanitize_terminal_label(&self.model);
+        let working_dir = sanitize_terminal_label(&self.working_dir);
+        let username = self
+            .username
+            .as_deref()
+            .map(sanitize_terminal_label)
+            .map(safety::SanitizedText::into_string);
         let title = Line::from(vec![
             Span::styled(
                 "OpenClaudia",
                 Style::default().fg(PURPLE).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!(" v{}", self.version), Style::default().fg(GOLD)),
+            Span::styled(format!(" v{}", version.as_str()), Style::default().fg(GOLD)),
         ]);
 
         let block = Block::default()
@@ -1100,7 +1232,7 @@ impl WelcomeScreen {
         frame.render_widget(block, area);
 
         // Left column content
-        let greeting = self.username.as_ref().map_or_else(
+        let greeting = username.as_ref().map_or_else(
             || "Welcome to OpenClaudia!".to_string(),
             |name| format!("Welcome back, {name}!"),
         );
@@ -1114,14 +1246,17 @@ impl WelcomeScreen {
             )),
             Line::from(""),
             Line::from(Span::styled(
-                format!("Provider: {}", capitalize_first(&self.provider)),
+                format!("Provider: {}", capitalize_first(provider.as_str())),
                 Style::default().fg(PURPLE),
             )),
             Line::from(Span::styled(
-                format!("Model: {}", self.model),
+                format!("Model: {}", model.as_str()),
                 Style::default().fg(GOLD),
             )),
-            Line::from(Span::styled(&self.working_dir, Style::default().fg(DIM))),
+            Line::from(Span::styled(
+                working_dir.into_string(),
+                Style::default().fg(DIM),
+            )),
         ];
         let left_para = Paragraph::new(left_text).wrap(Wrap { trim: true });
         frame.render_widget(left_para, chunks[0]);
@@ -1192,6 +1327,7 @@ pub fn teardown_pinned_bar() -> io::Result<()> {
 ///
 /// Returns an error if terminal operations fail.
 pub fn redraw_pinned_bar(effort: &str) -> io::Result<()> {
+    let effort = sanitize_terminal_label(effort);
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
     let bar_row = rows.saturating_sub(PINNED_ROWS) + 1;
     if bar_row < 3 {
@@ -1218,7 +1354,7 @@ pub fn redraw_pinned_bar(effort: &str) -> io::Result<()> {
     let status_row = bar_row + 1;
     write!(stdout, "\x1b[{status_row};1H")?;
     let left = "? for shortcuts";
-    let right = format!("\u{25CF} {effort} \u{00B7} /effort");
+    let right = format!("\u{25CF} {} \u{00B7} /effort", effort.as_str());
     let total = left.len() + right.len();
     let pad = if cols as usize > total {
         " ".repeat(cols as usize - total)
@@ -1340,10 +1476,11 @@ pub fn print_role_header(role: &str) {
             },
         ),
     };
+    let role = sanitize_terminal_label(role);
     let mut out = stdout();
     let _ = out.execute(SetForegroundColor(color));
     let _ = out.execute(SetAttribute(Attribute::Bold));
-    let _ = out.execute(Print(format!("{icon} {role}")));
+    let _ = out.execute(Print(format!("{icon} {}", role.as_str())));
     let _ = out.execute(SetAttribute(Attribute::Reset));
     let _ = out.execute(ResetColor);
     let _ = out.execute(Print("\n"));
@@ -1351,14 +1488,16 @@ pub fn print_role_header(role: &str) {
 
 /// Print a tool execution start indicator (matches Claude Code's ● symbol).
 pub fn print_tool_start(tool_name: &str, description: &str) {
+    let tool_name = sanitize_terminal_label(tool_name);
+    let description = sanitize_terminal_text(description, EVENT_TEXT_LIMITS);
     let mut out = stdout();
     let _ = out.execute(SetForegroundColor(CtColor::Cyan));
     let _ = out.execute(SetAttribute(Attribute::Bold));
-    let _ = out.execute(Print(format!("\n  \u{25CF} {tool_name}")));
+    let _ = out.execute(Print(format!("\n  \u{25CF} {}", tool_name.as_str())));
     let _ = out.execute(SetAttribute(Attribute::Reset));
-    if !description.is_empty() {
+    if !description.as_str().is_empty() {
         let _ = out.execute(SetForegroundColor(CtColor::DarkGrey));
-        let _ = out.execute(Print(format!(" ({description})")));
+        let _ = out.execute(Print(format!(" ({})", description.as_str())));
     }
     let _ = out.execute(ResetColor);
     let _ = out.execute(Print("\n"));
@@ -1366,14 +1505,15 @@ pub fn print_tool_start(tool_name: &str, description: &str) {
 
 /// Print tool completion status with duration.
 pub fn print_tool_done(tool_name: &str, success: bool, duration_ms: u64) {
+    let tool_name = sanitize_terminal_label(tool_name);
     let mut out = stdout();
     let _ = out.execute(Print("  "));
     if success {
         let _ = out.execute(SetForegroundColor(CtColor::Green));
-        let _ = out.execute(Print(format!("\u{2713} {tool_name}")));
+        let _ = out.execute(Print(format!("\u{2713} {}", tool_name.as_str())));
     } else {
         let _ = out.execute(SetForegroundColor(CtColor::Red));
-        let _ = out.execute(Print(format!("\u{2717} {tool_name}")));
+        let _ = out.execute(Print(format!("\u{2717} {}", tool_name.as_str())));
     }
     if duration_ms > 0 {
         let _ = out.execute(SetForegroundColor(CtColor::DarkGrey));
@@ -1421,6 +1561,10 @@ pub fn print_context_usage(used_tokens: usize, max_tokens: usize) {
 
 /// Print a clean welcome banner (inline fallback, no ratatui).
 pub fn print_welcome_banner(version: &str, provider: &str, model: &str, auth_method: &str) {
+    let version = sanitize_terminal_label(version);
+    let provider = sanitize_terminal_label(provider);
+    let model = sanitize_terminal_label(model);
+    let auth_method = sanitize_terminal_label(auth_method);
     let mut out = stdout();
     // Purple branding header
     let _ = out.execute(SetForegroundColor(CtColor::Rgb {
@@ -1429,14 +1573,17 @@ pub fn print_welcome_banner(version: &str, provider: &str, model: &str, auth_met
         b: 219,
     }));
     let _ = out.execute(SetAttribute(Attribute::Bold));
-    let _ = out.execute(Print(format!("  OpenClaudia v{version}")));
+    let _ = out.execute(Print(format!("  OpenClaudia v{}", version.as_str())));
     let _ = out.execute(SetAttribute(Attribute::Reset));
     let _ = out.execute(ResetColor);
     let _ = out.execute(Print("\n"));
     // Provider and model on next line
     let _ = out.execute(SetForegroundColor(CtColor::DarkGrey));
     let _ = out.execute(Print(format!(
-        "  {provider} \u{00B7} {model} \u{00B7} {auth_method}\n\n"
+        "  {} \u{00B7} {} \u{00B7} {}\n\n",
+        provider.as_str(),
+        model.as_str(),
+        auth_method.as_str()
     )));
     let _ = out.execute(ResetColor);
 }

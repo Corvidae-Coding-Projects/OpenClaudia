@@ -360,6 +360,9 @@ async fn print_sse_response(
     let mut state = PrintSseState::new(provider);
     let mut emitted_text = false;
     let mut full_text = String::new();
+    let mut response_text_truncated = false;
+    let mut live_display_bytes = 0usize;
+    let mut live_display_truncated = false;
 
     while let Some(event) = stream.next().await {
         let event = event.map_err(|err| anyhow::anyhow!("SSE stream error: {err}"))?;
@@ -372,9 +375,29 @@ async fn print_sse_response(
         state.terminal.observe(&json).map_err(anyhow::Error::msg)?;
         if let Some(text) = extract_print_sse_text(&json, &mut state) {
             emitted_text |= !text.is_empty();
-            full_text.push_str(&text);
-            if emit_live {
-                print!("{text}");
+            response_text_truncated |= openclaudia::tui::safety::append_raw_bounded(
+                &mut full_text,
+                &text,
+                openclaudia::tui::safety::STREAM_TEXT_LIMITS.max_input_bytes,
+            );
+            if emit_live && !live_display_truncated {
+                let remaining = openclaudia::tui::safety::STREAM_TEXT_LIMITS
+                    .max_output_bytes
+                    .saturating_sub(live_display_bytes);
+                let display = openclaudia::tui::safety::sanitize_terminal_text(
+                    &text,
+                    openclaudia::tui::safety::TextLimits::new(
+                        remaining,
+                        remaining,
+                        openclaudia::tui::safety::STREAM_TEXT_LIMITS.max_lines,
+                        openclaudia::tui::safety::STREAM_TEXT_LIMITS.max_line_bytes,
+                    ),
+                );
+                print!("{}", display.as_str());
+                live_display_bytes = live_display_bytes.saturating_add(display.as_str().len());
+                live_display_truncated = display.was_truncated()
+                    || live_display_bytes
+                        >= openclaudia::tui::safety::STREAM_TEXT_LIMITS.max_output_bytes;
                 std::io::stdout().flush()?;
             }
         }
@@ -399,6 +422,13 @@ async fn print_sse_response(
     }
     openclaudia::pipeline::ensure_provider_turn_succeeded(terminal, tool_call_count)
         .map_err(anyhow::Error::msg)?;
+
+    if response_text_truncated {
+        anyhow::bail!(
+            "provider assistant text exceeded the {}-byte print rendering limit",
+            openclaudia::tui::safety::STREAM_TEXT_LIMITS.max_input_bytes
+        );
+    }
 
     if !emitted_text {
         anyhow::bail!("provider stream did not contain printable assistant text");
@@ -483,7 +513,11 @@ async fn finalize_print_candidate(
     )
     .await
     .map_err(anyhow::Error::msg)?;
-    println!("{content}");
+    let content = openclaudia::tui::safety::sanitize_terminal_text(
+        &content,
+        openclaudia::tui::safety::MARKDOWN_TEXT_LIMITS,
+    );
+    println!("{}", content.as_str());
     Ok(())
 }
 

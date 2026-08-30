@@ -3045,7 +3045,9 @@ impl ChatRepl {
                 tools::ToolRetryability::Safe,
             ));
         }
-        display_tool_result(&final_result);
+        if let Err(error) = display_tool_result(&final_result) {
+            tracing::warn!(%error, "terminal tool-result rendering failed");
+        }
         push_observed_cli_typed_tool_result_message(
             &self.run_context,
             &mut self.chat_session,
@@ -3651,7 +3653,9 @@ impl ChatRepl {
                 tools::ToolRetryability::Safe,
             ));
         }
-        display_tool_result(&final_result);
+        if let Err(error) = display_tool_result(&final_result) {
+            tracing::warn!(%error, "terminal tool-result rendering failed");
+        }
         push_observed_cli_typed_tool_result_message(
             &self.run_context,
             &mut self.chat_session,
@@ -4327,7 +4331,9 @@ impl ChatRepl {
                 tools::ToolRetryability::Safe,
             ));
         }
-        display_tool_result(&final_result);
+        if let Err(error) = display_tool_result(&final_result) {
+            tracing::warn!(%error, "terminal tool-result rendering failed");
+        }
         push_observed_cli_typed_tool_result_message(
             &self.run_context,
             &mut self.chat_session,

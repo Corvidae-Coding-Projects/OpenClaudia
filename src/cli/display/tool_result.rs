@@ -4,24 +4,31 @@
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
 use crossterm::ExecutableCommand;
 use openclaudia::tools::{ToolDisplay, ToolResult};
+use openclaudia::tui::safety::{
+    sanitize_terminal_label, sanitize_terminal_text, EVENT_TEXT_LIMITS,
+};
 use std::io;
 
 use super::diff;
 
 /// Display a tool result in the terminal with per-tool formatting.
-pub fn display_tool_result(result: &ToolResult) {
+///
+/// # Errors
+///
+/// Returns the first terminal write error.
+pub fn display_tool_result(result: &ToolResult) -> io::Result<()> {
     let mut stdout = io::stdout();
     let content = result.content();
 
     if matches!(result.display(), ToolDisplay::Hidden) || content.is_empty() {
-        return;
+        return Ok(());
     }
 
     if result.is_error() {
-        let _ = stdout.execute(SetForegroundColor(Color::Red));
-        print_limited(&mut stdout, content, 30);
-        let _ = stdout.execute(ResetColor);
-        return;
+        stdout.execute(SetForegroundColor(Color::Red))?;
+        print_limited(&mut stdout, content, 30)?;
+        stdout.execute(ResetColor)?;
+        return Ok(());
     }
 
     if let ToolDisplay::Diff {
@@ -29,13 +36,14 @@ pub fn display_tool_result(result: &ToolResult) {
         diff: data,
     } = result.display()
     {
-        diff::render_color_diff(&data.path, &data.old_text, &data.new_text);
+        diff::render_color_diff(&data.path, &data.old_text, &data.new_text)?;
         if !summary.trim().is_empty() {
-            let _ = stdout.execute(SetForegroundColor(Color::Green));
-            let _ = stdout.execute(Print(format!("    {}\n", summary.trim())));
-            let _ = stdout.execute(ResetColor);
+            let summary = sanitize_terminal_text(summary.trim(), EVENT_TEXT_LIMITS);
+            stdout.execute(SetForegroundColor(Color::Green))?;
+            stdout.execute(Print(format!("    {}\n", summary.as_str())))?;
+            stdout.execute(ResetColor)?;
         }
-        return;
+        return Ok(());
     }
 
     let max_lines = match result.display() {
@@ -49,28 +57,28 @@ pub fn display_tool_result(result: &ToolResult) {
             }
         }
     };
-    let color = match result.handler() {
+    let handler = sanitize_terminal_label(result.handler());
+    let color = match handler.as_str() {
         "write_file" | "edit_file" => Color::Green,
         "bash" | "bash_output" => Color::White,
         _ => Color::DarkGrey,
     };
 
-    let _ = stdout.execute(SetForegroundColor(color));
-    print_limited(&mut stdout, content, max_lines);
-    let _ = stdout.execute(ResetColor);
+    stdout.execute(SetForegroundColor(color))?;
+    print_limited(&mut stdout, content, max_lines)?;
+    stdout.execute(ResetColor)?;
+    Ok(())
 }
 
-fn print_limited(stdout: &mut io::Stdout, content: &str, max_lines: usize) {
-    let lines: Vec<&str> = content.lines().collect();
-    let show = max_lines.min(lines.len());
-    for line in &lines[..show] {
-        let _ = stdout.execute(Print(format!("    {line}\n")));
+fn print_limited(stdout: &mut io::Stdout, content: &str, max_lines: usize) -> io::Result<()> {
+    let content = sanitize_terminal_text(content, EVENT_TEXT_LIMITS);
+    let mut lines = content.as_str().lines();
+    for line in lines.by_ref().take(max_lines) {
+        stdout.execute(Print(format!("    {line}\n")))?;
     }
-    if lines.len() > show {
-        let _ = stdout.execute(SetForegroundColor(Color::DarkGrey));
-        let _ = stdout.execute(Print(format!(
-            "    ... ({} more lines)\n",
-            lines.len() - show
-        )));
+    if lines.next().is_some() || content.was_truncated() {
+        stdout.execute(SetForegroundColor(Color::DarkGrey))?;
+        stdout.execute(Print("    … (additional output omitted)\n"))?;
     }
+    Ok(())
 }

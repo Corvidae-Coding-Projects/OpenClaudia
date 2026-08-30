@@ -64,6 +64,8 @@ pub enum SandboxProfile {
     DocumentParser,
     McpStdio,
     McpHeaderHelper,
+    GitReview,
+    GitCommit,
     GitWorktree,
 }
 
@@ -149,6 +151,13 @@ impl SandboxProfile {
                 permits_explicit_environment: true,
                 permits_project_path: false,
                 permits_child_processes: true,
+            },
+            Self::GitReview | Self::GitCommit => SandboxProfilePolicy {
+                workspace: WorkspaceMountPolicy::ProjectReadOnly,
+                environment: EnvironmentPolicy::Empty,
+                permits_explicit_environment: true,
+                permits_project_path: false,
+                permits_child_processes: false,
             },
             Self::GitWorktree => SandboxProfilePolicy {
                 workspace: WorkspaceMountPolicy::ProjectRunBound,
@@ -765,6 +774,19 @@ fn linux_bubblewrap_command(
     // the sandbox exits, or read transcripts and local agent state.
     if policy.workspace == WorkspaceMountPolicy::ScratchOnly {
         // The project is absent from this namespace.
+    } else if matches!(profile, SandboxProfile::GitCommit) {
+        expose_repository_metadata_for_git_commit(
+            &mut cmd,
+            &mut made_dirs,
+            &mut metadata_bind_fds,
+            project_root,
+        )?;
+        tracing::info!(
+            target: "openclaudia::sandbox",
+            event = "git_commit_metadata_grant",
+            session_id = security.session_id(),
+            "Git commit profile received validated metadata-only write access"
+        );
     } else if matches!(profile, SandboxProfile::GitWorktree) {
         tracing::info!(
             target: "openclaudia::sandbox",
@@ -1672,6 +1694,165 @@ fn protect_repository_metadata(
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_lines)] // The linked-worktree trust checks form one mount boundary.
+fn expose_repository_metadata_for_git_commit(
+    cmd: &mut Command,
+    made_dirs: &mut HashSet<PathBuf>,
+    inherited_bind_fds: &mut Vec<OwnedFd>,
+    project_root: &Path,
+) -> Result<(), String> {
+    let git_entry = project_root.join(".git");
+    let metadata = fs::symlink_metadata(&git_entry)
+        .map_err(|error| format!("Cannot inspect Git commit metadata boundary: {error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err("Refusing a symbolic-link .git metadata entry".to_string());
+    }
+    if metadata.is_dir() {
+        add_pinned_writable_directory_bind_existing(
+            cmd,
+            inherited_bind_fds,
+            &git_entry,
+            &git_entry,
+        )?;
+        for hidden in ["hooks", "info", "logs"] {
+            hide_control_path(cmd, &git_entry.join(hidden));
+        }
+        return Ok(());
+    }
+    if !metadata.is_file() {
+        return Err("Refusing non-file, non-directory .git metadata entry".to_string());
+    }
+
+    let contents = fs::read_to_string(&git_entry)
+        .map_err(|error| format!("Cannot read linked-worktree .git file: {error}"))?;
+    if contents.len() > 4096 {
+        return Err("Refusing oversized linked-worktree .git file".to_string());
+    }
+    let target = contents
+        .trim()
+        .strip_prefix("gitdir:")
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+        .ok_or_else(|| "Refusing malformed linked-worktree .git file".to_string())?;
+    let target = Path::new(target);
+    let admin_candidate = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        project_root.join(target)
+    };
+    let admin = admin_candidate
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve linked-worktree metadata: {error}"))?;
+    if !admin.is_dir() {
+        return Err("Linked-worktree metadata target is not a directory".to_string());
+    }
+    let commondir_text = fs::read_to_string(admin.join("commondir"))
+        .map_err(|error| format!("Linked-worktree metadata has no valid commondir: {error}"))?;
+    let commondir = Path::new(commondir_text.trim());
+    if commondir.as_os_str().is_empty() {
+        return Err("Linked-worktree commondir is empty".to_string());
+    }
+    let common_candidate = if commondir.is_absolute() {
+        commondir.to_path_buf()
+    } else {
+        admin.join(commondir)
+    };
+    let common = common_candidate
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve linked-worktree common metadata: {error}"))?;
+    let worktrees = common.join("worktrees").canonicalize().map_err(|error| {
+        format!("Linked-worktree common metadata has no worktrees directory: {error}")
+    })?;
+    if admin.parent() != Some(worktrees.as_path()) {
+        return Err(
+            "Refusing linked-worktree metadata that is not owned by its common repository"
+                .to_string(),
+        );
+    }
+    let backlink = fs::read_to_string(admin.join("gitdir"))
+        .map_err(|error| format!("Linked-worktree metadata has no backlink: {error}"))?;
+    let backlink = Path::new(backlink.trim())
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve linked-worktree backlink: {error}"))?;
+    let expected = git_entry
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve worktree .git backlink target: {error}"))?;
+    if backlink != expected {
+        return Err(
+            "Refusing linked-worktree metadata whose backlink does not name this worktree"
+                .to_string(),
+        );
+    }
+
+    add_directory_ancestors(cmd, made_dirs, &admin);
+    add_directory_ancestors(cmd, made_dirs, &common);
+    add_pinned_writable_directory_bind_existing(cmd, inherited_bind_fds, &admin, &admin)?;
+    hide_control_path(cmd, &admin.join("logs"));
+    for directory in [common.join("objects"), common.join("refs")] {
+        add_directory_ancestors(cmd, made_dirs, &directory);
+        add_pinned_writable_directory_bind_existing(
+            cmd,
+            inherited_bind_fds,
+            &directory,
+            &directory,
+        )?;
+    }
+    for file in [
+        common.join("HEAD"),
+        common.join("packed-refs"),
+        common.join("shallow"),
+    ] {
+        if file.exists() {
+            add_pinned_read_only_bind(cmd, inherited_bind_fds, &file)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn add_pinned_writable_directory_bind_existing(
+    cmd: &mut Command,
+    inherited_bind_fds: &mut Vec<OwnedFd>,
+    source: &Path,
+    destination: &Path,
+) -> Result<(), String> {
+    let source_c = std::ffi::CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| format!("Git metadata path contains NUL: '{}'", source.display()))?;
+    // SAFETY: `source_c` is NUL-terminated. O_NOFOLLOW and O_DIRECTORY refuse
+    // link substitution and non-directory metadata roots.
+    let opened = unsafe {
+        libc::open(
+            source_c.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if opened < 0 {
+        return Err(format!(
+            "Cannot pin writable Git metadata '{}': {}",
+            source.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: open returned a fresh owned descriptor.
+    let opened = unsafe { OwnedFd::from_raw_fd(opened) };
+    let duplicated = unsafe { libc::fcntl(opened.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 200) };
+    if duplicated < 0 {
+        return Err(format!(
+            "Cannot duplicate writable Git metadata handle '{}': {}",
+            source.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: fcntl returned a fresh owned descriptor.
+    let pinned = unsafe { OwnedFd::from_raw_fd(duplicated) };
+    cmd.arg("--bind-fd")
+        .arg(pinned.as_raw_fd().to_string())
+        .arg(destination);
+    inherited_bind_fds.push(pinned);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn add_pinned_writable_directory_bind(
     cmd: &mut Command,
     inherited_bind_fds: &mut Vec<OwnedFd>,
@@ -1868,6 +2049,7 @@ mod tests {
             SandboxProfile::QualityGate,
             SandboxProfile::DocumentParser,
             SandboxProfile::McpHeaderHelper,
+            SandboxProfile::GitCommit,
             SandboxProfile::GitWorktree,
         ] {
             assert_ne!(
@@ -1884,10 +2066,13 @@ mod tests {
             OsString::from("GIT_CONFIG_GLOBAL"),
             OsString::from("/dev/null"),
         )];
+        assert!(validate_explicit_environment(SandboxProfile::GitReview, &safe).is_ok());
+        assert!(validate_explicit_environment(SandboxProfile::GitCommit, &safe).is_ok());
         assert!(validate_explicit_environment(SandboxProfile::GitWorktree, &safe).is_ok());
         assert!(validate_explicit_environment(SandboxProfile::Shell, &safe).is_err());
 
         let loader = [(OsString::from("LD_PRELOAD"), OsString::from("attack.so"))];
+        assert!(validate_explicit_environment(SandboxProfile::GitCommit, &loader).is_err());
         assert!(validate_explicit_environment(SandboxProfile::GitWorktree, &loader).is_err());
         let sandbox_owned = [(OsString::from("PATH"), OsString::from("/host/bin"))];
         assert!(

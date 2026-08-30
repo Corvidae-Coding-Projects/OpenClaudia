@@ -340,11 +340,7 @@ pub fn process_tool_follow_up(
     let (content, response) = match result.follow_up() {
         tools::ToolFollowUp::None => return (result.clone(), None),
         tools::ToolFollowUp::UserQuestion { questions, .. } => {
-            let widget_questions: Vec<serde_json::Value> = questions
-                .iter()
-                .map(tools::ToolQuestion::widget_value)
-                .collect();
-            let answers = handle_user_questions(&widget_questions);
+            let answers = handle_user_questions(questions);
             let response = serde_json::from_str(&answers)
                 .unwrap_or_else(|_| serde_json::Value::String(answers.clone()));
             (answers, response)

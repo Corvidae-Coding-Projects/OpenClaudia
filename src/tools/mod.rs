@@ -60,9 +60,13 @@ pub use cron::{
 pub(crate) mod file;
 pub(crate) use file::open_capability_regular_read;
 pub use file::{
-    create_capability_text_file, create_run_control_directory, create_run_control_text_file,
-    initialize_project_for_run, read_capability_text_attachment, read_run_control_text,
-    resolve_path as resolve_capability_path, ProjectInitOutcome,
+    commit_project_initialization, create_capability_text_file, create_run_control_directory,
+    create_run_control_text_file, initialize_project_for_run, plan_project_initialization,
+    read_capability_text_attachment, read_run_control_text,
+    resolve_path as resolve_capability_path, ProjectInitAction, ProjectInitCollision,
+    ProjectInitCommitState, ProjectInitEffect, ProjectInitEntryKind, ProjectInitError,
+    ProjectInitOutcome, ProjectInitPlan, ProjectInitPolicy, ProjectInitReceipt,
+    DEFAULT_PROJECT_CONFIG,
 };
 mod grounding;
 pub(crate) mod host_safety;
