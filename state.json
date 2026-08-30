@@ -1,6 +1,6 @@
 {
   "next_display_id": 1232,
-  "next_comment_id": 2013,
+  "next_comment_id": 2014,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -33077,11 +33077,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T22:00:04.275917276Z",
-      "updated_at": "2026-08-30T22:01:47.172592551Z",
+      "updated_at": "2026-08-30T23:04:50.674912036Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "6a09514e-0cea-4e34-a4e3-f644c5faff56": {
+          "display_id": 2013,
+          "author": "6Vw9",
+          "content": "Implemented typed local private notes with explicit projection consent, tombstone deletion, transactional legacy migration, causal validation, and aggregate retention bounds. /btw now runs as a bounded tool-less child on an immutable parent snapshot with hierarchical cancellation and a local causal result, without mutating parent messages or continuation state. Rust 1.98 check, Clippy -D warnings, focused semantics/cancellation tests, and the serialized all-target/all-feature suite pass. Independent VDD review remains pending.",
+          "created_at": "2026-08-30T23:04:50.672384352Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA5HRK5DqM1topmWS9KqrblpZL8GDjkin42NQr/KLZCJgBktZnjgdcRaWIfCSz+ff6y3jjULD5CXCazbMnNhBqDQ=="
+        },
         "82b9cc05-3d09-41ed-a2b6-604e035931dc": {
           "display_id": 2010,
           "author": "6Vw9",
@@ -51070,11 +51079,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2536,
       "timestamp": "2026-08-30T23:04:45.674217557Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2537,
+      "timestamp": "2026-08-30T23:04:50.674912036Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T23:04:45.674217557Z",
+    "timestamp": "2026-08-30T23:04:50.674912036Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2536
+    "agent_seq": 2537
   }
 }
