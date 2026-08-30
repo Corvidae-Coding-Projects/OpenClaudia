@@ -1,6 +1,6 @@
 {
   "next_display_id": 1219,
-  "next_comment_id": 1970,
+  "next_comment_id": 1971,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9610,7 +9610,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-30T10:21:54.305253798Z",
+      "updated_at": "2026-08-30T10:22:03.278303859Z",
       "labels": [
         "remediation"
       ],
@@ -9627,6 +9627,15 @@
         "f5eb100a-4902-49bd-8713-b92f9293090b"
       ],
       "comments": {
+        "006b6e57-47ff-44c8-ab7a-419fb0bf8658": {
+          "display_id": 1970,
+          "author": "6Vw9",
+          "content": "Wave 6 complete. Signed commit f595cabc3bf76466ae8b2ef573c70be6a143473f is pushed to agent/refactor-agent-system-remediation and draft PR #66. All exact-head jobs green: repository-policy, Rust 1.98 MSRV, Linux full suite/fuzz/sandbox, macOS fail-closed, Windows fail-closed. Closed #1216 S-060, #1217 S-061, #1218 S-098; #1202 document drift was reconciled and closed. Nine source slices remain Status: Planned: 039,049,076,077,078,079,080,082,083. Removed 74.3 GiB Cargo artifacts, exact wave worktrees/branches, and /var/tmp/openclaudia-wave6-build.swap. Crosslink locks steal falsely reports success while stale worker locks remain after sync; existing #1058 tracks that defect. Older #1049/#1050/#1051 locks were untouched.",
+          "created_at": "2026-08-30T10:22:03.275875027Z",
+          "kind": "handoff",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAV0Gp63FpB0svw6++lVzrdbKWiclE+KjP8PFeYUbInR4jjL6DyMtaS4lZrKdu6C9FojxmWc7DY9LaHtVUIf6zCA=="
+        },
         "01379d2a-d725-42cf-b4e5-421a9b77b01c": {
           "display_id": 1588,
           "author": "6Vw9",
@@ -49952,11 +49961,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2439,
       "timestamp": "2026-08-30T10:21:58.861515190Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2440,
+      "timestamp": "2026-08-30T10:22:03.278303859Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T10:21:58.861515190Z",
+    "timestamp": "2026-08-30T10:22:03.278303859Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2439
+    "agent_seq": 2440
   }
 }
