@@ -34797,7 +34797,10 @@
       "priority": "medium",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T10:44:45.695968227Z",
-      "updated_at": "2026-08-30T10:44:45.695968227Z"
+      "updated_at": "2026-08-30T10:44:50.085608416Z",
+      "labels": [
+        "planning"
+      ]
     },
     "ec817473-ad68-4200-b723-de66d5652455": {
       "uuid": "ec817473-ad68-4200-b723-de66d5652455",
@@ -49982,11 +49985,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2441,
       "timestamp": "2026-08-30T10:44:45.695968227Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2442,
+      "timestamp": "2026-08-30T10:44:50.085608416Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T10:44:45.695968227Z",
+    "timestamp": "2026-08-30T10:44:50.085608416Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2441
+    "agent_seq": 2442
   }
 }
