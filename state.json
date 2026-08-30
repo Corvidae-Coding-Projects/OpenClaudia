@@ -13754,12 +13754,13 @@
       "display_id": 1214,
       "title": "S-093: Isolate proxy tenant and session state",
       "description": "Implement docs/remediation-slices/093-proxy-session-isolation.md as production behavior. Resolve authenticated proxy routes to tenant/client/session/call identities and isolate continuation, credentials, budgets, hooks, MCP, plugins, VDD, usage and cancellation. Worker writes code only; root performs review, tests, documentation, commits, push, CI and cleanup.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T04:50:26.764312208Z",
-      "updated_at": "2026-08-30T05:51:51.133155498Z",
+      "updated_at": "2026-08-30T05:51:55.867284575Z",
+      "closed_at": "2026-08-30T05:51:55.867279203Z",
       "labels": [
         "remediation"
       ],
@@ -49475,11 +49476,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2392,
       "timestamp": "2026-08-30T05:51:51.133155498Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2393,
+      "timestamp": "2026-08-30T05:51:55.867284575Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T05:51:51.133155498Z",
+    "timestamp": "2026-08-30T05:51:55.867284575Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2392
+    "agent_seq": 2393
   }
 }
