@@ -1,6 +1,6 @@
 {
   "next_display_id": 1230,
-  "next_comment_id": 2001,
+  "next_comment_id": 2002,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -22596,11 +22596,20 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T19:24:23.788934530Z",
-      "updated_at": "2026-08-30T19:26:30.470693371Z",
+      "updated_at": "2026-08-30T21:22:43.381576986Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "922e1ff5-dd79-42d2-9d72-f05f3219506f": {
+          "display_id": 2001,
+          "author": "6Vw9",
+          "content": "Implemented transactional legacy attachment admission with stable bounded reads, separate reference-authority content, typed provenance, cancellation and aggregate budgets, plus supervised scratch-only composition and plan editors. Root review corrected plan editing so only an exact successful staging generation is atomically published; failure leaves the original unchanged. Verified through the complete Rust 1.98 gate, focused editor/input tests, full suite, and manual review.",
+          "created_at": "2026-08-30T21:22:43.379080815Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAHSbtkSJ2Bnd8mpRHIDRqjoxVGAam72yo8szeaH7BbCNaynlED8mBGW2RNbfweGaVdA7c9ug52aKYjC8ke7r9Bw=="
+        },
         "a84d6527-3a19-4a5a-ba81-dec813c97a6a": {
           "display_id": 1998,
           "author": "6Vw9",
@@ -50800,11 +50809,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2513,
       "timestamp": "2026-08-30T21:22:38.785680487Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2514,
+      "timestamp": "2026-08-30T21:22:43.381576986Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T21:22:38.785680487Z",
+    "timestamp": "2026-08-30T21:22:43.381576986Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2513
+    "agent_seq": 2514
   }
 }
