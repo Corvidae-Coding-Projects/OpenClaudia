@@ -1,6 +1,6 @@
 {
   "next_display_id": 1219,
-  "next_comment_id": 1959,
+  "next_comment_id": 1960,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -22045,10 +22045,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-28T15:47:09.132646546Z",
-      "updated_at": "2026-08-28T15:47:14.151194600Z",
+      "updated_at": "2026-08-30T08:35:16.314991602Z",
       "labels": [
         "documentation"
-      ]
+      ],
+      "comments": {
+        "39675770-f97b-4b01-87a1-1c132b91a558": {
+          "display_id": 1959,
+          "author": "6Vw9",
+          "content": "[action] Launched code-only wave for S-060/S-061/S-098; reconciling eight stale delivered slice documents against issue and commit evidence.",
+          "created_at": "2026-08-30T08:35:16.312525781Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABATCvB9I+NLGl34Ze4Sw+aRKDpovZVzgRz7RNpSVCOrrr74BP797ZstBb16ULaybTtO0Tne+cfhZoXBSpTjBLXAQ=="
+        }
+      }
     },
     "8e4a5961-7f8d-4650-81ff-7ea7d29be200": {
       "uuid": "8e4a5961-7f8d-4650-81ff-7ea7d29be200",
@@ -49725,11 +49736,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2415,
       "timestamp": "2026-08-30T08:35:11.265087866Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2416,
+      "timestamp": "2026-08-30T08:35:16.314991602Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T08:35:11.265087866Z",
+    "timestamp": "2026-08-30T08:35:16.314991602Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2415
+    "agent_seq": 2416
   }
 }
