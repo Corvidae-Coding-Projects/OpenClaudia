@@ -28231,12 +28231,13 @@
       "display_id": 1212,
       "title": "S-096: Make TUI cancellation and shutdown real",
       "description": "Implement docs/remediation-slices/096-tui-run-cancellation-supervision.md as a bounded code-only worker slice. Root coordinator owns review, reconciliation, tests, docs, issue closure, commits, push, and CI.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T01:27:25.769371385Z",
-      "updated_at": "2026-08-30T03:59:53.581985663Z",
+      "updated_at": "2026-08-30T03:59:58.239230833Z",
+      "closed_at": "2026-08-30T03:59:58.239229426Z",
       "labels": [
         "remediation"
       ],
@@ -49163,11 +49164,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2374,
       "timestamp": "2026-08-30T03:59:53.581985663Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2375,
+      "timestamp": "2026-08-30T03:59:58.239230833Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T03:59:53.581985663Z",
+    "timestamp": "2026-08-30T03:59:58.239230833Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2374
+    "agent_seq": 2375
   }
 }
