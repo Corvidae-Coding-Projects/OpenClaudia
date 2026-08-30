@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1232,
+  "next_display_id": 1233,
   "next_comment_id": 2018,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -688,6 +688,7 @@
     "9a9484d3-e770-4ad5-aefd-218cd247b14e": 458,
     "9abd06c8-8577-4336-abee-4430c8b9bc77": 183,
     "9b00d9f1-cabf-4118-82d7-c1db5b3dfbfe": 1224,
+    "9b0ab450-9ee7-4347-807b-5a92103219fc": 1232,
     "9b174b85-300f-4818-ab72-3e18cfc8f6e7": 227,
     "9b3bdcbd-6afc-458f-803b-8ce848e87598": 195,
     "9b7ab8fe-277a-4c96-bd85-5f273b7bc874": 589,
@@ -24265,6 +24266,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAmuOjRvt5IjOkQcA9ogp2Ms6oM9rbZeowvqDJCrMS03jflUq+zXcJoSbPRRnB2htn8lHeSin8kSmvG1hi6B8VDw=="
         }
       }
+    },
+    "9b0ab450-9ee7-4347-807b-5a92103219fc": {
+      "uuid": "9b0ab450-9ee7-4347-807b-5a92103219fc",
+      "display_id": 1232,
+      "title": "S-080: Make plan approval an atomic capability transition",
+      "description": "Implement docs/remediation-slices/080-atomic-plan-approval.md. Bind immutable reviewed plan bytes, task graph, effect scope, budgets, expiry, actor, evidence, artifact generation, and execution capability generation in one atomic approval transition; invalidate authority on amendments, drift, mode changes, cancellation, or resume.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-30T23:09:03.694117605Z",
+      "updated_at": "2026-08-30T23:09:03.694117605Z"
     },
     "9b174b85-300f-4818-ab72-3e18cfc8f6e7": {
       "uuid": "9b174b85-300f-4818-ab72-3e18cfc8f6e7",
@@ -51154,11 +51167,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2545,
       "timestamp": "2026-08-30T23:05:55.493153077Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2546,
+      "timestamp": "2026-08-30T23:09:03.694117605Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T23:05:55.493153077Z",
+    "timestamp": "2026-08-30T23:09:03.694117605Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2545
+    "agent_seq": 2546
   }
 }
