@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1227,
+  "next_display_id": 1228,
   "next_comment_id": 1995,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -597,6 +597,7 @@
     "854ba3ce-f065-43d3-94fd-4d99e7ce5ebd": 180,
     "857faa83-e518-4e69-a896-5f068221afe4": 414,
     "85a80b7d-180f-41a0-a3d8-96c7ba8d537f": 71,
+    "863f4c13-913e-4378-9c1a-3f848e7a2785": 1227,
     "86759524-f0e3-43a4-b971-4cd249759cab": 707,
     "868ab41e-ae82-4242-8688-42ccdf545298": 534,
     "86e2d86b-d90a-4f2d-9ccb-fc9dc184ef09": 1093,
@@ -20992,6 +20993,18 @@
           "signature": "U1NIU0lHAAAAAQAAAGgAAAATZWNkc2Etc2hhMi1uaXN0cDI1NgAAAAhuaXN0cDI1NgAAAEEEe0KY4l/Z7G/vfkx00kFwZtY3FjD8lde6VcPNSNT06kyL5ZUnzQGbJUMzOdlFd65s/RCzZhVJQVonLQ3yKzipGAAAABFjcm9zc2xpbmstY29tbWVudAAAAAAAAAAGc2hhNTEyAAAAZQAAABNlY2RzYS1zaGEyLW5pc3RwMjU2AAAASgAAACEAgS8YyCVwpzVLe7d8XeMytZYyGn89h3rzwP0p9q9UfUkAAAAhAPKX0vI6Mh5NaPU5jUnRefjgy/ogteenyEe87pwfMxAa"
         }
       }
+    },
+    "863f4c13-913e-4378-9c1a-3f848e7a2785": {
+      "uuid": "863f4c13-913e-4378-9c1a-3f848e7a2785",
+      "display_id": 1227,
+      "title": "S-049: Separate reasoning continuation from display",
+      "description": "Implement docs/remediation-slices/049-reasoning-state-privacy.md. Preserve provider continuation correctness while separating opaque continuation, sanctioned summaries, protected monitoring, persistence, export, and rendering semantics.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-30T19:24:14.518433531Z",
+      "updated_at": "2026-08-30T19:24:14.518433531Z"
     },
     "86759524-f0e3-43a4-b971-4cd249759cab": {
       "uuid": "86759524-f0e3-43a4-b971-4cd249759cab",
@@ -50641,11 +50654,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2501,
       "timestamp": "2026-08-30T19:24:09.820162323Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2502,
+      "timestamp": "2026-08-30T19:24:14.518433531Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T19:24:09.820162323Z",
+    "timestamp": "2026-08-30T19:24:14.518433531Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2501
+    "agent_seq": 2502
   }
 }
