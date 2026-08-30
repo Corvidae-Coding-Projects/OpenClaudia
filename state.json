@@ -7883,21 +7883,6 @@
         }
       }
     },
-    "39a9bb6e-9213-4f4e-b77c-fe5f494fae76": {
-      "uuid": "39a9bb6e-9213-4f4e-b77c-fe5f494fae76",
-      "display_id": 1229,
-      "title": "S-079: Route legacy attachments and editor input through capabilities",
-      "description": "Implement docs/remediation-slices/079-legacy-attachments-and-editor-capabilities.md. Preserve working @file and editor workflows while enforcing run capabilities, descriptor-bound snapshots, budgets, supervision, typed user/evidence authority, and consistent failure semantics.",
-      "status": "open",
-      "priority": "high",
-      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
-      "created_by": "6Vw9",
-      "created_at": "2026-08-30T19:24:32.917109734Z",
-      "updated_at": "2026-08-30T19:24:37.499439967Z",
-      "labels": [
-        "remediation"
-      ]
-    },
     "39ada03d-188e-44b6-9f24-9098bf0764ba": {
       "uuid": "39ada03d-188e-44b6-9f24-9098bf0764ba",
       "display_id": 1044,
@@ -37654,6 +37639,7 @@
     }
   },
   "deleted_issues": [
+    "39a9bb6e-9213-4f4e-b77c-fe5f494fae76",
     "56dbec07-0948-4ee0-acf8-bedcb9b330e5",
     "94b073f3-de76-44ad-9f8b-3602f664d056",
     "f0fcde99-6fa2-49f3-8864-11024b80aa91"
@@ -50719,11 +50705,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2506,
       "timestamp": "2026-08-30T19:24:37.499439967Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2507,
+      "timestamp": "2026-08-30T19:24:49.297971827Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T19:24:37.499439967Z",
+    "timestamp": "2026-08-30T19:24:49.297971827Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2506
+    "agent_seq": 2507
   }
 }
