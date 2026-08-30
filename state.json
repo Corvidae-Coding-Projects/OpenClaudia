@@ -1,6 +1,6 @@
 {
   "next_display_id": 1216,
-  "next_comment_id": 1951,
+  "next_comment_id": 1952,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -23101,7 +23101,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T04:50:17.710061804Z",
-      "updated_at": "2026-08-30T05:50:52.346818690Z",
+      "updated_at": "2026-08-30T05:51:41.466006900Z",
       "labels": [
         "remediation"
       ],
@@ -23112,6 +23112,15 @@
           "content": "[action] Worker code-only handoff integrated and skeptically corrected by root; root owns verification and delivery.",
           "created_at": "2026-08-30T05:50:43.849926749Z",
           "kind": "note"
+        },
+        "247d21ce-3fe6-47ee-bad4-874474fcc16a": {
+          "display_id": 1951,
+          "author": "6Vw9",
+          "content": "Delivered bounded ACP stdio framing, bounded input/output queues, JSON-RPC core and method validation, duplicate active-ID rejection, bounded history/tool/update/error/output payloads, terminal-event validation, and provisional wire output with transcript rollback before durable prompt success. Root removed the worker compatibility regression that rejected extension fields and restored live provisional streaming. Rust 1.98 evidence: fmt check passed; all-target/all-feature check passed; strict Clippy passed; four focused transport tests, provisional-output test, 31 related ACP integration tests, and the complete all-target/all-feature serialized suite passed with zero failures.",
+          "created_at": "2026-08-30T05:51:41.461732140Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAVm0pGL9Gc+/IV6NJf9bN+hPyFSK0oNMFY57JWZosbcSsHvMqmNsMQ2IQySWvWnVm4pBl/Q42bS6xltEi/uSvBg=="
         },
         "577f5714-5883-4049-802c-19319cd4e3c0": {
           "display_id": 1946,
@@ -49441,11 +49450,16 @@
       "agent_id": "s097-wave5",
       "agent_seq": 4,
       "timestamp": "2026-08-30T05:51:17.331760199Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2390,
+      "timestamp": "2026-08-30T05:51:41.466006900Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T05:51:17.331760199Z",
-    "agent_id": "s097-wave5",
-    "agent_seq": 4
+    "timestamp": "2026-08-30T05:51:41.466006900Z",
+    "agent_id": "6Vw9",
+    "agent_seq": 2390
   }
 }
