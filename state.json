@@ -1,6 +1,6 @@
 {
   "next_display_id": 1225,
-  "next_comment_id": 1984,
+  "next_comment_id": 1985,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -23951,12 +23951,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T12:37:02.006003254Z",
-      "updated_at": "2026-08-30T12:39:03.361238568Z",
+      "updated_at": "2026-08-30T12:39:34.059262434Z",
       "closed_at": "2026-08-30T12:39:03.361232854Z",
       "labels": [
         "bug"
       ],
       "comments": {
+        "728957f7-1430-4848-926e-5910a8d12c61": {
+          "display_id": 1984,
+          "author": "6Vw9",
+          "content": "Signed corrective commit dd080500 (fix(init): use platform mkdir mode type) is ready on the refactor branch. Local Rust 1.98 format/check/strict Clippy and all 5 transactional-init tests passed.",
+          "created_at": "2026-08-30T12:39:34.056797415Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAHzyEA3xgLyhVsT7Jk8XYZhE/MR3vEExPbUdVmRMQUtSW9tfm5B8lKSUUW+syqAFzGvbTLaIkLzzB1BVKzqyPBQ=="
+        },
         "7e218e8e-9b38-4be3-ad74-e1ee99ec6c94": {
           "display_id": 1983,
           "author": "6Vw9",
@@ -50396,11 +50405,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2479,
       "timestamp": "2026-08-30T12:39:08.092285426Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2480,
+      "timestamp": "2026-08-30T12:39:34.059262434Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T12:39:08.092285426Z",
+    "timestamp": "2026-08-30T12:39:34.059262434Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2479
+    "agent_seq": 2480
   }
 }
