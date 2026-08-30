@@ -1,6 +1,6 @@
 {
   "next_display_id": 1216,
-  "next_comment_id": 1950,
+  "next_comment_id": 1951,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -18159,11 +18159,18 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T04:50:35.525681890Z",
-      "updated_at": "2026-08-30T05:51:08.908120500Z",
+      "updated_at": "2026-08-30T05:51:17.331760199Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "85b2ccae-98b0-4f16-9625-ccaeb529c0d6": {
+          "display_id": 1950,
+          "author": "s097-wave5",
+          "content": "Code-only S-097 handoff completed. Root corrected email parsing, bounded context projection, and cancellation/snapshot coverage; no worker verification claim retained.",
+          "created_at": "2026-08-30T05:51:17.331754410Z",
+          "kind": "handoff"
+        },
         "94576798-cfae-4f00-a557-bf01a58b0f14": {
           "display_id": 1949,
           "author": "s097-wave5",
@@ -49429,11 +49436,16 @@
       "agent_id": "s097-wave5",
       "agent_seq": 3,
       "timestamp": "2026-08-30T05:51:13.191106922Z"
+    },
+    {
+      "agent_id": "s097-wave5",
+      "agent_seq": 4,
+      "timestamp": "2026-08-30T05:51:17.331760199Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T05:51:13.191106922Z",
+    "timestamp": "2026-08-30T05:51:17.331760199Z",
     "agent_id": "s097-wave5",
-    "agent_seq": 3
+    "agent_seq": 4
   }
 }
