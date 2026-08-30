@@ -1,6 +1,6 @@
 {
   "next_display_id": 1216,
-  "next_comment_id": 1947,
+  "next_comment_id": 1948,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -13767,10 +13767,19 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T04:50:26.764312208Z",
-      "updated_at": "2026-08-30T04:50:31.133525784Z",
+      "updated_at": "2026-08-30T05:50:56.487305772Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "b5413e63-2d5d-46f0-a8f1-c765b4b7ea4e": {
+          "display_id": 1947,
+          "author": "s093-wave5",
+          "content": "[action] Worker code-only handoff integrated and skeptically corrected by root; root owns verification and delivery.",
+          "created_at": "2026-08-30T05:50:56.487296712Z",
+          "kind": "note"
+        }
+      }
     },
     "5b072c3e-0beb-4e95-9473-d3b349860613": {
       "uuid": "5b072c3e-0beb-4e95-9473-d3b349860613",
@@ -49387,11 +49396,16 @@
       "agent_id": "s090-wave5",
       "agent_seq": 4,
       "timestamp": "2026-08-30T05:50:52.346818690Z"
+    },
+    {
+      "agent_id": "s093-wave5",
+      "agent_seq": 2,
+      "timestamp": "2026-08-30T05:50:56.487305772Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T05:50:52.346818690Z",
-    "agent_id": "s090-wave5",
-    "agent_seq": 4
+    "timestamp": "2026-08-30T05:50:56.487305772Z",
+    "agent_id": "s093-wave5",
+    "agent_seq": 2
   }
 }
