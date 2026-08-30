@@ -1,6 +1,6 @@
 {
   "next_display_id": 1213,
-  "next_comment_id": 1938,
+  "next_comment_id": 1939,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -28236,10 +28236,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T01:27:25.769371385Z",
-      "updated_at": "2026-08-30T01:27:30.093912946Z",
+      "updated_at": "2026-08-30T03:59:53.581985663Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "0782137c-c850-4249-8d5e-6bddee94912e": {
+          "display_id": 1938,
+          "author": "6Vw9",
+          "content": "Delivered a fresh launch-scoped TUI supervisor with exact call correlation for model turns, plugin agents, hooks, MCP, discovery, filesystem, and process work. Escape cancels the real active run; shutdown cancels and joins supervised work; repeated launches do not inherit sticky shutdown; terminal modes and event readers use RAII cleanup. Root review also fixed startup admission ordering, scheduler-failure cleanup, and SessionEnd execution before run retirement. Broader isolated-workspace ownership transfer remains tracked by #1160. Verified on Rust 1.98 with strict all-target Clippy and the complete locked all-feature/all-target suite: 3,090 library tests passed, zero failed, one ignored, followed by every integration and example target.",
+          "created_at": "2026-08-30T03:59:53.579361847Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAjBqpKx/N9MFNJrvhs0S0dSL528FaUMUc2kd4Ja8WnyzEB1su+1xSgWQx18hW8QR2zUXhJxp2RuBdBmXDeffpDg=="
+        }
+      }
     },
     "bbd517d2-39cc-4ccc-8834-019ad215809f": {
       "uuid": "bbd517d2-39cc-4ccc-8834-019ad215809f",
@@ -49147,11 +49158,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2373,
       "timestamp": "2026-08-30T03:59:48.857416121Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2374,
+      "timestamp": "2026-08-30T03:59:53.581985663Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T03:59:48.857416121Z",
+    "timestamp": "2026-08-30T03:59:53.581985663Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2373
+    "agent_seq": 2374
   }
 }
