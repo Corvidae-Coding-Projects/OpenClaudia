@@ -1,6 +1,6 @@
 {
   "next_display_id": 1224,
-  "next_comment_id": 1980,
+  "next_comment_id": 1981,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -32886,11 +32886,20 @@
       "parent_uuid": "5524064d-6721-4080-928b-959fe9661d77",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T11:01:39.651263831Z",
-      "updated_at": "2026-08-30T11:03:09.335128812Z",
+      "updated_at": "2026-08-30T12:29:35.907416234Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "2fc6fa09-4c83-4a8c-81a9-fe5647c3ff00": {
+          "display_id": 1980,
+          "author": "6Vw9",
+          "content": "Implemented bounded inert terminal rendering across CLI and TUI, typed question overlays, pre-parse limits, control/ANSI/OSC/bidi neutralization, bounded streams/transcripts/diffs/Markdown/highlighting, and grapheme/cell-aware input. Verification: 164 TUI-focused tests plus Rust 1.98 format/check/strict Clippy, full library and integration suites passed.",
+          "created_at": "2026-08-30T12:29:35.904904701Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAs5LiyYGvSg3eKfnc8oO38l0ItMMlFvNv1gkXG2DelXsqPuXWh+zRgqAVtceWQF98H9w/QIMjwwMn4hxThpqSDg=="
+        },
         "8e0a4c3d-d00f-485f-a347-de4faa5ab972": {
           "display_id": 1975,
           "author": "6Vw9",
@@ -50262,11 +50271,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2464,
       "timestamp": "2026-08-30T12:29:31.275623181Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2465,
+      "timestamp": "2026-08-30T12:29:35.907416234Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T12:29:31.275623181Z",
+    "timestamp": "2026-08-30T12:29:35.907416234Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2464
+    "agent_seq": 2465
   }
 }
