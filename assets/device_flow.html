@@ -35,7 +35,7 @@
             margin: 0.5rem 0;
         }
         button:hover { background: #3182ce; }
-        input[type="text"] {
+        input[type="text"], input[type="password"] {
             width: 100%;
             padding: 0.75rem;
             border: 1px solid #e2e8f0;
@@ -76,6 +76,13 @@
         <h1>OpenClaudia - Claude Max Authentication</h1>
 
         <div class="step">
+            <h3>Proxy Caller</h3>
+            <p>Enter a configured proxy caller with the <code>auth-manage</code> scope. These values remain in this page only.</p>
+            <input type="text" id="client-id" autocomplete="username" placeholder="Proxy client identity">
+            <input type="password" id="client-secret" autocomplete="current-password" placeholder="Proxy client secret (at least 32 bytes)">
+        </div>
+
+        <div class="step">
             <h3>Step 1: Start Authorization</h3>
             <p>Click the button below to generate an authorization URL:</p>
             <button onclick="startAuth()">Start Authorization</button>
@@ -102,11 +109,47 @@
         let currentState = '';
         let authUrl = '';
 
+        function base64Url(bytes) {
+            let binary = '';
+            for (const byte of new Uint8Array(bytes)) binary += String.fromCharCode(byte);
+            return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+        }
+
+        async function signedHeaders(method, path, scope, body) {
+            const identity = document.getElementById('client-id').value.trim();
+            const secret = document.getElementById('client-secret').value;
+            if (!identity || !secret) throw new Error('Enter the configured proxy client identity and secret first');
+            const encoder = new TextEncoder();
+            const timestamp = Math.floor(Date.now() / 1000).toString();
+            const nonce = base64Url(crypto.getRandomValues(new Uint8Array(18)));
+            const digest = body === null
+                ? '-'
+                : base64Url(await crypto.subtle.digest('SHA-256', encoder.encode(body)));
+            const canonical = [
+                'OPENCLAUDIA-PROXY-V1', identity, timestamp, nonce,
+                method, path, scope, digest
+            ].join('\n');
+            const key = await crypto.subtle.importKey(
+                'raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+            );
+            const signature = base64Url(await crypto.subtle.sign('HMAC', key, encoder.encode(canonical)));
+            const headers = {
+                'x-openclaudia-client-id': identity,
+                'x-openclaudia-timestamp': timestamp,
+                'x-openclaudia-nonce': nonce,
+                'x-openclaudia-signature': signature
+            };
+            if (body !== null) headers['x-openclaudia-content-sha256'] = digest;
+            return headers;
+        }
+
         async function startAuth() {
             try {
+                const headers = await signedHeaders('POST', '/auth/device/start', 'auth-manage', null);
+                headers['Content-Type'] = 'application/json';
                 const response = await fetch('/auth/device/start', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' }
+                    headers: headers
                 });
                 const data = await response.json();
                 if (response.ok) {
@@ -134,10 +177,13 @@
             if (!currentState) { showTextStatus('Please start authorization first', 'error'); return; }
 
             try {
+                const body = JSON.stringify({ code: code, state: currentState });
+                const headers = await signedHeaders('POST', '/auth/device/submit', 'auth-manage', body);
+                headers['Content-Type'] = 'application/json';
                 const response = await fetch('/auth/device/submit', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ code: code, state: currentState })
+                    headers: headers,
+                    body: body
                 });
                 const data = await response.json();
                 if (response.ok) {

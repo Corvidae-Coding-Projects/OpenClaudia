@@ -960,6 +960,16 @@ impl SessionManager {
         self.current_session.as_ref()
     }
 
+    /// Replace the active canonical session with a host-validated snapshot.
+    ///
+    /// Multi-session frontends such as ACP authenticate and validate their
+    /// own durable envelope before calling this boundary. Keeping the swap in
+    /// `SessionManager` prevents mode, usage, and lifecycle mutations from
+    /// continuing against whichever wire session happened to run last.
+    pub(crate) const fn replace_current_session(&mut self, session: Session) -> Option<Session> {
+        self.current_session.replace(session)
+    }
+
     /// Get a zero-copy [`SessionView`] of the current session.
     ///
     /// Returns `None` when there is no active session.  This is the

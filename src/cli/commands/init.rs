@@ -82,6 +82,16 @@ proxy:
   # localai, text-generation-webui, openrouter, opencode/opencode-go,
   # openai-compatible
   target: anthropic
+  # `openclaudia start` fails closed until at least one proxy caller is
+  # provisioned. Uncomment this block and replace the example with at least
+  # 32 random bytes. This credential is separate from provider credentials.
+  # auth:
+  #   clients:
+  #     - identity: local-client
+  #       secret: replace-with-at-least-32-random-bytes
+  #       scopes: [inference, models-read, state-read, auth-manage]
+  #       requests_per_minute: 60
+  #       cost_units_per_minute: 60
 
 providers:
   # Anthropic - Models: claude-fable-5, claude-opus-4-8, claude-opus-4-7, claude-sonnet-4-6

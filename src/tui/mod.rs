@@ -12,6 +12,7 @@ pub mod components;
 pub mod events;
 pub mod input;
 pub mod messages;
+mod supervision;
 
 use crossterm::{
     cursor,

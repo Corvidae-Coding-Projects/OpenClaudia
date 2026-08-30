@@ -205,6 +205,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-096: Make TUI cancellation and shutdown real (#1212)
+- S-092: Authenticate proxy callers before credential spend (#1211)
+- S-089: Isolate ACP sessions and calls (#1210)
 - S-075: Create one typed command registry (#1206)
 - S-058: Require explicit trust for hook imports (#1205)
 - S-038: Repair session schema migration and ownership (#1204)

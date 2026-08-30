@@ -7,27 +7,32 @@ use axum::{
     body::Body,
     extract::{Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{any, get, post},
     Json, Router,
 };
+use base64::Engine as _;
 use bytes::Bytes;
 use futures::{Stream, StreamExt as _};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
+    net::IpAddr,
     pin::Pin,
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+use zeroize::Zeroize as _;
 
 use crate::compaction::{CompactionOverrides, ContextCompactor};
 use crate::config::{AppConfig, ProviderConfig};
@@ -86,6 +91,484 @@ pub struct ProxyState {
     /// proxy turns, fire Stop hooks, and shut the server down at the
     /// documented iteration limit.
     pub loop_control: Option<Arc<LoopControl>>,
+}
+
+const CLIENT_ID_HEADER: &str = "x-openclaudia-client-id";
+const CLIENT_TIMESTAMP_HEADER: &str = "x-openclaudia-timestamp";
+const CLIENT_NONCE_HEADER: &str = "x-openclaudia-nonce";
+const CLIENT_SIGNATURE_HEADER: &str = "x-openclaudia-signature";
+const CONTENT_DIGEST_HEADER: &str = "x-openclaudia-content-sha256";
+const MAX_PROXY_CLIENTS: usize = 256;
+const MAX_CLIENT_ID_BYTES: usize = 128;
+const MIN_NONCE_BYTES: usize = 16;
+const MAX_NONCE_BYTES: usize = 128;
+const RATE_WINDOW: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequiredProxyScope {
+    Inference,
+    ModelsRead,
+    StateRead,
+    AuthManage,
+}
+
+impl RequiredProxyScope {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inference => "inference",
+            Self::ModelsRead => "models-read",
+            Self::StateRead => "state-read",
+            Self::AuthManage => "auth-manage",
+        }
+    }
+
+    const fn cost_units(self, configured: u32) -> u32 {
+        if matches!(self, Self::Inference) {
+            configured
+        } else {
+            0
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ProxyAuthenticator {
+    config: crate::config::ProxyConfig,
+    admission: Arc<tokio::sync::Mutex<HashMap<String, ClientAdmission>>>,
+    configuration_valid: bool,
+}
+
+struct ClientAdmission {
+    window_started: Instant,
+    requests: u32,
+    cost_units: u32,
+    nonces: VecDeque<(String, u64)>,
+}
+
+impl ClientAdmission {
+    const fn new(now: Instant) -> Self {
+        Self {
+            window_started: now,
+            requests: 0,
+            cost_units: 0,
+            nonces: VecDeque::new(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AuthenticatedProxyCaller {
+    identity: String,
+    content_digest: Option<[u8; 32]>,
+}
+
+struct VerifiedProxyRequest {
+    caller: AuthenticatedProxyCaller,
+    nonce: String,
+    timestamp: u64,
+    now_timestamp: u64,
+    replay_window_secs: u64,
+    max_nonces_per_client: usize,
+    requests_per_minute: u32,
+    cost_units_per_minute: u32,
+    cost: u32,
+}
+
+#[derive(Debug, Error)]
+enum ProxyAdmissionError {
+    #[error("proxy caller authentication is not configured safely")]
+    Misconfigured,
+    #[error("proxy caller authentication is required")]
+    MissingAuthentication,
+    #[error("proxy caller authentication failed")]
+    InvalidAuthentication,
+    #[error("proxy caller lacks the required scope")]
+    WrongScope,
+    #[error("cross-origin proxy request is not allowed")]
+    CrossOrigin,
+    #[error("proxy request timestamp is outside the replay window")]
+    Stale,
+    #[error("proxy request nonce has already been used")]
+    Replay,
+    #[error("proxy caller admission limit exceeded")]
+    RateExceeded,
+}
+
+impl IntoResponse for ProxyAdmissionError {
+    fn into_response(self) -> Response {
+        let status = match &self {
+            Self::Misconfigured => StatusCode::SERVICE_UNAVAILABLE,
+            Self::MissingAuthentication | Self::InvalidAuthentication | Self::Stale => {
+                StatusCode::UNAUTHORIZED
+            }
+            Self::WrongScope | Self::CrossOrigin | Self::Replay => StatusCode::FORBIDDEN,
+            Self::RateExceeded => StatusCode::TOO_MANY_REQUESTS,
+        };
+        let mut response = (
+            status,
+            Json(serde_json::json!({
+                "error": {
+                    "message": self.to_string(),
+                    "type": "proxy_admission_error"
+                }
+            })),
+        )
+            .into_response();
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+        }
+        response
+    }
+}
+
+fn required_proxy_scope(path: &str) -> RequiredProxyScope {
+    match path {
+        "/stats" => RequiredProxyScope::StateRead,
+        "/v1/models" => RequiredProxyScope::ModelsRead,
+        path if path.starts_with("/auth/") => RequiredProxyScope::AuthManage,
+        _ => RequiredProxyScope::Inference,
+    }
+}
+
+fn body_digest_required(method: &Method, path: &str) -> bool {
+    method == Method::POST && (path.starts_with("/v1/") || path == "/auth/device/submit")
+}
+
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    let maximum = left.len().max(right.len());
+    for index in 0..maximum {
+        let left_byte = left.get(index).copied().unwrap_or(0);
+        let right_byte = right.get(index).copied().unwrap_or(0);
+        difference |= usize::from(left_byte ^ right_byte);
+    }
+    difference == 0
+}
+
+fn hmac_sha256(secret: &crate::secrets::SecretString, message: &[u8]) -> [u8; 32] {
+    const BLOCK_BYTES: usize = 64;
+    let mut key = [0_u8; BLOCK_BYTES];
+    secret.expose(|raw| {
+        if raw.len() > BLOCK_BYTES {
+            key[..32].copy_from_slice(&Sha256::digest(raw.as_bytes()));
+        } else {
+            key[..raw.len()].copy_from_slice(raw.as_bytes());
+        }
+    });
+    let mut inner_pad = [0x36_u8; BLOCK_BYTES];
+    let mut outer_pad = [0x5c_u8; BLOCK_BYTES];
+    for ((inner, outer), key_byte) in inner_pad
+        .iter_mut()
+        .zip(outer_pad.iter_mut())
+        .zip(key.iter())
+    {
+        *inner ^= key_byte;
+        *outer ^= key_byte;
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(message);
+    let inner_hash = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_hash);
+    let result = outer.finalize().into();
+    key.zeroize();
+    inner_pad.zeroize();
+    outer_pad.zeroize();
+    result
+}
+
+fn decode_digest_header(value: &str) -> Result<[u8; 32], ProxyAdmissionError> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| ProxyAdmissionError::InvalidAuthentication)?;
+    bytes
+        .try_into()
+        .map_err(|_| ProxyAdmissionError::InvalidAuthentication)
+}
+
+fn header_text<'a>(
+    headers: &'a HeaderMap,
+    name: &'static str,
+) -> Result<&'a str, ProxyAdmissionError> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .ok_or(ProxyAdmissionError::MissingAuthentication)
+}
+
+fn valid_client_component(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn origin_allowed(headers: &HeaderMap, configured: &[String]) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return true;
+    };
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    if configured.iter().any(|allowed| allowed == origin) {
+        return true;
+    }
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    origin == format!("http://{host}") || origin == format!("https://{host}")
+}
+
+fn unix_timestamp() -> Result<u64, ProxyAdmissionError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| ProxyAdmissionError::InvalidAuthentication)
+}
+
+fn proxy_bind_is_loopback(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn validate_proxy_security(config: &crate::config::ProxyConfig) -> anyhow::Result<()> {
+    let loopback = proxy_bind_is_loopback(&config.host);
+    if !loopback && !config.has_unsafe_external_bind_acknowledgement() {
+        anyhow::bail!(
+            "refusing non-loopback proxy bind without the exact unsafe external-bind acknowledgement"
+        );
+    }
+    if config.auth.clients.is_empty() {
+        anyhow::bail!("proxy.auth.clients must provision at least one authenticated caller");
+    }
+    if config.auth.clients.len() > MAX_PROXY_CLIENTS {
+        anyhow::bail!("proxy.auth.clients exceeds the {MAX_PROXY_CLIENTS}-client bound");
+    }
+    if !(5..=300).contains(&config.auth.replay_window_secs) {
+        anyhow::bail!("proxy.auth.replay_window_secs must be between 5 and 300");
+    }
+    if config.auth.inference_cost_units == 0 {
+        anyhow::bail!("proxy.auth.inference_cost_units must be greater than zero");
+    }
+    let mut identities = HashSet::new();
+    for client in &config.auth.clients {
+        if !valid_client_component(&client.identity, MAX_CLIENT_ID_BYTES) {
+            anyhow::bail!("proxy client identity contains invalid characters or exceeds its bound");
+        }
+        if !identities.insert(client.identity.as_str()) {
+            anyhow::bail!("proxy client identities must be unique");
+        }
+        if client.secret.len() < 32 {
+            anyhow::bail!("proxy client secrets must contain at least 32 bytes");
+        }
+        if client.scopes.is_empty() {
+            anyhow::bail!("every proxy client must have at least one scope");
+        }
+        if client.requests_per_minute == 0 || client.cost_units_per_minute == 0 {
+            anyhow::bail!("proxy client rate and cost limits must be greater than zero");
+        }
+        let nonce_floor = usize::try_from(client.requests_per_minute).unwrap_or(usize::MAX);
+        if config.auth.max_nonces_per_client < nonce_floor {
+            anyhow::bail!(
+                "proxy.auth.max_nonces_per_client must cover each client's requests_per_minute"
+            );
+        }
+    }
+    for origin in &config.allowed_origins {
+        let parsed = url::Url::parse(origin)
+            .map_err(|_| anyhow::anyhow!("proxy allowed origins must be exact absolute origins"))?;
+        let loopback_http = parsed.scheme() == "http"
+            && parsed.host_str().is_some_and(|host| {
+                host.eq_ignore_ascii_case("localhost")
+                    || host
+                        .parse::<IpAddr>()
+                        .is_ok_and(|address| address.is_loopback())
+            });
+        if (parsed.scheme() != "https" && !loopback_http)
+            || parsed.username() != ""
+            || parsed.password().is_some()
+            || parsed.path() != "/"
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            anyhow::bail!(
+                "proxy allowed origins must be exact HTTPS origins (HTTP is loopback-only)"
+            );
+        }
+    }
+    if config.max_request_bytes == 0 {
+        anyhow::bail!("proxy.max_request_bytes must be greater than zero");
+    }
+    Ok(())
+}
+
+async fn authenticate_proxy_request(
+    State(authenticator): State<ProxyAuthenticator>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let verified = verify_proxy_request(&authenticator, &request);
+    let result = match verified {
+        Ok(verified) => {
+            admit_verified_proxy_request(Arc::clone(&authenticator.admission), verified).await
+        }
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(caller) => {
+            debug!(
+                caller = %caller.identity,
+                path = request.uri().path(),
+                "Proxy caller admitted"
+            );
+            request.extensions_mut().insert(caller);
+            next.run(request).await
+        }
+        Err(error) => {
+            warn!(
+                path = request.uri().path(),
+                reason = %error,
+                "Proxy caller denied before request body admission"
+            );
+            error.into_response()
+        }
+    }
+}
+
+fn verify_proxy_request(
+    authenticator: &ProxyAuthenticator,
+    request: &Request,
+) -> Result<VerifiedProxyRequest, ProxyAdmissionError> {
+    if !authenticator.configuration_valid {
+        return Err(ProxyAdmissionError::Misconfigured);
+    }
+    let headers = request.headers();
+    if !origin_allowed(headers, &authenticator.config.allowed_origins) {
+        return Err(ProxyAdmissionError::CrossOrigin);
+    }
+    // Own values read from the request before awaiting admission state. Axum's
+    // request body is not `Sync`, so retaining header borrows across the mutex
+    // wait would make the middleware future non-`Send`.
+    let identity = header_text(headers, CLIENT_ID_HEADER)?.to_string();
+    let timestamp_text = header_text(headers, CLIENT_TIMESTAMP_HEADER)?.to_string();
+    let nonce = header_text(headers, CLIENT_NONCE_HEADER)?.to_string();
+    let signature_text = header_text(headers, CLIENT_SIGNATURE_HEADER)?.to_string();
+    if !valid_client_component(&identity, MAX_CLIENT_ID_BYTES)
+        || !valid_client_component(&nonce, MAX_NONCE_BYTES)
+        || nonce.len() < MIN_NONCE_BYTES
+    {
+        return Err(ProxyAdmissionError::InvalidAuthentication);
+    }
+    let timestamp = timestamp_text
+        .parse::<u64>()
+        .map_err(|_| ProxyAdmissionError::InvalidAuthentication)?;
+    let now_timestamp = unix_timestamp()?;
+    if now_timestamp.abs_diff(timestamp) > authenticator.config.auth.replay_window_secs {
+        return Err(ProxyAdmissionError::Stale);
+    }
+    let scope = required_proxy_scope(request.uri().path());
+    let client = authenticator
+        .config
+        .auth
+        .clients
+        .iter()
+        .find(|client| client.identity == identity)
+        .cloned()
+        .ok_or(ProxyAdmissionError::InvalidAuthentication)?;
+    let content_digest_text = if body_digest_required(request.method(), request.uri().path()) {
+        header_text(headers, CONTENT_DIGEST_HEADER)?
+    } else {
+        "-"
+    };
+    let content_digest = if content_digest_text == "-" {
+        None
+    } else {
+        Some(decode_digest_header(content_digest_text)?)
+    };
+    let path_and_query = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_string(), ToString::to_string);
+    let canonical = format!(
+        "OPENCLAUDIA-PROXY-V1\n{identity}\n{timestamp_text}\n{nonce}\n{}\n{path_and_query}\n{}\n{content_digest_text}",
+        request.method(),
+        scope.as_str()
+    );
+    let expected = hmac_sha256(&client.secret, canonical.as_bytes());
+    let supplied = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&signature_text)
+        .map_err(|_| ProxyAdmissionError::InvalidAuthentication)?;
+    if !constant_time_equal(&expected, &supplied) {
+        return Err(ProxyAdmissionError::InvalidAuthentication);
+    }
+    if !client.allows_scope(scope.as_str()) {
+        return Err(ProxyAdmissionError::WrongScope);
+    }
+
+    let cost = scope.cost_units(authenticator.config.auth.inference_cost_units);
+    Ok(VerifiedProxyRequest {
+        caller: AuthenticatedProxyCaller {
+            identity,
+            content_digest,
+        },
+        nonce,
+        timestamp,
+        now_timestamp,
+        replay_window_secs: authenticator.config.auth.replay_window_secs,
+        max_nonces_per_client: authenticator.config.auth.max_nonces_per_client,
+        requests_per_minute: client.requests_per_minute,
+        cost_units_per_minute: client.cost_units_per_minute,
+        cost,
+    })
+}
+
+async fn admit_verified_proxy_request(
+    admission: Arc<tokio::sync::Mutex<HashMap<String, ClientAdmission>>>,
+    verified: VerifiedProxyRequest,
+) -> Result<AuthenticatedProxyCaller, ProxyAdmissionError> {
+    let now = Instant::now();
+    let mut admission = admission.lock().await;
+    let state = admission
+        .entry(verified.caller.identity.clone())
+        .or_insert_with(|| ClientAdmission::new(now));
+    while state.nonces.front().is_some_and(|(_, seen_at)| {
+        verified.now_timestamp.saturating_sub(*seen_at) > verified.replay_window_secs
+    }) {
+        state.nonces.pop_front();
+    }
+    if state.nonces.iter().any(|(seen, _)| seen == &verified.nonce) {
+        return Err(ProxyAdmissionError::Replay);
+    }
+    if now.duration_since(state.window_started) >= RATE_WINDOW {
+        state.window_started = now;
+        state.requests = 0;
+        state.cost_units = 0;
+    }
+    let next_requests = state.requests.saturating_add(1);
+    let next_cost = state.cost_units.saturating_add(verified.cost);
+    if next_requests > verified.requests_per_minute || next_cost > verified.cost_units_per_minute {
+        return Err(ProxyAdmissionError::RateExceeded);
+    }
+    state.requests = next_requests;
+    state.cost_units = next_cost;
+    if state.nonces.len() == verified.max_nonces_per_client {
+        state.nonces.pop_front();
+    }
+    state.nonces.push_back((verified.nonce, verified.timestamp));
+    drop(admission);
+    Ok(verified.caller)
 }
 
 pub struct LoopControl {
@@ -861,6 +1344,13 @@ async fn read_normalized_proxy_request(
             path,
         });
     }
+    let content_digest = request
+        .extensions()
+        .get::<AuthenticatedProxyCaller>()
+        .and_then(|caller| caller.content_digest)
+        .ok_or(ProxyError::Unauthorized(
+            "authenticated request body digest is missing",
+        ))?;
     let path_and_query = request
         .uri()
         .path_and_query()
@@ -869,6 +1359,12 @@ async fn read_normalized_proxy_request(
     let bytes = axum::body::to_bytes(body, max_bytes)
         .await
         .map_err(|error| ProxyError::InvalidBody(format!("request body rejected: {error}")))?;
+    let actual_digest: [u8; 32] = Sha256::digest(&bytes).into();
+    if !constant_time_equal(&content_digest, &actual_digest) {
+        return Err(ProxyError::Unauthorized(
+            "authenticated request body digest does not match",
+        ));
+    }
     let wire = serde_json::from_slice::<Value>(&bytes)
         .map_err(|error| ProxyError::InvalidBody(error.to_string()))?;
     let normalized = normalize_proxy_request(route, wire)?;
@@ -877,11 +1373,14 @@ async fn read_normalized_proxy_request(
 
 /// Create the proxy router
 pub fn create_router(state: ProxyState) -> Router {
-    Router::new()
-        // Health check
-        .route("/health", get(health_check))
+    let configuration_valid = validate_proxy_security(&state.config.proxy).is_ok();
+    let authenticator = ProxyAuthenticator {
+        config: state.config.proxy.clone(),
+        admission: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        configuration_valid,
+    };
+    let protected = Router::new()
         // Auth routes (device flow for Claude Max OAuth)
-        .route("/auth/device", get(auth_device_page))
         .route("/auth/device/start", post(auth_device_start))
         .route("/auth/device/submit", post(auth_device_submit))
         .route("/auth/status", get(auth_status))
@@ -896,16 +1395,52 @@ pub fn create_router(state: ProxyState) -> Router {
         .route("/v1/messages", any(proxy_anthropic_messages))
         // Catch-all for other API routes
         .route("/v1/{*path}", any(proxy_passthrough))
+        .route_layer(middleware::from_fn_with_state(
+            authenticator,
+            authenticate_proxy_request,
+        ));
+    Router::new()
+        // Health reveals no agent or provider state and remains available to
+        // local readiness probes without caller credentials. The device-flow
+        // shell is likewise static; every stateful OAuth operation remains in
+        // the authenticated router above.
+        .route("/health", get(health_check))
+        .route("/auth/device", get(auth_device_page))
+        .merge(protected)
         .with_state(state)
 }
 
 /// Health check endpoint
-async fn health_check() -> impl IntoResponse {
-    Json(serde_json::json!({
-        "status": "ok",
-        "service": "openclaudia",
-        "version": env!("CARGO_PKG_VERSION")
-    }))
+async fn health_check(State(state): State<ProxyState>) -> Response {
+    if validate_proxy_security(&state.config.proxy).is_err() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "not_ready",
+                "service": "openclaudia",
+                "version": env!("CARGO_PKG_VERSION")
+            })),
+        )
+            .into_response();
+    }
+    if proxy_bind_is_loopback(&state.config.proxy.host) {
+        Json(serde_json::json!({
+            "status": "ready",
+            "exposure": "loopback",
+            "service": "openclaudia",
+            "version": env!("CARGO_PKG_VERSION")
+        }))
+        .into_response()
+    } else {
+        Json(serde_json::json!({
+            "status": "degraded",
+            "exposure": "external",
+            "transport": "plaintext_acknowledged",
+            "service": "openclaudia",
+            "version": env!("CARGO_PKG_VERSION")
+        }))
+        .into_response()
+    }
 }
 
 /// Session stats endpoint - returns token usage and turn metrics.
@@ -1073,13 +1608,31 @@ fn extract_device_submit_fields(payload: &Value) -> Result<(String, String), Pro
 /// Submit authorization code from device flow
 async fn auth_device_submit(
     State(state): State<ProxyState>,
-    headers: HeaderMap,
-    Json(payload): Json<serde_json::Value>,
+    request: Request,
 ) -> Result<Response, ProxyError> {
     use crate::oauth::{OAuthClient, OAuthSession};
 
+    let content_digest = request
+        .extensions()
+        .get::<AuthenticatedProxyCaller>()
+        .and_then(|caller| caller.content_digest)
+        .ok_or(ProxyError::Unauthorized(
+            "authenticated request body digest is missing",
+        ))?;
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(body, state.config.proxy.max_request_bytes)
+        .await
+        .map_err(|error| ProxyError::InvalidBody(format!("request body rejected: {error}")))?;
+    let actual_digest: [u8; 32] = Sha256::digest(&bytes).into();
+    if !constant_time_equal(&content_digest, &actual_digest) {
+        return Err(ProxyError::Unauthorized(
+            "authenticated request body digest does not match",
+        ));
+    }
+    let payload = serde_json::from_slice::<Value>(&bytes)
+        .map_err(|error| ProxyError::InvalidBody(error.to_string()))?;
     let (code, oauth_state) = extract_device_submit_fields(&payload)?;
-    let client_binding = oauth_cookie_secret(&headers, OAUTH_CLIENT_COOKIE)
+    let client_binding = oauth_cookie_secret(&parts.headers, OAUTH_CLIENT_COOKIE)
         .ok_or(ProxyError::Unauthorized("OAuth client binding is missing"))?;
 
     let pkce = state
@@ -2625,7 +3178,7 @@ async fn proxy_chat_completions(
     let (headers, _, normalized) = read_normalized_proxy_request(
         request,
         ProxyRouteKind::ChatCompletions,
-        state.config.proxy.max_response_bytes,
+        state.config.proxy.max_request_bytes,
     )
     .await?;
     let (mut normalized, provider_name, mut trace) =
@@ -2829,7 +3382,7 @@ async fn proxy_completions(
     let (headers, _, normalized) = read_normalized_proxy_request(
         request,
         ProxyRouteKind::LegacyCompletions,
-        state.config.proxy.max_response_bytes,
+        state.config.proxy.max_request_bytes,
     )
     .await?;
     let (mut normalized, provider_name, mut trace) =
@@ -3044,7 +3597,7 @@ async fn proxy_anthropic_messages(
     let (headers, _, normalized) = read_normalized_proxy_request(
         request,
         ProxyRouteKind::AnthropicMessages,
-        state.config.proxy.max_response_bytes,
+        state.config.proxy.max_request_bytes,
     )
     .await?;
     let (mut normalized, provider_name, mut trace) =
@@ -3139,7 +3692,7 @@ async fn proxy_passthrough(
     let (headers, path_and_query, normalized) = read_normalized_proxy_request(
         request,
         ProxyRouteKind::OpenAiResponses,
-        state.config.proxy.max_response_bytes,
+        state.config.proxy.max_request_bytes,
     )
     .await?;
     let (mut normalized, provider_name, mut trace) =
@@ -5204,6 +5757,7 @@ async fn finish_proxy_runtime(state: &ProxyState, handoff: Option<&str>) -> anyh
 /// Returns an error if binding the TCP listener, serving, or session
 /// finalization fails.
 pub async fn start_server(config: AppConfig) -> anyhow::Result<()> {
+    validate_proxy_security(&config.proxy)?;
     let addr = format!("{}:{}", config.proxy.host, config.proxy.port);
     let state = build_proxy_state(config).await?;
     fire_session_start(&state).await?;
@@ -5233,6 +5787,7 @@ pub async fn start_server_with_shutdown(
     config: AppConfig,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    validate_proxy_security(&config.proxy)?;
     let addr = format!("{}:{}", config.proxy.host, config.proxy.port);
 
     // Build the proxy state + fire SessionStart hook via the SAME
@@ -5284,6 +5839,7 @@ pub async fn start_server_with_shutdown(
 /// Returns an error if binding the TCP listener, serving, VDD configuration
 /// validation, or session finalization fails.
 pub async fn start_loop_server(config: AppConfig, max_iterations: u32) -> anyhow::Result<()> {
+    validate_proxy_security(&config.proxy)?;
     let addr = format!("{}:{}", config.proxy.host, config.proxy.port);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let control = Arc::new(LoopControl::new(max_iterations, shutdown_tx.clone()));
@@ -5339,6 +5895,13 @@ pub async fn start_loop_server(config: AppConfig, max_iterations: u32) -> anyhow
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn authenticate_test_request_body(request: &mut Request, body: &[u8]) {
+        request.extensions_mut().insert(AuthenticatedProxyCaller {
+            identity: "proxy-test-caller".to_string(),
+            content_digest: Some(Sha256::digest(body).into()),
+        });
+    }
 
     #[test]
     fn trusted_mcp_server_names_must_have_one_plugin_owner() {
@@ -5442,6 +6005,186 @@ mod tests {
             "providers": {}
         }))
         .expect("minimal_config must deserialise")
+    }
+
+    fn proxy_authenticator(scopes: &[&str], requests_per_minute: u32) -> ProxyAuthenticator {
+        let scopes = scopes
+            .iter()
+            .map(|scope| format!("        - {scope}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let config: crate::config::ProxyConfig = serde_yaml::from_str(&format!(
+            r"
+host: 127.0.0.1
+auth:
+  max_nonces_per_client: 16
+  clients:
+    - identity: test-client
+      secret: 0123456789abcdef0123456789abcdef
+      scopes:
+{scopes}
+      requests_per_minute: {requests_per_minute}
+      cost_units_per_minute: 16
+"
+        ))
+        .expect("authenticated proxy fixture");
+        ProxyAuthenticator {
+            config,
+            admission: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            configuration_valid: true,
+        }
+    }
+
+    fn signed_proxy_request(
+        authenticator: &ProxyAuthenticator,
+        method: Method,
+        path: &str,
+        nonce: &str,
+        body: Option<&[u8]>,
+        origin: Option<&str>,
+    ) -> Request {
+        let timestamp = unix_timestamp().expect("test timestamp").to_string();
+        let digest = body.map_or_else(
+            || "-".to_string(),
+            |body| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(body)),
+        );
+        let scope = required_proxy_scope(path);
+        let canonical = format!(
+            "OPENCLAUDIA-PROXY-V1\ntest-client\n{timestamp}\n{nonce}\n{method}\n{path}\n{}\n{digest}",
+            scope.as_str()
+        );
+        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hmac_sha256(
+            &authenticator.config.auth.clients[0].secret,
+            canonical.as_bytes(),
+        ));
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(CLIENT_ID_HEADER, "test-client")
+            .header(CLIENT_TIMESTAMP_HEADER, timestamp)
+            .header(CLIENT_NONCE_HEADER, nonce)
+            .header(CLIENT_SIGNATURE_HEADER, signature);
+        if let Some(origin) = origin {
+            builder = builder.header(header::ORIGIN, origin);
+        }
+        if body.is_some() {
+            builder = builder.header(CONTENT_DIGEST_HEADER, digest);
+        }
+        builder
+            .body(body.map_or_else(Body::empty, |body| Body::from(body.to_vec())))
+            .expect("signed request")
+    }
+
+    #[test]
+    fn proxy_security_requires_provisioned_callers_and_explicit_external_exposure() {
+        let missing = crate::config::ProxyConfig::default();
+        let error = validate_proxy_security(&missing).expect_err("empty caller list must fail");
+        assert!(error.to_string().contains("auth.clients"), "{error}");
+
+        let mut configured = proxy_authenticator(&["inference"], 8).config;
+        validate_proxy_security(&configured).expect("authenticated loopback proxy");
+
+        configured.host = "0.0.0.0".to_string();
+        let error = validate_proxy_security(&configured)
+            .expect_err("external plaintext bind needs an exact acknowledgement");
+        assert!(error.to_string().contains("acknowledgement"), "{error}");
+
+        configured.unsafe_external_bind_acknowledgement =
+            Some(crate::config::UNSAFE_EXTERNAL_BIND_ACKNOWLEDGEMENT.to_string());
+        validate_proxy_security(&configured).expect("explicit external plaintext deployment");
+    }
+
+    #[tokio::test]
+    async fn proxy_auth_rejects_missing_wrong_scope_cross_origin_and_replay_before_admission() {
+        let authenticator = proxy_authenticator(&["inference"], 8);
+        let missing = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .body(Body::empty())
+            .expect("missing-auth request");
+        assert!(matches!(
+            verify_proxy_request(&authenticator, &missing),
+            Err(ProxyAdmissionError::MissingAuthentication)
+        ));
+
+        let wrong_scope = signed_proxy_request(
+            &authenticator,
+            Method::GET,
+            "/stats",
+            "nonce-wrong-scope-0001",
+            None,
+            None,
+        );
+        assert!(matches!(
+            verify_proxy_request(&authenticator, &wrong_scope),
+            Err(ProxyAdmissionError::WrongScope)
+        ));
+
+        let cross_origin = signed_proxy_request(
+            &authenticator,
+            Method::POST,
+            "/v1/chat/completions",
+            "nonce-cross-origin-001",
+            Some(br#"{"model":"test"}"#),
+            Some("https://attacker.example"),
+        );
+        assert!(matches!(
+            verify_proxy_request(&authenticator, &cross_origin),
+            Err(ProxyAdmissionError::CrossOrigin)
+        ));
+        assert!(authenticator.admission.lock().await.is_empty());
+
+        let first = signed_proxy_request(
+            &authenticator,
+            Method::POST,
+            "/v1/chat/completions",
+            "nonce-replay-proof-0001",
+            Some(br#"{"model":"test"}"#),
+            None,
+        );
+        let first = verify_proxy_request(&authenticator, &first).expect("valid signed request");
+        admit_verified_proxy_request(Arc::clone(&authenticator.admission), first)
+            .await
+            .expect("first request admitted");
+        let replay = signed_proxy_request(
+            &authenticator,
+            Method::POST,
+            "/v1/chat/completions",
+            "nonce-replay-proof-0001",
+            Some(br#"{"model":"test"}"#),
+            None,
+        );
+        let replay = verify_proxy_request(&authenticator, &replay).expect("valid replay proof");
+        assert!(matches!(
+            admit_verified_proxy_request(Arc::clone(&authenticator.admission), replay).await,
+            Err(ProxyAdmissionError::Replay)
+        ));
+    }
+
+    #[tokio::test]
+    async fn proxy_auth_enforces_rate_bound_before_a_second_request_is_admitted() {
+        let authenticator = proxy_authenticator(&["inference"], 1);
+        for (nonce, admitted) in [
+            ("nonce-rate-bound-000001", true),
+            ("nonce-rate-bound-000002", false),
+        ] {
+            let request = signed_proxy_request(
+                &authenticator,
+                Method::POST,
+                "/v1/chat/completions",
+                nonce,
+                Some(br#"{"model":"test"}"#),
+                None,
+            );
+            let verified = verify_proxy_request(&authenticator, &request).expect("signed request");
+            let result =
+                admit_verified_proxy_request(Arc::clone(&authenticator.admission), verified).await;
+            assert_eq!(result.is_ok(), admitted);
+            if !admitted {
+                assert!(matches!(result, Err(ProxyAdmissionError::RateExceeded)));
+            }
+        }
     }
 
     fn test_provider_config(base_url: String) -> ProviderConfig {
@@ -5949,12 +6692,14 @@ mod tests {
             .providers
             .insert("local".to_string(), test_provider_config(server.uri()));
         let state = test_proxy_state(config);
-        let request = Request::builder()
+        let request_body = request_body.to_string();
+        let mut request = Request::builder()
             .method("POST")
             .uri("/v1/responses?include=reasoning.encrypted_content")
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(request_body.to_string()))
+            .body(Body::from(request_body.clone()))
             .expect("request");
+        authenticate_test_request_body(&mut request, request_body.as_bytes());
 
         let response = proxy_passthrough(State(state), request)
             .await
@@ -6368,6 +7113,17 @@ mod tests {
         assert!(html.contains("status.textContent = message"), "{html}");
         assert!(!html.contains("data.session_id"), "{html}");
         assert!(!html.contains("status.innerHTML"), "{html}");
+        for required in [
+            "crypto.subtle.sign('HMAC'",
+            "x-openclaudia-client-id",
+            "x-openclaudia-content-sha256",
+            "auth-manage",
+        ] {
+            assert!(
+                html.contains(required),
+                "missing signed device-flow input: {required}"
+            );
+        }
         assert!(
             html.contains(
                 "showTextStatus('Authentication failed: ' + errorMessage(data), 'error')"

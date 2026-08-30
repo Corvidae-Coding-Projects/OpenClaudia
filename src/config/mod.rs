@@ -51,7 +51,10 @@ pub use provider::{
     adaptive_budget_for, is_local_provider_name, validate_base_url, validate_provider_base_url,
     ProviderConfig, ThinkingConfig,
 };
-pub use proxy::ProxyConfig;
+pub use proxy::{
+    ProxyAuthConfig, ProxyClientConfig, ProxyClientScope, ProxyConfig,
+    UNSAFE_EXTERNAL_BIND_ACKNOWLEDGEMENT,
+};
 pub use remote_actions::{RemoteActionConfig, RemoteActionsConfig};
 pub use session::{RunBudgetConfig, SessionConfig, TokenTrackingConfig};
 pub use stop_conditions::{StopConditionsConfig, StopReason, TokenTotals};

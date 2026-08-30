@@ -108,6 +108,12 @@ pub enum ApiRetryKind {
 
 /// Application events from multiple sources.
 pub enum AppEvent {
+    /// Event emitted by work owned by one exact TUI call. Terminal input and
+    /// render ticks are launch-scoped and therefore remain unwrapped.
+    Correlated {
+        call_id: crate::runtime::CallId,
+        event: Box<Self>,
+    },
     /// Terminal key event
     Key(KeyEvent),
     /// Bracketed terminal paste payload
@@ -253,6 +259,8 @@ pub enum AppEvent {
 pub struct EventHandler {
     rx: mpsc::Receiver<AppEvent>,
     tx: mpsc::Sender<AppEvent>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    reader: Option<std::thread::JoinHandle<()>>,
 }
 
 impl EventHandler {
@@ -260,8 +268,13 @@ impl EventHandler {
     pub fn new(tick_rate: Duration) -> Self {
         let (tx, rx) = mpsc::channel();
         let event_tx = tx.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_stop = std::sync::Arc::clone(&stop);
 
-        std::thread::spawn(move || loop {
+        let reader = std::thread::spawn(move || loop {
+            if reader_stop.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
             if event::poll(tick_rate).unwrap_or(false) {
                 if let Ok(evt) = event::read() {
                     if let Some(app_evt) = translate_terminal_event(&evt) {
@@ -275,7 +288,12 @@ impl EventHandler {
             }
         });
 
-        Self { rx, tx }
+        Self {
+            rx,
+            tx,
+            stop,
+            reader: Some(reader),
+        }
     }
 
     /// Get a sender for pushing async events (streaming, tool results) into the loop.
@@ -308,6 +326,83 @@ impl EventHandler {
     /// (terminal-reader thread + API senders) have hung up.
     pub fn try_next(&self) -> Result<AppEvent, mpsc::TryRecvError> {
         self.rx.try_recv()
+    }
+}
+
+impl Drop for EventHandler {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(reader) = self.reader.take() {
+            if reader.join().is_err() {
+                tracing::warn!("TUI terminal reader panicked during shutdown");
+            }
+        }
+    }
+}
+
+/// Owned bridge that tags every event emitted by one model call before it
+/// enters the launch-wide event queue.
+///
+/// The provider pipeline intentionally accepts a standard synchronous sender.
+/// This bridge preserves that boundary while ensuring streaming, tools,
+/// approvals, questions, and terminal events all carry the same typed call ID.
+pub(crate) struct CallEventBridge {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CallEventBridge {
+    pub(crate) fn new(
+        call_id: crate::runtime::CallId,
+        output: mpsc::Sender<AppEvent>,
+    ) -> (Self, mpsc::Sender<AppEvent>) {
+        let (input, receiver) = mpsc::channel();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_stop = std::sync::Arc::clone(&stop);
+        let reader = std::thread::spawn(move || loop {
+            match receiver.recv_timeout(Duration::from_millis(25)) {
+                Ok(event) => {
+                    if output
+                        .send(AppEvent::Correlated {
+                            call_id,
+                            event: Box::new(event),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout)
+                    if reader_stop.load(std::sync::atomic::Ordering::Acquire) =>
+                {
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        });
+        (
+            Self {
+                stop,
+                reader: Some(reader),
+            },
+            input,
+        )
+    }
+
+    pub(crate) fn finish(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(reader) = self.reader.take() {
+            if reader.join().is_err() {
+                tracing::warn!("TUI call-event bridge panicked");
+            }
+        }
+    }
+}
+
+impl Drop for CallEventBridge {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 

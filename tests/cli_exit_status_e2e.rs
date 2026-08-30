@@ -7,6 +7,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::Engine as _;
+use sha2::{Digest as _, Sha256};
+
+const TEST_PROXY_CLIENT_ID: &str = "cli-e2e-client";
+const TEST_PROXY_CLIENT_SECRET: &str = "0123456789abcdef0123456789abcdef";
+
 const CONFIG_ENV_VARS: &[&str] = &[
     "OPENCLAUDIA_PROXY_PORT",
     "OPENCLAUDIA_PROXY_HOST",
@@ -160,6 +166,61 @@ fn isolated_command(cwd: &tempfile::TempDir, home: &tempfile::TempDir) -> Comman
         command.env_remove(var);
     }
     command
+}
+
+fn provision_proxy_test_client(cwd: &tempfile::TempDir) {
+    let path = cwd.path().join(".openclaudia/config.yaml");
+    let source = fs::read_to_string(&path).expect("read proxy fixture config");
+    let mut config: serde_yaml::Value =
+        serde_yaml::from_str(&source).expect("parse proxy fixture config");
+    let proxy = config
+        .get_mut("proxy")
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .expect("proxy fixture mapping");
+    let auth = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+        r"
+clients:
+  - identity: {TEST_PROXY_CLIENT_ID}
+    secret: {TEST_PROXY_CLIENT_SECRET}
+    scopes: [all]
+    requests_per_minute: 60
+    cost_units_per_minute: 600
+"
+    ))
+    .expect("proxy authentication fixture");
+    proxy.insert(serde_yaml::Value::String("auth".to_string()), auth);
+    fs::write(
+        path,
+        serde_yaml::to_string(&config).expect("encode proxy fixture config"),
+    )
+    .expect("write authenticated proxy fixture config");
+}
+
+fn test_hmac_sha256(secret: &[u8], message: &[u8]) -> [u8; 32] {
+    const BLOCK_BYTES: usize = 64;
+    let mut key = [0_u8; BLOCK_BYTES];
+    if secret.len() > BLOCK_BYTES {
+        key[..32].copy_from_slice(&Sha256::digest(secret));
+    } else {
+        key[..secret.len()].copy_from_slice(secret);
+    }
+    let mut inner_pad = [0x36_u8; BLOCK_BYTES];
+    let mut outer_pad = [0x5c_u8; BLOCK_BYTES];
+    for ((inner, outer), key_byte) in inner_pad
+        .iter_mut()
+        .zip(outer_pad.iter_mut())
+        .zip(key.iter())
+    {
+        *inner ^= key_byte;
+        *outer ^= key_byte;
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(message);
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner.finalize());
+    outer.finalize().into()
 }
 
 #[cfg(unix)]
@@ -1118,8 +1179,23 @@ fn post_chat_completion_to_proxy(port: u16) -> Result<String, String> {
         .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|err| format!("set read timeout failed: {err}"))?;
     let body = r#"{"model":"local-test-model","messages":[{"role":"user","content":"hello"}],"stream":false}"#;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|err| format!("derive proxy request timestamp failed: {err}"))?
+        .as_secs()
+        .to_string();
+    let nonce = format!("cli-e2e-{timestamp}-{port}");
+    let content_digest =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(body.as_bytes()));
+    let canonical = format!(
+        "OPENCLAUDIA-PROXY-V1\n{TEST_PROXY_CLIENT_ID}\n{timestamp}\n{nonce}\nPOST\n/v1/chat/completions\ninference\n{content_digest}"
+    );
+    let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(test_hmac_sha256(
+        TEST_PROXY_CLIENT_SECRET.as_bytes(),
+        canonical.as_bytes(),
+    ));
     let request = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nx-openclaudia-client-id: {TEST_PROXY_CLIENT_ID}\r\nx-openclaudia-timestamp: {timestamp}\r\nx-openclaudia-nonce: {nonce}\r\nx-openclaudia-content-sha256: {content_digest}\r\nx-openclaudia-signature: {signature}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream
@@ -1156,6 +1232,7 @@ fn start_allows_keyless_local_provider_until_bind_failure() {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
     write_local_provider_config(&cwd);
+    provision_proxy_test_client(&cwd);
     let (_listener, port) = held_loopback_port();
     let port = port.to_string();
 
@@ -1191,6 +1268,7 @@ fn start_mixed_case_anthropic_target_keeps_anthropic_auth_path() {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
     write_anthropic_provider_config_with_target(&cwd, "Anthropic");
+    provision_proxy_test_client(&cwd);
     let (_listener, port) = held_loopback_port();
     let port = port.to_string();
 
@@ -1225,6 +1303,7 @@ fn start_target_flag_overrides_config_before_auth_preflight() {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
     write_openai_target_with_local_fallback_config(&cwd);
+    provision_proxy_test_client(&cwd);
     let (_listener, port) = held_loopback_port();
     let port = port.to_string();
 
@@ -1261,6 +1340,7 @@ fn start_proxy_allows_keyless_local_provider_request() {
     let home = tempfile::tempdir().expect("home tempdir");
     let (server, base_url) = spawn_local_chat_server_rejecting_auth();
     write_local_provider_config_with_base_url(&cwd, &base_url);
+    provision_proxy_test_client(&cwd);
     let proxy_port = unused_loopback_port();
     let proxy_port_arg = proxy_port.to_string();
 
@@ -1307,6 +1387,7 @@ fn loop_allows_keyless_local_provider_and_reports_bind_failure() {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
     write_local_provider_config(&cwd);
+    provision_proxy_test_client(&cwd);
     let (_listener, port) = held_loopback_port();
     let port = port.to_string();
 
@@ -1342,6 +1423,7 @@ fn loop_root_target_flag_overrides_config_before_auth_preflight() {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
     write_openai_target_with_local_fallback_config(&cwd);
+    provision_proxy_test_client(&cwd);
     let (_listener, port) = held_loopback_port();
     let port = port.to_string();
 
@@ -1384,6 +1466,7 @@ fn loop_host_flag_overrides_config_before_bind() {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
     write_local_provider_config_with_host(&cwd, "192.0.2.1");
+    provision_proxy_test_client(&cwd);
     let (_listener, port) = held_loopback_port();
     let port = port.to_string();
 
@@ -1423,6 +1506,7 @@ fn loop_proxy_allows_keyless_local_provider_request_and_stops_after_one_iteratio
     let home = tempfile::tempdir().expect("home tempdir");
     let (server, base_url) = spawn_local_chat_server_rejecting_auth();
     write_local_provider_config_with_base_url(&cwd, &base_url);
+    provision_proxy_test_client(&cwd);
     let proxy_port = unused_loopback_port();
     let proxy_port_arg = proxy_port.to_string();
 
@@ -1463,6 +1547,7 @@ fn loop_stop_hook_denial_shuts_down_unlimited_loop_after_first_iteration() {
     let home = tempfile::tempdir().expect("home tempdir");
     let (server, base_url) = spawn_local_chat_server_rejecting_auth();
     write_local_provider_config_with_stop_hook(&cwd, &base_url);
+    provision_proxy_test_client(&cwd);
     approve_first_repository_hook_proposal(&cwd, &home);
     let proxy_port = unused_loopback_port();
     let proxy_port_arg = proxy_port.to_string();

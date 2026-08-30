@@ -264,6 +264,15 @@ proxy:
   # google/gemini, qwen/alibaba, zai/glm/zhipu, kimi/moonshot
   # opencode/opencode-go share the OpenCode Go provider configuration
   target: anthropic
+  # `openclaudia start` fails closed until at least one caller is provisioned.
+  # Replace this example secret with at least 32 random bytes before use.
+  auth:
+    clients:
+      - identity: local-client
+        secret: replace-with-at-least-32-random-bytes
+        scopes: [inference, models-read, state-read, auth-manage]
+        requests_per_minute: 60
+        cost_units_per_minute: 60
 
 providers:
   anthropic:
@@ -332,6 +341,33 @@ session:
 #   mcp:
 #     filesystem: ["read_file", "list_directory"]
 ```
+
+The proxy's caller credentials are separate from provider API keys and OAuth
+tokens. Protected requests carry `x-openclaudia-client-id`, a Unix timestamp,
+a unique nonce, and a base64url HMAC-SHA256 signature. The signed canonical
+value is the following newline-separated text; body-bearing routes also carry
+`x-openclaudia-content-sha256` with the base64url SHA-256 digest used on the
+last line:
+
+```text
+OPENCLAUDIA-PROXY-V1
+<client identity>
+<unix timestamp>
+<unique nonce>
+<HTTP method>
+<path and query>
+<required scope>
+<body digest or ->
+```
+
+The built-in `/auth/device` page signs its own OAuth operations after you enter
+a configured `auth-manage` identity and secret; the secret remains in page
+memory. Browser callers from another origin also require that exact HTTPS
+origin in `proxy.allowed_origins` (loopback HTTP origins are permitted).
+Non-loopback binding remains disabled unless
+`unsafe_external_bind_acknowledgement` exactly equals
+`I acknowledge that this proxy listener has no native TLS`; acknowledged
+plaintext exposure is reported as degraded health and should sit behind TLS.
 
 Named remote actions are authority-bearing host configuration. A
 `remote_actions` block in `.openclaudia/config.yaml` is ignored; place it in

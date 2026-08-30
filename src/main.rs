@@ -566,7 +566,12 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Some(Commands::Start { port, host, target }) => {
-            cli::commands::start::cmd_start(port, host, target.or(cli.target)).await
+            Box::pin(cli::commands::start::cmd_start(
+                port,
+                host,
+                target.or(cli.target),
+            ))
+            .await
         }
         Some(Commands::Config) => cli::commands::config_cmd::cmd_config(),
         Some(Commands::Doctor { json, allow_active }) => {
@@ -906,6 +911,7 @@ fn prepare_tui_startup(options: &TuiStartupOptions) -> anyhow::Result<PreparedTu
     })
 }
 
+#[allow(clippy::future_not_send)] // Full-screen terminal input is intentionally current-thread owned.
 async fn cmd_tui(options: TuiStartupOptions) -> anyhow::Result<()> {
     chdir_to_git_root();
 
@@ -1068,7 +1074,7 @@ fn rebuild_resumed_tui_endpoint(
     )?)
 }
 
-#[allow(clippy::too_many_lines)] // TUI composition is one fail-closed startup transaction.
+#[allow(clippy::too_many_lines, clippy::future_not_send)] // Current-thread TUI composition is one fail-closed startup transaction.
 async fn tui_launch(options: TuiLaunchOptions<'_>) -> anyhow::Result<()> {
     use openclaudia::hooks::{load_effective_hooks, HookEngine};
 

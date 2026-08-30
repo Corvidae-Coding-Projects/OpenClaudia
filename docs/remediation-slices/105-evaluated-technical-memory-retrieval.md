@@ -226,6 +226,18 @@ digests are respectively
 `50a2a964fb05554e9d3ed018b50ae438b0664484d858d212e93b6dc4235be532`,
 and `c6af92cebbb68f2c0579aa35118fb7c0ef3103284216fe335f6c08352dcbbd24`.
 
+S-096 later changed the still-cited `src/main.rs` while preserving the
+migration-doctor contract exercised by the held-out corpus. That citation is
+rebound to `worktree:s096` at source digest
+`1b3b409b9faf5cd9cee87eb8d7fc5a8ed9d9b0fab86f4d267d3d169168364629`.
+The canonical generator rebuilt the evaluation, and the deliberately rejected
+review remains rejected. The current tuning, held-out, evaluation, and review
+artifact digests are respectively
+`702d85d34bae885cac5d73bda74696cd0a48d95c84b96e64e964af69c7e3486b`,
+`f498fb9b5ccc23d55ba4d109461c00cf5517259c475788545c0cd9c65e4a8f4c`,
+`aa30e04b9ae4aa21c89a16bf44d2c3e15dedf5c795d087f5294bcd8a71ed4256`,
+and `94ef5ed75d6ac381bc892a072ecd08275844dd59937939ddade3fbc4a2b11257`.
+
 ## Residual boundaries
 
 - S-088 owns the independent artifact-bound VDD review, including the required

@@ -129,6 +129,11 @@ fn explicit_cli_target_overrides_file_and_environment_before_startup_preflight()
         r"
 proxy:
   target: anthropic
+  auth:
+    clients:
+      - identity: typed-environment-e2e
+        secret: 0123456789abcdef0123456789abcdef
+        scopes: [all]
 providers:
   local:
     base_url: http://localhost:1234/v1

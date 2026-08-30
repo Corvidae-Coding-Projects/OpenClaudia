@@ -1,6 +1,6 @@
 //! End-to-end tests for `config::ProxyConfig` field
 //! defaults: port=8080, host=127.0.0.1, target=anthropic,
-//! `max_response_bytes`=50 MiB. Plus YAML round-trip across
+//! request/response bounds and caller-admission defaults. Plus YAML round-trip across
 //! partial-field configs (each `#[serde(default = "...")]`
 //! producer reachable from YAML omission).
 //!
@@ -13,7 +13,7 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::config::ProxyConfig;
+use openclaudia::config::{ProxyClientScope, ProxyConfig};
 
 // ───────────────────────────────────────────────────────────────────────────
 // Section A — Default values for each field
@@ -48,6 +48,18 @@ fn default_max_response_bytes_is_50_mebibytes() {
     assert_eq!(cfg.max_response_bytes, 50 * 1024 * 1024);
 }
 
+#[test]
+fn caller_admission_defaults_are_fail_closed_and_bounded() {
+    let cfg = ProxyConfig::default();
+    assert_eq!(cfg.max_request_bytes, 10 * 1024 * 1024);
+    assert!(cfg.auth.clients.is_empty());
+    assert_eq!(cfg.auth.replay_window_secs, 30);
+    assert_eq!(cfg.auth.max_nonces_per_client, 256);
+    assert_eq!(cfg.auth.inference_cost_units, 1);
+    assert!(cfg.unsafe_external_bind_acknowledgement.is_none());
+    assert!(cfg.allowed_origins.is_empty());
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Section B — YAML deserialize defaults each field independently
 // ───────────────────────────────────────────────────────────────────────────
@@ -59,6 +71,8 @@ fn empty_yaml_yields_all_defaults() {
     assert_eq!(cfg.host, "127.0.0.1");
     assert_eq!(cfg.target, "anthropic");
     assert_eq!(cfg.max_response_bytes, 50 * 1024 * 1024);
+    assert_eq!(cfg.max_request_bytes, 10 * 1024 * 1024);
+    assert!(cfg.auth.clients.is_empty());
 }
 
 #[test]
@@ -94,7 +108,7 @@ fn yaml_max_response_bytes_override_preserves_other_defaults() {
 }
 
 #[test]
-fn yaml_full_override_all_fields() {
+fn yaml_full_override_core_listener_fields() {
     let yaml = "
 port: 4242
 host: ::1
@@ -106,6 +120,42 @@ max_response_bytes: 1024
     assert_eq!(cfg.host, "::1");
     assert_eq!(cfg.target, "google");
     assert_eq!(cfg.max_response_bytes, 1024);
+}
+
+#[test]
+fn yaml_caller_auth_deserializes_scopes_and_bounds() {
+    let yaml = r"
+auth:
+  replay_window_secs: 45
+  max_nonces_per_client: 300
+  inference_cost_units: 4
+  clients:
+    - identity: desktop-client
+      secret: 0123456789abcdef0123456789abcdef
+      scopes: [inference, models-read, auth-manage]
+      requests_per_minute: 75
+      cost_units_per_minute: 120
+allowed_origins: [https://console.example.test]
+";
+    let cfg: ProxyConfig = serde_yaml::from_str(yaml).expect("authenticated proxy config");
+    assert_eq!(cfg.auth.replay_window_secs, 45);
+    assert_eq!(cfg.auth.max_nonces_per_client, 300);
+    assert_eq!(cfg.auth.inference_cost_units, 4);
+    assert_eq!(cfg.auth.clients.len(), 1);
+    let client = &cfg.auth.clients[0];
+    assert_eq!(client.identity, "desktop-client");
+    assert_eq!(client.secret.len(), 32);
+    assert_eq!(
+        client.scopes,
+        vec![
+            ProxyClientScope::Inference,
+            ProxyClientScope::ModelsRead,
+            ProxyClientScope::AuthManage,
+        ]
+    );
+    assert_eq!(client.requests_per_minute, 75);
+    assert_eq!(client.cost_units_per_minute, 120);
+    assert_eq!(cfg.allowed_origins, vec!["https://console.example.test"]);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -164,18 +214,43 @@ fn yaml_host_can_be_dns_name() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn clone_preserves_all_4_fields() {
-    let original = ProxyConfig {
+fn clone_preserves_all_fields() {
+    let mut original = ProxyConfig {
         port: 1234,
         host: "192.168.1.1".to_string(),
         target: "qwen".to_string(),
         max_response_bytes: 999,
+        max_request_bytes: 777,
+        unsafe_external_bind_acknowledgement: Some("explicit test acknowledgement".to_string()),
+        allowed_origins: vec!["https://example.test".to_string()],
+        ..ProxyConfig::default()
     };
+    original.auth.replay_window_secs = 42;
+    original.auth.max_nonces_per_client = 321;
+    original.auth.inference_cost_units = 7;
     let cloned = original.clone();
     assert_eq!(cloned.port, original.port);
     assert_eq!(cloned.host, original.host);
     assert_eq!(cloned.target, original.target);
     assert_eq!(cloned.max_response_bytes, original.max_response_bytes);
+    assert_eq!(cloned.max_request_bytes, original.max_request_bytes);
+    assert_eq!(
+        cloned.unsafe_external_bind_acknowledgement,
+        original.unsafe_external_bind_acknowledgement
+    );
+    assert_eq!(cloned.allowed_origins, original.allowed_origins);
+    assert_eq!(
+        cloned.auth.replay_window_secs,
+        original.auth.replay_window_secs
+    );
+    assert_eq!(
+        cloned.auth.max_nonces_per_client,
+        original.auth.max_nonces_per_client
+    );
+    assert_eq!(
+        cloned.auth.inference_cost_units,
+        original.auth.inference_cost_units
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────

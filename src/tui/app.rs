@@ -6,11 +6,12 @@
 //! and streaming response display wired to the real API pipeline.
 
 use super::events::{
-    ApiRetryKind, AppEvent, EventHandler, PlanModeReply, PlanModeRequest, ProviderSwitch,
-    SpawnTarget,
+    ApiRetryKind, AppEvent, CallEventBridge, EventHandler, PlanModeReply, PlanModeRequest,
+    ProviderSwitch, SpawnTarget,
 };
 use super::input::TextInput;
 use super::messages::{DisplayMessage, EffortLevel, MessageKind, MessageList, Mode};
+use super::supervision::{TuiSupervisor, TuiTaskCompletion, TuiTaskKind, TuiTaskOutcome};
 use super::{DIM, GOLD, PURPLE, SPINNER_FRAMES};
 use crossterm::{
     event::{DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyModifiers},
@@ -25,6 +26,8 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::Duration;
+
+use futures::FutureExt as _;
 
 use crate::file_error::{self, FileError};
 use crate::state::{AgentMode, Session};
@@ -78,29 +81,88 @@ fn format_review_command_output(out: &Output) -> String {
     }
 }
 
-/// Process-wide shutdown flag for the TUI event loop.
-///
-/// crosslink #910: the original `run()` loop relied entirely on the
-/// `should_quit` field plus the event channel — there was no way for
-/// out-of-band code (a tokio signal handler, an integration test, the
-/// proxy's `/shutdown` endpoint) to ask the loop to exit without
-/// synthesising a keypress. This `AtomicBool` is checked at the top of
-/// every tick, giving any caller a lock-free, panic-safe way to bring
-/// the UI down cleanly.
-///
-/// Set via [`request_tui_shutdown`]. The flag is sticky for the
-/// lifetime of the process — once shutdown is requested, every future
-/// TUI invocation will exit immediately. That is intentional: a
-/// shutdown request that survives a restart is what an embedded host
-/// (or a watchdog) wants.
-pub static TUI_SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
+}
+
+const fn cancellation_reason_label(reason: &crate::runtime::CancellationReason) -> &'static str {
+    match reason {
+        crate::runtime::CancellationReason::User => "user request",
+        crate::runtime::CancellationReason::Deadline => "deadline",
+        crate::runtime::CancellationReason::BudgetExhausted => "budget exhausted",
+        crate::runtime::CancellationReason::FrontendDisconnected => "frontend shutdown",
+        crate::runtime::CancellationReason::ParentTerminated => "parent terminated",
+        crate::runtime::CancellationReason::RuntimeFailure { .. } => "runtime failure",
+    }
+}
 
 /// Signal the TUI event loop to exit at the next tick.
 ///
-/// Safe to call from any thread, including signal handlers — the
-/// underlying store is lock-free.
+/// The request is scoped to the active launch generation. It is not sticky:
+/// a later in-process launch receives a fresh supervisor and remains live.
 pub fn request_tui_shutdown() {
-    TUI_SHUTDOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+    super::supervision::request_active_tui_shutdown();
+}
+
+/// Owns every terminal mode mutation made by the full-screen renderer.
+struct TerminalSession {
+    raw_mode: bool,
+    alternate_screen: bool,
+    bracketed_paste: bool,
+}
+
+impl TerminalSession {
+    fn enter() -> io::Result<Self> {
+        let mut session = Self {
+            raw_mode: false,
+            alternate_screen: false,
+            bracketed_paste: false,
+        };
+        enable_raw_mode()?;
+        session.raw_mode = true;
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        session.alternate_screen = true;
+        execute!(io::stdout(), EnableBracketedPaste)?;
+        session.bracketed_paste = true;
+        Ok(session)
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        let mut first_error = None;
+        if self.bracketed_paste {
+            match execute!(io::stdout(), DisableBracketedPaste) {
+                Ok(()) => self.bracketed_paste = false,
+                Err(error) => first_error = Some(error),
+            }
+        }
+        if self.alternate_screen {
+            match execute!(io::stdout(), LeaveAlternateScreen) {
+                Ok(()) => self.alternate_screen = false,
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        if self.raw_mode {
+            match disable_raw_mode() {
+                Ok(()) => self.raw_mode = false,
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            tracing::error!(%error, "failed to restore TUI terminal state");
+        }
+    }
 }
 
 const fn tui_mode_for_agent(mode: crate::state::AgentMode) -> Mode {
@@ -370,6 +432,29 @@ struct PendingPlanApproval {
     allowed_prompts: Vec<crate::tools::ToolAllowedPrompt>,
     scroll_offset: u16,
     reply: tokio::sync::oneshot::Sender<PlanModeReply>,
+}
+
+enum ActiveTurnTerminal {
+    Succeeded,
+    Failed(String),
+    PluginAgent {
+        label: String,
+        result: crate::subagent::SubagentResult,
+    },
+    Cancelled(crate::runtime::CancellationReason),
+}
+
+struct ActiveTurn {
+    call_id: crate::runtime::CallId,
+    run_context: std::sync::Arc<crate::tools::ToolRunContext>,
+    event_bridge: Option<CallEventBridge>,
+    terminal: Option<ActiveTurnTerminal>,
+    task_outcome: Option<TuiTaskOutcome>,
+}
+
+struct CompletedTurnRun {
+    call_id: crate::runtime::CallId,
+    run_context: std::sync::Arc<crate::tools::ToolRunContext>,
 }
 
 const fn tui_supports_key_action(action: &crate::keybindings::KeyAction) -> bool {
@@ -686,6 +771,7 @@ fn build_startup_session_run_context(
     session: &Session,
     provider: &str,
     budget_limits: crate::runtime::BudgetLimits,
+    parent_budget: Option<crate::runtime::RunBudgetAuthority>,
     remote_actions: crate::tools::remote_trigger::WebhookRegistry,
     web_egress_grants: crate::web_egress::WebEgressGrants,
 ) -> Result<std::sync::Arc<crate::tools::ToolRunContext>, String> {
@@ -699,7 +785,7 @@ fn build_startup_session_run_context(
         || identity.cwd.clone(),
         |workspace| workspace.repository_root().to_path_buf(),
     );
-    let base_run = crate::tools::ToolRunContext::builder(identity.session_id, project_root)
+    let mut builder = crate::tools::ToolRunContext::builder(identity.session_id, project_root)
         .working_directory(working_directory)
         .host_startup_grants()
         .remote_actions(remote_actions)
@@ -711,8 +797,11 @@ fn build_startup_session_run_context(
         .provider(provider)
         .runtime_mode(runtime_mode_for_tui_session(session))
         .behavior_scope_targets(session.behavior_scope_targets())
-        .budget_limits(budget_limits)
-        .build()?;
+        .budget_limits(budget_limits);
+    if let Some(parent_budget) = parent_budget {
+        builder = builder.parent_budget(parent_budget);
+    }
+    let base_run = builder.build()?;
     active_workspace
         .as_ref()
         .map_or(Ok(base_run.clone()), |workspace| {
@@ -873,6 +962,18 @@ pub struct App {
     pub vdd_builder_auth: crate::vdd::VddProviderAuth,
     /// Async runtime handle for spawning API tasks from the sync event loop.
     runtime_handle: Option<tokio::runtime::Handle>,
+    /// Fresh owner for every async task spawned during one `run()` launch.
+    supervisor: Option<TuiSupervisor>,
+    /// Exact model/plugin call currently controlling the streaming UI.
+    active_turn: Option<ActiveTurn>,
+    /// One-shot ancillary calls whose terminal event is still eligible for
+    /// this launch. Completion events remove their exact call generation.
+    background_calls: std::collections::HashMap<crate::runtime::CallId, TuiTaskKind>,
+    /// Latest eligible completion for replacement-style discovery actions.
+    latest_background_calls: std::collections::HashMap<TuiTaskKind, crate::runtime::CallId>,
+    /// Successfully completed turn generations retained so background jobs
+    /// deliberately started by those calls remain session-owned until exit.
+    completed_turn_runs: Vec<CompletedTurnRun>,
     /// Persistent chat session (for save/load/resume)
     pub chat_session: Session,
     /// Coalescing transcript writer subscribed to canonical state changes.
@@ -992,6 +1093,7 @@ impl App {
             &chat_session,
             provider,
             budget_limits,
+            None,
             remote_actions,
             web_egress_grants,
         );
@@ -1032,6 +1134,11 @@ impl App {
             vdd_engine: None,
             vdd_builder_auth: crate::vdd::VddProviderAuth::None,
             runtime_handle: None,
+            supervisor: None,
+            active_turn: None,
+            background_calls: std::collections::HashMap::new(),
+            latest_background_calls: std::collections::HashMap::new(),
+            completed_turn_runs: Vec::new(),
             chat_session,
             transcript_subscriber,
             analytics_subscriber: None,
@@ -1309,7 +1416,7 @@ impl App {
             );
             return;
         };
-        drop(handle.spawn(async move {
+        let task = async move {
             if let Err(error) = previous_manager.write().await.disconnect_all().await {
                 tracing::warn!(%error, "failed to disconnect MCP servers for retired TUI run");
             }
@@ -1319,7 +1426,13 @@ impl App {
                 &trusted_servers,
             )
             .await;
-        }));
+        };
+        let call_id = crate::runtime::CallId::new();
+        if let Some(supervisor) = self.supervisor.as_mut() {
+            supervisor.spawn(call_id, TuiTaskKind::Mcp, task);
+        } else {
+            drop(handle.spawn(task));
+        }
     }
 
     fn stop_scheduler_service(&mut self) {
@@ -1554,41 +1667,50 @@ impl App {
     /// Fire the `Stop` hook. Invoked when a turn reaches a terminal
     /// assistant response (no further tool-call follow-up). Best-effort
     /// — runtime/engine absence short-circuits silently.
-    fn fire_stop_hook(&mut self) {
+    fn fire_stop_hook_for_run(
+        &mut self,
+        run_context: std::sync::Arc<crate::tools::ToolRunContext>,
+        call_id: crate::runtime::CallId,
+    ) {
         let engine = self
             .active_turn_hook_engine
             .take()
             .or_else(|| self.hook_engine.clone());
-        if let (Some(engine), Some(handle)) = (engine, self.runtime_handle.as_ref()) {
-            let Ok(run_context) = self.run_context.as_ref().map(std::sync::Arc::clone) else {
-                return;
-            };
+        if let (Some(engine), Some(handle)) = (engine, self.runtime_handle.clone()) {
             let session_id = self.chat_session.id();
-            handle.spawn(async move {
+            let task = async move {
                 let input =
                     crate::hooks::HookInput::for_run(&run_context, crate::hooks::HookEvent::Stop)
                         .with_session_id(session_id);
                 let _ = engine.run(crate::hooks::HookEvent::Stop, &input).await;
-            });
+            };
+            if let Some(supervisor) = self.supervisor.as_mut() {
+                supervisor.spawn(call_id, TuiTaskKind::Hook, task);
+            } else {
+                drop(handle.spawn(task));
+            }
         }
     }
 
     /// Fire the `Notification` hook with a free-form message. Used for
     /// API errors, rate-limit warnings, etc. Best-effort as above.
-    fn fire_notification_hook(&self, message: &str, level: &str) {
+    fn fire_notification_hook_for_run(
+        &mut self,
+        run_context: std::sync::Arc<crate::tools::ToolRunContext>,
+        call_id: crate::runtime::CallId,
+        message: &str,
+        level: &str,
+    ) {
         let engine = self
             .active_turn_hook_engine
             .as_ref()
             .or(self.hook_engine.as_ref());
-        if let (Some(engine), Some(handle)) = (engine, self.runtime_handle.as_ref()) {
-            let Ok(run_context) = self.run_context.as_ref().map(std::sync::Arc::clone) else {
-                return;
-            };
+        if let (Some(engine), Some(handle)) = (engine, self.runtime_handle.clone()) {
             let engine = engine.clone();
             let session_id = self.chat_session.id();
             let message = message.to_string();
             let level = level.to_string();
-            handle.spawn(async move {
+            let task = async move {
                 let payload = serde_json::json!({
                     "message": message,
                     "level": level.clone(),
@@ -1603,7 +1725,12 @@ impl App {
                 let _ = engine
                     .run(crate::hooks::HookEvent::Notification, &input)
                     .await;
-            });
+            };
+            if let Some(supervisor) = self.supervisor.as_mut() {
+                supervisor.spawn(call_id, TuiTaskKind::Hook, task);
+            } else {
+                drop(handle.spawn(task));
+            }
         }
     }
 
@@ -1757,6 +1884,342 @@ impl App {
         self.api_event_tx.clone()
     }
 
+    fn refresh_cancelled_launch_run(&mut self) -> Result<bool, String> {
+        let current = self.tool_run_context()?;
+        if !current.runtime().cancellation().is_cancelled() {
+            return Ok(false);
+        }
+        let next = if current.isolated_workspace().is_some() {
+            let config = self.app_config.as_ref().ok_or_else(|| {
+                "Cannot rebuild a cancelled isolated-workspace run without app configuration"
+                    .to_string()
+            })?;
+            let remote_actions = config.remote_actions.build_registry()?;
+            let web_egress_grants = config.build_web_egress_grants()?;
+            crate::tools::worktree::release_workspace_descriptor_owner(&current)?;
+            build_startup_session_run_context(
+                &self.chat_session,
+                &self.provider,
+                config
+                    .session
+                    .run_budget
+                    .limits_for_session(&config.session),
+                Some(current.runtime().budget().clone()),
+                remote_actions,
+                web_egress_grants,
+            )?
+        } else {
+            derive_session_run_context(&current, &self.chat_session, &self.provider)?
+        };
+        if let Some(config) = self.app_config.as_ref() {
+            crate::guardrails::configure(&next, &config.guardrails)?;
+        }
+        let durable_tasks = self
+            .task_mgr
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_durable();
+        let manager = if durable_tasks {
+            crate::session::TaskManager::open_for_run(&next)?
+        } else {
+            crate::session::TaskManager::for_run(&next)?
+        };
+        self.run_context = Ok(std::sync::Arc::clone(&next));
+        crate::tools::retire_run(&current);
+        self.task_mgr = std::sync::Arc::new(std::sync::Mutex::new(manager));
+        self.rebind_permission_manager(&next);
+        self.refresh_prompt_context_for_run();
+        Ok(true)
+    }
+
+    fn ensure_live_launch_run(&mut self) -> Result<(), String> {
+        if !self.refresh_cancelled_launch_run()? {
+            return Ok(());
+        }
+        let run = self
+            .tool_run_context()
+            .map_err(|error| format!("Cancelled TUI run could not publish replacement: {error}"))?;
+        self.rebind_mcp_runtime(&run);
+        self.rebind_scheduler_service(&run)
+            .map_err(|error| format!("Cancelled TUI run could not restart its scheduler: {error}"))
+    }
+
+    async fn reap_supervised_tasks(&mut self) {
+        let completions = match self.supervisor.as_mut() {
+            Some(supervisor) => supervisor.reap_finished().await,
+            None => Vec::new(),
+        };
+        for completion in completions {
+            self.observe_task_completion(completion);
+        }
+        self.reap_completed_turn_runs();
+    }
+
+    fn reap_completed_turn_runs(&mut self) {
+        let supervisor = self.supervisor.as_ref();
+        self.completed_turn_runs.retain(|completed| {
+            let supervised =
+                supervisor.is_some_and(|supervisor| supervisor.contains(completed.call_id));
+            let shell_active = !crate::tools::BACKGROUND_SHELLS
+                .active_ids_for_run(&completed.run_context)
+                .is_empty();
+            let agent_active = crate::subagent::BACKGROUND_AGENTS
+                .active_ids_for_run(&completed.run_context)
+                .map_or(true, |ids| !ids.is_empty());
+            let retain = supervised || shell_active || agent_active;
+            if !retain {
+                crate::tools::retire_run(&completed.run_context);
+            }
+            retain
+        });
+    }
+
+    fn retain_completed_turn_run(
+        &mut self,
+        call_id: crate::runtime::CallId,
+        run_context: &std::sync::Arc<crate::tools::ToolRunContext>,
+    ) {
+        let is_session_generation = self
+            .run_context
+            .as_ref()
+            .is_ok_and(|current| std::sync::Arc::ptr_eq(current, run_context));
+        if !is_session_generation {
+            self.completed_turn_runs.push(CompletedTurnRun {
+                call_id,
+                run_context: std::sync::Arc::clone(run_context),
+            });
+        }
+    }
+
+    /// Own one ancillary TUI operation and deliver exactly one terminal event.
+    ///
+    /// Production launches route the task through the launch supervisor and
+    /// tag its result with a typed call ID. The unsupervised branch is retained
+    /// for unit fixtures that exercise these helpers without entering `run()`.
+    fn spawn_owned_event<F>(
+        &mut self,
+        kind: TuiTaskKind,
+        future: F,
+    ) -> Option<tokio::task::JoinHandle<()>>
+    where
+        F: std::future::Future<Output = AppEvent> + Send + 'static,
+    {
+        let output = self.event_sender()?;
+        let runtime = self.runtime_handle.clone()?;
+        let call_id = crate::runtime::CallId::new();
+        if let Some(supervisor) = self.supervisor.as_mut() {
+            self.background_calls.insert(call_id, kind);
+            if kind.supersedes_previous() {
+                if let Some(previous) = self.latest_background_calls.insert(kind, call_id) {
+                    supervisor.cancel_call(
+                        previous,
+                        &crate::runtime::CancellationReason::ParentTerminated,
+                    );
+                }
+            }
+            supervisor.spawn(call_id, kind, async move {
+                let event = future.await;
+                let _ = output.send(AppEvent::Correlated {
+                    call_id,
+                    event: Box::new(event),
+                });
+            });
+            None
+        } else {
+            Some(runtime.spawn(async move {
+                let _ = output.send(future.await);
+            }))
+        }
+    }
+
+    fn remove_background_call(&mut self, call_id: crate::runtime::CallId) -> Option<TuiTaskKind> {
+        let kind = self.background_calls.remove(&call_id)?;
+        if self.latest_background_calls.get(&kind) == Some(&call_id) {
+            self.latest_background_calls.remove(&kind);
+        }
+        Some(kind)
+    }
+
+    fn observe_task_completion(&mut self, completion: TuiTaskCompletion) {
+        if let Some(turn) = self
+            .active_turn
+            .as_mut()
+            .filter(|turn| turn.call_id == completion.call_id)
+        {
+            if let Some(bridge) = turn.event_bridge.as_mut() {
+                bridge.finish();
+            }
+            turn.task_outcome = Some(completion.outcome);
+            return;
+        }
+        if !matches!(&completion.outcome, TuiTaskOutcome::Completed) {
+            self.remove_background_call(completion.call_id);
+        }
+        if let TuiTaskOutcome::Panicked(error) = completion.outcome {
+            self.messages.add(DisplayMessage::error(format!(
+                "Background {:?} call {} panicked: {error}",
+                completion.kind, completion.call_id
+            )));
+        }
+    }
+
+    fn finalize_joined_active_turn(&mut self) {
+        if self
+            .active_turn
+            .as_ref()
+            .is_none_or(|turn| turn.task_outcome.is_none())
+        {
+            return;
+        }
+        let Some(mut turn) = self.active_turn.take() else {
+            return;
+        };
+        if let Some(bridge) = turn.event_bridge.as_mut() {
+            bridge.finish();
+        }
+        let Some(task_outcome) = turn.task_outcome.take() else {
+            self.active_turn = Some(turn);
+            return;
+        };
+        let terminal = match (turn.terminal.take(), task_outcome) {
+            (Some(terminal), TuiTaskOutcome::Completed) => terminal,
+            (Some(ActiveTurnTerminal::Failed(error)), TuiTaskOutcome::Cancelled(_)) => {
+                ActiveTurnTerminal::Failed(error)
+            }
+            (Some(ActiveTurnTerminal::Cancelled(reason)), _) => {
+                ActiveTurnTerminal::Cancelled(reason)
+            }
+            (_, TuiTaskOutcome::Cancelled(receipt)) => {
+                ActiveTurnTerminal::Cancelled(receipt.reason)
+            }
+            (_, TuiTaskOutcome::Panicked(error)) => ActiveTurnTerminal::Failed(format!(
+                "Owned TUI call {} panicked: {error}",
+                turn.call_id
+            )),
+            (None, TuiTaskOutcome::Completed) => ActiveTurnTerminal::Failed(format!(
+                "Owned TUI call {} ended without a terminal outcome",
+                turn.call_id
+            )),
+        };
+
+        match terminal {
+            ActiveTurnTerminal::Succeeded => {
+                self.retain_completed_turn_run(turn.call_id, &turn.run_context);
+                self.handle_response_done_for_run(turn.run_context, turn.call_id);
+            }
+            ActiveTurnTerminal::Failed(error) => {
+                self.retain_completed_turn_run(turn.call_id, &turn.run_context);
+                self.handle_api_error_for_run(&error, turn.run_context, turn.call_id);
+            }
+            ActiveTurnTerminal::PluginAgent { label, result } => {
+                self.retain_completed_turn_run(turn.call_id, &turn.run_context);
+                self.handle_plugin_agent_done(&label, &result);
+            }
+            ActiveTurnTerminal::Cancelled(reason) => {
+                crate::tools::retire_run(&turn.run_context);
+                self.cancel_pending_keybinding();
+                self.preserve_failed_stream_for_display();
+                self.is_waiting = false;
+                self.active_turn_hook_engine = None;
+                self.messages.add(DisplayMessage::system(format!(
+                    "[Response cancelled: {}]",
+                    cancellation_reason_label(&reason)
+                )));
+            }
+        }
+    }
+
+    fn handle_correlated_event(
+        &mut self,
+        call_id: crate::runtime::CallId,
+        event: AppEvent,
+    ) -> bool {
+        let is_active_turn = self
+            .active_turn
+            .as_ref()
+            .is_some_and(|turn| turn.call_id == call_id);
+        if is_active_turn {
+            match event {
+                AppEvent::ResponseDone => {
+                    if let Some(turn) = self.active_turn.as_mut() {
+                        turn.terminal.get_or_insert(ActiveTurnTerminal::Succeeded);
+                    }
+                }
+                AppEvent::ApiError(error) => {
+                    if let Some(turn) = self.active_turn.as_mut() {
+                        turn.terminal
+                            .get_or_insert_with(|| ActiveTurnTerminal::Failed(error.to_string()));
+                    }
+                    self.cancel_active_turn_resources(
+                        &crate::runtime::CancellationReason::RuntimeFailure {
+                            detail: "model turn failed".to_string(),
+                        },
+                    );
+                }
+                AppEvent::PluginAgentDone { label, result } => {
+                    if let Some(turn) = self.active_turn.as_mut() {
+                        turn.terminal
+                            .get_or_insert(ActiveTurnTerminal::PluginAgent { label, result });
+                    }
+                }
+                AppEvent::WorkspaceTransition { ref run_context } => {
+                    if let Some(turn) = self.active_turn.as_mut() {
+                        turn.run_context = std::sync::Arc::clone(run_context);
+                    }
+                    return self.handle_app_event(Ok(event));
+                }
+                other => return self.handle_app_event(Ok(other)),
+            }
+            return true;
+        }
+
+        if let Some(kind) = self.background_calls.get(&call_id).copied() {
+            let is_latest = !kind.supersedes_previous()
+                || self.latest_background_calls.get(&kind) == Some(&call_id);
+            self.remove_background_call(call_id);
+            if is_latest {
+                return self.handle_app_event(Ok(event));
+            }
+            tracing::debug!(%call_id, ?kind, "ignored superseded TUI background completion");
+            return true;
+        }
+
+        if self
+            .supervisor
+            .as_ref()
+            .is_some_and(|supervisor| supervisor.contains(call_id))
+        {
+            return self.handle_app_event(Ok(event));
+        }
+        tracing::debug!(%call_id, "ignored event from completed or cancelled TUI call");
+        true
+    }
+
+    fn cancel_active_turn_resources(&mut self, reason: &crate::runtime::CancellationReason) {
+        let Some(turn) = self.active_turn.as_ref() else {
+            return;
+        };
+        let _ = turn
+            .run_context
+            .runtime()
+            .cancellation()
+            .cancel((*reason).clone());
+        if let Some(supervisor) = self.supervisor.as_ref() {
+            supervisor.cancel_call(turn.call_id, reason);
+        }
+        if let Some(permission) = self.pending_permission.take() {
+            let _ = permission
+                .reply
+                .send(super::events::PermissionResponse::Deny);
+        }
+        self.pending_user_question = None;
+        if let Some(plan) = self.pending_plan_approval.take() {
+            let _ = plan.reply.send(PlanModeReply::Cancelled {
+                message: "Plan approval cancelled with its owning turn".to_string(),
+            });
+        }
+    }
+
     /// Run the interactive TUI event loop.
     ///
     /// `async` so the `SessionEnd` cleanup at the end can `.await` the
@@ -1771,10 +2234,23 @@ impl App {
     /// # Errors
     ///
     /// Returns an error if terminal initialization or rendering fails.
-    #[allow(clippy::too_many_lines)] // Terminal, hooks, scheduler, and MCP share one ordered lifecycle boundary.
+    #[allow(clippy::too_many_lines, clippy::future_not_send)] // Current-thread terminal receiver and async cleanup share one ordered lifecycle boundary.
     pub async fn run(&mut self) -> io::Result<()> {
-        // Capture the tokio runtime handle (must be called inside an async context).
-        self.runtime_handle = tokio::runtime::Handle::try_current().ok();
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|error| io::Error::other(format!("TUI requires an async runtime: {error}")))?;
+        self.runtime_handle = Some(runtime.clone());
+        self.should_quit = false;
+        self.is_waiting = false;
+        self.api_event_tx = None;
+        self.active_turn = None;
+        self.background_calls.clear();
+        self.latest_background_calls.clear();
+
+        let refreshed_run = self
+            .refresh_cancelled_launch_run()
+            .map_err(io::Error::other)?;
+        let launch_run = self.tool_run_context().map_err(io::Error::other)?;
+        self.supervisor = Some(TuiSupervisor::new(runtime));
 
         // Session admission is a runtime lifecycle boundary shared with the
         // proxy, ACP, and legacy frontend. It runs before terminal mutation so
@@ -1799,6 +2275,13 @@ impl App {
                     }
                 }
                 crate::tools::retire_run(run_context);
+                if let Some(mut supervisor) = self.supervisor.take() {
+                    let _ = supervisor
+                        .cancel_and_join(crate::runtime::CancellationReason::RuntimeFailure {
+                            detail: "TUI session admission denied".to_string(),
+                        })
+                        .await;
+                }
                 return Err(io::Error::other(format!(
                     "SessionStart hook blocked TUI startup: {reason}"
                 )));
@@ -1812,33 +2295,38 @@ impl App {
             .map_err(|error| {
                 io::Error::other(format!("Durable scheduler run is unavailable: {error}"))
             })?;
-        self.rebind_scheduler_service(&scheduler_run)
-            .map_err(|error| {
-                io::Error::other(format!("Durable scheduler startup failed: {error}"))
-            })?;
+        if let Err(error) = self.rebind_scheduler_service(&scheduler_run) {
+            if let Some(mut supervisor) = self.supervisor.take() {
+                let _ = supervisor
+                    .cancel_and_join(crate::runtime::CancellationReason::RuntimeFailure {
+                        detail: "TUI scheduler startup failed".to_string(),
+                    })
+                    .await;
+            }
+            crate::tools::retire_run(&scheduler_run);
+            return Err(io::Error::other(format!(
+                "Durable scheduler startup failed: {error}"
+            )));
+        }
+        if refreshed_run {
+            self.rebind_mcp_runtime(&launch_run);
+        }
 
-        let outcome: io::Result<()> = async {
-            enable_raw_mode()?;
-            let mut stdout = io::stdout();
-            execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
-            let backend = CrosstermBackend::new(stdout);
-            let mut terminal = Terminal::new(backend)?;
+        let mut terminal_session = TerminalSession::enter()?;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend)?;
+        // Single event handler — two readers would steal each other's input.
+        let events = EventHandler::new(Duration::from_millis(100));
+        self.api_event_tx = Some(events.sender());
 
-            // Single event handler — MUST NOT create two, or they steal each other's keypresses
-            let events = EventHandler::new(Duration::from_millis(100));
-            // Store a sender clone so spawn_api_turn can push events into the same channel
-            self.api_event_tx = Some(events.sender());
-
-            // No welcome message added to the message list — the welcome
-            // box is rendered directly in draw() as a ratatui widget.
-
+        let loop_outcome = std::panic::AssertUnwindSafe(async {
             loop {
-                // crosslink #910: out-of-band shutdown signal. Any process
-                // (signal handler, background task, test fixture) can
-                // request a clean exit by flipping TUI_SHUTDOWN — the loop
-                // checks it before every tick so we exit promptly without
-                // a synthetic keypress.
-                if TUI_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
+                self.reap_supervised_tasks().await;
+                if self
+                    .supervisor
+                    .as_ref()
+                    .is_some_and(TuiSupervisor::is_cancelled)
+                {
                     break;
                 }
 
@@ -1872,6 +2360,7 @@ impl App {
                         }
                     }
                 }
+                self.finalize_joined_active_turn();
                 self.drain_state_subscribers();
                 if channel_dead || self.should_quit {
                     break;
@@ -1897,16 +2386,58 @@ impl App {
                 analytics.finish();
             }
             debug_assert!(self.service_registry.analytics_is_enabled());
-            Ok(())
-        }
+            Ok::<(), io::Error>(())
+        })
+        .catch_unwind()
         .await;
 
-        // Restore the terminal even when setup or drawing failed after raw
-        // mode/alternate-screen activation. Preserve the operational error
-        // when both the run loop and cleanup fail.
-        let terminal_cleanup = disable_raw_mode()
-            .and_then(|()| execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen));
-        let mut outcome = outcome.and(terminal_cleanup);
+        let mut outcome = match loop_outcome {
+            Ok(outcome) => outcome,
+            Err(payload) => Err(io::Error::other(format!(
+                "TUI event loop panicked: {}",
+                panic_payload_message(payload.as_ref())
+            ))),
+        };
+
+        // Restore the user's terminal before awaiting potentially slow child
+        // cleanup. The guard retries best-effort if explicit restoration fails.
+        outcome = outcome.and_then(|()| terminal_session.restore());
+
+        let shutdown_reason = if outcome.is_ok() {
+            crate::runtime::CancellationReason::FrontendDisconnected
+        } else {
+            crate::runtime::CancellationReason::RuntimeFailure {
+                detail: "TUI event loop terminated with an error".to_string(),
+            }
+        };
+        if let Some(turn) = self.active_turn.as_mut() {
+            turn.terminal
+                .get_or_insert_with(|| ActiveTurnTerminal::Cancelled(shutdown_reason.clone()));
+        }
+        self.cancel_active_turn_resources(&shutdown_reason);
+        if let Some(mut supervisor) = self.supervisor.take() {
+            let completions = supervisor.cancel_and_join(shutdown_reason).await;
+            for completion in completions {
+                self.observe_task_completion(completion);
+            }
+        }
+        self.background_calls.clear();
+        self.latest_background_calls.clear();
+        if let Some(mut turn) = self.active_turn.take() {
+            if let Some(bridge) = turn.event_bridge.as_mut() {
+                bridge.finish();
+            }
+            crate::tools::retire_run(&turn.run_context);
+            tracing::info!(
+                call_id = %turn.call_id,
+                "TUI active call joined during launch shutdown"
+            );
+        }
+        for completed in self.completed_turn_runs.drain(..) {
+            crate::tools::retire_run(&completed.run_context);
+        }
+        self.api_event_tx = None;
+        drop(events);
 
         if let Some(scheduler) = self.scheduler_service.take() {
             if let Err(error) = scheduler.shutdown().await {
@@ -1948,7 +2479,6 @@ impl App {
         if let Ok(run_context) = self.run_context.as_ref() {
             crate::tools::retire_run(run_context);
         }
-
         outcome
     }
 
@@ -1956,6 +2486,9 @@ impl App {
     #[allow(clippy::too_many_lines)]
     fn handle_app_event(&mut self, event: Result<AppEvent, std::sync::mpsc::RecvError>) -> bool {
         match event {
+            Ok(AppEvent::Correlated { call_id, event }) => {
+                return self.handle_correlated_event(call_id, *event);
+            }
             Ok(AppEvent::Key(key)) => self.handle_key(key),
             Ok(AppEvent::Paste(text)) => self.handle_paste(&text),
             Ok(AppEvent::Tick) => {
@@ -2004,38 +2537,9 @@ impl App {
                 self.apply_workspace_run_transition(&run_context);
             }
             Ok(AppEvent::ResponseDone) => self.handle_response_done(),
-            Ok(AppEvent::ApiError(msg)) => {
-                self.cancel_pending_keybinding();
-                self.preserve_failed_stream_for_display();
-                self.messages
-                    .add(DisplayMessage::error(format!("Error: {msg}")));
-                self.is_waiting = false;
-                self.fire_notification_hook(&format!("API error: {msg}"), "error");
-                self.active_turn_hook_engine = None;
-            }
+            Ok(AppEvent::ApiError(msg)) => self.handle_api_error(msg.as_str()),
             Ok(AppEvent::PluginAgentDone { label, result }) => {
-                self.cancel_pending_keybinding();
-                self.is_waiting = false;
-                self.active_turn_hook_engine = None;
-                if result.success {
-                    self.messages
-                        .add(DisplayMessage::assistant(result.output.clone()));
-                    self.chat_session.push_message(serde_json::json!({
-                        "role": "assistant",
-                        "content": result.output,
-                    }));
-                } else {
-                    self.messages.add(DisplayMessage::error(format!(
-                        "Plugin agent {label} failed: {}",
-                        result.output
-                    )));
-                    self.chat_session.push_message(serde_json::json!({
-                        "role": "system",
-                        "content": format!("Plugin agent {label} failed: {}", result.output),
-                    }));
-                }
-                self.chat_session.touch();
-                self.persist_session();
+                self.handle_plugin_agent_done(&label, &result);
             }
             Ok(AppEvent::ApiRetry {
                 kind,
@@ -2201,6 +2705,22 @@ impl App {
     /// chat session, refreshing the token estimate, and firing the
     /// Stop hook so external orchestrators get the round-trip signal.
     fn handle_response_done(&mut self) {
+        self.finish_response_state();
+        if let Ok(run_context) = self.run_context.as_ref().map(std::sync::Arc::clone) {
+            self.fire_stop_hook_for_run(run_context, crate::runtime::CallId::new());
+        }
+    }
+
+    fn handle_response_done_for_run(
+        &mut self,
+        run_context: std::sync::Arc<crate::tools::ToolRunContext>,
+        call_id: crate::runtime::CallId,
+    ) {
+        self.finish_response_state();
+        self.fire_stop_hook_for_run(run_context, call_id);
+    }
+
+    fn finish_response_state(&mut self) {
         self.cancel_pending_keybinding();
         self.messages.finish_thinking();
         self.prepare_streaming_final_for_display();
@@ -2211,7 +2731,68 @@ impl App {
         self.chat_session.touch();
         let _ = self.chat_session.refresh_estimated_tokens();
         self.persist_session();
-        self.fire_stop_hook();
+    }
+
+    fn handle_api_error(&mut self, error: &str) {
+        self.finish_api_error_state(error);
+        if let Ok(run_context) = self.run_context.as_ref().map(std::sync::Arc::clone) {
+            self.fire_notification_hook_for_run(
+                run_context,
+                crate::runtime::CallId::new(),
+                &format!("API error: {error}"),
+                "error",
+            );
+        }
+        self.active_turn_hook_engine = None;
+    }
+
+    fn handle_api_error_for_run(
+        &mut self,
+        error: &str,
+        run_context: std::sync::Arc<crate::tools::ToolRunContext>,
+        call_id: crate::runtime::CallId,
+    ) {
+        self.finish_api_error_state(error);
+        self.fire_notification_hook_for_run(
+            run_context,
+            call_id,
+            &format!("API error: {error}"),
+            "error",
+        );
+        self.active_turn_hook_engine = None;
+    }
+
+    fn finish_api_error_state(&mut self, error: &str) {
+        self.cancel_pending_keybinding();
+        self.preserve_failed_stream_for_display();
+        self.messages
+            .add(DisplayMessage::error(format!("Error: {error}")));
+        self.is_waiting = false;
+    }
+
+    fn handle_plugin_agent_done(&mut self, label: &str, result: &crate::subagent::SubagentResult) {
+        self.cancel_pending_keybinding();
+        self.is_waiting = false;
+        self.active_turn_hook_engine = None;
+        if result.success {
+            self.messages
+                .add(DisplayMessage::assistant(result.output.clone()));
+            self.chat_session.push_message(serde_json::json!({
+                "role": "assistant",
+                "content": result.output,
+            }));
+        } else {
+            self.messages.add(DisplayMessage::error(format!(
+                "Plugin agent {label} failed: {}",
+                result.output
+            )));
+            self.chat_session.push_message(serde_json::json!({
+                "role": "system",
+                "content": format!("Plugin agent {label} failed: {}", result.output),
+            }));
+        }
+        self.chat_session.touch();
+        self.persist_session();
     }
 
     fn preserve_failed_stream_for_display(&mut self) {
@@ -2575,6 +3156,7 @@ impl App {
         // If permission prompt is active, deny and dismiss without quitting.
         if let Some(perm) = self.pending_permission.take() {
             let _ = perm.reply.send(super::events::PermissionResponse::Deny);
+            self.cancel_streaming_response();
             return;
         }
         // If an ask_user_question modal is active, cancel it (drop the
@@ -2585,6 +3167,7 @@ impl App {
             self.messages.add(DisplayMessage::system(
                 "ask_user_question cancelled".to_string(),
             ));
+            self.cancel_streaming_response();
             return;
         }
         if let Some(plan) = self.pending_plan_approval.take() {
@@ -2593,6 +3176,7 @@ impl App {
                 message: message.clone(),
             });
             self.messages.add(DisplayMessage::system(message));
+            self.cancel_streaming_response();
             return;
         }
         // If an overlay is open, close it instead of quitting — matches
@@ -2601,6 +3185,9 @@ impl App {
         if self.overlay.is_some() {
             self.overlay = None;
             return;
+        }
+        if self.active_turn.is_some() {
+            self.cancel_streaming_response();
         }
         self.should_quit = true;
     }
@@ -2658,12 +3245,21 @@ impl App {
 
     fn cancel_streaming_response(&mut self) {
         self.cancel_pending_keybinding();
-        self.is_waiting = false;
-        self.messages.finish_streaming();
-        self.streaming_raw_text.clear();
-        self.active_turn_hook_engine = None;
+        let Some(turn) = self.active_turn.as_mut() else {
+            self.is_waiting = false;
+            self.messages.finish_streaming();
+            self.streaming_raw_text.clear();
+            self.active_turn_hook_engine = None;
+            self.messages
+                .add(DisplayMessage::system("[Response interrupted]"));
+            return;
+        };
+        turn.terminal.get_or_insert(ActiveTurnTerminal::Cancelled(
+            crate::runtime::CancellationReason::User,
+        ));
+        self.cancel_active_turn_resources(&crate::runtime::CancellationReason::User);
         self.messages
-            .add(DisplayMessage::system("[Response interrupted]"));
+            .add(DisplayMessage::system("[Cancelling response…]"));
     }
 
     /// Normal-mode keystrokes: interactive editing. Permission, question,
@@ -2717,6 +3313,7 @@ impl App {
             _ => None,
         };
         if let Some(resp) = response {
+            let cancelled = key.code == KeyCode::Esc;
             if let Some(perm) = self.pending_permission.take() {
                 let label = match resp {
                     PermissionResponse::Allow => "Allowed",
@@ -2736,6 +3333,9 @@ impl App {
                 });
                 let _ = perm.reply.send(resp);
             }
+            if cancelled {
+                self.cancel_streaming_response();
+            }
         }
     }
 
@@ -2752,6 +3352,7 @@ impl App {
                     });
                     self.messages.add(DisplayMessage::system(message));
                 }
+                self.cancel_streaming_response();
             }
             KeyCode::Up => {
                 if let Some(plan) = self.pending_plan_approval.as_mut() {
@@ -2892,6 +3493,7 @@ impl App {
                     "ask_user_question cancelled".to_string(),
                 ));
             }
+            self.cancel_streaming_response();
             return;
         }
 
@@ -3040,12 +3642,7 @@ impl App {
         // During streaming, Escape cancels
         if self.is_waiting {
             if key.code == KeyCode::Esc {
-                self.is_waiting = false;
-                self.messages.finish_streaming();
-                self.streaming_raw_text.clear();
-                self.active_turn_hook_engine = None;
-                self.messages
-                    .add(DisplayMessage::system("[Response interrupted]"));
+                self.cancel_streaming_response();
             }
             return;
         }
@@ -3224,7 +3821,7 @@ impl App {
     }
 
     /// Handle /export and /effort slash commands. Returns true if handled.
-    fn handle_export_effort_slash(&self, text: &str) -> bool {
+    fn handle_export_effort_slash(&mut self, text: &str) -> bool {
         if text == "/export" {
             // Build the markdown body synchronously — needs `&self` and is
             // bounded by session size. The blocking part is the disk write,
@@ -3888,21 +4485,25 @@ impl App {
     }
 
     fn spawn_plugin_agent(&mut self, invocation: crate::plugins::PluginAgentInvocation) {
-        let Some(handle) = self.runtime_handle.as_ref() else {
+        let Some(runtime) = self.runtime_handle.clone() else {
             self.messages.add(DisplayMessage::error(
                 "Plugin agents require the async runtime.",
             ));
             return;
         };
-        let Some(tx) = self.event_sender() else {
+        if self.active_turn.is_some() {
             self.messages.add(DisplayMessage::error(
-                "Plugin agent event delivery is unavailable.",
+                "Cannot start a plugin agent while another response is active.",
             ));
             return;
-        };
-        let Ok(run_context) = self.run_context.as_ref().map(std::sync::Arc::clone) else {
+        }
+        if let Err(error) = self.ensure_live_launch_run() {
+            self.handle_api_error(&error);
+            return;
+        }
+        let Some(event_output) = self.event_sender() else {
             self.messages.add(DisplayMessage::error(
-                "Plugin agents require an active run context.",
+                "Plugin agent event delivery is unavailable.",
             ));
             return;
         };
@@ -3911,6 +4512,25 @@ impl App {
                 "Plugin agents require active application configuration.",
             ));
             return;
+        };
+        let Ok(launch_run) = self.run_context.as_ref().map(std::sync::Arc::clone) else {
+            self.messages.add(DisplayMessage::error(
+                "Plugin agents require an active run context.",
+            ));
+            return;
+        };
+        let run_context = if launch_run.isolated_workspace().is_some() {
+            launch_run
+        } else {
+            match derive_session_run_context(&launch_run, &self.chat_session, &self.provider) {
+                Ok(run) => run,
+                Err(error) => {
+                    self.messages.add(DisplayMessage::error(format!(
+                        "Cannot create plugin-agent run: {error}"
+                    )));
+                    return;
+                }
+            }
         };
         let metadata = &invocation.registration.metadata;
         let label = format!(
@@ -3927,7 +4547,10 @@ impl App {
         self.is_waiting = true;
         let client = self.api_client.client.clone();
         let memory_db = self.memory_db.clone();
-        handle.spawn(async move {
+        let call_id = crate::runtime::CallId::new();
+        let (event_bridge, tx) = CallEventBridge::new(call_id, event_output);
+        let active_run = std::sync::Arc::clone(&run_context);
+        let task = async move {
             let result = crate::subagent::run_plugin_agent(
                 &run_context,
                 &invocation,
@@ -3937,7 +4560,19 @@ impl App {
             )
             .await;
             let _ = tx.send(AppEvent::PluginAgentDone { label, result });
+        };
+        self.active_turn = Some(ActiveTurn {
+            call_id,
+            run_context: active_run,
+            event_bridge: Some(event_bridge),
+            terminal: None,
+            task_outcome: None,
         });
+        if let Some(supervisor) = self.supervisor.as_mut() {
+            supervisor.spawn(call_id, TuiTaskKind::PluginAgent, task);
+        } else {
+            drop(runtime.spawn(task));
+        }
     }
 
     fn apply_skill_turn_metadata(&mut self, activation: &crate::skills::SkillActivation) {
@@ -4009,31 +4644,32 @@ impl App {
             return true;
         }
 
-        let Some(handle) = self.runtime_handle.clone() else {
+        if self.runtime_handle.is_none() {
             self.messages.add(DisplayMessage::error(
                 "No async runtime bound; cannot switch providers.",
             ));
             return true;
-        };
-        let Some(tx) = self.event_sender() else {
+        }
+        if self.event_sender().is_none() {
             self.messages.add(DisplayMessage::error(
                 "No TUI event channel bound; cannot switch providers.",
             ));
             return true;
-        };
+        }
 
         let requested = requested.to_string();
         let prompt_blocks = self.api_client.prompt_blocks.clone();
         self.messages.add(DisplayMessage::system(format!(
             "Switching provider to {requested}..."
         )));
-        handle.spawn(async move {
-            let event = match resolve_provider_switch(&requested, prompt_blocks) {
-                Ok(switch) => AppEvent::ProviderSwitchReady(Box::new(switch)),
-                Err(err) => AppEvent::ProviderSwitchError(err),
-            };
-            let _ = tx.send(event);
-        });
+        drop(
+            self.spawn_owned_event(TuiTaskKind::ProviderDiscovery, async move {
+                match resolve_provider_switch(&requested, prompt_blocks) {
+                    Ok(switch) => AppEvent::ProviderSwitchReady(Box::new(switch)),
+                    Err(err) => AppEvent::ProviderSwitchError(err),
+                }
+            }),
+        );
         true
     }
 
@@ -4071,18 +4707,18 @@ impl App {
             ));
             return;
         };
-        let Some(handle) = self.runtime_handle.clone() else {
+        if self.runtime_handle.is_none() {
             self.show_model_list_fallback(Some(
                 "No async runtime is bound for dynamic model listing.",
             ));
             return;
-        };
-        let Some(tx) = self.event_sender() else {
+        }
+        if self.event_sender().is_none() {
             self.show_model_list_fallback(Some(
                 "No TUI event channel is bound for dynamic model listing.",
             ));
             return;
-        };
+        }
 
         let provider = self.provider.clone();
         let current_model = self.model.clone();
@@ -4090,34 +4726,36 @@ impl App {
         self.messages.add(DisplayMessage::system(format!(
             "Fetching models for {provider} from the configured /models endpoint..."
         )));
-        handle.spawn(async move {
-            let event = match crate::providers::fetch_models_for_provider_with_headers(
-                &provider,
-                &provider_config.base_url,
-                provider_config.api_key.as_ref(),
-                &extra_headers,
-                adapter,
-            )
-            .await
-            {
-                Ok(models) => {
-                    let model_ids: Vec<String> = models.into_iter().map(|model| model.id).collect();
-                    AppEvent::ModelListReady {
-                        provider,
-                        current_model,
-                        models: model_ids,
-                        source: "provider API".to_string(),
-                        fallback_note: None,
+        drop(
+            self.spawn_owned_event(TuiTaskKind::ModelDiscovery, async move {
+                match crate::providers::fetch_models_for_provider_with_headers(
+                    &provider,
+                    &provider_config.base_url,
+                    provider_config.api_key.as_ref(),
+                    &extra_headers,
+                    adapter,
+                )
+                .await
+                {
+                    Ok(models) => {
+                        let model_ids: Vec<String> =
+                            models.into_iter().map(|model| model.id).collect();
+                        AppEvent::ModelListReady {
+                            provider,
+                            current_model,
+                            models: model_ids,
+                            source: "provider API".to_string(),
+                            fallback_note: None,
+                        }
                     }
+                    Err(err) => AppEvent::ModelListError {
+                        provider,
+                        message: err.to_string(),
+                        fallback_models,
+                    },
                 }
-                Err(err) => AppEvent::ModelListError {
-                    provider,
-                    message: err.to_string(),
-                    fallback_models,
-                },
-            };
-            let _ = tx.send(event);
-        });
+            }),
+        );
     }
 
     fn handle_slash_model(&mut self, text: &str) -> bool {
@@ -4195,7 +4833,7 @@ impl App {
     /// thread the way the previous synchronous `std::fs::read_dir` did.
     /// The result is rendered when the matching
     /// `AppEvent::ShellDone { target: SpawnTarget::Files, .. }` arrives.
-    fn handle_slash_files(&self, text: &str) {
+    fn handle_slash_files(&mut self, text: &str) {
         let dir = text.strip_prefix("/files").unwrap_or("").trim().to_owned();
         let dir = if dir.is_empty() { ".".to_string() } else { dir };
         let dir_for_render = dir.clone();
@@ -4229,7 +4867,7 @@ impl App {
     /// Dispatches to the tokio runtime via [`Self::spawn_shell`] — see
     /// crosslink #371. The rendering of the result happens on the next
     /// `AppEvent::ShellDone` tick handled in `handle_app_event`.
-    fn handle_slash_diff(&self) {
+    fn handle_slash_diff(&mut self) {
         // Drop the JoinHandle explicitly: the slash-command call site is
         // fire-and-forget, the receiver lives in the mpsc channel.
         drop(self.spawn_shell(vec!["git", "diff", "--stat"], SpawnTarget::Diff));
@@ -4386,7 +5024,7 @@ impl App {
     ///
     /// Dispatches the typed user-origin action through the canonical process
     /// capability without blocking the TUI event loop.
-    fn handle_shell_command(&self, cmd: &str) {
+    fn handle_shell_command(&mut self, cmd: &str) {
         if cmd.is_empty() {
             return;
         }
@@ -4395,12 +5033,12 @@ impl App {
 
     /// Spawn one explicit `!command` action through the shared sandboxed
     /// supervisor and deliver its bounded result through the existing TUI event.
-    fn spawn_direct_shell(&self, command: &str) -> Option<tokio::task::JoinHandle<()>> {
+    fn spawn_direct_shell(&mut self, command: &str) -> Option<tokio::task::JoinHandle<()>> {
         let target = SpawnTarget::ShellCommand {
             displayed: command.to_string(),
         };
         let tx = self.api_event_tx.clone()?;
-        let Some(handle) = self.runtime_handle.clone() else {
+        if self.runtime_handle.is_none() {
             let _ = tx.send(AppEvent::ShellDone {
                 target,
                 stdout: String::new(),
@@ -4408,7 +5046,7 @@ impl App {
                 exit_code: None,
             });
             return None;
-        };
+        }
         let run = match &self.run_context {
             Ok(run) => std::sync::Arc::clone(run),
             Err(error) => {
@@ -4422,8 +5060,8 @@ impl App {
             }
         };
         let action = crate::tools::DirectShellAction::new(command, self.chat_session.id());
-        Some(handle.spawn(async move {
-            let event = match crate::tools::execute_direct_shell_async(&run, action).await {
+        self.spawn_owned_event(TuiTaskKind::Process, async move {
+            match crate::tools::execute_direct_shell_async(&run, action).await {
                 Ok(execution) => {
                     let exit_code = execution.exit_code();
                     let mut stderr = execution.stderr;
@@ -4461,9 +5099,8 @@ impl App {
                         exit_code: None,
                     }
                 }
-            };
-            let _ = tx.send(event);
-        }))
+            }
+        })
     }
 
     /// Send a user message to the API.
@@ -4501,13 +5138,13 @@ impl App {
     /// helper synthesises an error `ShellDone` directly through the
     /// channel — same shape as `spawn_shell`'s no-runtime branch. Tests
     /// without a runtime still observe the event.
-    fn spawn_fs<F>(&self, target: SpawnTarget, op: F)
+    fn spawn_fs<F>(&mut self, target: SpawnTarget, op: F)
     where
         F: FnOnce() -> Result<String, String> + Send + 'static,
     {
         let tx = self.api_event_tx.clone();
 
-        let Some(handle) = self.runtime_handle.clone() else {
+        if self.runtime_handle.is_none() {
             if let Some(tx) = tx {
                 let _ = tx.send(AppEvent::ShellDone {
                     target,
@@ -4517,14 +5154,14 @@ impl App {
                 });
             }
             return;
-        };
+        }
 
         // spawn_blocking puts the closure on the tokio blocking-IO pool
         // (default 512 threads) so a slow read_dir() doesn't take down
         // any of the async-runtime worker threads either.
-        handle.spawn(async move {
+        drop(self.spawn_owned_event(TuiTaskKind::Filesystem, async move {
             let join = tokio::task::spawn_blocking(op).await;
-            let evt = match join {
+            match join {
                 Ok(Ok(text)) => AppEvent::ShellDone {
                     target,
                     stdout: text,
@@ -4543,11 +5180,8 @@ impl App {
                     stderr: format!("fs task panicked: {join_err}"),
                     exit_code: None,
                 },
-            };
-            if let Some(tx) = tx {
-                let _ = tx.send(evt);
             }
-        });
+        }));
     }
 
     /// Spawn a subprocess on the tokio runtime and post the result back
@@ -4572,7 +5206,7 @@ impl App {
     /// explaining the missing runtime) and returns `None`.
     #[allow(clippy::too_many_lines)] // Keep async process lifecycle and its single TUI completion event together.
     fn spawn_shell(
-        &self,
+        &mut self,
         cmd: Vec<&str>,
         target: SpawnTarget,
     ) -> Option<tokio::task::JoinHandle<()>> {
@@ -4633,7 +5267,7 @@ impl App {
         let private_temp = run_context.private_temp_root().to_path_buf();
         let executable_search_path = run_context.executable_search_path().to_os_string();
 
-        let Some(handle) = self.runtime_handle.clone() else {
+        if self.runtime_handle.is_none() {
             // No runtime — surface as a failed ShellDone so the receiver
             // still gets called.
             if let Some(tx) = tx {
@@ -4645,7 +5279,7 @@ impl App {
                 });
             }
             return None;
-        };
+        }
 
         let mutation_effect = match &target {
             SpawnTarget::Init => Some(crate::tools::effect::ToolEffect::WorkspaceMutation),
@@ -4673,17 +5307,14 @@ impl App {
             None => None,
         };
 
-        Some(handle.spawn(async move {
+        self.spawn_owned_event(TuiTaskKind::Process, async move {
             let Some((exe, rest)) = argv.split_first() else {
-                if let Some(tx) = tx {
-                    let _ = tx.send(AppEvent::ShellDone {
-                        target,
-                        stdout: String::new(),
-                        stderr: "spawn_shell called with empty argv".to_string(),
-                        exit_code: None,
-                    });
-                }
-                return;
+                return AppEvent::ShellDone {
+                    target,
+                    stdout: String::new(),
+                    stderr: "spawn_shell called with empty argv".to_string(),
+                    exit_code: None,
+                };
             };
 
             let result = match run_context.resolve_executable(exe) {
@@ -4721,7 +5352,7 @@ impl App {
                 }
             }
 
-            let evt = match result {
+            match result {
                 Ok(out) => AppEvent::ShellDone {
                     target,
                     stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -4734,31 +5365,32 @@ impl App {
                     stderr: format!("{e}"),
                     exit_code: None,
                 },
-            };
-
-            if let Some(tx) = tx {
-                let _ = tx.send(evt);
             }
-        }))
+        })
     }
 
     /// Spawn an async API turn on the tokio runtime.
     ///
     /// Sends events through the event handler's mpsc channel so the
     /// synchronous TUI event loop can display streaming output.
+    #[allow(clippy::too_many_lines)] // One atomic snapshot composes the exact model-turn capability and transport.
     fn spawn_api_turn(&mut self) {
-        self.refresh_prompt_context_for_run();
-        let Some(ref handle) = self.runtime_handle else {
-            // No async runtime — show fallback message
+        if self.runtime_handle.is_none() {
             self.messages.add(DisplayMessage::error(
                 "[No async runtime — cannot call API. Run with tokio.]",
             ));
             self.is_waiting = false;
             self.clear_next_turn_metadata();
             return;
-        };
+        }
+        if let Err(error) = self.ensure_live_launch_run() {
+            self.handle_api_error(&error);
+            self.clear_next_turn_metadata();
+            return;
+        }
+        self.refresh_prompt_context_for_run();
 
-        let Some(tx) = self.event_sender() else {
+        let Some(event_output) = self.event_sender() else {
             self.is_waiting = false;
             self.clear_next_turn_metadata();
             return;
@@ -4792,21 +5424,29 @@ impl App {
         self.active_turn_hook_engine.clone_from(&hook_engine);
         self.next_turn_skill_context.clear();
         let session_id_for_task = self.chat_session.id();
-        let run_context = match &self.run_context {
+        let launch_run = match &self.run_context {
             Ok(run_context) => std::sync::Arc::clone(run_context),
             Err(error) => {
-                send_or_warn(
-                    &tx,
-                    super::events::AppEvent::ApiError(
-                        format!("Tool execution is unavailable: {error}").into(),
-                    ),
-                    &session_id_for_task,
-                );
+                self.handle_api_error(&format!("Tool execution is unavailable: {error}"));
                 self.is_waiting = false;
                 self.clear_next_turn_metadata();
                 return;
             }
         };
+        let run_context = if launch_run.isolated_workspace().is_some() {
+            launch_run
+        } else {
+            match derive_session_run_context(&launch_run, &self.chat_session, &self.provider) {
+                Ok(run) => run,
+                Err(error) => {
+                    self.handle_api_error(&format!("Cannot create model-turn run: {error}"));
+                    self.clear_next_turn_metadata();
+                    return;
+                }
+            }
+        };
+        let call_id = crate::runtime::CallId::new();
+        let (event_bridge, tx) = CallEventBridge::new(call_id, event_output);
         let memory_db = self.memory_db.clone();
         let app_config = self.app_config.clone();
         let permission_mgr = self.permission_mgr.clone();
@@ -4814,43 +5454,90 @@ impl App {
         let vdd_builder_auth = self.vdd_builder_auth.clone();
         let policy_enforcer = std::sync::Arc::clone(&self.policy_enforcer);
         let task_mgr = self.task_mgr.clone();
-        let mcp_manager = self
-            .mcp_runtime
+        let turn_mcp = self.mcp_runtime.as_ref().map(|runtime| {
+            let manager = std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::mcp::McpManager::new_with_permissions(
+                    std::sync::Arc::clone(&run_context),
+                    self.app_config
+                        .as_ref()
+                        .map_or_else(crate::config::PermissionsConfig::default, |config| {
+                            config.permissions.clone()
+                        }),
+                ),
+            ));
+            let _ = crate::mcp::install_manager(&run_context, &manager);
+            (
+                manager,
+                std::sync::Arc::clone(&runtime.plugin_manager),
+                runtime.trusted_servers.clone(),
+            )
+        });
+        let mcp_manager = turn_mcp
             .as_ref()
-            .map(|runtime| std::sync::Arc::clone(&runtime.manager));
+            .map(|(manager, _, _)| std::sync::Arc::clone(manager));
         // Clone the canonical state snapshot so the async task can build
         // follow-up requests without holding the state lock across awaits.
         let session_messages = self.chat_session.messages_snapshot();
         let provider_native_state = self.chat_session.provider_native_state_snapshot();
+        let active_run = std::sync::Arc::clone(&run_context);
 
-        handle.spawn(run_api_turn_async(ApiTurnParams {
-            run_context,
-            session_messages,
-            provider_native_state,
-            client,
-            endpoint,
-            headers,
-            provider,
-            model,
-            effort_level,
-            wire_api,
-            claude_code_token,
-            claude_agent_sdk,
-            codex_agent_sdk,
-            prompt_blocks,
-            memory_db,
-            app_config,
-            permission_mgr,
-            vdd_engine,
-            vdd_builder_auth,
-            transient_allowed_tool_rules,
-            hook_engine,
-            policy_enforcer,
-            task_mgr,
-            mcp_manager,
-            session_id: session_id_for_task,
-            tx,
-        }));
+        let task = async move {
+            if let Some((manager, plugin_manager, trusted_servers)) = turn_mcp.as_ref() {
+                plugin_manager.configure_lsp_service_for_run(&run_context);
+                crate::proxy::connect_mcp_servers_with_trust(
+                    manager,
+                    plugin_manager,
+                    trusted_servers,
+                )
+                .await;
+            }
+            Box::pin(run_api_turn_async(ApiTurnParams {
+                run_context,
+                session_messages,
+                provider_native_state,
+                client,
+                endpoint,
+                headers,
+                provider,
+                model,
+                effort_level,
+                wire_api,
+                claude_code_token,
+                claude_agent_sdk,
+                codex_agent_sdk,
+                prompt_blocks,
+                memory_db,
+                app_config,
+                permission_mgr,
+                vdd_engine,
+                vdd_builder_auth,
+                transient_allowed_tool_rules,
+                hook_engine,
+                policy_enforcer,
+                task_mgr,
+                mcp_manager,
+                session_id: session_id_for_task,
+                tx,
+            }))
+            .await;
+            if let Some((manager, _, _)) = turn_mcp {
+                if let Err(error) = manager.write().await.disconnect_all().await {
+                    tracing::warn!(%error, "failed to disconnect model-turn MCP transports");
+                }
+            }
+        };
+        self.active_turn = Some(ActiveTurn {
+            call_id,
+            run_context: active_run,
+            event_bridge: Some(event_bridge),
+            terminal: None,
+            task_outcome: None,
+        });
+        if let Some(supervisor) = self.supervisor.as_mut() {
+            supervisor.spawn(call_id, TuiTaskKind::ModelTurn, task);
+        } else if let Some(handle) = self.runtime_handle.as_ref() {
+            drop(handle.spawn(task));
+        }
     }
 
     fn clear_next_turn_metadata(&mut self) {
@@ -5208,6 +5895,12 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        if let Some(turn) = self.active_turn.take() {
+            crate::tools::retire_run(&turn.run_context);
+        }
+        for completed in self.completed_turn_runs.drain(..) {
+            crate::tools::retire_run(&completed.run_context);
+        }
         if let Ok(run) = self.run_context.as_ref() {
             crate::tools::retire_run(run);
         }
@@ -5703,6 +6396,9 @@ fn format_stream_timeout_message(elapsed_secs: u64, timeout_secs: u64) -> String
 /// it and adding the derive would ripple through the rest of the file.
 fn describe_event(event: &super::events::AppEvent) -> String {
     match event {
+        super::events::AppEvent::Correlated { call_id, event } => {
+            format!("Correlated({call_id}, {})", describe_event(event))
+        }
         super::events::AppEvent::SyncSession {
             session_id,
             messages,
@@ -6840,8 +7536,8 @@ mod tests {
         format_api_retry_message, format_review_command_output, format_stream_timeout_message,
         handle_turn_result, list_sessions, provider_state_after_turn, read_tui_session_file,
         resolve_provider_switch_auth, save_session, write_orphan_recovery_file, ApiClient, App,
-        AppEvent, EffortLevel, MessageKind, Mode, ProviderSwitch, SpawnTarget, TurnContext,
-        TEST_SESSIONS_DIR,
+        AppEvent, EffortLevel, MessageKind, Mode, ProviderSwitch, SpawnTarget, TuiSupervisor,
+        TuiTaskKind, TurnContext, TEST_SESSIONS_DIR,
     };
     use super::{compile_file_ref_regex, expand_file_refs};
     use crate::slash_commands::all_tui_commands;
@@ -7546,7 +8242,7 @@ mod tests {
 
     #[test]
     fn tui_effort_slash_updates_status_without_chat_message() {
-        let app = App::new("claude-sonnet-4-6", "anthropic");
+        let mut app = App::new("claude-sonnet-4-6", "anthropic");
 
         assert!(app.handle_export_effort_slash("/effort high"));
 
@@ -8444,6 +9140,79 @@ mod tests {
         let (tx, rx) = mpsc::channel::<AppEvent>();
         app.api_event_tx = Some(tx);
         rx
+    }
+
+    #[tokio::test]
+    async fn supervised_background_completion_keeps_its_call_id_until_event_delivery() {
+        let mut app = App::new("test-model", "test-provider");
+        let rx = wire_app(&mut app);
+        app.supervisor = Some(TuiSupervisor::new(tokio::runtime::Handle::current()));
+
+        let detached = app.spawn_owned_event(TuiTaskKind::Filesystem, async {
+            AppEvent::ShellDone {
+                target: SpawnTarget::Files,
+                stdout: "owned result".to_string(),
+                stderr: String::new(),
+                exit_code: Some(0),
+            }
+        });
+        assert!(
+            detached.is_none(),
+            "the launch supervisor must own the task"
+        );
+
+        let event = loop {
+            tokio::task::yield_now().await;
+            if let Ok(event) = rx.try_recv() {
+                break event;
+            }
+        };
+        let AppEvent::Correlated { call_id, .. } = &event else {
+            panic!("supervised background completion must be call-correlated");
+        };
+        let call_id = *call_id;
+
+        app.reap_supervised_tasks().await;
+        assert!(
+            app.background_calls.contains_key(&call_id),
+            "task completion must not make its already-queued event stale"
+        );
+        assert!(app.handle_app_event(Ok(event)));
+        assert!(!app.background_calls.contains_key(&call_id));
+    }
+
+    #[tokio::test]
+    async fn newer_discovery_cancels_the_superseded_call_generation() {
+        let mut app = App::new("test-model", "test-provider");
+        let rx = wire_app(&mut app);
+        app.supervisor = Some(TuiSupervisor::new(tokio::runtime::Handle::current()));
+
+        drop(app.spawn_owned_event(TuiTaskKind::ProviderDiscovery, std::future::pending()));
+        drop(
+            app.spawn_owned_event(TuiTaskKind::ProviderDiscovery, async {
+                AppEvent::ProviderSwitchError("latest discovery".to_string())
+            }),
+        );
+
+        let event = loop {
+            tokio::task::yield_now().await;
+            app.reap_supervised_tasks().await;
+            if let Ok(event) = rx.try_recv() {
+                break event;
+            }
+        };
+        assert!(matches!(
+            &event,
+            AppEvent::Correlated { event, .. }
+                if matches!(event.as_ref(), AppEvent::ProviderSwitchError(message) if message == "latest discovery")
+        ));
+        assert_eq!(
+            app.background_calls.len(),
+            1,
+            "the cancelled discovery generation must be reaped"
+        );
+        assert!(app.handle_app_event(Ok(event)));
+        assert!(app.background_calls.is_empty());
     }
 
     /// Block the current thread on `rx` for up to `timeout`, returning the

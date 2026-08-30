@@ -103,6 +103,199 @@ const _INTERNAL_ERROR: i64 = -32603;
 type SharedAcpTaskManagers =
     Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<crate::session::TaskManager>>>>>;
 
+const ACP_SESSION_ENVELOPE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcpSessionEnvelope {
+    schema_version: u32,
+    generation: u64,
+    wire_session_id: String,
+    canonical_session_id: String,
+    runtime_mode: String,
+    config_options: HashMap<String, Value>,
+    lifecycle_session: crate::session::Session,
+    session: crate::state::Session,
+}
+
+#[derive(Debug, Error)]
+enum AcpSessionStoreError {
+    #[error("unknown ACP session {0}")]
+    UnknownSession(String),
+    #[error("invalid ACP session id: {0}")]
+    InvalidSessionId(String),
+    #[error("ACP session {session_id} has unsupported schema version {found}")]
+    UnsupportedSchema { session_id: String, found: u32 },
+    #[error("ACP session {session_id} has inconsistent canonical ownership")]
+    OwnershipMismatch { session_id: String },
+    #[error("ACP session {session_id} generation is exhausted")]
+    GenerationExhausted { session_id: String },
+    #[error("cannot serialize ACP session {session_id}: {source}")]
+    Serialize {
+        session_id: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("ACP session storage failed for {session_id}: {source}")]
+    Storage {
+        session_id: String,
+        #[source]
+        source: crate::persistence::PersistenceError,
+    },
+    #[error("cannot decode ACP session {session_id}: {source}")]
+    Decode {
+        session_id: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("ACP session {session_id} storage generation conflicts with the proposed envelope")]
+    GenerationConflict { session_id: String },
+    #[error("ACP session {session_id} was published without proven directory durability")]
+    DurabilityUncertain { session_id: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcpActiveCallMarker {
+    session_id: String,
+    call_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveAcpCall {
+    request_key: String,
+    call_id: String,
+    cancellation: Arc<AtomicBool>,
+    canonical_cancellation: Option<crate::runtime::CancellationHandle>,
+    completed: bool,
+}
+
+#[derive(Debug, Default)]
+struct AcpCallRegistry {
+    calls: HashMap<String, ActiveAcpCall>,
+}
+
+type SharedAcpCalls = Arc<std::sync::Mutex<AcpCallRegistry>>;
+
+fn prepare_acp_session_storage(
+    persist_dir: &std::path::Path,
+) -> Result<crate::persistence::PersistentStorage, String> {
+    let root = persist_dir.join("acp");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        if let Err(error) = builder.create(&root) {
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(format!("Cannot create ACP session store: {error}"));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    if let Err(error) = std::fs::create_dir_all(&root) {
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(format!("Cannot create ACP session store: {error}"));
+        }
+    }
+    let root = std::fs::canonicalize(&root)
+        .map_err(|error| format!("Cannot resolve ACP session store: {error}"))?;
+    crate::persistence::PersistentStorage::open(root)
+        .map_err(|error| format!("Cannot open ACP session store: {error}"))
+}
+
+impl AcpCallRegistry {
+    fn reserve_prompt(
+        &mut self,
+        session_id: &str,
+        request_id: &Value,
+    ) -> Result<ActiveAcpCall, String> {
+        let request_key = serde_json::to_string(request_id)
+            .map_err(|error| format!("invalid JSON-RPC request id: {error}"))?;
+        if let Some(existing) = self.calls.get(session_id) {
+            if existing.request_key == request_key && !existing.completed {
+                return Ok(existing.clone());
+            }
+            if !existing.completed {
+                return Err(format!(
+                    "ACP session {session_id} already has active call {}",
+                    existing.call_id
+                ));
+            }
+        }
+        if self.calls.len() >= MAX_ACP_SESSIONS {
+            return Err(format!(
+                "ACP active-call registry reached its {MAX_ACP_SESSIONS}-session bound"
+            ));
+        }
+        let call = ActiveAcpCall {
+            request_key,
+            call_id: crate::runtime::CallId::new().to_string(),
+            cancellation: Arc::new(AtomicBool::new(false)),
+            canonical_cancellation: None,
+            completed: false,
+        };
+        self.calls.insert(session_id.to_string(), call.clone());
+        Ok(call)
+    }
+
+    fn bind_run(
+        &mut self,
+        session_id: &str,
+        call_id: &str,
+        run: &crate::tools::ToolRunContext,
+    ) -> Result<(), String> {
+        let active = self
+            .calls
+            .get_mut(session_id)
+            .ok_or_else(|| format!("ACP call {call_id} is no longer active"))?;
+        if active.call_id != call_id || active.completed {
+            return Err(format!("ACP call {call_id} is no longer active"));
+        }
+        let cancellation = run.runtime().cancellation();
+        if active.cancellation.load(Ordering::SeqCst) {
+            let _ = cancellation.cancel(crate::runtime::CancellationReason::User);
+        }
+        active.canonical_cancellation = Some(cancellation);
+        Ok(())
+    }
+
+    fn request_cancel(&mut self, session_id: &str, call_id: Option<&str>) -> bool {
+        let Some(active) = self.calls.get_mut(session_id) else {
+            return false;
+        };
+        if call_id.is_some_and(|expected| expected != active.call_id) {
+            return false;
+        }
+        active.cancellation.store(true, Ordering::SeqCst);
+        if let Some(cancellation) = active.canonical_cancellation.as_ref() {
+            let _ = cancellation.cancel(crate::runtime::CancellationReason::User);
+        }
+        true
+    }
+
+    fn complete(&mut self, session_id: &str, call_id: &str) {
+        if self
+            .calls
+            .get(session_id)
+            .is_some_and(|active| active.call_id == call_id)
+        {
+            self.calls.remove(session_id);
+        }
+    }
+
+    fn cancel_all(&mut self) {
+        for active in self.calls.values_mut().filter(|active| !active.completed) {
+            active.cancellation.store(true, Ordering::SeqCst);
+            if let Some(cancellation) = active.canonical_cancellation.as_ref() {
+                let _ =
+                    cancellation.cancel(crate::runtime::CancellationReason::FrontendDisconnected);
+            }
+        }
+    }
+}
+
 /// ACP server state.
 pub struct AcpServer {
     /// Application config (providers, hooks, etc.)
@@ -174,6 +367,15 @@ pub struct AcpServer {
     stdout_tx: mpsc::UnboundedSender<String>,
     /// Session config options set via `session/set_config_option`
     config_options: HashMap<String, Value>,
+    /// In-memory envelopes for the bounded live ACP session set. Durable
+    /// copies live in the descriptor-pinned `OpenClaudia` application store.
+    session_envelopes: HashMap<String, AcpSessionEnvelope>,
+    /// OpenClaudia-owned, descriptor-safe persistence for ACP envelopes.
+    acp_session_storage: crate::persistence::PersistentStorage,
+    /// Exact call currently allowed to publish ACP session updates.
+    active_call: Option<AcpActiveCallMarker>,
+    /// Startup model restored when a newly created wire session becomes active.
+    initial_model: String,
     /// Terminal ID counter for ACP terminal lifecycle
     #[allow(dead_code)]
     next_terminal_id: AtomicU64,
@@ -868,6 +1070,7 @@ impl AcpServer {
             if let Some(retired) = self.run_contexts.remove(&session_id) {
                 crate::tools::retire_run(&retired);
             }
+            self.session_envelopes.remove(&session_id);
         }
         let mut task_managers = self
             .task_managers
@@ -901,31 +1104,75 @@ impl AcpServer {
         openclaudia_session_id: &str,
         runtime_mode: crate::modes::RuntimeMode,
     ) -> Result<Arc<crate::tools::ToolRunContext>, String> {
+        self.build_run_context_for_mode_with_parent(openclaudia_session_id, runtime_mode, None)
+    }
+
+    fn build_run_context_for_mode_with_parent(
+        &self,
+        openclaudia_session_id: &str,
+        runtime_mode: crate::modes::RuntimeMode,
+        parent_budget: Option<crate::runtime::RunBudgetAuthority>,
+    ) -> Result<Arc<crate::tools::ToolRunContext>, String> {
         let session_id = crate::state::SessionId::from_raw(openclaudia_session_id)
             .map_err(|error| format!("Invalid OpenClaudia session id: {error}"))?;
-        let run = self.launch_capabilities.derive_frontend_session(
-            session_id,
-            &self.launch_root,
-            &self.launch_root,
-            &self.config.proxy.target,
-        )?;
-        run.transition_runtime_mode(runtime_mode)?;
+        let launch = &self.launch_capabilities;
+        let workspace_access = if launch.grants_resource(crate::tools::ToolResource::WorkspaceWrite)
+        {
+            crate::tools::WorkspaceAccess::ReadWrite
+        } else {
+            crate::tools::WorkspaceAccess::ReadOnly
+        };
+        let inherited_root = |root: &&std::path::PathBuf| {
+            root.as_path() != launch.project_root() && root.as_path() != launch.private_temp_root()
+        };
+        let read_only_roots = launch
+            .read_only_roots()
+            .iter()
+            .filter(inherited_root)
+            .cloned()
+            .collect();
+        let read_write_roots = launch
+            .read_write_roots()
+            .iter()
+            .filter(inherited_root)
+            .cloned()
+            .collect();
+        // Each ACP wire session is a budget/cancellation root, not a child of
+        // the launch placeholder or a sibling wire session. All mutable host
+        // inputs are copied from the immutable startup snapshot.
+        let mut builder = crate::tools::ToolRunContext::builder(session_id, &self.launch_root)
+            .working_directory(&self.launch_root)
+            .read_only_roots(read_only_roots)
+            .read_write_roots(read_write_roots)
+            .project_secret_masks(launch.project_secret_masks().to_vec())
+            .protected_environment_grants(launch.environment_grants().clone())
+            .protected_mcp_environment_grants(launch.mcp_environment_grants().clone())
+            .executable_search_path(launch.executable_search_path())
+            .host_home(launch.host_home().map(std::path::Path::to_path_buf))
+            .skill_access(launch.skill_access().clone())
+            .remote_actions(launch.remote_actions().registry().clone())
+            .web_egress_grants(launch.web_egress_grants().clone())
+            .workspace_access(workspace_access)
+            .process(launch.grants_resource(crate::tools::ToolResource::Process))
+            .network(launch.grants_resource(crate::tools::ToolResource::Network))
+            .secrets(launch.grants_resource(crate::tools::ToolResource::Secrets))
+            .process_owner(openclaudia_session_id)
+            .actor_role(crate::runtime::ActorRole::Frontend)
+            .provider(self.config.proxy.target.clone())
+            .budget_limits(
+                self.config
+                    .session
+                    .run_budget
+                    .limits_for_session(&self.config.session),
+            )
+            .runtime_mode(runtime_mode);
+        if let Some(parent_budget) = parent_budget {
+            builder = builder.parent_budget(parent_budget);
+        }
+        let run = builder.build()?;
         crate::guardrails::configure(&run, &self.config.guardrails)
             .map_err(|error| format!("Cannot configure ACP guardrails: {error}"))?;
         Ok(run)
-    }
-
-    fn build_run_context(
-        &self,
-        openclaudia_session_id: &str,
-    ) -> Result<Arc<crate::tools::ToolRunContext>, String> {
-        let runtime_mode = match self.current_session_mode() {
-            SessionMode::Initializer => crate::modes::RuntimeMode::Initializer,
-            SessionMode::Coding => {
-                crate::modes::RuntimeMode::Behavioral(crate::modes::BehaviorMode::default())
-            }
-        };
-        self.build_run_context_for_mode(openclaudia_session_id, runtime_mode)
     }
 
     fn run_context_for_acp(
@@ -935,10 +1182,287 @@ impl AcpServer {
         self.run_contexts.get(acp_session_id)
     }
 
-    fn current_session_mode(&self) -> SessionMode {
-        self.session_manager
+    fn session_store_target(
+        acp_session_id: &str,
+    ) -> Result<std::path::PathBuf, AcpSessionStoreError> {
+        uuid::Uuid::parse_str(acp_session_id).map_err(|error| {
+            AcpSessionStoreError::InvalidSessionId(format!("{acp_session_id}: {error}"))
+        })?;
+        Ok(std::path::PathBuf::from(format!("{acp_session_id}.json")))
+    }
+
+    fn validate_session_envelope(
+        envelope: AcpSessionEnvelope,
+        expected_wire_id: &str,
+    ) -> Result<AcpSessionEnvelope, AcpSessionStoreError> {
+        if envelope.schema_version != ACP_SESSION_ENVELOPE_SCHEMA_VERSION {
+            return Err(AcpSessionStoreError::UnsupportedSchema {
+                session_id: expected_wire_id.to_string(),
+                found: envelope.schema_version,
+            });
+        }
+        if envelope.wire_session_id != expected_wire_id
+            || envelope.canonical_session_id != envelope.session.id()
+            || envelope.lifecycle_session.id != envelope.canonical_session_id
+            || envelope.generation == 0
+        {
+            return Err(AcpSessionStoreError::OwnershipMismatch {
+                session_id: expected_wire_id.to_string(),
+            });
+        }
+        let state = envelope.session.state_snapshot();
+        if state.identity.session_id.as_str() != envelope.canonical_session_id
+            || envelope
+                .session
+                .provider_native_state_snapshot()
+                .as_ref()
+                .is_some_and(|native| {
+                    native
+                        .validate_identity(&envelope.session.provider, &envelope.session.model)
+                        .is_err()
+                })
+        {
+            return Err(AcpSessionStoreError::OwnershipMismatch {
+                session_id: expected_wire_id.to_string(),
+            });
+        }
+        Ok(envelope)
+    }
+
+    fn remembered_session_envelope(
+        &self,
+        acp_session_id: &str,
+    ) -> Result<Option<AcpSessionEnvelope>, AcpSessionStoreError> {
+        let Some(envelope) = self.session_envelopes.get(acp_session_id).cloned() else {
+            return Ok(None);
+        };
+        Self::validate_session_envelope(envelope, acp_session_id).map(Some)
+    }
+
+    fn remember_session_envelope(
+        &mut self,
+        envelope: &AcpSessionEnvelope,
+    ) -> Result<(), AcpSessionStoreError> {
+        Self::validate_session_envelope(envelope.clone(), &envelope.wire_session_id)?;
+        self.session_envelopes
+            .insert(envelope.wire_session_id.clone(), envelope.clone());
+        Ok(())
+    }
+
+    fn read_persisted_session_envelope(
+        &self,
+        acp_session_id: &str,
+    ) -> Result<AcpSessionEnvelope, AcpSessionStoreError> {
+        let target = Self::session_store_target(acp_session_id)?;
+        let observed = self
+            .acp_session_storage
+            .read(&target, crate::persistence::FileClass::Session)
+            .map_err(|source| AcpSessionStoreError::Storage {
+                session_id: acp_session_id.to_string(),
+                source,
+            })?;
+        let envelope = observed
+            .expose_bytes(|bytes| {
+                bytes
+                    .map(serde_json::from_slice::<AcpSessionEnvelope>)
+                    .transpose()
+            })
+            .map_err(|source| AcpSessionStoreError::Decode {
+                session_id: acp_session_id.to_string(),
+                source,
+            })?
+            .ok_or_else(|| AcpSessionStoreError::UnknownSession(acp_session_id.to_string()))?;
+        Self::validate_session_envelope(envelope, acp_session_id)
+    }
+
+    fn persist_session_envelope(
+        &self,
+        envelope: &AcpSessionEnvelope,
+    ) -> Result<(), AcpSessionStoreError> {
+        let target = Self::session_store_target(&envelope.wire_session_id)?;
+        let bytes = serde_json::to_vec_pretty(envelope).map_err(|source| {
+            AcpSessionStoreError::Serialize {
+                session_id: envelope.wire_session_id.clone(),
+                source,
+            }
+        })?;
+        let observed = self
+            .acp_session_storage
+            .read(&target, crate::persistence::FileClass::Session)
+            .map_err(|source| AcpSessionStoreError::Storage {
+                session_id: envelope.wire_session_id.clone(),
+                source,
+            })?;
+        let existing = observed
+            .expose_bytes(|bytes| {
+                bytes
+                    .map(serde_json::from_slice::<AcpSessionEnvelope>)
+                    .transpose()
+            })
+            .map_err(|source| AcpSessionStoreError::Decode {
+                session_id: envelope.wire_session_id.clone(),
+                source,
+            })?
+            .map(|stored| Self::validate_session_envelope(stored, &envelope.wire_session_id))
+            .transpose()?;
+        if existing
+            .as_ref()
+            .is_some_and(|stored| stored.generation == envelope.generation)
+        {
+            let already_published = observed
+                .expose_bytes(|stored| stored.is_some_and(|stored| stored == bytes.as_slice()));
+            return if already_published {
+                Ok(())
+            } else {
+                Err(AcpSessionStoreError::GenerationConflict {
+                    session_id: envelope.wire_session_id.clone(),
+                })
+            };
+        }
+        let expected_logical_generation = existing
+            .as_ref()
+            .map_or(Some(1), |stored| stored.generation.checked_add(1));
+        if expected_logical_generation != Some(envelope.generation) {
+            return Err(AcpSessionStoreError::GenerationConflict {
+                session_id: envelope.wire_session_id.clone(),
+            });
+        }
+        let mut receipt = self
+            .acp_session_storage
+            .commit(
+                &target,
+                crate::persistence::FileClass::Session,
+                observed.generation(),
+                &bytes,
+            )
+            .map_err(|source| AcpSessionStoreError::Storage {
+                session_id: envelope.wire_session_id.clone(),
+                source,
+            })?;
+        if receipt.state() == crate::persistence::CommitState::PublishedDurabilityUncertain {
+            receipt = self
+                .acp_session_storage
+                .commit(
+                    &target,
+                    crate::persistence::FileClass::Session,
+                    observed.generation(),
+                    &bytes,
+                )
+                .map_err(|source| AcpSessionStoreError::Storage {
+                    session_id: envelope.wire_session_id.clone(),
+                    source,
+                })?;
+        }
+        if receipt.state() == crate::persistence::CommitState::PublishedDurabilityUncertain {
+            return Err(AcpSessionStoreError::DurabilityUncertain {
+                session_id: envelope.wire_session_id.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn visible_config_options(&self) -> HashMap<String, Value> {
+        self.config_options.clone()
+    }
+
+    fn capture_active_session(
+        &mut self,
+        acp_session_id: &str,
+    ) -> Result<AcpSessionEnvelope, AcpSessionStoreError> {
+        let canonical_session_id = self
+            .session_map
+            .get(acp_session_id)
+            .cloned()
+            .ok_or_else(|| AcpSessionStoreError::UnknownSession(acp_session_id.to_string()))?;
+        let previous = self.remembered_session_envelope(acp_session_id)?;
+        let generation = previous.as_ref().map_or(Ok(1), |envelope| {
+            envelope.generation.checked_add(1).ok_or_else(|| {
+                AcpSessionStoreError::GenerationExhausted {
+                    session_id: acp_session_id.to_string(),
+                }
+            })
+        })?;
+        let lifecycle_session = self
+            .session_manager
             .get_session()
-            .map_or(SessionMode::Initializer, |session| session.mode)
+            .filter(|session| session.id == canonical_session_id)
+            .cloned()
+            .or_else(|| {
+                previous
+                    .as_ref()
+                    .map(|envelope| envelope.lifecycle_session.clone())
+            })
+            .ok_or_else(|| AcpSessionStoreError::OwnershipMismatch {
+                session_id: acp_session_id.to_string(),
+            })?;
+        let mut canonical = previous.as_ref().map_or_else(
+            || crate::state::Session::new(&self.model, &self.config.proxy.target),
+            |envelope| envelope.session.clone(),
+        );
+        canonical.set_provider_and_model(&self.config.proxy.target, &self.model);
+        let mut snapshot = self.state.snapshot();
+        snapshot.identity.session_id = crate::state::SessionId::from_raw(&canonical_session_id)
+            .map_err(|error| {
+                AcpSessionStoreError::InvalidSessionId(format!("{canonical_session_id}: {error}"))
+            })?;
+        snapshot.conversation.messages.clone_from(&self.messages);
+        snapshot
+            .conversation
+            .provider_native_state
+            .clone_from(&self.provider_native_state);
+        canonical.update_state(|state, _| *state = snapshot);
+        canonical.touch();
+        let runtime_mode = self
+            .run_context_for_acp(acp_session_id)
+            .map_or("initializer", |run| {
+                acp_runtime_mode_label(&run.runtime_mode())
+            })
+            .to_string();
+        let envelope = AcpSessionEnvelope {
+            schema_version: ACP_SESSION_ENVELOPE_SCHEMA_VERSION,
+            generation,
+            wire_session_id: acp_session_id.to_string(),
+            canonical_session_id,
+            runtime_mode,
+            config_options: self.visible_config_options(),
+            lifecycle_session,
+            session: canonical,
+        };
+        self.persist_session_envelope(&envelope)?;
+        self.remember_session_envelope(&envelope)?;
+        Ok(envelope)
+    }
+
+    fn restore_session_envelope(
+        &mut self,
+        envelope: &AcpSessionEnvelope,
+    ) -> Result<(), AcpSessionStoreError> {
+        let envelope =
+            Self::validate_session_envelope(envelope.clone(), &envelope.wire_session_id)?;
+        let snapshot = envelope.session.state_snapshot();
+        self.messages.clone_from(&snapshot.conversation.messages);
+        self.provider_native_state
+            .clone_from(&snapshot.conversation.provider_native_state);
+        self.model.clone_from(&envelope.session.model);
+        self.session_manager
+            .replace_current_session(envelope.lifecycle_session.clone());
+        self.state.replace(snapshot);
+        self.config_options.clone_from(&envelope.config_options);
+        self.active_conversation_acp_session_id = Some(envelope.wire_session_id.clone());
+        self.remember_session_envelope(&envelope)
+    }
+
+    fn activate_owned_session(&mut self, acp_session_id: &str) -> Result<(), AcpSessionStoreError> {
+        if self.active_conversation_acp_session_id.as_deref() == Some(acp_session_id) {
+            return Ok(());
+        }
+        if let Some(active) = self.active_conversation_acp_session_id.clone() {
+            self.capture_active_session(&active)?;
+        }
+        let envelope = self
+            .remembered_session_envelope(acp_session_id)?
+            .ok_or_else(|| AcpSessionStoreError::UnknownSession(acp_session_id.to_string()))?;
+        self.restore_session_envelope(&envelope)
     }
 
     fn cumulative_policy_tokens(&self) -> u64 {
@@ -996,29 +1520,28 @@ impl AcpServer {
         params: &Value,
     ) -> Result<String, AcpCapabilityError> {
         if let Some(session_id) = self.existing_requested_acp_session_id(params)? {
+            self.activate_owned_session(&session_id)
+                .map_err(|error| AcpCapabilityError::Transition(error.to_string()))?;
             return Ok(session_id);
         }
-        let (acp_session_id, openclaudia_session_id, run) = self
+        let (acp_session_id, canonical_session, run) = self
             .prepare_new_session()
             .map_err(AcpCapabilityError::Construction)?;
-        self.admit_session_start(&run, &openclaudia_session_id)
+        self.admit_session_start(&run, &canonical_session.id)
             .await
             .map_err(AcpCapabilityError::Transition)?;
-        self.install_new_session(&acp_session_id, openclaudia_session_id, Arc::clone(&run));
+        self.install_new_session(&acp_session_id, canonical_session, Arc::clone(&run))
+            .map_err(|error| AcpCapabilityError::Construction(error.to_string()))?;
         self.install_run_integrations(&acp_session_id, &run).await?;
         Ok(acp_session_id)
     }
 
-    async fn apply_acp_mode_value(
+    fn apply_acp_mode_value(
         &mut self,
         acp_session_id: &str,
         mode: &str,
     ) -> Result<Arc<crate::tools::ToolRunContext>, AcpCapabilityError> {
         let profile = acp_mode_profile(mode)?;
-        let openclaudia_session_id = self
-            .oc_session_id_for_acp(acp_session_id)
-            .ok_or_else(|| AcpCapabilityError::UnknownSession(acp_session_id.to_string()))?
-            .to_string();
         let current = Arc::clone(
             self.run_context_for_acp(acp_session_id)
                 .ok_or_else(|| AcpCapabilityError::UnknownSession(acp_session_id.to_string()))?,
@@ -1027,41 +1550,19 @@ impl AcpServer {
             return Ok(current);
         }
 
-        // Validate the requested policy against the live generation without
-        // mutating it. The replacement run is not published until its mode,
-        // workspace, guardrails, and dynamic integrations are ready, so a
-        // failed construction cannot leave the current ACP session in a mode
-        // it never successfully negotiated.
+        // Mode is mutable policy within this wire session's exact capability
+        // and budget root. Rotating the root here would reset accounting and
+        // manufacture a different cancellation/workspace owner.
         current
             .validate_runtime_mode_transition(&profile.runtime_mode)
             .map_err(AcpCapabilityError::Transition)?;
-        let persisted_workspace = current.isolated_workspace().cloned();
-        let base = self
-            .build_run_context_for_mode(&openclaudia_session_id, profile.runtime_mode)
-            .map_err(AcpCapabilityError::Construction)?;
-        let next = if let Some(workspace) = persisted_workspace.as_ref() {
-            crate::tools::worktree::release_workspace_descriptor_owner(&current)
-                .map_err(AcpCapabilityError::Transition)?;
-            match crate::tools::ToolRunContext::resume_isolated_workspace(&base, workspace) {
-                Ok(next) => {
-                    crate::tools::retire_run(&base);
-                    next
-                }
-                Err(error) => {
-                    crate::tools::retire_run(&base);
-                    return Err(AcpCapabilityError::Construction(error.to_string()));
-                }
-            }
-        } else {
-            base
-        };
-
-        self.install_run_integrations(acp_session_id, &next).await?;
-        self.replace_run_context(acp_session_id.to_string(), Arc::clone(&next));
+        current
+            .transition_runtime_mode(profile.runtime_mode)
+            .map_err(AcpCapabilityError::Transition)?;
         if self.active_conversation_acp_session_id.as_deref() == Some(acp_session_id) {
             self.session_manager.set_current_mode(profile.session_mode);
         }
-        Ok(next)
+        Ok(current)
     }
 
     fn apply_acp_model_value(&mut self, model: &str) -> Result<(), String> {
@@ -1324,6 +1825,8 @@ impl AcpServer {
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join("openclaudia")
             .join("sessions");
+        let acp_session_storage = prepare_acp_session_storage(&persist_dir)?;
+        let initial_model = model.clone();
 
         let merged_hooks = load_effective_hooks(config.hooks.clone());
         let hook_engine = HookEngine::new(merged_hooks);
@@ -1362,6 +1865,10 @@ impl AcpServer {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             stdout_tx,
             config_options: HashMap::new(),
+            session_envelopes: HashMap::new(),
+            acp_session_storage,
+            active_call: None,
+            initial_model,
             next_terminal_id: AtomicU64::new(1),
             state: crate::state::StateStore::new(crate::state::SessionState::new(
                 launch_root.clone(),
@@ -1386,19 +1893,6 @@ impl AcpServer {
             replacement.identity.session_id = session_id;
         }
         self.state.replace(replacement);
-    }
-
-    fn activate_conversation(&mut self, acp_session_id: &str) {
-        if self.active_conversation_acp_session_id.as_deref() == Some(acp_session_id) {
-            return;
-        }
-        tracing::warn!(
-            acp_session_id,
-            "ACP conversation switched; clearing the prior in-memory transcript and native continuation"
-        );
-        self.messages.clear();
-        self.provider_native_state = None;
-        self.active_conversation_acp_session_id = Some(acp_session_id.to_string());
     }
 
     // ========================================================================
@@ -1432,10 +1926,22 @@ impl AcpServer {
 
     /// Send a session/update notification.
     fn send_session_update(&self, session_id: &str, update_type: &str, content: &Value) {
+        let active_call = self
+            .active_call
+            .as_ref()
+            .filter(|call| call.session_id == session_id);
+        let Some(active_call) = active_call else {
+            warn!(
+                session_id,
+                update_type, "Dropped uncorrelated ACP session update"
+            );
+            return;
+        };
         self.send_notification(
             "session/update",
             Some(json!({
                 "sessionId": session_id,
+                "callId": active_call.call_id,
                 "sessionUpdate": update_type,
                 "content": content,
             })),
@@ -1493,8 +1999,7 @@ impl AcpServer {
     // Message routing
     // ========================================================================
 
-    /// Route an incoming JSON-RPC message.
-    async fn handle_message(&mut self, msg: JsonRpcMessage) {
+    async fn handle_message_with_calls(&mut self, msg: JsonRpcMessage, calls: &SharedAcpCalls) {
         // This server sends notifications and responses, never requests, so an
         // incoming message must be a request or notification from the client.
         let method = if let Some(ref m) = msg.method {
@@ -1513,8 +2018,11 @@ impl AcpServer {
             "authenticate" => self.handle_authenticate(msg.id, params),
             "session/new" => self.handle_session_new_canonical(msg.id, params).await,
             "session/load" => self.handle_session_load(msg.id, &params).await,
-            "session/prompt" => self.handle_session_prompt(msg.id, params).await,
-            "session/cancel" => self.handle_session_cancel(msg.id, params),
+            "session/prompt" => {
+                self.handle_session_prompt_with_calls(msg.id, params, calls)
+                    .await;
+            }
+            "session/cancel" => self.handle_session_cancel(msg.id, &params, calls),
             "session/set_mode" => self.handle_session_set_mode(msg.id, &params).await,
             "session/set_config_option" => {
                 self.handle_session_set_config_option(msg.id, &params).await;
@@ -1590,13 +2098,14 @@ impl AcpServer {
     async fn handle_session_new_canonical(&mut self, id: Option<Value>, _params: Value) {
         let Some(id) = id else { return };
 
-        let (acp_session_id, oc_session_id, run_context) = match self.prepare_new_session() {
+        let (acp_session_id, canonical_session, run_context) = match self.prepare_new_session() {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.send_error(id, _INTERNAL_ERROR, &error);
                 return;
             }
         };
+        let oc_session_id = canonical_session.id.clone();
         if let Err(reason) = self.admit_session_start(&run_context, &oc_session_id).await {
             crate::tools::retire_run(&run_context);
             self.send_error(
@@ -1607,7 +2116,13 @@ impl AcpServer {
             return;
         }
 
-        self.install_new_session(&acp_session_id, oc_session_id, Arc::clone(&run_context));
+        if let Err(error) =
+            self.install_new_session(&acp_session_id, canonical_session, Arc::clone(&run_context))
+        {
+            crate::tools::retire_run(&run_context);
+            self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+            return;
+        }
         if let Err(error) = self
             .install_run_integrations(&acp_session_id, &run_context)
             .await
@@ -1635,26 +2150,52 @@ impl AcpServer {
     }
 
     fn prepare_new_session(
-        &mut self,
-    ) -> Result<(String, String, Arc<crate::tools::ToolRunContext>), String> {
-        let oc_session_id = self.session_manager.get_or_create_session().id.clone();
-        let run_context = self.build_run_context(&oc_session_id)?;
-        Ok((uuid::Uuid::new_v4().to_string(), oc_session_id, run_context))
+        &self,
+    ) -> Result<
+        (
+            String,
+            crate::session::Session,
+            Arc<crate::tools::ToolRunContext>,
+        ),
+        String,
+    > {
+        let canonical_session = crate::session::Session::new_initializer();
+        let oc_session_id = canonical_session.id.clone();
+        let run_context = self
+            .build_run_context_for_mode(&oc_session_id, crate::modes::RuntimeMode::Initializer)?;
+        Ok((
+            uuid::Uuid::new_v4().to_string(),
+            canonical_session,
+            run_context,
+        ))
     }
 
     fn install_new_session(
         &mut self,
         acp_session_id: &str,
-        oc_session_id: String,
+        canonical_session: crate::session::Session,
         run_context: Arc<crate::tools::ToolRunContext>,
-    ) {
-        self.upsert_session_mapping(acp_session_id.to_string(), oc_session_id, run_context);
+    ) -> Result<(), AcpSessionStoreError> {
+        if let Some(active) = self.active_conversation_acp_session_id.clone() {
+            self.capture_active_session(&active)?;
+        }
+        let oc_session_id = canonical_session.id.clone();
+        self.session_manager
+            .replace_current_session(canonical_session);
+        let initial_model = self.initial_model.clone();
+        self.config_options.clear();
+        self.model = initial_model;
+        self.upsert_session_mapping(
+            acp_session_id.to_string(),
+            oc_session_id.clone(),
+            run_context,
+        );
         self.messages.clear();
         self.provider_native_state = None;
         self.active_conversation_acp_session_id = Some(acp_session_id.to_string());
-        if let Some(oc_session_id) = self.session_map.get(acp_session_id) {
-            self.reset_state_for_session(oc_session_id);
-        }
+        self.reset_state_for_session(&oc_session_id);
+        self.capture_active_session(acp_session_id)?;
+        Ok(())
     }
 
     async fn send_new_session_response(&self, id: Value, acp_session_id: &str) {
@@ -1703,91 +2244,79 @@ impl AcpServer {
             return;
         }
 
-        // Check if we know this ACP session
-        if let Some(oc_id) = self.session_map.get(&acp_session_id).cloned() {
-            // Try to load the persisted OpenClaudia session
-            if let Some(session) = self.session_manager.load_session(&oc_id) {
-                let run_context = match self.build_run_context(&oc_id) {
-                    Ok(run) => run,
-                    Err(error) => {
-                        self.send_error(id, _INTERNAL_ERROR, &error);
-                        return;
-                    }
-                };
-                if let Err(reason) = self.admit_session_start(&run_context, &oc_id).await {
-                    crate::tools::retire_run(&run_context);
-                    self.send_error(
-                        id,
-                        _INTERNAL_ERROR,
-                        &format!("SessionStart hook blocked ACP session load: {reason}"),
-                    );
-                    return;
-                }
-                // Restore it as active only after canonical admission.
-                self.session_manager.start_coding(&session.id);
-                self.replace_run_context(acp_session_id.clone(), Arc::clone(&run_context));
-                if let Err(error) = self
-                    .install_run_integrations(&acp_session_id, &run_context)
-                    .await
-                {
-                    self.send_error(id, _INTERNAL_ERROR, &error.to_string());
-                    return;
-                }
-                self.reset_state_for_session(&oc_id);
-                self.messages.clear();
-                self.provider_native_state = None;
-                self.active_conversation_acp_session_id = Some(acp_session_id.clone());
-                let config_options = match self.acp_config_options(&acp_session_id) {
-                    Ok(options) => options,
-                    Err(error) => {
-                        self.send_error(id, _INTERNAL_ERROR, &error.to_string());
-                        return;
-                    }
-                };
-                let effective = match self.session_capability_payload(&acp_session_id).await {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        self.send_error(id, _INTERNAL_ERROR, &error.to_string());
-                        return;
-                    }
-                };
-                self.send_response(
-                    id,
-                    Some(json!({
-                        "sessionId": acp_session_id,
-                        "loaded": true,
-                        "configOptions": config_options,
-                        "effectiveCapabilities": effective,
-                    })),
-                    None,
-                );
-                info!(acp_session_id = %acp_session_id, "Loaded ACP session");
+        if self.active_conversation_acp_session_id.as_deref() == Some(&acp_session_id) {
+            if let Err(error) = self.capture_active_session(&acp_session_id) {
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
                 return;
             }
         }
-
-        // Unknown or unloadable — create a new session and map it
-        let session = self.session_manager.get_or_create_session();
-        let oc_session_id = session.id.clone();
-        let run_context = match self.build_run_context(&oc_session_id) {
+        let envelope = match self.read_persisted_session_envelope(&acp_session_id) {
+            Ok(envelope) => envelope,
+            Err(AcpSessionStoreError::UnknownSession(_)) => {
+                self.send_error(id, INVALID_PARAMS, "Unknown ACP sessionId");
+                return;
+            }
+            Err(error) => {
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                return;
+            }
+        };
+        let profile = match acp_mode_profile(&envelope.runtime_mode) {
+            Ok(profile) => profile,
+            Err(error) => {
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                return;
+            }
+        };
+        let base = match self
+            .build_run_context_for_mode(&envelope.canonical_session_id, profile.runtime_mode)
+        {
             Ok(run) => run,
             Err(error) => {
                 self.send_error(id, _INTERNAL_ERROR, &error);
                 return;
             }
         };
-        if let Err(reason) = self.admit_session_start(&run_context, &oc_session_id).await {
+        let workspace = envelope.session.state_snapshot().identity.active_workspace;
+        let run_context = if let Some(workspace) = workspace.as_ref() {
+            match crate::tools::ToolRunContext::resume_isolated_workspace(&base, workspace) {
+                Ok(run) => {
+                    crate::tools::retire_run(&base);
+                    run
+                }
+                Err(error) => {
+                    crate::tools::retire_run(&base);
+                    self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                    return;
+                }
+            }
+        } else {
+            base
+        };
+        if let Err(reason) = self
+            .admit_session_start(&run_context, &envelope.canonical_session_id)
+            .await
+        {
             crate::tools::retire_run(&run_context);
             self.send_error(
                 id,
                 _INTERNAL_ERROR,
-                &format!("SessionStart hook blocked ACP session load fallback: {reason}"),
+                &format!("SessionStart hook blocked ACP session load: {reason}"),
             );
             return;
         }
+        if let Some(active) = self.active_conversation_acp_session_id.clone() {
+            if active != acp_session_id {
+                if let Err(error) = self.capture_active_session(&active) {
+                    crate::tools::retire_run(&run_context);
+                    self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                    return;
+                }
+            }
+        }
         self.upsert_session_mapping(
             acp_session_id.clone(),
-            oc_session_id,
+            envelope.canonical_session_id.clone(),
             Arc::clone(&run_context),
         );
         if let Err(error) = self
@@ -1797,12 +2326,11 @@ impl AcpServer {
             self.send_error(id, _INTERNAL_ERROR, &error.to_string());
             return;
         }
-        self.messages.clear();
-        self.provider_native_state = None;
-        self.active_conversation_acp_session_id = Some(acp_session_id.clone());
-        if let Some(oc_session_id) = self.session_map.get(&acp_session_id) {
-            self.reset_state_for_session(oc_session_id);
+        if let Err(error) = self.restore_session_envelope(&envelope) {
+            self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+            return;
         }
+        self.session_manager.set_current_mode(profile.session_mode);
 
         let config_options = match self.acp_config_options(&acp_session_id) {
             Ok(options) => options,
@@ -1822,30 +2350,69 @@ impl AcpServer {
             id,
             Some(json!({
                 "sessionId": acp_session_id,
-                "loaded": false,
+                "loaded": true,
+                "generation": envelope.generation,
                 "configOptions": config_options,
                 "effectiveCapabilities": effective,
             })),
             None,
         );
 
-        info!(acp_session_id = %acp_session_id, "session/load fell back to new session");
+        info!(acp_session_id = %acp_session_id, generation = envelope.generation, "Loaded exact ACP session generation");
     }
 
-    fn handle_session_cancel(&self, id: Option<Value>, _params: Value) {
-        self.cancel_flag.store(true, Ordering::SeqCst);
+    fn handle_session_cancel(&self, id: Option<Value>, params: &Value, calls: &SharedAcpCalls) {
+        let session_id = match Self::required_string_param(params, "sessionId", "Missing sessionId")
+        {
+            Ok(session_id) if self.session_map.contains_key(session_id) => session_id,
+            Ok(_) => {
+                if let Some(id) = id {
+                    self.send_error(id, INVALID_PARAMS, "Unknown ACP sessionId");
+                }
+                return;
+            }
+            Err(message) => {
+                if let Some(id) = id {
+                    self.send_error(id, INVALID_PARAMS, &message);
+                }
+                return;
+            }
+        };
+        let call_id = match params.get("callId") {
+            Some(Value::String(call_id)) => Some(call_id.as_str()),
+            Some(_) => {
+                if let Some(id) = id {
+                    self.send_error(
+                        id,
+                        INVALID_PARAMS,
+                        "Invalid 'callId' parameter: expected string",
+                    );
+                }
+                return;
+            }
+            None => None,
+        };
+        let cancelled = calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .request_cancel(session_id, call_id);
 
         if let Some(id) = id {
             self.send_response(
                 id,
                 Some(json!({
-                    "cancelled": true,
+                    "sessionId": session_id,
+                    "callId": call_id,
+                    "cancelled": cancelled,
                 })),
                 None,
             );
         }
 
-        info!("Prompt cancellation requested");
+        info!(
+            session_id,
+            call_id, cancelled, "Prompt cancellation request correlated"
+        );
     }
 
     async fn handle_session_set_mode(&mut self, id: Option<Value>, params: &Value) {
@@ -1877,7 +2444,7 @@ impl AcpServer {
 
         let active_mode = match mode {
             "initializer" | "coding" | "plan" | "readonly" => {
-                match self.apply_acp_mode_value(&acp_session_id, mode).await {
+                match self.apply_acp_mode_value(&acp_session_id, mode) {
                     Ok(run) => acp_runtime_mode_label(&run.runtime_mode()),
                     Err(reason) => {
                         self.send_error(id, INVALID_PARAMS, &reason.to_string());
@@ -1899,6 +2466,10 @@ impl AcpServer {
                 return;
             }
         };
+        if let Err(error) = self.capture_active_session(&acp_session_id) {
+            self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+            return;
+        }
         let config_options = match self.acp_config_options(&acp_session_id) {
             Ok(options) => options,
             Err(error) => {
@@ -1988,7 +2559,6 @@ impl AcpServer {
         let apply_result = match config_id.as_str() {
             ACP_CONFIG_MODE_ID => self
                 .apply_acp_mode_value(&acp_session_id, &value)
-                .await
                 .map(|_| ())
                 .map_err(|error| error.to_string()),
             ACP_CONFIG_MODEL_ID => self.apply_acp_model_value(&value),
@@ -2004,6 +2574,10 @@ impl AcpServer {
 
         self.config_options
             .insert(config_id.clone(), Value::String(value.clone()));
+        if let Err(error) = self.capture_active_session(&acp_session_id) {
+            self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+            return;
+        }
         let config_options = match self.acp_config_options(&acp_session_id) {
             Ok(options) => options,
             Err(error) => {
@@ -2042,36 +2616,74 @@ impl AcpServer {
     // bridge loop over a schema drift in a 3rd-party plugin.
     // ========================================================================
 
-    fn handle_ide_file_opened(&self, params: &Value) {
+    fn handle_ide_file_opened(&mut self, params: &Value) {
         if !self.ide_notification_path_allowed(params) {
             return;
         }
-        self.state
-            .update(|state, _| apply_ide_file_opened(&mut state.ide, params));
+        self.update_owned_ide_state(params, apply_ide_file_opened);
     }
 
-    fn handle_ide_file_closed(&self, params: &Value) {
+    fn handle_ide_file_closed(&mut self, params: &Value) {
         if !self.ide_notification_path_allowed(params) {
             return;
         }
-        self.state
-            .update(|state, _| apply_ide_file_closed(&mut state.ide, params));
+        self.update_owned_ide_state(params, apply_ide_file_closed);
     }
 
-    fn handle_ide_selection_changed(&self, params: &Value) {
+    fn handle_ide_selection_changed(&mut self, params: &Value) {
         if !self.ide_notification_path_allowed(params) {
             return;
         }
-        self.state
-            .update(|state, _| apply_ide_selection_changed(&mut state.ide, params));
+        self.update_owned_ide_state(params, |ide, params| {
+            apply_ide_selection_changed(ide, params);
+        });
     }
 
-    fn handle_ide_diagnostics(&self, params: &Value) {
+    fn handle_ide_diagnostics(&mut self, params: &Value) {
         if !self.ide_notification_path_allowed(params) {
             return;
         }
-        self.state
-            .update(|state, _| apply_ide_diagnostics(&mut state.ide, params));
+        self.update_owned_ide_state(params, apply_ide_diagnostics);
+    }
+
+    fn update_owned_ide_state(
+        &mut self,
+        params: &Value,
+        update: impl FnOnce(&mut IdeState, &Value),
+    ) {
+        let Some(acp_session_id) = params.get("sessionId").and_then(Value::as_str) else {
+            return;
+        };
+        if self.active_conversation_acp_session_id.as_deref() == Some(acp_session_id) {
+            self.state.update(|state, _| update(&mut state.ide, params));
+            if let Err(error) = self.capture_active_session(acp_session_id) {
+                warn!(%error, acp_session_id, "Failed to persist ACP IDE state generation");
+            }
+            return;
+        }
+        let mut envelope = match self.remembered_session_envelope(acp_session_id) {
+            Ok(Some(envelope)) => envelope,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(%error, acp_session_id, "Rejected malformed ACP IDE session state");
+                return;
+            }
+        };
+        let Some(generation) = envelope.generation.checked_add(1) else {
+            warn!(acp_session_id, "ACP IDE session generation exhausted");
+            return;
+        };
+        envelope
+            .session
+            .update_state(|state, _| update(&mut state.ide, params));
+        envelope.generation = generation;
+        envelope.session.touch();
+        if let Err(error) = self
+            .remember_session_envelope(&envelope)
+            .and_then(|()| self.persist_session_envelope(&envelope))
+        {
+            warn!(%error, acp_session_id, "Failed to persist inactive ACP IDE state");
+        }
     }
 
     fn ide_notification_path_allowed(&self, params: &Value) -> bool {
@@ -2133,27 +2745,33 @@ impl AcpServer {
         acp_session_id: &str,
         oc_session_id: &str,
     ) -> Result<Arc<crate::tools::ToolRunContext>, String> {
-        let runtime_mode = self.run_contexts.get(acp_session_id).map_or_else(
-            || match self.current_session_mode() {
-                SessionMode::Initializer => crate::modes::RuntimeMode::Initializer,
-                SessionMode::Coding => {
-                    crate::modes::RuntimeMode::Behavioral(crate::modes::BehaviorMode::default())
-                }
-            },
-            |run| run.runtime_mode().mode,
-        );
-        let persisted_workspace = self
+        let current = self
             .run_contexts
             .get(acp_session_id)
-            .and_then(|run| run.isolated_workspace().cloned());
-        if persisted_workspace.is_some() {
-            if let Some(retired) = self.run_contexts.remove(acp_session_id) {
-                crate::tools::worktree::release_workspace_descriptor_owner(&retired)?;
-                crate::tools::retire_run(&retired);
-            }
-        }
-        let base_run = self.build_run_context_for_mode(oc_session_id, runtime_mode)?;
+            .cloned()
+            .ok_or_else(|| format!("Unknown ACP session {acp_session_id}"))?;
+        let runtime_mode = current.runtime_mode().mode;
+        let parent_budget = current.runtime().budget().clone();
+        let persisted_workspace = current.isolated_workspace().cloned();
+
+        // A prompt owns an exact cancellation generation. Its budget remains
+        // a child of the wire session's cumulative authority, so rotating the
+        // generation cannot reset provider/tool limits between turns.
+        let base_run = self.build_run_context_for_mode_with_parent(
+            oc_session_id,
+            runtime_mode,
+            Some(parent_budget),
+        )?;
         let run_context = if let Some(workspace) = persisted_workspace.as_ref() {
+            self.run_contexts.remove(acp_session_id);
+            if let Err(error) = crate::tools::worktree::release_workspace_descriptor_owner(&current)
+            {
+                crate::tools::retire_run(&base_run);
+                self.run_contexts
+                    .insert(acp_session_id.to_string(), current);
+                return Err(error);
+            }
+            crate::tools::retire_run(&current);
             match crate::tools::ToolRunContext::resume_isolated_workspace(&base_run, workspace) {
                 Ok(run) => {
                     crate::tools::retire_run(&base_run);
@@ -2174,8 +2792,28 @@ impl AcpServer {
         Ok(run_context)
     }
 
-    #[allow(clippy::too_many_lines)] // Keep prompt admission and published capability response together.
-    async fn handle_session_prompt(&mut self, id: Option<Value>, params: Value) {
+    fn finish_prompt_call(&mut self, calls: &SharedAcpCalls, acp_session_id: &str, call_id: &str) {
+        calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .complete(acp_session_id, call_id);
+        let marker_matches = self
+            .active_call
+            .as_ref()
+            .is_some_and(|marker| marker.session_id == acp_session_id && marker.call_id == call_id);
+        if marker_matches {
+            self.active_call = None;
+        }
+        self.cancel_flag = Arc::new(AtomicBool::new(false));
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn handle_session_prompt_with_calls(
+        &mut self,
+        id: Option<Value>,
+        params: Value,
+        calls: &SharedAcpCalls,
+    ) {
         let Some(id) = id else { return };
         let (acp_session_id, prompt) = match Self::parse_prompt_params(&params) {
             Ok(parsed) => parsed,
@@ -2185,29 +2823,65 @@ impl AcpServer {
             }
         };
 
-        // Reset cancel flag
-        self.cancel_flag.store(false, Ordering::SeqCst);
+        let reservation = {
+            let mut registry = calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry.reserve_prompt(&acp_session_id, &id)
+        };
+        let call = match reservation {
+            Ok(call) => call,
+            Err(error) => {
+                self.send_error(id, INVALID_REQUEST, &error);
+                return;
+            }
+        };
         let Some(oc_session_id) = self
             .oc_session_id_for_acp(&acp_session_id)
             .map(str::to_string)
         else {
+            self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
             self.send_error(id, INVALID_PARAMS, "Unknown ACP sessionId");
             return;
         };
-        self.activate_conversation(&acp_session_id);
-        // A prompt is one cancellable run generation. Rotate the capability
-        // rather than clearing a process-global cancellation bit so a prior
-        // cancelled turn can never poison or revive another turn.
+        if let Err(error) = self.activate_owned_session(&acp_session_id) {
+            self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
+            self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+            return;
+        }
         let run_context = match self
             .prepare_prompt_run_context(&acp_session_id, &oc_session_id)
             .await
         {
             Ok(run) => run,
             Err(error) => {
+                self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
                 self.send_error(id, _INTERNAL_ERROR, &error);
                 return;
             }
         };
+        let binding = {
+            let mut registry = calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry.bind_run(&acp_session_id, &call.call_id, &run_context)
+        };
+        if let Err(error) = binding {
+            self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
+            self.send_error(id, INVALID_REQUEST, &error);
+            return;
+        }
+        self.cancel_flag = Arc::clone(&call.cancellation);
+        let marker = AcpActiveCallMarker {
+            session_id: acp_session_id.clone(),
+            call_id: call.call_id.clone(),
+        };
+        self.active_call = Some(marker);
+        self.send_session_update(
+            &acp_session_id,
+            "call_started",
+            &json!({"callId": &call.call_id}),
+        );
 
         let prompt_input = crate::hooks::HookInput::for_run(
             &run_context,
@@ -2221,6 +2895,7 @@ impl AcpServer {
             .run_lifecycle(crate::hooks::HookEvent::UserPromptSubmit, &prompt_input)
             .await;
         if let Some(reason) = prompt_receipt.blocking_reason() {
+            self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
             self.send_error(
                 id,
                 INVALID_REQUEST,
@@ -2286,6 +2961,16 @@ impl AcpServer {
         let effective = match self.session_capability_payload(&acp_session_id).await {
             Ok(payload) => payload,
             Err(error) => {
+                let _ = self.capture_active_session(&acp_session_id);
+                self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                return;
+            }
+        };
+        let persisted_generation = match self.capture_active_session(&acp_session_id) {
+            Ok(envelope) => envelope.generation,
+            Err(error) => {
+                self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
                 self.send_error(id, _INTERNAL_ERROR, &error.to_string());
                 return;
             }
@@ -2294,11 +2979,15 @@ impl AcpServer {
         self.send_response(
             id,
             Some(json!({
+                "sessionId": acp_session_id,
+                "callId": &call.call_id,
+                "generation": persisted_generation,
                 "stopReason": stop_reason,
                 "effectiveCapabilities": effective,
             })),
             None,
         );
+        self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
     }
 
     /// Run the prompt → tool calls → re-prompt loop.
@@ -2989,7 +3678,7 @@ impl AcpServer {
                             .await;
                         match result.follow_up().clone() {
                             crate::tools::ToolFollowUp::EnterPlanMode { .. } => {
-                                match self.apply_acp_mode_value(acp_session_id, "plan").await {
+                                match self.apply_acp_mode_value(acp_session_id, "plan") {
                                     Ok(next_run) => {
                                         let mode = next_run.runtime_mode();
                                         result = result
@@ -3085,6 +3774,17 @@ impl AcpServer {
                                         acp_session_id.to_string(),
                                         Arc::clone(&next_run),
                                     );
+                                    self.state.update(|state, _| {
+                                        let root = next_run.project_root().to_path_buf();
+                                        state.identity.cwd =
+                                            next_run.working_directory().to_path_buf();
+                                        state.identity.project_root.clone_from(&root);
+                                        state.identity.session_project_dir = root;
+                                        state.identity.active_workspace =
+                                            next_run.isolated_workspace().cloned();
+                                        state.transcript.transcript_cwd =
+                                            next_run.working_directory().to_path_buf();
+                                    });
                                     task_obs = self.messages.iter().rev().find_map(|message| {
                                         (message.get("role").and_then(Value::as_str)
                                             == Some("user"))
@@ -4537,6 +5237,7 @@ fn acp_tool_definitions_for_chat_request(definitions: Value) -> Result<Vec<Value
 ///
 /// # Errors
 /// Returns an error if the server fails to start or encounters an I/O error.
+#[allow(clippy::too_many_lines)] // Stdio reader, dispatcher, and writer share one ordered shutdown boundary.
 pub async fn run_acp_server(
     config: AppConfig,
     model: String,
@@ -4581,10 +5282,11 @@ pub async fn run_acp_server(
     server.discover_runtime_plugins();
 
     // Spawn stdin reader on a blocking thread — stdin.lock() is not Send.
-    // Cancellation is raised here, before the sequential dispatcher receives
-    // the message, so an in-flight prompt/tool cannot starve session/cancel.
+    // Prompt reservations and cancellation are correlated here before the
+    // sequential dispatcher can be occupied by provider/tool work.
     let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
-    let reader_cancel = Arc::clone(&server.cancel_flag);
+    let active_calls = Arc::new(std::sync::Mutex::new(AcpCallRegistry::default()));
+    let reader_calls = Arc::clone(&active_calls);
     std::thread::spawn(move || {
         let stdin = io::stdin();
         let reader = stdin.lock();
@@ -4592,18 +5294,23 @@ pub async fn run_acp_server(
             match line_result {
                 Ok(line) => {
                     let trimmed = line.trim().to_string();
-                    if serde_json::from_str::<Value>(&trimmed)
-                        .ok()
-                        .and_then(|value| {
-                            value
-                                .get("method")
-                                .and_then(Value::as_str)
-                                .map(str::to_string)
-                        })
-                        .as_deref()
-                        == Some("session/cancel")
-                    {
-                        reader_cancel.store(true, Ordering::SeqCst);
+                    if let Ok(value) = serde_json::from_str::<Value>(&trimmed) {
+                        let method = value.get("method").and_then(Value::as_str);
+                        let params = value.get("params").unwrap_or(&Value::Null);
+                        let session_id = params.get("sessionId").and_then(Value::as_str);
+                        let mut calls = reader_calls
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match (method, session_id, value.get("id")) {
+                            (Some("session/prompt"), Some(session_id), Some(request_id)) => {
+                                let _ = calls.reserve_prompt(session_id, request_id);
+                            }
+                            (Some("session/cancel"), Some(session_id), _) => {
+                                let call_id = params.get("callId").and_then(Value::as_str);
+                                let _ = calls.request_cancel(session_id, call_id);
+                            }
+                            _ => {}
+                        }
                     }
                     if !trimmed.is_empty() && stdin_tx.send(trimmed).is_err() {
                         break;
@@ -4612,7 +5319,10 @@ pub async fn run_acp_server(
                 Err(_) => break,
             }
         }
-        reader_cancel.store(true, Ordering::SeqCst);
+        reader_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancel_all();
         crate::tools::cancel_all_sandbox_processes();
     });
 
@@ -4634,7 +5344,7 @@ pub async fn run_acp_server(
             }
         };
 
-        server.handle_message(msg).await;
+        server.handle_message_with_calls(msg, &active_calls).await;
     }
 
     // Close every admitted ACP session through the same observable lifecycle
@@ -5628,8 +6338,8 @@ mod tool_argument_tests {
 #[cfg(test)]
 mod session_mode_tests {
     use super::{
-        build_acp_prompt_context, AcpServer, ACP_CONFIG_MODEL_ID, ACP_CONFIG_MODE_ID,
-        INVALID_PARAMS,
+        build_acp_prompt_context, prepare_acp_session_storage, AcpServer, ACP_CONFIG_MODEL_ID,
+        ACP_CONFIG_MODE_ID, INVALID_PARAMS,
     };
     use crate::config::{AppConfig, Hook, HookEntry, HookPolicy, HooksConfig};
     use crate::hooks::HookEngine;
@@ -5708,6 +6418,8 @@ memory:
             crate::memory::MemoryDb::open_for_workspace(tmp.path(), &launch_root)
                 .expect("test ACP technical memory"),
         );
+        let acp_session_storage =
+            prepare_acp_session_storage(tmp.path()).expect("test ACP session storage");
         let server = AcpServer {
             config: test_config(),
             vdd_engine: None,
@@ -5734,6 +6446,10 @@ memory:
             cancel_flag: Arc::new(AtomicBool::new(false)),
             stdout_tx,
             config_options: HashMap::new(),
+            session_envelopes: HashMap::new(),
+            acp_session_storage,
+            active_call: None,
+            initial_model: "local-model".to_string(),
             next_terminal_id: AtomicU64::new(1),
             state: crate::state::StateStore::new(crate::state::SessionState::new(
                 launch_root.clone(),
@@ -5749,45 +6465,6 @@ memory:
             .run_contexts
             .get("unit-test")
             .expect("test server carries an explicit run capability")
-    }
-
-    #[test]
-    fn conversation_switch_clears_portable_and_native_state_without_clearing_same_session() {
-        let (mut server, _rx, _tmp) = test_server();
-        let output = crate::providers::OpenAiResponsesTurnOutput::new(
-            "resp_acp_session_1",
-            vec![json!({
-                "type": "message",
-                "id": "msg_acp_session_1",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": "answer"}]
-            })],
-        )
-        .expect("Responses output");
-        let native_state = crate::providers::advance_openai_responses_state(
-            "openai", "gpt-test", None, 1, &output,
-        )
-        .expect("Responses state");
-        let messages = vec![
-            json!({"role": "user", "content": "question"}),
-            json!({"role": "assistant", "content": "answer"}),
-        ];
-
-        server.active_conversation_acp_session_id = Some("session-a".to_string());
-        server.messages.clone_from(&messages);
-        server.provider_native_state = Some(native_state.clone());
-
-        server.activate_conversation("session-a");
-        assert_eq!(server.messages, messages);
-        assert_eq!(server.provider_native_state, Some(native_state));
-
-        server.activate_conversation("session-b");
-        assert!(server.messages.is_empty());
-        assert!(server.provider_native_state.is_none());
-        assert_eq!(
-            server.active_conversation_acp_session_id.as_deref(),
-            Some("session-b")
-        );
     }
 
     #[cfg(unix)]
@@ -6465,10 +7142,10 @@ memory:
         let session_id = crate::state::SessionId::new();
 
         let first = server
-            .build_run_context(session_id.as_str())
+            .build_run_context_for_mode(session_id.as_str(), crate::modes::RuntimeMode::Initializer)
             .expect("first prompt generation");
         let second = server
-            .build_run_context(session_id.as_str())
+            .build_run_context_for_mode(session_id.as_str(), crate::modes::RuntimeMode::Initializer)
             .expect("second prompt generation");
 
         assert_eq!(first.environment_grants(), launch.environment_grants());
@@ -6494,7 +7171,7 @@ blast_radius:
 
         let session_id = crate::state::SessionId::new();
         let run = server
-            .build_run_context(session_id.as_str())
+            .build_run_context_for_mode(session_id.as_str(), crate::modes::RuntimeMode::Initializer)
             .expect("guardrail-bound ACP run");
         let rejection = crate::guardrails::check_file_access(&run, ".env")
             .expect_err("ACP run must enforce its configured deny rule");
@@ -6803,12 +7480,20 @@ blast_radius:
         assert_no_client_request(&mut rx, "locally confined ACP filesystem tools");
     }
 
-    #[test]
-    fn ide_unsaved_buffers_require_session_scoped_file_capability() {
-        let (server, _rx, _tmp) = test_server();
+    #[tokio::test]
+    async fn ide_unsaved_buffers_require_session_scoped_file_capability() {
+        let (mut server, mut rx, _tmp) = test_server();
+        server
+            .handle_session_new_canonical(Some(json!(1)), Value::Null)
+            .await;
+        let created = next_response(&mut rx);
+        let acp_session_id = created["result"]["sessionId"]
+            .as_str()
+            .expect("admitted ACP session")
+            .to_string();
         let state_reader = server.state.clone();
         server.handle_ide_file_opened(&json!({
-            "sessionId": "unit-test",
+            "sessionId": acp_session_id,
             "filePath": "src/lib.rs",
             "text": "unsaved editor contents"
         }));
@@ -6824,7 +7509,7 @@ blast_radius:
         );
 
         server.handle_ide_selection_changed(&json!({
-            "sessionId": "unit-test",
+            "sessionId": acp_session_id,
             "filePath": "src/lib.rs",
             "text": "fn selected() {}",
             "selection": {
@@ -6832,7 +7517,12 @@ blast_radius:
                 "end": {"line": 4, "character": 16}
             }
         }));
-        let prompt = build_acp_prompt_context(test_run(&server), &server.ide_state());
+        let prompt = build_acp_prompt_context(
+            server
+                .run_context_for_acp(&acp_session_id)
+                .expect("admitted IDE session run"),
+            &server.ide_state(),
+        );
         assert!(prompt
             .reference_context()
             .contains("Selection: src/lib.rs:4 (1 line(s))"));
@@ -6840,7 +7530,7 @@ blast_radius:
 
         let outside = tempfile::NamedTempFile::new().expect("outside IDE fixture");
         server.handle_ide_file_opened(&json!({
-            "sessionId": "unit-test",
+            "sessionId": acp_session_id,
             "filePath": outside.path(),
             "text": "outside unsaved secret"
         }));
@@ -7680,7 +8370,7 @@ blast_radius:
     }
 
     #[tokio::test]
-    async fn negotiated_mode_rotates_capability_and_denies_unadvertised_effects() {
+    async fn negotiated_mode_updates_policy_without_resetting_session_capability() {
         let (mut server, mut rx, _tmp) = test_server();
         server
             .handle_session_new_canonical(Some(json!(1)), Value::Null)
@@ -7705,7 +8395,11 @@ blast_radius:
         let coding_generation = coding["result"]["effectiveCapabilities"]["capabilityGeneration"]
             .as_u64()
             .expect("coding capability generation");
-        assert_ne!(initializer_generation, coding_generation);
+        assert_eq!(initializer_generation, coding_generation);
+        assert_ne!(
+            created["result"]["effectiveCapabilities"]["runtimeModeGeneration"],
+            coding["result"]["effectiveCapabilities"]["runtimeModeGeneration"]
+        );
         assert_eq!(coding["result"]["activeMode"], "coding");
         assert_eq!(
             coding["result"]["effectiveCapabilities"]["capabilities"]["fs"]["write"],
@@ -7917,6 +8611,7 @@ blast_radius:
     async fn session_set_config_option_rejects_policy_denied_model_without_mutation() {
         let (mut server, mut rx, _tmp) = test_server();
         server.model = "allowed-model".to_string();
+        server.initial_model = "allowed-model".to_string();
         server.policy_enforcer = Arc::new(crate::services::policy::PolicyEnforcer::new(
             crate::services::policy::EnterprisePolicy {
                 model_allowlist: std::collections::HashSet::from(["allowed-model".to_string()]),
@@ -8045,8 +8740,11 @@ blast_radius:
             ),
         ] {
             let (mut server, mut rx, _tmp) = test_server();
+            let calls = Arc::new(std::sync::Mutex::new(super::AcpCallRegistry::default()));
 
-            server.handle_session_prompt(Some(id), params).await;
+            server
+                .handle_session_prompt_with_calls(Some(id), params, &calls)
+                .await;
             let response = next_response(&mut rx);
 
             assert_invalid_params(&response, expected);
@@ -8060,6 +8758,216 @@ blast_radius:
             );
             assert_no_client_request(&mut rx, "invalid session/prompt params");
         }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One end-to-end scenario proves every independently restored field.
+    async fn acp_sessions_restore_independent_transcript_model_config_and_ide_state() {
+        let (mut server, mut rx, _tmp) = test_server();
+        server
+            .handle_session_new_canonical(Some(json!(1)), Value::Null)
+            .await;
+        let created_a = next_response(&mut rx);
+        let session_a = created_a["result"]["sessionId"]
+            .as_str()
+            .expect("session A id")
+            .to_string();
+        server
+            .handle_session_set_mode(
+                Some(json!(2)),
+                &json!({"sessionId": session_a, "mode": "coding"}),
+            )
+            .await;
+        let _ = next_response(&mut rx);
+        server
+            .handle_session_set_config_option(
+                Some(json!(3)),
+                &json!({
+                    "sessionId": session_a,
+                    "configId": "model",
+                    "value": "model-a"
+                }),
+            )
+            .await;
+        let _ = next_response(&mut rx);
+        server.handle_ide_file_opened(&json!({
+            "sessionId": session_a,
+            "filePath": "src/lib.rs",
+            "text": "session A buffer"
+        }));
+        server
+            .messages
+            .push(json!({"role": "user", "content": "session A transcript"}));
+
+        server
+            .handle_session_new_canonical(Some(json!(4)), Value::Null)
+            .await;
+        let created_b = next_response(&mut rx);
+        let session_b = created_b["result"]["sessionId"]
+            .as_str()
+            .expect("session B id")
+            .to_string();
+        assert_ne!(session_a, session_b);
+        assert_eq!(server.model, "local-model");
+        assert!(server.messages.is_empty());
+        assert!(server.ide_state().active_file.is_none());
+        server
+            .handle_session_set_config_option(
+                Some(json!(5)),
+                &json!({
+                    "sessionId": session_b,
+                    "configId": "model",
+                    "value": "model-b"
+                }),
+            )
+            .await;
+        let _ = next_response(&mut rx);
+        server.handle_ide_file_opened(&json!({
+            "sessionId": session_b,
+            "filePath": "src/main.rs",
+            "text": "session B buffer"
+        }));
+
+        server
+            .activate_owned_session(&session_a)
+            .expect("restore session A");
+        assert_eq!(
+            server
+                .session_manager
+                .get_session()
+                .expect("canonical session A")
+                .id,
+            server.session_map[&session_a]
+        );
+        assert_eq!(
+            server
+                .session_manager
+                .get_session()
+                .expect("canonical session A")
+                .mode,
+            SessionMode::Coding
+        );
+        assert_eq!(server.model, "model-a");
+        assert_eq!(server.config_options.get("model"), Some(&json!("model-a")));
+        assert_eq!(
+            server.ide_state().active_file.as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(server.messages[0]["content"], "session A transcript");
+
+        server
+            .activate_owned_session(&session_b)
+            .expect("restore session B");
+        assert_eq!(
+            server
+                .session_manager
+                .get_session()
+                .expect("canonical session B")
+                .id,
+            server.session_map[&session_b]
+        );
+        assert_eq!(
+            server
+                .session_manager
+                .get_session()
+                .expect("canonical session B")
+                .mode,
+            SessionMode::Initializer
+        );
+        assert_eq!(server.model, "model-b");
+        assert_eq!(server.config_options.get("model"), Some(&json!("model-b")));
+        assert_eq!(
+            server.ide_state().active_file.as_deref(),
+            Some("src/main.rs")
+        );
+        assert!(server.messages.is_empty());
+        assert_ne!(
+            server
+                .run_context_for_acp(&session_a)
+                .expect("run A")
+                .run_id(),
+            server
+                .run_context_for_acp(&session_b)
+                .expect("run B")
+                .run_id()
+        );
+
+        server.session_envelopes.remove(&session_a);
+        let mut persisted = server
+            .read_persisted_session_envelope(&session_a)
+            .expect("session A durable envelope");
+        assert_eq!(persisted.wire_session_id, session_a);
+        assert_eq!(persisted.session.model, "model-a");
+        assert!(persisted.generation > 0);
+        server
+            .persist_session_envelope(&persisted)
+            .expect("reconciling an already-published envelope is idempotent");
+        persisted
+            .config_options
+            .insert("model".to_string(), json!("conflicting-model"));
+        assert!(matches!(
+            server.persist_session_envelope(&persisted),
+            Err(super::AcpSessionStoreError::GenerationConflict { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn acp_prompt_generations_cancel_independently_with_cumulative_session_budget() {
+        let (mut server, mut rx, _tmp) = test_server();
+        server
+            .handle_session_new_canonical(Some(json!(1)), Value::Null)
+            .await;
+        let created = next_response(&mut rx);
+        let acp_session_id = created["result"]["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        let oc_session_id = server
+            .oc_session_id_for_acp(&acp_session_id)
+            .expect("canonical session id")
+            .to_string();
+
+        let first = server
+            .prepare_prompt_run_context(&acp_session_id, &oc_session_id)
+            .await
+            .expect("first prompt generation");
+        let second = server
+            .prepare_prompt_run_context(&acp_session_id, &oc_session_id)
+            .await
+            .expect("second prompt generation");
+        assert_ne!(first.run_id(), second.run_id());
+        assert!(first.runtime().cancellation().is_cancelled());
+        assert!(!second.runtime().cancellation().is_cancelled());
+
+        let mut calls = super::AcpCallRegistry::default();
+        let call = calls
+            .reserve_prompt(&acp_session_id, &json!(7))
+            .expect("reserve prompt");
+        calls
+            .bind_run(&acp_session_id, &call.call_id, &second)
+            .expect("bind exact generation");
+        assert!(!calls.request_cancel(&acp_session_id, Some("wrong-call")));
+        assert!(!second.runtime().cancellation().is_cancelled());
+        assert!(calls.request_cancel(&acp_session_id, Some(&call.call_id)));
+        assert!(second.runtime().cancellation().is_cancelled());
+        calls.complete(&acp_session_id, &call.call_id);
+        assert!(calls.calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_load_rejects_unknown_well_formed_id_without_manufacturing_state() {
+        let (mut server, mut rx, _tmp) = test_server();
+        let unknown = uuid::Uuid::new_v4().to_string();
+
+        server
+            .handle_session_load(Some(json!(1)), &json!({"sessionId": unknown}))
+            .await;
+        let response = next_response(&mut rx);
+
+        assert_invalid_params(&response, "Unknown ACP sessionId");
+        assert!(server.session_map.is_empty());
+        assert!(server.session_envelopes.is_empty());
+        assert!(server.session_manager.get_session().is_none());
     }
 }
 
