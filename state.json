@@ -1,6 +1,6 @@
 {
   "next_display_id": 1216,
-  "next_comment_id": 1953,
+  "next_comment_id": 1954,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -18169,7 +18169,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T04:50:35.525681890Z",
-      "updated_at": "2026-08-30T05:51:17.331760199Z",
+      "updated_at": "2026-08-30T05:52:00.256901010Z",
       "labels": [
         "remediation"
       ],
@@ -18187,6 +18187,15 @@
           "content": "[action] Worker code-only handoff integrated and skeptically corrected by root; root owns verification and delivery.",
           "created_at": "2026-08-30T05:51:08.908111773Z",
           "kind": "note"
+        },
+        "c6d71c53-495a-4bb1-b090-7eb32991aadd": {
+          "display_id": 1953,
+          "author": "6Vw9",
+          "content": "Delivered descriptor-relative, nonblocking regular-file attachment admission; per-file, aggregate byte, conservative token, projected-context, and reference-count budgets; cancellation-aware stable double reads; UTF-8/binary checks; digest/generation provenance; and source-labeled reference projection without mutating the literal user prompt. Root fixed the worker regression that treated ordinary email addresses as missing files. Rust 1.98 evidence: fmt check passed; all-target/all-feature check passed; strict Clippy passed; five root attachment tests, changed-after-admission coverage, 17 descriptor-race integration tests, and the complete all-target/all-feature serialized suite passed with zero failures.",
+          "created_at": "2026-08-30T05:52:00.254318969Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA4d5ZbT6vPedgK4M8rf61/+52PcnbtI4Y1uq1E+AVH68TGspvU+4/J+o5NorYtKOOx5MLncjvzSd4LKzExyWADA=="
         }
       }
     },
@@ -49481,11 +49490,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2393,
       "timestamp": "2026-08-30T05:51:55.867284575Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2394,
+      "timestamp": "2026-08-30T05:52:00.256901010Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T05:51:55.867284575Z",
+    "timestamp": "2026-08-30T05:52:00.256901010Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2393
+    "agent_seq": 2394
   }
 }
