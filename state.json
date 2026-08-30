@@ -1,6 +1,6 @@
 {
   "next_display_id": 1225,
-  "next_comment_id": 1985,
+  "next_comment_id": 1986,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -9620,7 +9620,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T12:27:08.521360094Z",
-      "updated_at": "2026-08-30T12:31:11.358172994Z",
+      "updated_at": "2026-08-30T12:39:38.679971524Z",
       "labels": [
         "remediation"
       ],
@@ -10612,6 +10612,15 @@
           "driver_key_fingerprint": "SHA256:6GbEO9gckWEeR3l6YB3LUaTe1Oc9qqn0WLtMVuu7a8A",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAoCf0JtxRuB20fFtMjeHiBrAMtwXf3mqHyUDdFwnpdv7gKZguzi3A4h/Aq2VjOe0H1CKnF731/1Qn78AX6wovAA=="
+        },
+        "93e0322e-7e8e-4162-9899-417557a0c504": {
+          "display_id": 1985,
+          "author": "6Vw9",
+          "content": "Corrective commit dd080500 fixes the exact-head macOS S-076 runner failure by using platform libc::mode_t at mkdirat; local Rust 1.98 format/check/strict Clippy and focused init tests are green. Exact-head CI rerun follows.",
+          "created_at": "2026-08-30T12:39:38.677358443Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAVpkb7ykgWyhzTnAVsG1LTTZyo6zYJ/DKiYulfWj7iTLuFirPInbsgwla/is6O6Dq5rDvsMokt8xPeZEDV+KVBw=="
         },
         "942f2203-729c-4b7e-abe7-7150a0d88a6e": {
           "display_id": 1954,
@@ -50410,11 +50419,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2480,
       "timestamp": "2026-08-30T12:39:34.059262434Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2481,
+      "timestamp": "2026-08-30T12:39:38.679971524Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T12:39:34.059262434Z",
+    "timestamp": "2026-08-30T12:39:38.679971524Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2480
+    "agent_seq": 2481
   }
 }
