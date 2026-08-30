@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1230,
+  "next_display_id": 1231,
   "next_comment_id": 2009,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -547,6 +547,7 @@
     "7aca4758-cb75-4fa4-b75d-dac620ff9049": 1206,
     "7ace8980-ed9d-4732-8114-ddc6e6778fa4": 744,
     "7affeebf-2e4d-4376-ae71-74483ede9b0c": 1171,
+    "7b62ce01-9095-4fb5-8444-c731d92c6f88": 1230,
     "7b7677f6-2896-4c57-bc57-cd7566fff977": 493,
     "7ba08817-664f-47bb-b216-76a0abf734e4": 1046,
     "7bb5d5db-e5a7-487e-8679-0618d3a1b54b": 1111,
@@ -19159,6 +19160,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA9XMXQDSbARb2vjWVpMmETGnUxLyr5vI36KJjSXUQso5Kin4F7pXnml8loAU0wx6S6OTYcPHrwvLbq/vXiAocCQ=="
         }
       }
+    },
+    "7b62ce01-9095-4fb5-8444-c731d92c6f88": {
+      "uuid": "7b62ce01-9095-4fb5-8444-c731d92c6f88",
+      "display_id": 1230,
+      "title": "S-078: Move print mode onto the canonical runtime",
+      "description": "Implement docs/remediation-slices/078-bounded-print-mode-adapter.md. Preserve noninteractive print behavior while routing it through the canonical bounded runtime profile, provider continuation, cancellation, policy hooks, committed terminal outcomes, and typed nonzero failures.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-30T21:59:44.675158710Z",
+      "updated_at": "2026-08-30T21:59:44.675158710Z"
     },
     "7b7677f6-2896-4c57-bc57-cd7566fff977": {
       "uuid": "7b7677f6-2896-4c57-bc57-cd7566fff977",
@@ -50940,11 +50953,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2526,
       "timestamp": "2026-08-30T21:59:25.144106901Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2527,
+      "timestamp": "2026-08-30T21:59:44.675158710Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T21:59:25.144106901Z",
+    "timestamp": "2026-08-30T21:59:44.675158710Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2526
+    "agent_seq": 2527
   }
 }
