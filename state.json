@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1216,
+  "next_display_id": 1217,
   "next_comment_id": 1958,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -176,6 +176,7 @@
     "2834d98a-60ad-4263-9e82-4f8e0d37eb17": 915,
     "28c76b8e-b6dc-4cdf-be06-fc99b2ca2fa0": 759,
     "28e67526-76e6-4ead-9a88-750a13d1825e": 327,
+    "2940b6c5-5bf6-47cb-b43e-dbf60e46e706": 1216,
     "2950b4f5-019d-41da-88e7-e2aadda07c09": 8,
     "297de2c2-cfe7-41be-aa10-fbe09c1db9cd": 998,
     "29938ae3-95c3-4e2f-9a18-c9295a189af4": 1129,
@@ -5945,6 +5946,18 @@
         "qa-seam-memory",
         "refactor"
       ]
+    },
+    "2940b6c5-5bf6-47cb-b43e-dbf60e46e706": {
+      "uuid": "2940b6c5-5bf6-47cb-b43e-dbf60e46e706",
+      "display_id": 1216,
+      "title": "S-060: Sandbox and budget hook execution",
+      "description": "Implement docs/remediation-slices/060-hook-execution-admission.md as production behavior. Resolve trusted executable identity and argv without shell reinterpretation; enforce least-privilege profiles; reserve aggregate process/model/time/byte/cost/concurrency budgets before launch; cancel and join siblings on denial or run end. Worker writes production code only and must not run tests, builds, linters, Git, Crosslink, network, cache, or documentation commands. Root owns skeptical review, integration, all verification, documentation, commit, push, CI, and cleanup.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-30T08:29:54.423455751Z",
+      "updated_at": "2026-08-30T08:29:54.423455751Z"
     },
     "2950b4f5-019d-41da-88e7-e2aadda07c09": {
       "uuid": "2950b4f5-019d-41da-88e7-e2aadda07c09",
@@ -49557,11 +49570,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2399,
       "timestamp": "2026-08-30T06:19:20.621863183Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2400,
+      "timestamp": "2026-08-30T08:29:54.423455751Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T06:19:20.621863183Z",
+    "timestamp": "2026-08-30T08:29:54.423455751Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2399
+    "agent_seq": 2400
   }
 }
