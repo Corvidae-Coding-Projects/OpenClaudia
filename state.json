@@ -23096,12 +23096,13 @@
       "display_id": 1213,
       "title": "S-090: Bound and validate ACP transport",
       "description": "Implement docs/remediation-slices/090-bounded-acp-transport.md as production behavior. Validate ACP JSON-RPC framing, IDs, methods and schemas with pre-allocation bounds; add bounded queues/backpressure; keep stream output provisional until terminal success and durable commit; preserve cancellation and exact session/call ownership. Worker writes code only; root performs review, tests, documentation, commits, push, CI and cleanup.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T04:50:17.710061804Z",
-      "updated_at": "2026-08-30T05:51:41.466006900Z",
+      "updated_at": "2026-08-30T05:51:46.364537150Z",
+      "closed_at": "2026-08-30T05:51:46.364531022Z",
       "labels": [
         "remediation"
       ],
@@ -49455,11 +49456,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2390,
       "timestamp": "2026-08-30T05:51:41.466006900Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2391,
+      "timestamp": "2026-08-30T05:51:46.364537150Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T05:51:41.466006900Z",
+    "timestamp": "2026-08-30T05:51:46.364537150Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2390
+    "agent_seq": 2391
   }
 }
