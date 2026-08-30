@@ -21,6 +21,11 @@ pub enum ProxyClientScope {
 /// One explicitly provisioned proxy caller.
 #[derive(Debug, Deserialize, Clone)]
 pub struct ProxyClientConfig {
+    /// Stable tenant boundary for this caller. When omitted, the caller
+    /// identity is also the tenant identity, preserving the single-principal
+    /// S-092 configuration contract without creating an ambient tenant.
+    #[serde(default)]
+    pub tenant: Option<String>,
     /// Stable, non-secret identity sent in `x-openclaudia-client-id`.
     pub identity: String,
     /// HMAC key used to authenticate request metadata. This is distinct from
@@ -35,6 +40,12 @@ pub struct ProxyClientConfig {
 }
 
 impl ProxyClientConfig {
+    /// Return the provisioned tenant boundary for this caller.
+    #[must_use]
+    pub(crate) fn tenant_identity(&self) -> &str {
+        self.tenant.as_deref().unwrap_or(&self.identity)
+    }
+
     #[must_use]
     pub(crate) fn allows_scope(&self, required: &str) -> bool {
         self.scopes.iter().any(|scope| {

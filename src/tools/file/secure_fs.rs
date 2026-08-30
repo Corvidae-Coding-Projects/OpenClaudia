@@ -74,7 +74,7 @@ pub fn open_regular_read(context: &ToolRunContext, path: &Path) -> Result<File, 
         context,
         path,
         false,
-        libc_flags::O_RDONLY,
+        libc_flags::O_RDONLY | libc_flags::O_NONBLOCK,
         0,
         CapabilityDomain::Agent,
     )?;
@@ -511,6 +511,95 @@ pub fn read_stable_bounded_bytes(
         ));
     }
     Ok(first)
+}
+
+/// Asynchronously read one admitted descriptor-pinned file twice under a hard
+/// byte ceiling and the owning run's cancellation capability.
+///
+/// `admitted` must come from the same open descriptor before the caller
+/// reserves its byte/token allowance. Revalidating it before the first read
+/// closes the gap between admission and I/O; the repeated read then rejects a
+/// rewrite during capture. Dropping this future closes the owned descriptor,
+/// so supervised TUI cancellation cannot leave detached filesystem work.
+pub async fn read_stable_bounded_bytes_async(
+    file: File,
+    path: &Path,
+    admitted: std::fs::Metadata,
+    maximum_bytes: usize,
+    cancellation: &crate::runtime::CancellationHandle,
+) -> Result<Vec<u8>, String> {
+    let mut file = tokio::fs::File::from_std(file);
+    let before = cancellable_file_io(cancellation, file.metadata(), path, "inspect").await?;
+    if !same_file_snapshot(&admitted, &before) {
+        return Err(format!(
+            "File '{}' changed after attachment admission",
+            path.display()
+        ));
+    }
+    if before.len() > u64::try_from(maximum_bytes).unwrap_or(u64::MAX) {
+        return Err(format!(
+            "File '{}' exceeds the {maximum_bytes}-byte read budget",
+            path.display()
+        ));
+    }
+    let first = read_bounded_once_async(&mut file, path, maximum_bytes, cancellation).await?;
+    let middle = cancellable_file_io(cancellation, file.metadata(), path, "inspect").await?;
+    let second = read_bounded_once_async(&mut file, path, maximum_bytes, cancellation).await?;
+    let after = cancellable_file_io(cancellation, file.metadata(), path, "inspect").await?;
+    if !same_file_snapshot(&before, &middle)
+        || !same_file_snapshot(&middle, &after)
+        || first != second
+    {
+        return Err(format!(
+            "File '{}' changed while its bounded snapshot was read",
+            path.display()
+        ));
+    }
+    Ok(first)
+}
+
+async fn read_bounded_once_async(
+    file: &mut tokio::fs::File,
+    path: &Path,
+    maximum_bytes: usize,
+    cancellation: &crate::runtime::CancellationHandle,
+) -> Result<Vec<u8>, String> {
+    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+
+    cancellable_file_io(cancellation, file.seek(SeekFrom::Start(0)), path, "seek").await?;
+    let limit = u64::try_from(maximum_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(maximum_bytes.min(64 * 1024));
+    let mut limited = file.take(limit);
+    cancellable_file_io(cancellation, limited.read_to_end(&mut bytes), path, "read").await?;
+    if bytes.len() > maximum_bytes {
+        return Err(format!(
+            "File '{}' exceeds the {maximum_bytes}-byte read budget",
+            path.display()
+        ));
+    }
+    Ok(bytes)
+}
+
+async fn cancellable_file_io<T>(
+    cancellation: &crate::runtime::CancellationHandle,
+    operation: impl std::future::Future<Output = std::io::Result<T>>,
+    path: &Path,
+    operation_name: &'static str,
+) -> Result<T, String> {
+    tokio::select! {
+        biased;
+        receipt = cancellation.cancelled() => Err(format!(
+            "Attachment read of '{}' was cancelled: {:?}",
+            path.display(),
+            receipt.reason,
+        )),
+        result = operation => result.map_err(|error| format!(
+            "Failed to {operation_name} '{}': {error}",
+            path.display(),
+        )),
+    }
 }
 
 fn read_bounded_once(
@@ -1538,6 +1627,7 @@ fn relative_to_root(path: &Path, root: &Path) -> Result<PathBuf, String> {
 #[cfg(unix)]
 mod libc_flags {
     pub(super) const O_RDONLY: i32 = libc::O_RDONLY;
+    pub(super) const O_NONBLOCK: i32 = libc::O_NONBLOCK;
     pub(super) const O_RDWR: i32 = libc::O_RDWR;
     pub(super) const O_CREAT: i32 = libc::O_CREAT;
     pub(super) const O_EXCL: i32 = libc::O_EXCL;
@@ -1557,6 +1647,7 @@ fn openat2_relative(
 #[cfg(windows)]
 mod libc_flags {
     pub(super) const O_RDONLY: i32 = 0;
+    pub(super) const O_NONBLOCK: i32 = 0;
     pub(super) const O_RDWR: i32 = 1 << 0;
     pub(super) const O_CREAT: i32 = 1 << 1;
     pub(super) const O_EXCL: i32 = 1 << 2;
@@ -1566,6 +1657,7 @@ mod libc_flags {
 #[cfg(not(any(unix, windows)))]
 mod libc_flags {
     pub(super) const O_RDONLY: i32 = 0;
+    pub(super) const O_NONBLOCK: i32 = 0;
     pub(super) const O_RDWR: i32 = 0;
     pub(super) const O_CREAT: i32 = 0;
     pub(super) const O_EXCL: i32 = 0;
@@ -1586,6 +1678,23 @@ pub(super) use windows_backend::{open_directory, write_atomic_generation};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn async_stable_read_rejects_change_after_descriptor_admission() {
+        let root = tempfile::tempdir().expect("stable-read root");
+        let path = root.path().join("attachment.txt");
+        std::fs::write(&path, "before").expect("initial attachment");
+        let file = File::open(&path).expect("open attachment descriptor");
+        let admitted = file.metadata().expect("admitted metadata");
+        std::fs::write(&path, "changed after admission").expect("replace admitted bytes");
+        let cancellation = crate::runtime::CancellationTree::new().root();
+
+        let error = read_stable_bounded_bytes_async(file, &path, admitted, 1024, &cancellation)
+            .await
+            .expect_err("changed generation must be rejected");
+
+        assert!(error.contains("changed after attachment admission"));
+    }
 
     #[test]
     #[cfg(target_os = "linux")]

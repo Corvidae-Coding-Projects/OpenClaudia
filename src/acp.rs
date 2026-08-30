@@ -15,10 +15,11 @@
 //! caller crosses `OpenClaudia`'s filesystem jail and OS sandbox instead of
 //! trusting the client's filesystem or terminal implementation.
 
-use std::collections::{HashMap, VecDeque};
-use std::io::{self, BufRead, Write};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -45,20 +46,13 @@ pub use crate::state::{IdeDiagnostic, IdeSelection, IdeState};
 // JSON-RPC types
 // ============================================================================
 
-/// Incoming JSON-RPC message (could be request, notification, or response).
-#[derive(Debug, Clone, Deserialize)]
+/// Validated incoming JSON-RPC request or notification.
+#[derive(Debug, Clone)]
 pub(crate) struct JsonRpcMessage {
-    #[allow(dead_code)]
-    jsonrpc: String,
-    /// Present on requests (needs response) and responses.
-    #[serde(default)]
+    /// Present on requests that need a response.
     id: Option<Value>,
-    /// Present on requests and notifications.
-    #[serde(default)]
-    method: Option<String>,
-    /// Present on requests and notifications.
-    #[serde(default)]
-    params: Option<Value>,
+    method: String,
+    params: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +89,456 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const _INTERNAL_ERROR: i64 = -32603;
+const ACP_CANCELLED: i64 = -32_800;
+
+// Transport and retained-state bounds. These are deliberately byte limits,
+// not token estimates: every layer can enforce them before allocating the
+// next buffer or publishing a wire frame.
+const MAX_ACP_INPUT_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_ACP_INPUT_QUEUE_FRAMES: usize = 32;
+const MAX_ACP_OUTPUT_QUEUE_FRAMES: usize = 16;
+const MAX_ACP_OUTPUT_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ACP_UPDATE_BYTES: usize = 512 * 1024;
+const MAX_ACP_ERROR_BYTES: usize = 16 * 1024;
+const MAX_ACP_PROMPT_BYTES: usize = 256 * 1024;
+const MAX_ACP_HISTORY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ACP_TOOL_ARGUMENT_BYTES: usize = 256 * 1024;
+const MAX_ACP_TOOL_BYTES_PER_TURN: usize = 2 * 1024 * 1024;
+const MAX_ACP_TOOL_OUTPUT_BYTES: usize = 512 * 1024;
+const MAX_ACP_ASSISTANT_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ACP_TOOL_CALLS_PER_TURN: usize = 128;
+const MAX_ACP_ID_BYTES: usize = 256;
+const MAX_ACP_METHOD_BYTES: usize = 128;
+const MAX_ACP_SESSION_ID_BYTES: usize = 256;
+const MAX_ACP_FILE_PATH_BYTES: usize = 16 * 1024;
+const MAX_ACP_IDE_SELECTION_BYTES: usize = 64 * 1024;
+const MAX_ACP_IDE_DIAGNOSTIC_FILES: usize = 128;
+const MAX_ACP_IDE_DIAGNOSTICS_PER_FILE: usize = 256;
+const MAX_ACP_IDE_DIAGNOSTIC_MESSAGE_BYTES: usize = 4 * 1024;
+const ACP_FRAME_ASSEMBLY_TIMEOUT: Duration = Duration::from_secs(30);
+const ACP_OUTPUT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Error)]
+enum AcpTransportError {
+    #[error("ACP JSON frame exceeded its {limit}-byte limit")]
+    FrameTooLarge { limit: usize },
+    #[error("ACP JSON serialization failed: {0}")]
+    Serialize(#[from] serde_json::Error),
+    #[error("ACP JSON frame was not UTF-8")]
+    InvalidUtf8,
+    #[error("ACP output queue is full")]
+    OutputBackpressure,
+    #[error("ACP output client disconnected")]
+    OutputDisconnected,
+}
+
+struct BoundedJsonWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedJsonWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(limit.min(8 * 1024)),
+            limit,
+        }
+    }
+
+    fn finish(self) -> Result<String, AcpTransportError> {
+        String::from_utf8(self.bytes).map_err(|_| AcpTransportError::InvalidUtf8)
+    }
+}
+
+impl Write for BoundedJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.bytes.len().saturating_add(bytes.len()) > self.limit {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                AcpTransportError::FrameTooLarge { limit: self.limit },
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_bounded_json<T: Serialize>(
+    value: &T,
+    limit: usize,
+) -> Result<String, AcpTransportError> {
+    let mut writer = BoundedJsonWriter::new(limit);
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => writer.finish(),
+        Err(error) if error.io_error_kind() == Some(io::ErrorKind::FileTooLarge) => {
+            Err(AcpTransportError::FrameTooLarge { limit })
+        }
+        Err(error) => Err(AcpTransportError::Serialize(error)),
+    }
+}
+
+fn bounded_json_size<T: Serialize>(value: &T, limit: usize) -> Result<usize, AcpTransportError> {
+    serialize_bounded_json(value, limit).map(|encoded| encoded.len())
+}
+
+fn bounded_diagnostic(message: &str) -> String {
+    crate::tools::safe_truncate(message, MAX_ACP_ERROR_BYTES).to_string()
+}
+
+fn validate_bounded_string(value: &Value, field: &str, limit: usize) -> Result<(), String> {
+    let Some(value) = value.as_str() else {
+        return Err(format!("Invalid '{field}' parameter: expected string"));
+    };
+    if value.len() > limit {
+        return Err(format!("'{field}' exceeds the {limit}-byte ACP limit"));
+    }
+    Ok(())
+}
+
+fn validate_optional_bounded_string(
+    params: &serde_json::Map<String, Value>,
+    field: &str,
+    limit: usize,
+) -> Result<(), String> {
+    params
+        .get(field)
+        .map_or(Ok(()), |value| validate_bounded_string(value, field, limit))
+}
+
+fn required_params_object(params: &Value) -> Result<&serde_json::Map<String, Value>, String> {
+    params
+        .as_object()
+        .ok_or_else(|| "JSON-RPC params must be an object".to_string())
+}
+
+#[allow(clippy::too_many_lines)] // Protocol schemas stay adjacent so supported ACP methods cannot drift apart.
+fn validate_json_rpc_method_schema(message: &JsonRpcMessage) -> Result<(), String> {
+    let method = message.method.as_str();
+    let id_required = matches!(
+        method,
+        "initialize"
+            | "authenticate"
+            | "session/new"
+            | "session/load"
+            | "session/prompt"
+            | "session/set_mode"
+            | "session/set_config_option"
+    );
+    if id_required && message.id.is_none() {
+        return Err(format!("ACP method '{method}' requires a JSON-RPC id"));
+    }
+    if method.starts_with("ide/") && message.id.is_some() {
+        return Err(format!("ACP IDE method '{method}' must be a notification"));
+    }
+
+    match method {
+        "initialize" | "authenticate" | "session/new" => {
+            if !message.params.is_null() && !message.params.is_object() {
+                return Err(format!("ACP method '{method}' requires object params"));
+            }
+        }
+        "session/load" => {
+            let params = required_params_object(&message.params)?;
+            let session_id = params
+                .get("sessionId")
+                .ok_or_else(|| "Missing sessionId".to_string())?;
+            validate_bounded_string(session_id, "sessionId", MAX_ACP_SESSION_ID_BYTES)?;
+            if session_id.as_str().is_some_and(str::is_empty) {
+                return Err("sessionId must not be empty".to_string());
+            }
+        }
+        "session/prompt" => {
+            let params = required_params_object(&message.params)?;
+            let session_id = params
+                .get("sessionId")
+                .ok_or_else(|| "Missing sessionId".to_string())?;
+            validate_bounded_string(session_id, "sessionId", MAX_ACP_SESSION_ID_BYTES)?;
+            if session_id.as_str().is_some_and(str::is_empty) {
+                return Err("sessionId must not be empty".to_string());
+            }
+            let prompt = params
+                .get("prompt")
+                .ok_or_else(|| "Missing prompt".to_string())?;
+            validate_bounded_string(prompt, "prompt", MAX_ACP_PROMPT_BYTES)?;
+        }
+        "session/cancel" => {
+            let params = required_params_object(&message.params)?;
+            let session_id = params
+                .get("sessionId")
+                .ok_or_else(|| "Missing sessionId".to_string())?;
+            validate_bounded_string(session_id, "sessionId", MAX_ACP_SESSION_ID_BYTES)?;
+            validate_optional_bounded_string(params, "callId", MAX_ACP_ID_BYTES)?;
+        }
+        "session/set_mode" => {
+            let params = required_params_object(&message.params)?;
+            validate_optional_bounded_string(params, "sessionId", MAX_ACP_SESSION_ID_BYTES)?;
+            let mode = params
+                .get("mode")
+                .or_else(|| params.get("modeId"))
+                .ok_or_else(|| "Missing mode".to_string())?;
+            validate_bounded_string(mode, "mode", MAX_ACP_METHOD_BYTES)?;
+        }
+        "session/set_config_option" => {
+            let params = required_params_object(&message.params)?;
+            validate_optional_bounded_string(params, "sessionId", MAX_ACP_SESSION_ID_BYTES)?;
+            let config_id = params
+                .get("configId")
+                .or_else(|| params.get("key"))
+                .ok_or_else(|| "Missing configId".to_string())?;
+            validate_bounded_string(config_id, "configId", MAX_ACP_METHOD_BYTES)?;
+            let value = params
+                .get("value")
+                .ok_or_else(|| "Missing string value".to_string())?;
+            validate_bounded_string(value, "value", MAX_ACP_PROMPT_BYTES)?;
+        }
+        "ide/file_opened" | "ide/file_closed" | "ide/selection_changed" => {
+            let params = required_params_object(&message.params)?;
+            let session_id = params
+                .get("sessionId")
+                .ok_or_else(|| "Missing sessionId".to_string())?;
+            validate_bounded_string(session_id, "sessionId", MAX_ACP_SESSION_ID_BYTES)?;
+            let path = params
+                .get("filePath")
+                .ok_or_else(|| "Missing filePath".to_string())?;
+            validate_bounded_string(path, "filePath", MAX_ACP_FILE_PATH_BYTES)?;
+            if method == "ide/selection_changed" {
+                validate_optional_bounded_string(params, "text", MAX_ACP_IDE_SELECTION_BYTES)?;
+                if params
+                    .get("selection")
+                    .is_some_and(|value| !value.is_object())
+                {
+                    return Err("Invalid 'selection' parameter: expected object".to_string());
+                }
+            }
+        }
+        "ide/diagnostics" => {
+            let params = required_params_object(&message.params)?;
+            let session_id = params
+                .get("sessionId")
+                .ok_or_else(|| "Missing sessionId".to_string())?;
+            validate_bounded_string(session_id, "sessionId", MAX_ACP_SESSION_ID_BYTES)?;
+            let path = params
+                .get("filePath")
+                .ok_or_else(|| "Missing filePath".to_string())?;
+            validate_bounded_string(path, "filePath", MAX_ACP_FILE_PATH_BYTES)?;
+            if let Some(diagnostics) = params.get("diagnostics") {
+                let diagnostics = diagnostics
+                    .as_array()
+                    .ok_or_else(|| "Invalid 'diagnostics' parameter: expected array".to_string())?;
+                if diagnostics.len() > MAX_ACP_IDE_DIAGNOSTICS_PER_FILE {
+                    return Err(format!(
+                        "'diagnostics' exceeds the {MAX_ACP_IDE_DIAGNOSTICS_PER_FILE}-item ACP limit"
+                    ));
+                }
+                for diagnostic in diagnostics {
+                    let diagnostic = diagnostic
+                        .as_object()
+                        .ok_or_else(|| "Invalid diagnostic entry: expected object".to_string())?;
+                    for field in ["severity", "message"] {
+                        let value = diagnostic
+                            .get(field)
+                            .ok_or_else(|| format!("Diagnostic missing '{field}'"))?;
+                        validate_bounded_string(
+                            value,
+                            field,
+                            MAX_ACP_IDE_DIAGNOSTIC_MESSAGE_BYTES,
+                        )?;
+                    }
+                    validate_optional_bounded_string(
+                        diagnostic,
+                        "source",
+                        MAX_ACP_IDE_DIAGNOSTIC_MESSAGE_BYTES,
+                    )?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn decode_json_rpc_frame(frame: &[u8]) -> Result<JsonRpcMessage, (Value, i64, String)> {
+    let value = serde_json::from_slice::<Value>(frame).map_err(|error| {
+        (
+            Value::Null,
+            PARSE_ERROR,
+            bounded_diagnostic(&format!("Parse error: {error}")),
+        )
+    })?;
+    let Value::Object(mut object) = value else {
+        return Err((
+            Value::Null,
+            INVALID_REQUEST,
+            "JSON-RPC message must be an object".to_string(),
+        ));
+    };
+    let id = object.remove("id");
+    let error_id = id.clone().unwrap_or(Value::Null);
+    match object.remove("jsonrpc") {
+        Some(Value::String(version)) if version == "2.0" => {}
+        Some(_) => {
+            return Err((
+                error_id,
+                INVALID_REQUEST,
+                "JSON-RPC version must be exactly '2.0'".to_string(),
+            ));
+        }
+        None => {
+            return Err((
+                error_id,
+                INVALID_REQUEST,
+                "Missing jsonrpc field".to_string(),
+            ));
+        }
+    }
+    if let Some(id) = id.as_ref() {
+        let valid = match id {
+            Value::String(value) => !value.is_empty() && value.len() <= MAX_ACP_ID_BYTES,
+            Value::Number(number) => number.as_i64().is_some() || number.as_u64().is_some(),
+            _ => false,
+        };
+        if !valid {
+            return Err((
+                Value::Null,
+                INVALID_REQUEST,
+                format!(
+                    "JSON-RPC id must be a non-empty string of at most {MAX_ACP_ID_BYTES} bytes or an integer"
+                ),
+            ));
+        }
+    }
+    let method = match object.remove("method") {
+        Some(Value::String(method))
+            if !method.is_empty() && method.len() <= MAX_ACP_METHOD_BYTES =>
+        {
+            method
+        }
+        Some(Value::String(_)) => {
+            return Err((
+                error_id,
+                INVALID_REQUEST,
+                format!(
+                    "JSON-RPC method must be non-empty and at most {MAX_ACP_METHOD_BYTES} bytes"
+                ),
+            ));
+        }
+        Some(_) => {
+            return Err((
+                error_id,
+                INVALID_REQUEST,
+                "JSON-RPC method must be a string".to_string(),
+            ));
+        }
+        None => {
+            return Err((
+                error_id,
+                INVALID_REQUEST,
+                "Missing method field".to_string(),
+            ));
+        }
+    };
+    let params = object.remove("params").unwrap_or(Value::Null);
+    if !params.is_null() && !params.is_object() {
+        return Err((
+            error_id,
+            INVALID_PARAMS,
+            "JSON-RPC params must be an object".to_string(),
+        ));
+    }
+    let message = JsonRpcMessage { id, method, params };
+    validate_json_rpc_method_schema(&message)
+        .map_err(|message_text| (error_id, INVALID_PARAMS, message_text))?;
+    Ok(message)
+}
+
+#[derive(Debug)]
+enum AcpInbound {
+    Message(JsonRpcMessage),
+    ProtocolError {
+        id: Value,
+        code: i64,
+        message: String,
+    },
+}
+
+#[derive(Debug)]
+struct AcpFrameDecoder {
+    current: Vec<u8>,
+    discarding_oversized: bool,
+    started_at: Option<Instant>,
+}
+
+impl Default for AcpFrameDecoder {
+    fn default() -> Self {
+        Self {
+            current: Vec::with_capacity(8 * 1024),
+            discarding_oversized: false,
+            started_at: None,
+        }
+    }
+}
+
+impl AcpFrameDecoder {
+    const fn has_partial_frame(&self) -> bool {
+        self.discarding_oversized || !self.current.is_empty()
+    }
+
+    fn remaining_assembly_time(&self, now: Instant) -> Option<Duration> {
+        self.started_at
+            .map(|started| ACP_FRAME_ASSEMBLY_TIMEOUT.saturating_sub(now.duration_since(started)))
+    }
+
+    fn feed(&mut self, bytes: &[u8], now: Instant) -> Vec<Result<Vec<u8>, String>> {
+        let mut frames = Vec::new();
+        for &byte in bytes {
+            if byte == b'\n' {
+                if self.discarding_oversized {
+                    frames.push(Err(format!(
+                        "ACP input frame exceeded the {MAX_ACP_INPUT_FRAME_BYTES}-byte limit"
+                    )));
+                } else {
+                    if self.current.last() == Some(&b'\r') {
+                        self.current.pop();
+                    }
+                    if !self.current.is_empty() {
+                        frames.push(Ok(std::mem::take(&mut self.current)));
+                        self.current = Vec::with_capacity(8 * 1024);
+                    }
+                }
+                self.current.clear();
+                self.discarding_oversized = false;
+                self.started_at = None;
+                continue;
+            }
+            if self.started_at.is_none() {
+                self.started_at = Some(now);
+            }
+            if self.discarding_oversized {
+                continue;
+            }
+            if self.current.len() >= MAX_ACP_INPUT_FRAME_BYTES {
+                self.current.clear();
+                self.current.shrink_to(8 * 1024);
+                self.discarding_oversized = true;
+                continue;
+            }
+            self.current.push(byte);
+        }
+        frames
+    }
+
+    fn finish(self) -> Option<String> {
+        if self.has_partial_frame() {
+            Some("ACP input ended with a partial JSON-RPC frame".to_string())
+        } else {
+            None
+        }
+    }
+}
 
 // ============================================================================
 // ACP Server
@@ -173,6 +617,7 @@ struct ActiveAcpCall {
 #[derive(Debug, Default)]
 struct AcpCallRegistry {
     calls: HashMap<String, ActiveAcpCall>,
+    request_ids: HashSet<String>,
 }
 
 type SharedAcpCalls = Arc<std::sync::Mutex<AcpCallRegistry>>;
@@ -206,13 +651,33 @@ fn prepare_acp_session_storage(
 }
 
 impl AcpCallRegistry {
+    fn request_key(request_id: &Value) -> Result<String, String> {
+        serialize_bounded_json(request_id, MAX_ACP_ID_BYTES.saturating_mul(2))
+            .map_err(|error| format!("invalid JSON-RPC request id: {error}"))
+    }
+
+    fn reserve_request(&mut self, request_id: &Value) -> Result<(), String> {
+        let request_key = Self::request_key(request_id)?;
+        if !self.request_ids.insert(request_key) {
+            return Err("Duplicate active JSON-RPC request id".to_string());
+        }
+        Ok(())
+    }
+
+    fn complete_request(&mut self, request_id: &Value) {
+        let Ok(request_key) = Self::request_key(request_id) else {
+            return;
+        };
+        self.request_ids.remove(&request_key);
+        self.calls.retain(|_, call| call.request_key != request_key);
+    }
+
     fn reserve_prompt(
         &mut self,
         session_id: &str,
         request_id: &Value,
     ) -> Result<ActiveAcpCall, String> {
-        let request_key = serde_json::to_string(request_id)
-            .map_err(|error| format!("invalid JSON-RPC request id: {error}"))?;
+        let request_key = Self::request_key(request_id)?;
         if let Some(existing) = self.calls.get(session_id) {
             if existing.request_key == request_key && !existing.completed {
                 return Ok(existing.clone());
@@ -293,6 +758,7 @@ impl AcpCallRegistry {
                     cancellation.cancel(crate::runtime::CancellationReason::FrontendDisconnected);
             }
         }
+        self.request_ids.clear();
     }
 }
 
@@ -364,7 +830,15 @@ pub struct AcpServer {
     /// Cancellation flag for in-flight prompts
     cancel_flag: Arc<AtomicBool>,
     /// Channel for writing to stdout (serialized access)
-    stdout_tx: mpsc::UnboundedSender<String>,
+    stdout_tx: mpsc::Sender<String>,
+    /// Queue saturation, writer failure, and client disconnect cancel the
+    /// exact active call instead of silently dropping output.
+    transport_failed: Arc<AtomicBool>,
+    /// Assistant bytes staged until provider terminal success and durable
+    /// canonical session publication.
+    provisional_output: String,
+    /// Bounded reason retained while a prompt is in flight.
+    last_prompt_error: Option<String>,
     /// Session config options set via `session/set_config_option`
     config_options: HashMap<String, Value>,
     /// In-memory envelopes for the bounded live ACP session set. Durable
@@ -454,6 +928,10 @@ pub(crate) fn apply_ide_file_opened(state: &mut IdeState, params: &Value) {
         warn!("ide/file_opened notification missing `filePath`");
         return;
     };
+    if path.len() > MAX_ACP_FILE_PATH_BYTES {
+        warn!("ide/file_opened notification exceeded the ACP path limit");
+        return;
+    }
     let path = path.to_string();
     state.active_file = Some(path.clone());
     // Move-to-front in the recents ring.
@@ -469,6 +947,10 @@ pub(crate) fn apply_ide_file_closed(state: &mut IdeState, params: &Value) {
         warn!("ide/file_closed notification missing `filePath`");
         return;
     };
+    if path.len() > MAX_ACP_FILE_PATH_BYTES {
+        warn!("ide/file_closed notification exceeded the ACP path limit");
+        return;
+    }
     if state.active_file.as_deref() == Some(path) {
         state.active_file = None;
     }
@@ -477,9 +959,14 @@ pub(crate) fn apply_ide_file_closed(state: &mut IdeState, params: &Value) {
 
 pub(crate) fn apply_ide_selection_changed(state: &mut IdeState, params: &Value) {
     let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    if text.len() > MAX_ACP_IDE_SELECTION_BYTES {
+        warn!("ide/selection_changed notification exceeded the ACP selection limit");
+        return;
+    }
     let file_path = params
         .get("filePath")
         .and_then(|v| v.as_str())
+        .filter(|path| path.len() <= MAX_ACP_FILE_PATH_BYTES)
         .map(str::to_string);
     let range = params.get("selection");
 
@@ -525,24 +1012,38 @@ pub(crate) fn apply_ide_diagnostics(state: &mut IdeState, params: &Value) {
         warn!("ide/diagnostics notification missing `filePath`");
         return;
     };
+    if file_path.len() > MAX_ACP_FILE_PATH_BYTES {
+        warn!("ide/diagnostics notification exceeded the ACP path limit");
+        return;
+    }
     let Some(items) = params.get("diagnostics").and_then(|v| v.as_array()) else {
         state.diagnostics.remove(file_path);
         return;
     };
+    if items.len() > MAX_ACP_IDE_DIAGNOSTICS_PER_FILE {
+        warn!("ide/diagnostics notification exceeded the per-file item limit");
+        return;
+    }
     let parsed: Vec<IdeDiagnostic> = items
         .iter()
         .filter_map(|item| {
             let line = u32::try_from(item.get("line")?.as_u64()?).ok()?;
-            let severity = item.get("severity")?.as_str()?.to_string();
-            let message = item.get("message")?.as_str()?.to_string();
+            let severity = item.get("severity")?.as_str()?;
+            let message = item.get("message")?.as_str()?;
+            if severity.len() > MAX_ACP_IDE_DIAGNOSTIC_MESSAGE_BYTES
+                || message.len() > MAX_ACP_IDE_DIAGNOSTIC_MESSAGE_BYTES
+            {
+                return None;
+            }
             let source = item
                 .get("source")
                 .and_then(|v| v.as_str())
+                .filter(|source| source.len() <= MAX_ACP_IDE_DIAGNOSTIC_MESSAGE_BYTES)
                 .map(str::to_string);
             Some(IdeDiagnostic {
                 line,
-                severity,
-                message,
+                severity: severity.to_string(),
+                message: message.to_string(),
                 source,
             })
         })
@@ -550,6 +1051,12 @@ pub(crate) fn apply_ide_diagnostics(state: &mut IdeState, params: &Value) {
     if parsed.is_empty() {
         state.diagnostics.remove(file_path);
     } else {
+        if !state.diagnostics.contains_key(file_path)
+            && state.diagnostics.len() >= MAX_ACP_IDE_DIAGNOSTIC_FILES
+        {
+            warn!("ide/diagnostics state reached its file limit");
+            return;
+        }
         state.diagnostics.insert(file_path.to_string(), parsed);
     }
 }
@@ -598,9 +1105,10 @@ fn ide_context_item(state: &IdeState) -> Option<crate::context::ContextItem> {
     }
     if !state.diagnostics.is_empty() {
         context.push_str("Diagnostics:\n");
-        for (path, diagnostics) in state
-            .diagnostics
-            .iter()
+        let mut diagnostics_by_path = state.diagnostics.iter().collect::<Vec<_>>();
+        diagnostics_by_path.sort_by_key(|(path, _)| *path);
+        for (path, diagnostics) in diagnostics_by_path
+            .into_iter()
             .take(IDE_DIAGNOSTIC_FILES_IN_PROMPT)
         {
             let _ = writeln!(context, "{path}:");
@@ -679,6 +1187,11 @@ fn parse_acp_tool_arguments(
     tool_name: &str,
     arguments_json: &str,
 ) -> Result<(HashMap<String, Value>, Value), ToolFailure> {
+    if arguments_json.len() > MAX_ACP_TOOL_ARGUMENT_BYTES {
+        return Err(acp_arg_error(format!(
+            "Tool arguments exceed the {MAX_ACP_TOOL_ARGUMENT_BYTES}-byte ACP limit"
+        )));
+    }
     crate::services::tool_executor::ToolExecutor::parse_arguments_map(tool_name, arguments_json)
         .map_err(acp_arg_error)
 }
@@ -1754,7 +2267,7 @@ impl AcpServer {
         claude_code_token: Option<crate::secrets::OAuthToken>,
         claude_agent_sdk: Option<crate::claude_agent_sdk::ClaudeAgentSdk>,
         codex_agent_sdk: Option<crate::codex_agent_sdk::CodexAgentSdk>,
-        stdout_tx: mpsc::UnboundedSender<String>,
+        stdout_tx: mpsc::Sender<String>,
         launch_root: std::path::PathBuf,
     ) -> Result<Self, String> {
         let host_home = dirs::home_dir()
@@ -1767,6 +2280,7 @@ impl AcpServer {
             claude_agent_sdk,
             codex_agent_sdk,
             stdout_tx,
+            Arc::new(AtomicBool::new(false)),
             launch_root,
             host_home,
         )
@@ -1780,7 +2294,8 @@ impl AcpServer {
         claude_code_token: Option<crate::secrets::OAuthToken>,
         claude_agent_sdk: Option<crate::claude_agent_sdk::ClaudeAgentSdk>,
         codex_agent_sdk: Option<crate::codex_agent_sdk::CodexAgentSdk>,
-        stdout_tx: mpsc::UnboundedSender<String>,
+        stdout_tx: mpsc::Sender<String>,
+        transport_failed: Arc<AtomicBool>,
         launch_root: std::path::PathBuf,
         host_home: std::path::PathBuf,
     ) -> Result<Self, String> {
@@ -1864,6 +2379,9 @@ impl AcpServer {
             policy_enforcer,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             stdout_tx,
+            transport_failed,
+            provisional_output: String::new(),
+            last_prompt_error: None,
             config_options: HashMap::new(),
             session_envelopes: HashMap::new(),
             acp_session_storage,
@@ -1899,6 +2417,29 @@ impl AcpServer {
     // Transport helpers
     // ========================================================================
 
+    fn mark_transport_failed(&self, error: &AcpTransportError) {
+        if !self.transport_failed.swap(true, Ordering::SeqCst) {
+            warn!(%error, "ACP output transport failed; cancelling active work");
+        }
+        self.cancel_flag.store(true, Ordering::SeqCst);
+        if let Some(marker) = self.active_call.as_ref() {
+            if let Some(run) = self.run_context_for_acp(&marker.session_id) {
+                let _ = run
+                    .runtime()
+                    .cancellation()
+                    .cancel(crate::runtime::CancellationReason::FrontendDisconnected);
+            }
+        }
+    }
+
+    fn enqueue_json<T: Serialize>(&self, value: &T, limit: usize) -> Result<(), AcpTransportError> {
+        let line = serialize_bounded_json(value, limit)?;
+        self.stdout_tx.try_send(line).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => AcpTransportError::OutputBackpressure,
+            mpsc::error::TrySendError::Closed(_) => AcpTransportError::OutputDisconnected,
+        })
+    }
+
     /// Send a JSON-RPC response.
     fn send_response(&self, id: Value, result: Option<Value>, error: Option<JsonRpcError>) {
         let resp = JsonRpcResponse {
@@ -1907,8 +2448,8 @@ impl AcpServer {
             result,
             error,
         };
-        if let Ok(line) = serde_json::to_string(&resp) {
-            let _ = self.stdout_tx.send(line);
+        if let Err(error) = self.enqueue_json(&resp, MAX_ACP_OUTPUT_FRAME_BYTES) {
+            self.mark_transport_failed(&error);
         }
     }
 
@@ -1919,8 +2460,13 @@ impl AcpServer {
             method: method.to_string(),
             params,
         };
-        if let Ok(line) = serde_json::to_string(&notif) {
-            let _ = self.stdout_tx.send(line);
+        let limit = if method == "session/update" {
+            MAX_ACP_UPDATE_BYTES
+        } else {
+            MAX_ACP_OUTPUT_FRAME_BYTES
+        };
+        if let Err(error) = self.enqueue_json(&notif, limit) {
+            self.mark_transport_failed(&error);
         }
     }
 
@@ -1954,7 +2500,7 @@ impl AcpServer {
             None,
             Some(JsonRpcError {
                 code,
-                message: message.to_string(),
+                message: bounded_diagnostic(message),
                 data: None,
             }),
         );
@@ -1999,19 +2545,44 @@ impl AcpServer {
     // Message routing
     // ========================================================================
 
+    fn validate_message_ownership(&self, message: &JsonRpcMessage) -> Result<(), String> {
+        let session_id = message.params.get("sessionId").and_then(Value::as_str);
+        let requires_live_owner = matches!(
+            message.method.as_str(),
+            "session/prompt"
+                | "session/cancel"
+                | "ide/file_opened"
+                | "ide/file_closed"
+                | "ide/selection_changed"
+                | "ide/diagnostics"
+        );
+        if requires_live_owner {
+            let session_id = session_id.ok_or_else(|| "Missing sessionId".to_string())?;
+            if !self.session_map.contains_key(session_id) {
+                return Err("Unknown ACP sessionId".to_string());
+            }
+        }
+        if matches!(
+            message.method.as_str(),
+            "session/set_mode" | "session/set_config_option"
+        ) && session_id.is_some_and(|session_id| !self.session_map.contains_key(session_id))
+        {
+            return Err("Unknown ACP sessionId".to_string());
+        }
+        Ok(())
+    }
+
     async fn handle_message_with_calls(&mut self, msg: JsonRpcMessage, calls: &SharedAcpCalls) {
-        // This server sends notifications and responses, never requests, so an
-        // incoming message must be a request or notification from the client.
-        let method = if let Some(ref m) = msg.method {
-            m.clone()
-        } else {
+        if let Err(error) = self.validate_message_ownership(&msg) {
             if let Some(id) = msg.id {
-                self.send_error(id, INVALID_REQUEST, "Missing method field");
+                self.send_error(id, INVALID_PARAMS, &error);
+            } else {
+                warn!(method = %msg.method, %error, "Rejected unowned ACP notification");
             }
             return;
-        };
-
-        let params = msg.params.unwrap_or(Value::Null);
+        }
+        let method = msg.method;
+        let params = msg.params;
 
         match method.as_str() {
             "initialize" => self.handle_initialize(msg.id, params),
@@ -2717,17 +3288,64 @@ impl AcpServer {
     // Prompt execution — the core agentic loop
     // ========================================================================
 
-    fn record_failed_prompt_turn(&mut self, reason: &str) {
-        crate::session::append_failed_turn_message(&mut self.messages, reason);
+    fn ensure_history_bound(&self) -> Result<(), String> {
+        bounded_json_size(&self.messages, MAX_ACP_HISTORY_BYTES)
+            .map(|_| ())
+            .map_err(|_| {
+                format!("ACP conversation history exceeds the {MAX_ACP_HISTORY_BYTES}-byte limit")
+            })
     }
 
-    fn fail_prompt_with_update(&mut self, acp_session_id: &str, text: &str) -> String {
-        self.record_failed_prompt_turn(text);
-        self.send_session_update(
-            acp_session_id,
-            "agent_message_chunk",
-            &json!({"type": "text", "text": text}),
-        );
+    fn push_history_message(&mut self, message: Value) -> Result<(), String> {
+        self.messages.push(message);
+        if let Err(error) = self.ensure_history_bound() {
+            self.messages.pop();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn append_reference_messages_bounded(
+        &mut self,
+        projection: &crate::context::ContextProjection,
+    ) -> Result<(), String> {
+        let original_len = self.messages.len();
+        projection.append_reference_to_json_messages(&mut self.messages);
+        if let Err(error) = self.ensure_history_bound() {
+            self.messages.truncate(original_len);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn stage_assistant_output(&mut self, acp_session_id: &str, text: &str) -> Result<(), String> {
+        if self.provisional_output.len().saturating_add(text.len()) > MAX_ACP_ASSISTANT_OUTPUT_BYTES
+        {
+            return Err(format!(
+                "ACP assistant output exceeds the {MAX_ACP_ASSISTANT_OUTPUT_BYTES}-byte limit"
+            ));
+        }
+        self.provisional_output.push_str(text);
+        if !text.is_empty() {
+            self.send_session_update(
+                acp_session_id,
+                "agent_message_chunk",
+                &json!({
+                    "type": "text",
+                    "text": text,
+                    "provisional": true,
+                }),
+            );
+        }
+        Ok(())
+    }
+
+    fn record_prompt_error(&mut self, reason: &str) {
+        self.last_prompt_error = Some(bounded_diagnostic(reason));
+    }
+
+    fn fail_prompt_with_update(&mut self, _acp_session_id: &str, text: &str) -> String {
+        self.record_prompt_error(text);
         "error".to_string()
     }
 
@@ -2737,6 +3355,11 @@ impl AcpServer {
             return Err("sessionId must not be empty".to_string());
         }
         let prompt = Self::required_string_param(params, "prompt", "Missing prompt")?;
+        if prompt.len() > MAX_ACP_PROMPT_BYTES {
+            return Err(format!(
+                "prompt exceeds the {MAX_ACP_PROMPT_BYTES}-byte ACP limit"
+            ));
+        }
         Ok((session_id.to_string(), prompt.to_string()))
     }
 
@@ -2849,6 +3472,16 @@ impl AcpServer {
             self.send_error(id, _INTERNAL_ERROR, &error.to_string());
             return;
         }
+        if let Err(error) = self.ensure_history_bound() {
+            self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
+            self.send_error(id, INVALID_REQUEST, &error);
+            return;
+        }
+        let committed_messages = self.messages.clone();
+        let committed_provider_native_state = self.provider_native_state.clone();
+        let committed_lifecycle_session = self.session_manager.get_session().cloned();
+        self.provisional_output.clear();
+        self.last_prompt_error = None;
         let run_context = match self
             .prepare_prompt_run_context(&acp_session_id, &oc_session_id)
             .await
@@ -2904,11 +3537,16 @@ impl AcpServer {
             return;
         }
 
-        // Add user message
-        self.messages.push(json!({
+        // The user turn and all assistant/tool projections remain provisional
+        // until the final durable envelope commit below.
+        if let Err(error) = self.push_history_message(json!({
             "role": "user",
             "content": prompt.clone(),
-        }));
+        })) {
+            self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
+            self.send_error(id, INVALID_REQUEST, &error);
+            return;
+        }
         let hook_items = crate::context::hook_result_reference_items(
             &prompt_receipt.into_result(),
             "user_prompt_submit",
@@ -2919,7 +3557,13 @@ impl AcpServer {
                 hook_items,
                 crate::context::ContextBudget::default(),
             );
-            projection.append_reference_to_json_messages(&mut self.messages);
+            if let Err(error) = self.append_reference_messages_bounded(&projection) {
+                self.messages = committed_messages;
+                self.provider_native_state = committed_provider_native_state;
+                self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
+                self.send_error(id, INVALID_REQUEST, &error);
+                return;
+            }
         }
         let task_obs = crate::grounded_loop::observe_session_user_task(
             &run_context,
@@ -2946,11 +3590,41 @@ impl AcpServer {
                 .run_lifecycle(crate::hooks::HookEvent::Stop, &stop_input)
                 .await;
             if let Some(reason) = stop_receipt.blocking_reason() {
-                self.record_failed_prompt_turn(&format!(
+                self.record_prompt_error(&format!(
                     "Stop hook blocked ACP turn finalization: {reason}"
                 ));
                 stop_reason = "hook_blocked".to_string();
             }
+        }
+
+        if stop_reason != "end_turn" || self.transport_failed.load(Ordering::SeqCst) {
+            self.messages = committed_messages;
+            self.provider_native_state = committed_provider_native_state;
+            self.provisional_output.clear();
+            let message =
+                self.last_prompt_error
+                    .take()
+                    .unwrap_or_else(|| match stop_reason.as_str() {
+                        "cancelled" => "ACP prompt was cancelled before commit".to_string(),
+                        "max_iterations" => {
+                            "ACP prompt exhausted its iteration budget before terminal success"
+                                .to_string()
+                        }
+                        "hook_blocked" => {
+                            "ACP prompt finalization was blocked by policy".to_string()
+                        }
+                        _ => "ACP prompt failed before terminal success".to_string(),
+                    });
+            let code = if stop_reason == "cancelled" {
+                ACP_CANCELLED
+            } else {
+                _INTERNAL_ERROR
+            };
+            self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
+            if !self.transport_failed.load(Ordering::SeqCst) {
+                self.send_error(id, code, &message);
+            }
+            return;
         }
 
         // Record turn metrics
@@ -2961,7 +3635,12 @@ impl AcpServer {
         let effective = match self.session_capability_payload(&acp_session_id).await {
             Ok(payload) => payload,
             Err(error) => {
-                let _ = self.capture_active_session(&acp_session_id);
+                self.messages = committed_messages;
+                self.provider_native_state = committed_provider_native_state;
+                if let Some(session) = committed_lifecycle_session {
+                    self.session_manager.replace_current_session(session);
+                }
+                self.provisional_output.clear();
                 self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
                 self.send_error(id, _INTERNAL_ERROR, &error.to_string());
                 return;
@@ -2970,11 +3649,19 @@ impl AcpServer {
         let persisted_generation = match self.capture_active_session(&acp_session_id) {
             Ok(envelope) => envelope.generation,
             Err(error) => {
+                self.messages = committed_messages;
+                self.provider_native_state = committed_provider_native_state;
+                if let Some(session) = committed_lifecycle_session {
+                    self.session_manager.replace_current_session(session);
+                }
+                self.provisional_output.clear();
                 self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
                 self.send_error(id, _INTERNAL_ERROR, &error.to_string());
                 return;
             }
         };
+
+        self.provisional_output.clear();
 
         self.send_response(
             id,
@@ -3044,8 +3731,14 @@ impl AcpServer {
         };
 
         for iteration in 0..max_iterations {
-            if self.cancel_flag.load(Ordering::SeqCst) {
+            if self.cancel_flag.load(Ordering::SeqCst)
+                || self.transport_failed.load(Ordering::SeqCst)
+            {
+                self.record_prompt_error("ACP prompt was cancelled before commit");
                 return "cancelled".to_string();
+            }
+            if let Err(error) = self.ensure_history_bound() {
+                return self.fail_prompt_with_update(acp_session_id, &error);
             }
 
             // Build the request
@@ -3435,12 +4128,7 @@ impl AcpServer {
                     } else {
                         format!("Error {status}: {}", headers.sanitize_diagnostic(&body))
                     };
-                    self.send_session_update(
-                        acp_session_id,
-                        "agent_message_chunk",
-                        &json!({"type": "text", "text": error_msg}),
-                    );
-                    self.record_failed_prompt_turn(&error_msg);
+                    self.record_prompt_error(&error_msg);
                     return "error".to_string();
                 }
 
@@ -3534,14 +4222,9 @@ impl AcpServer {
                     ) {
                         Ok(rendered) => rendered,
                         Err(reason) => {
-                            self.send_session_update(
-                                acp_session_id,
-                                "agent_message_chunk",
-                                &json!({
-                                    "type": "text",
-                                    "text": format!("\nFinal answer failed grounding gate: {reason}"),
-                                }),
-                            );
+                            self.record_prompt_error(&format!(
+                                "Final answer failed grounding gate: {reason}"
+                            ));
                             return "error".to_string();
                         }
                     };
@@ -3581,35 +4264,31 @@ impl AcpServer {
                                 withheld.outcome(),
                                 withheld.detail()
                             );
-                            self.send_session_update(
-                                acp_session_id,
-                                "agent_message_chunk",
-                                &json!({"type": "text", "text": format!("\n{reason}")}),
-                            );
-                            self.record_failed_prompt_turn(&reason);
+                            self.record_prompt_error(&reason);
                             return "error".to_string();
                         }
                     };
-                    // No tool calls — we're done
-                    if !rendered_content.is_empty() {
-                        self.send_session_update(
-                            acp_session_id,
-                            "agent_message_chunk",
-                            &json!({"type": "text", "text": rendered_content}),
-                        );
+                    if let Err(error) =
+                        self.stage_assistant_output(acp_session_id, &rendered_content)
+                    {
+                        return self.fail_prompt_with_update(acp_session_id, &error);
                     }
                     if wire_api.is_responses() || !rendered_content.is_empty() {
-                        self.messages.push(json!({
+                        if let Err(error) = self.push_history_message(json!({
                             "role": "assistant",
                             "content": rendered_content,
-                        }));
+                        })) {
+                            return self.fail_prompt_with_update(acp_session_id, &error);
+                        }
                     }
                     if let Some(observation) = vdd_observation {
                         let projection = crate::context::ContextProjector::project(
                             vec![observation],
                             crate::context::ContextBudget::default(),
                         );
-                        projection.append_reference_to_json_messages(&mut self.messages);
+                        if let Err(error) = self.append_reference_messages_bounded(&projection) {
+                            return self.fail_prompt_with_update(acp_session_id, &error);
+                        }
                     }
                     if let Some(state) = next_provider_native_state {
                         self.provider_native_state = Some(state);
@@ -3620,12 +4299,8 @@ impl AcpServer {
                     content,
                     tool_calls,
                 } => {
-                    if !content.is_empty() {
-                        self.send_session_update(
-                            acp_session_id,
-                            "agent_message_chunk",
-                            &json!({"type": "text", "text": content}),
-                        );
+                    if let Err(error) = self.stage_assistant_output(acp_session_id, &content) {
+                        return self.fail_prompt_with_update(acp_session_id, &error);
                     }
                     // Add assistant message with tool calls
                     let tool_calls_json: Vec<Value> = tool_calls
@@ -3642,11 +4317,13 @@ impl AcpServer {
                         })
                         .collect();
 
-                    self.messages.push(json!({
+                    if let Err(error) = self.push_history_message(json!({
                         "role": "assistant",
                         "content": if content.is_empty() { Value::Null } else { Value::String(content) },
                         "tool_calls": tool_calls_json,
-                    }));
+                    })) {
+                        return self.fail_prompt_with_update(acp_session_id, &error);
+                    }
                     if let Some(state) = next_provider_native_state {
                         self.provider_native_state = Some(state);
                     }
@@ -3820,7 +4497,11 @@ impl AcpServer {
                         // The provider receives the exact typed result envelope
                         // in its text-only tool-result slot. The canonical value
                         // remains available above for UI and evidence consumers.
-                        self.messages.push(result.openai_message());
+                        if let Err(error) =
+                            self.push_history_message(bounded_acp_tool_message(&result))
+                        {
+                            return self.fail_prompt_with_update(acp_session_id, &error);
+                        }
                     }
 
                     if let Some(report) = crate::guardrails::run_quality_gates_at(
@@ -3843,7 +4524,7 @@ impl AcpServer {
                                 },
                                 ToString::to_string,
                             );
-                            self.messages.push(json!({
+                            if let Err(error) = self.push_history_message(json!({
                                 "role": "system",
                                 "content": format!(
                                     "Configured quality-gate findings must be addressed before finalization: {detail}"
@@ -3851,27 +4532,28 @@ impl AcpServer {
                                 "metadata": {
                                     "openclaudia_context_source": "reality"
                                 }
-                            }));
+                            })) {
+                                return self.fail_prompt_with_update(acp_session_id, &error);
+                            }
                         }
                     }
 
                     // Continue the loop — re-prompt with tool results
                 }
                 StreamResult::Cancelled => {
+                    self.record_prompt_error("ACP provider stream was cancelled before commit");
                     return "cancelled".to_string();
                 }
                 StreamResult::Error(msg) => {
-                    self.send_session_update(
-                        acp_session_id,
-                        "agent_message_chunk",
-                        &json!({"type": "text", "text": msg}),
-                    );
-                    self.record_failed_prompt_turn(&msg);
+                    self.record_prompt_error(&msg);
                     return "error".to_string();
                 }
             }
         }
 
+        self.record_prompt_error(
+            "ACP prompt exhausted its iteration budget before terminal success",
+        );
         "max_iterations".to_string()
     }
 
@@ -3903,19 +4585,6 @@ impl AcpServer {
 
         loop {
             if self.cancel_flag.load(Ordering::SeqCst) {
-                if !full_content.trim().is_empty() {
-                    self.send_session_update(
-                        acp_session_id,
-                        "agent_message_chunk",
-                        &json!({
-                            "type": "text",
-                            "text": format!(
-                                "Partial provider response (not committed to conversation history):\n{}",
-                                crate::tools::safe_truncate(&full_content, 4_000)
-                            )
-                        }),
-                    );
-                }
                 return StreamResult::Cancelled;
             }
 
@@ -3964,7 +4633,14 @@ impl AcpServer {
                     };
 
                     if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
-                        full_content.push_str(text);
+                        if let Err(error) = append_bounded_stream_text(
+                            &mut full_content,
+                            text,
+                            MAX_ACP_ASSISTANT_OUTPUT_BYTES,
+                            "assistant output",
+                        ) {
+                            return failed_acp_stream(error, &full_content);
+                        }
                     }
 
                     if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
@@ -3983,20 +4659,49 @@ impl AcpServer {
                             }
 
                             while tool_calls.len() <= index {
+                                if tool_calls.len() >= MAX_ACP_TOOL_CALLS_PER_TURN {
+                                    return failed_acp_stream(
+                                        format!(
+                                            "Provider returned more than {MAX_ACP_TOOL_CALLS_PER_TURN} ACP tool calls"
+                                        ),
+                                        &full_content,
+                                    );
+                                }
                                 tool_calls.push(AccumulatedToolCall::default());
                             }
 
                             if let Some(tc_id) = tc_delta.get("id").and_then(|i| i.as_str()) {
+                                if tc_id.len() > MAX_ACP_ID_BYTES {
+                                    return failed_acp_stream(
+                                        "Provider tool call id exceeded the ACP id limit"
+                                            .to_string(),
+                                        &full_content,
+                                    );
+                                }
                                 tool_calls[index].id = tc_id.to_string();
                             }
 
                             if let Some(func) = tc_delta.get("function") {
                                 if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
+                                    if name.len() > MAX_ACP_METHOD_BYTES {
+                                        return failed_acp_stream(
+                                            "Provider tool name exceeded the ACP method limit"
+                                                .to_string(),
+                                            &full_content,
+                                        );
+                                    }
                                     tool_calls[index].name = name.to_string();
                                     current_tool_index = Some(index);
                                 }
                                 if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
-                                    tool_calls[index].arguments.push_str(args);
+                                    if let Err(error) = append_bounded_stream_text(
+                                        &mut tool_calls[index].arguments,
+                                        args,
+                                        MAX_ACP_TOOL_ARGUMENT_BYTES,
+                                        "tool arguments",
+                                    ) {
+                                        return failed_acp_stream(error, &full_content);
+                                    }
                                 }
                             }
                         }
@@ -4023,6 +4728,14 @@ impl AcpServer {
                                 );
                             }
                             "tool_use" => {
+                                if tool_calls.len() >= MAX_ACP_TOOL_CALLS_PER_TURN {
+                                    return failed_acp_stream(
+                                        format!(
+                                            "Provider returned more than {MAX_ACP_TOOL_CALLS_PER_TURN} ACP tool calls"
+                                        ),
+                                        &full_content,
+                                    );
+                                }
                                 let name = content_block
                                     .get("name")
                                     .and_then(|value| value.as_str())
@@ -4031,6 +4744,14 @@ impl AcpServer {
                                     .get("id")
                                     .and_then(|value| value.as_str())
                                     .unwrap_or("");
+                                if name.len() > MAX_ACP_METHOD_BYTES
+                                    || tc_id.len() > MAX_ACP_ID_BYTES
+                                {
+                                    return failed_acp_stream(
+                                        "Provider tool identity exceeded ACP limits".to_string(),
+                                        &full_content,
+                                    );
+                                }
                                 tool_calls.push(AccumulatedToolCall {
                                     id: tc_id.to_string(),
                                     name: name.to_string(),
@@ -4051,7 +4772,14 @@ impl AcpServer {
                         match delta_type {
                             "text_delta" => {
                                 if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
-                                    full_content.push_str(text);
+                                    if let Err(error) = append_bounded_stream_text(
+                                        &mut full_content,
+                                        text,
+                                        MAX_ACP_ASSISTANT_OUTPUT_BYTES,
+                                        "assistant output",
+                                    ) {
+                                        return failed_acp_stream(error, &full_content);
+                                    }
                                 }
                             }
                             "thinking_delta" => {
@@ -4070,7 +4798,14 @@ impl AcpServer {
                                     if let Some(call) = current_tool_index
                                         .and_then(|index| tool_calls.get_mut(index))
                                     {
-                                        call.arguments.push_str(partial);
+                                        if let Err(error) = append_bounded_stream_text(
+                                            &mut call.arguments,
+                                            partial,
+                                            MAX_ACP_TOOL_ARGUMENT_BYTES,
+                                            "tool arguments",
+                                        ) {
+                                            return failed_acp_stream(error, &full_content);
+                                        }
                                     }
                                 }
                             }
@@ -4823,19 +5558,54 @@ fn record_acp_tool_result_observation(
     }
 }
 
+fn bounded_acp_tool_message(result: &ToolResult) -> Value {
+    let message = result.openai_message();
+    if bounded_json_size(&message, MAX_ACP_TOOL_OUTPUT_BYTES).is_ok() {
+        return message;
+    }
+    let excerpt_limit = MAX_ACP_TOOL_OUTPUT_BYTES / 2;
+    let truncated = json!({
+        "schema": "openclaudia.tool_result.truncated.v1",
+        "tool_call_id": result.tool_call_id(),
+        "handler": result.handler(),
+        "evidence_digest": result.evidence_digest(),
+        "original_status": if result.is_error() { "error" } else if result.is_partial() { "partial" } else { "success" },
+        "content": crate::tools::safe_truncate(result.content(), excerpt_limit),
+        "kept_bytes": excerpt_limit.min(result.content().len()),
+        "truncated": true,
+    });
+    let content = serialize_bounded_json(&truncated, MAX_ACP_TOOL_OUTPUT_BYTES)
+        .unwrap_or_else(|error| format!("ACP tool output could not be projected: {error}"));
+    json!({
+        "role": "tool",
+        "tool_call_id": result.tool_call_id(),
+        "content": content,
+        "is_error": true,
+    })
+}
+
 fn acp_tool_call_update_payload(result: &ToolResult) -> Value {
     let status = if matches!(result.outcome(), ToolOutcome::Success { .. }) {
         "completed"
     } else {
         "failed"
     };
-    json!({
+    let rendered = result.render_text();
+    let output = crate::tools::safe_truncate(&rendered, MAX_ACP_TOOL_OUTPUT_BYTES / 2);
+    let mut payload = json!({
         "toolCallId": result.tool_call_id(),
         "title": result.handler(),
         "status": status,
-        "output": result.render_text(),
-        "rawOutput": result.model_payload(),
-    })
+        "output": output,
+    });
+    let raw_output = result.model_payload();
+    if bounded_json_size(&raw_output, MAX_ACP_TOOL_OUTPUT_BYTES / 2).is_ok() {
+        payload["rawOutput"] = raw_output;
+    } else {
+        payload["truncated"] = Value::Bool(true);
+        payload["evidenceDigest"] = Value::String(result.evidence_digest());
+    }
+    payload
 }
 
 #[cfg(test)]
@@ -5058,11 +5828,79 @@ impl AccumulatedToolCall {
     }
 }
 
+fn append_bounded_stream_text(
+    target: &mut String,
+    fragment: &str,
+    limit: usize,
+    field: &str,
+) -> Result<(), String> {
+    if target.len().saturating_add(fragment.len()) > limit {
+        return Err(format!(
+            "Provider {field} exceeded the {limit}-byte ACP limit"
+        ));
+    }
+    target.push_str(fragment);
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // Terminal validation is one atomic provider-frame admission gate.
 fn finish_acp_stream(
     content: String,
     tool_calls: Vec<AccumulatedToolCall>,
     terminal_outcome: crate::pipeline::ProviderTerminalOutcome,
 ) -> StreamResult {
+    if content.len() > MAX_ACP_ASSISTANT_OUTPUT_BYTES {
+        return failed_acp_stream(
+            format!(
+                "Provider assistant output exceeded the {MAX_ACP_ASSISTANT_OUTPUT_BYTES}-byte ACP limit"
+            ),
+            &content,
+        );
+    }
+    if tool_calls.len() > MAX_ACP_TOOL_CALLS_PER_TURN {
+        return failed_acp_stream(
+            format!(
+                "Provider returned {} tool calls; ACP limit is {MAX_ACP_TOOL_CALLS_PER_TURN}",
+                tool_calls.len()
+            ),
+            &content,
+        );
+    }
+    let mut aggregate_tool_bytes = 0usize;
+    for (index, call) in tool_calls.iter().enumerate() {
+        if call.id.len() > MAX_ACP_ID_BYTES {
+            return failed_acp_stream(
+                format!("Provider tool call id at index {index} exceeded the ACP id limit"),
+                &content,
+            );
+        }
+        if call.name.len() > MAX_ACP_METHOD_BYTES {
+            return failed_acp_stream(
+                format!("Provider tool name at index {index} exceeded the ACP method limit"),
+                &content,
+            );
+        }
+        if call.arguments.len() > MAX_ACP_TOOL_ARGUMENT_BYTES {
+            return failed_acp_stream(
+                format!(
+                    "Provider tool arguments at index {index} exceeded the {MAX_ACP_TOOL_ARGUMENT_BYTES}-byte ACP limit"
+                ),
+                &content,
+            );
+        }
+        aggregate_tool_bytes = aggregate_tool_bytes
+            .saturating_add(call.id.len())
+            .saturating_add(call.name.len())
+            .saturating_add(call.arguments.len());
+        if aggregate_tool_bytes > MAX_ACP_TOOL_BYTES_PER_TURN {
+            return failed_acp_stream(
+                format!(
+                    "Provider tool data exceeded the {MAX_ACP_TOOL_BYTES_PER_TURN}-byte ACP turn limit"
+                ),
+                &content,
+            );
+        }
+    }
     if tool_calls.is_empty() {
         if let Err(error) = crate::pipeline::ensure_provider_turn_succeeded(terminal_outcome, 0) {
             return failed_acp_stream(error, &content);
@@ -5233,6 +6071,205 @@ fn acp_tool_definitions_for_chat_request(definitions: Value) -> Result<Vec<Value
 // Server entry point
 // ============================================================================
 
+#[cfg(unix)]
+fn wait_for_stdio(fd: std::os::fd::RawFd, events: i16, timeout: Duration) -> io::Result<bool> {
+    let timeout_ms = i32::try_from(timeout.as_millis().min(i32::MAX as u128)).unwrap_or(i32::MAX);
+    let mut descriptor = libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: `descriptor` points to one initialized pollfd for the exact
+        // duration of the call. No other thread aliases it mutably.
+        let outcome = unsafe { libc::poll(&raw mut descriptor, 1, timeout_ms) };
+        if outcome > 0 {
+            return Ok(true);
+        }
+        if outcome == 0 {
+            return Ok(false);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn write_acp_stdout_frame(line: &str) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    let deadline = Instant::now() + ACP_OUTPUT_WRITE_TIMEOUT;
+    let mut bytes = line.as_bytes();
+    while !bytes.is_empty() {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || !wait_for_stdio(output.as_raw_fd(), libc::POLLOUT, remaining)?
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "ACP stdout client did not accept output before the deadline",
+                ));
+            }
+        }
+        let chunk_len = bytes.len().min(4 * 1024);
+        let written = output.write(&bytes[..chunk_len])?;
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "ACP stdout client disconnected",
+            ));
+        }
+        bytes = &bytes[written..];
+    }
+    output.write_all(b"\n")?;
+    output.flush()
+}
+
+fn enqueue_inbound(sender: &mpsc::Sender<AcpInbound>, inbound: AcpInbound) -> Result<(), ()> {
+    sender.blocking_send(inbound).map_err(|_| ())
+}
+
+fn reserve_inbound_request(message: &JsonRpcMessage, calls: &SharedAcpCalls) -> Result<(), String> {
+    let mut registry = calls
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if message.method == "session/cancel" {
+        if let Some(session_id) = message.params["sessionId"].as_str() {
+            let call_id = message.params.get("callId").and_then(Value::as_str);
+            let _ = registry.request_cancel(session_id, call_id);
+        }
+    }
+    let Some(request_id) = message.id.as_ref() else {
+        drop(registry);
+        return Ok(());
+    };
+    registry.reserve_request(request_id)?;
+    if message.method == "session/prompt" {
+        let session_id = message.params["sessionId"]
+            .as_str()
+            .ok_or_else(|| "Missing sessionId".to_string())?;
+        if let Err(error) = registry.reserve_prompt(session_id, request_id) {
+            registry.complete_request(request_id);
+            drop(registry);
+            return Err(error);
+        }
+    }
+    drop(registry);
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // Framing and EOF cleanup share one blocking stdio owner.
+fn read_acp_stdin(
+    sender: &mpsc::Sender<AcpInbound>,
+    calls: &SharedAcpCalls,
+    transport_failed: &Arc<AtomicBool>,
+) {
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut decoder = AcpFrameDecoder::default();
+    let mut buffer = [0u8; 8 * 1024];
+    loop {
+        if transport_failed.load(Ordering::SeqCst) {
+            break;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            let now = Instant::now();
+            let wait = decoder
+                .remaining_assembly_time(now)
+                .unwrap_or(Duration::from_millis(250))
+                .min(Duration::from_millis(250));
+            if wait.is_zero() {
+                let _ = enqueue_inbound(
+                    sender,
+                    AcpInbound::ProtocolError {
+                        id: Value::Null,
+                        code: PARSE_ERROR,
+                        message: "ACP input frame timed out before newline".to_string(),
+                    },
+                );
+                break;
+            }
+            match wait_for_stdio(input.as_raw_fd(), libc::POLLIN, wait) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    let _ = enqueue_inbound(
+                        sender,
+                        AcpInbound::ProtocolError {
+                            id: Value::Null,
+                            code: PARSE_ERROR,
+                            message: bounded_diagnostic(&format!("ACP stdin failed: {error}")),
+                        },
+                    );
+                    break;
+                }
+            }
+        }
+        let read = match input.read(&mut buffer) {
+            Ok(0) => {
+                if let Some(message) = decoder.finish() {
+                    let _ = enqueue_inbound(
+                        sender,
+                        AcpInbound::ProtocolError {
+                            id: Value::Null,
+                            code: PARSE_ERROR,
+                            message,
+                        },
+                    );
+                }
+                break;
+            }
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                let _ = enqueue_inbound(
+                    sender,
+                    AcpInbound::ProtocolError {
+                        id: Value::Null,
+                        code: PARSE_ERROR,
+                        message: bounded_diagnostic(&format!("ACP stdin failed: {error}")),
+                    },
+                );
+                break;
+            }
+        };
+        for decoded in decoder.feed(&buffer[..read], Instant::now()) {
+            let inbound = match decoded {
+                Err(message) => AcpInbound::ProtocolError {
+                    id: Value::Null,
+                    code: INVALID_REQUEST,
+                    message,
+                },
+                Ok(frame) => match decode_json_rpc_frame(&frame) {
+                    Ok(message) => match reserve_inbound_request(&message, calls) {
+                        Ok(()) => AcpInbound::Message(message),
+                        Err(error) => AcpInbound::ProtocolError {
+                            id: message.id.unwrap_or(Value::Null),
+                            code: INVALID_REQUEST,
+                            message: error,
+                        },
+                    },
+                    Err((id, code, message)) => AcpInbound::ProtocolError { id, code, message },
+                },
+            };
+            if enqueue_inbound(sender, inbound).is_err() {
+                return;
+            }
+        }
+    }
+    drop(input);
+    calls
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .cancel_all();
+    crate::tools::cancel_all_sandbox_processes();
+}
+
 /// Run the ACP server on stdin/stdout.
 ///
 /// # Errors
@@ -5250,18 +6287,22 @@ pub async fn run_acp_server(
         .map_err(|error| anyhow::anyhow!("Cannot resolve ACP workspace: {error}"))?;
     let host_home = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("Cannot resolve host home for private technical memory"))?;
-    // Set up stdout writer channel — all writes go through this to avoid interleaving
-    let (stdout_tx, mut stdout_rx) = mpsc::unbounded_channel::<String>();
+    let transport_failed = Arc::new(AtomicBool::new(false));
+    let active_calls = Arc::new(std::sync::Mutex::new(AcpCallRegistry::default()));
+    // Both directions are bounded. Saturation applies backpressure rather than
+    // retaining an unbounded client-controlled transcript in memory.
+    let (stdout_tx, mut stdout_rx) = mpsc::channel::<String>(MAX_ACP_OUTPUT_QUEUE_FRAMES);
 
-    // Spawn stdout writer on a blocking thread — StdoutLock is not Send
+    let writer_failed = Arc::clone(&transport_failed);
+    let writer_calls = Arc::clone(&active_calls);
     let writer_handle = std::thread::spawn(move || {
-        let stdout = io::stdout();
         while let Some(line) = stdout_rx.blocking_recv() {
-            let mut out = stdout.lock();
-            if writeln!(out, "{line}").is_err() {
-                break;
-            }
-            if out.flush().is_err() {
+            if write_acp_stdout_frame(&line).is_err() {
+                writer_failed.store(true, Ordering::SeqCst);
+                writer_calls
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .cancel_all();
                 break;
             }
         }
@@ -5275,6 +6316,7 @@ pub async fn run_acp_server(
         claude_agent_sdk,
         codex_agent_sdk,
         stdout_tx,
+        Arc::clone(&transport_failed),
         launch_root,
         host_home,
     )
@@ -5284,67 +6326,37 @@ pub async fn run_acp_server(
     // Spawn stdin reader on a blocking thread — stdin.lock() is not Send.
     // Prompt reservations and cancellation are correlated here before the
     // sequential dispatcher can be occupied by provider/tool work.
-    let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
-    let active_calls = Arc::new(std::sync::Mutex::new(AcpCallRegistry::default()));
+    let (stdin_tx, mut stdin_rx) = mpsc::channel::<AcpInbound>(MAX_ACP_INPUT_QUEUE_FRAMES);
     let reader_calls = Arc::clone(&active_calls);
-    std::thread::spawn(move || {
-        let stdin = io::stdin();
-        let reader = stdin.lock();
-        for line_result in reader.lines() {
-            match line_result {
-                Ok(line) => {
-                    let trimmed = line.trim().to_string();
-                    if let Ok(value) = serde_json::from_str::<Value>(&trimmed) {
-                        let method = value.get("method").and_then(Value::as_str);
-                        let params = value.get("params").unwrap_or(&Value::Null);
-                        let session_id = params.get("sessionId").and_then(Value::as_str);
-                        let mut calls = reader_calls
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        match (method, session_id, value.get("id")) {
-                            (Some("session/prompt"), Some(session_id), Some(request_id)) => {
-                                let _ = calls.reserve_prompt(session_id, request_id);
-                            }
-                            (Some("session/cancel"), Some(session_id), _) => {
-                                let call_id = params.get("callId").and_then(Value::as_str);
-                                let _ = calls.request_cancel(session_id, call_id);
-                            }
-                            _ => {}
-                        }
-                    }
-                    if !trimmed.is_empty() && stdin_tx.send(trimmed).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        reader_calls
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cancel_all();
-        crate::tools::cancel_all_sandbox_processes();
+    let reader_failed = Arc::clone(&transport_failed);
+    let reader_handle = std::thread::spawn(move || {
+        read_acp_stdin(&stdin_tx, &reader_calls, &reader_failed);
     });
 
     info!("ACP server started on stdio");
 
     // Process messages from stdin reader thread
-    while let Some(line) = stdin_rx.recv().await {
-        let msg: JsonRpcMessage = match serde_json::from_str(&line) {
-            Ok(m) => m,
-            Err(e) => {
-                // Send parse error if we can extract an id
-                let id = serde_json::from_str::<Value>(&line)
-                    .ok()
-                    .and_then(|v| v.get("id").cloned())
-                    .unwrap_or(Value::Null);
-
-                server.send_error(id, PARSE_ERROR, &format!("Parse error: {e}"));
-                continue;
+    while let Some(inbound) = stdin_rx.recv().await {
+        if transport_failed.load(Ordering::SeqCst) {
+            break;
+        }
+        match inbound {
+            AcpInbound::ProtocolError { id, code, message } => {
+                server.send_error(id, code, &message);
             }
-        };
-
-        server.handle_message_with_calls(msg, &active_calls).await;
+            AcpInbound::Message(message) => {
+                let request_id = message.id.clone();
+                server
+                    .handle_message_with_calls(message, &active_calls)
+                    .await;
+                if let Some(request_id) = request_id {
+                    active_calls
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .complete_request(&request_id);
+                }
+            }
+        }
     }
 
     // Close every admitted ACP session through the same observable lifecycle
@@ -5362,11 +6374,86 @@ pub async fn run_acp_server(
         crate::tools::retire_run(&run_context);
     }
 
-    // Dropping server drops stdout_tx, which causes the writer thread to exit.
+    transport_failed.store(true, Ordering::SeqCst);
+    active_calls
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .cancel_all();
     drop(server);
+    #[cfg(unix)]
+    let _ = reader_handle.join();
+    #[cfg(not(unix))]
+    if reader_handle.is_finished() {
+        let _ = reader_handle.join();
+    }
     let _ = writer_handle.join();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod bounded_transport_tests {
+    use super::*;
+
+    #[test]
+    fn decoder_rejects_oversized_and_partial_frames_without_retaining_them() {
+        let now = Instant::now();
+        let mut decoder = AcpFrameDecoder::default();
+        let mut oversized = vec![b'x'; MAX_ACP_INPUT_FRAME_BYTES + 1];
+        oversized.push(b'\n');
+
+        let frames = decoder.feed(&oversized, now);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0]
+            .as_ref()
+            .expect_err("oversized frame")
+            .contains("exceeded"));
+        assert!(!decoder.has_partial_frame());
+
+        assert!(decoder.feed(br#"{"jsonrpc":"2.0""#, now).is_empty());
+        assert!(decoder
+            .finish()
+            .expect("partial EOF")
+            .contains("partial JSON-RPC frame"));
+    }
+
+    #[test]
+    fn decoder_tracks_one_deadline_for_a_drip_fed_frame() {
+        let started = Instant::now();
+        let mut decoder = AcpFrameDecoder::default();
+        assert!(decoder.feed(b"{", started).is_empty());
+        assert_eq!(
+            decoder.remaining_assembly_time(started + ACP_FRAME_ASSEMBLY_TIMEOUT),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn json_rpc_decode_validates_core_fields_and_allows_extensions() {
+        let decoded = decode_json_rpc_frame(
+            br#"{"jsonrpc":"2.0","id":7,"method":"initialize","params":{},"extension":true}"#,
+        )
+        .expect("valid extended request");
+        assert_eq!(decoded.id, Some(json!(7)));
+        assert_eq!(decoded.method, "initialize");
+
+        let (_, code, _) =
+            decode_json_rpc_frame(br#"{"jsonrpc":"1.0","id":7,"method":"initialize","params":{}}"#)
+                .expect_err("wrong protocol version");
+        assert_eq!(code, INVALID_REQUEST);
+    }
+
+    #[test]
+    fn active_json_rpc_request_ids_cannot_be_reused() {
+        let mut registry = AcpCallRegistry::default();
+        let id = json!("request-7");
+        registry.reserve_request(&id).expect("first reservation");
+        assert!(registry.reserve_request(&id).is_err());
+        registry.complete_request(&id);
+        registry
+            .reserve_request(&id)
+            .expect("id released after completion");
+    }
 }
 
 #[cfg(test)]
@@ -6338,8 +7425,8 @@ mod tool_argument_tests {
 #[cfg(test)]
 mod session_mode_tests {
     use super::{
-        build_acp_prompt_context, prepare_acp_session_storage, AcpServer, ACP_CONFIG_MODEL_ID,
-        ACP_CONFIG_MODE_ID, INVALID_PARAMS,
+        build_acp_prompt_context, prepare_acp_session_storage, AcpActiveCallMarker, AcpServer,
+        ACP_CONFIG_MODEL_ID, ACP_CONFIG_MODE_ID, INVALID_PARAMS, MAX_ACP_OUTPUT_QUEUE_FRAMES,
     };
     use crate::config::{AppConfig, Hook, HookEntry, HookPolicy, HooksConfig};
     use crate::hooks::HookEngine;
@@ -6375,24 +7462,16 @@ memory:
         .expect("test config")
     }
 
-    fn test_server() -> (
-        AcpServer,
-        mpsc::UnboundedReceiver<String>,
-        tempfile::TempDir,
-    ) {
+    fn test_server() -> (AcpServer, mpsc::Receiver<String>, tempfile::TempDir) {
         test_server_with_read_only_roots(Vec::new())
     }
 
     fn test_server_with_read_only_roots(
         read_only_roots: Vec<std::path::PathBuf>,
-    ) -> (
-        AcpServer,
-        mpsc::UnboundedReceiver<String>,
-        tempfile::TempDir,
-    ) {
+    ) -> (AcpServer, mpsc::Receiver<String>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let launch_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let (stdout_tx, stdout_rx) = mpsc::unbounded_channel();
+        let (stdout_tx, stdout_rx) = mpsc::channel(MAX_ACP_OUTPUT_QUEUE_FRAMES);
         let launch_capabilities =
             crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), &launch_root)
                 .read_only_roots(read_only_roots)
@@ -6445,6 +7524,9 @@ memory:
             )),
             cancel_flag: Arc::new(AtomicBool::new(false)),
             stdout_tx,
+            transport_failed: Arc::new(AtomicBool::new(false)),
+            provisional_output: String::new(),
+            last_prompt_error: None,
             config_options: HashMap::new(),
             session_envelopes: HashMap::new(),
             acp_session_storage,
@@ -6465,6 +7547,29 @@ memory:
             .run_contexts
             .get("unit-test")
             .expect("test server carries an explicit run capability")
+    }
+
+    #[test]
+    fn assistant_chunks_are_streamed_as_provisional_until_prompt_commit() {
+        let (mut server, mut stdout, _tmp) = test_server();
+        server.active_call = Some(AcpActiveCallMarker {
+            session_id: "acp-session".to_string(),
+            call_id: "call-1".to_string(),
+        });
+        server
+            .stage_assistant_output("acp-session", "hello")
+            .expect("bounded provisional output");
+
+        let update: Value = serde_json::from_str(
+            &stdout
+                .try_recv()
+                .expect("provisional session update must be emitted"),
+        )
+        .expect("session update JSON");
+        assert_eq!(update["method"], "session/update");
+        assert_eq!(update["params"]["content"]["text"], "hello");
+        assert_eq!(update["params"]["content"]["provisional"], true);
+        assert_eq!(server.provisional_output, "hello");
     }
 
     #[cfg(unix)]
@@ -6560,7 +7665,7 @@ memory:
         .expect("team authority");
         let mut config = test_config();
         config.memory.team_id = Some(authority.team_id().clone());
-        let (stdout_tx, _stdout_rx) = mpsc::unbounded_channel();
+        let (stdout_tx, _stdout_rx) = mpsc::channel(MAX_ACP_OUTPUT_QUEUE_FRAMES);
         let server = AcpServer::new_with_host_home(
             config,
             "local-model".to_string(),
@@ -6569,6 +7674,7 @@ memory:
             None,
             None,
             stdout_tx,
+            Arc::new(AtomicBool::new(false)),
             workspace.path().to_path_buf(),
             host.path().to_path_buf(),
         )
@@ -7182,7 +8288,7 @@ blast_radius:
         crate::tools::retire_run(&run);
     }
 
-    fn next_response(rx: &mut mpsc::UnboundedReceiver<String>) -> Value {
+    fn next_response(rx: &mut mpsc::Receiver<String>) -> Value {
         let line = rx.try_recv().expect("expected ACP response");
         serde_json::from_str(&line).expect("response must be JSON")
     }
@@ -7198,7 +8304,7 @@ blast_radius:
         );
     }
 
-    fn assert_no_client_request(rx: &mut mpsc::UnboundedReceiver<String>, context: &str) {
+    fn assert_no_client_request(rx: &mut mpsc::Receiver<String>, context: &str) {
         assert!(
             rx.try_recv().is_err(),
             "{context} must fail before emitting an ACP client request"

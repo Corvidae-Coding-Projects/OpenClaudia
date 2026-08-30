@@ -1,6 +1,6 @@
 # S-090: Bound and validate ACP transport
 
-Status: Planned
+Status: Delivered; artifact-bound VDD pending S-088
 Effort: Medium
 Primary findings: F-124
 Workstreams: W10, W12
@@ -27,3 +27,35 @@ Prevent unbounded or partial ACP protocol data from becoming normal committed ag
 ## Handoff
 
 Record changed artifact generations, commands/tests run, typed evidence receipts, unresolved risks, and any newly proposed slice. Completion of this slice does not imply completion of its parent workstream.
+
+## Delivered architecture — 2026-08-30
+
+ACP stdio now admits newline-delimited JSON through a pre-allocation frame
+decoder with one assembly deadline, a bounded input queue, and duplicate active
+request-ID rejection. JSON-RPC core fields and supported method schemas are
+validated before dispatch while compatible extension members remain allowed.
+The output path uses bounded serialization and queue backpressure, reports
+writer failure to the owning transport, and bounds errors, updates, history,
+assistant output, tool calls, tool arguments, tool results, IDE paths, and
+diagnostics.
+
+Provider streams now require a typed terminal outcome before the turn can
+commit. Visible assistant chunks are labeled provisional on the ACP wire while
+the transcript and provider continuation remain staged; malformed or partial
+provider streams roll the provisional state back and cannot produce a
+successful prompt result. Prompt failure, cancellation, EOF, stalled frame
+assembly, client disconnect, and output backpressure terminate through explicit
+bounded failure paths.
+
+Focused Rust 1.98 verification passed the four bounded-transport framing,
+deadline, JSON-RPC, and duplicate-ID tests; the provisional-output test; and the
+31 related ACP configuration and IDE-state integration tests. The all-target,
+all-feature check, strict Clippy gate, and complete serialized native suite also
+pass with zero failures.
+
+## Residual boundaries
+
+- S-091 owns exact effective capability advertisement and execution parity; it
+  is not claimed by this transport slice.
+- S-088 still owns the independent artifact-bound VDD receipt; no unavailable
+  verifier result is claimed here.

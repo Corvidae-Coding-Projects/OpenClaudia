@@ -5,7 +5,7 @@
 
 use axum::{
     body::Body,
-    extract::{Request, State},
+    extract::{Extension, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -25,7 +25,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicU32, Ordering},
-        Arc,
+        Arc, Mutex as StdMutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -91,6 +91,14 @@ pub struct ProxyState {
     /// proxy turns, fire Stop hooks, and shut the server down at the
     /// documented iteration limit.
     pub loop_control: Option<Arc<LoopControl>>,
+    /// Exact authenticated owner of this mutable proxy session generation.
+    session_owner: Option<ProxySessionOwner>,
+    /// Serializes state-changing calls within one canonical session while
+    /// leaving unrelated caller sessions concurrent.
+    call_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Present only on the router root. Session entries never retain the
+    /// registry, avoiding ownership cycles and ambient fallback lookup.
+    session_registry: Option<Arc<ProxySessionRegistry>>,
 }
 
 const CLIENT_ID_HEADER: &str = "x-openclaudia-client-id";
@@ -98,6 +106,14 @@ const CLIENT_TIMESTAMP_HEADER: &str = "x-openclaudia-timestamp";
 const CLIENT_NONCE_HEADER: &str = "x-openclaudia-nonce";
 const CLIENT_SIGNATURE_HEADER: &str = "x-openclaudia-signature";
 const CONTENT_DIGEST_HEADER: &str = "x-openclaudia-content-sha256";
+const TENANT_ID_RESPONSE_HEADER: &str = "x-openclaudia-tenant-id";
+const SESSION_ID_RESPONSE_HEADER: &str = "x-openclaudia-session-id";
+const CALL_ID_RESPONSE_HEADER: &str = "x-openclaudia-call-id";
+const RUN_ID_RESPONSE_HEADER: &str = "x-openclaudia-run-id";
+const WORKSPACE_GENERATION_RESPONSE_HEADER: &str = "x-openclaudia-workspace-generation";
+const CAPABILITY_GENERATION_RESPONSE_HEADER: &str = "x-openclaudia-capability-generation";
+const BUDGET_GENERATION_RESPONSE_HEADER: &str = "x-openclaudia-budget-generation";
+const PROVIDER_ID_RESPONSE_HEADER: &str = "x-openclaudia-provider-id";
 const MAX_PROXY_CLIENTS: usize = 256;
 const MAX_CLIENT_ID_BYTES: usize = 128;
 const MIN_NONCE_BYTES: usize = 16;
@@ -135,7 +151,155 @@ impl RequiredProxyScope {
 struct ProxyAuthenticator {
     config: crate::config::ProxyConfig,
     admission: Arc<tokio::sync::Mutex<HashMap<String, ClientAdmission>>>,
+    sessions: Option<Arc<ProxySessionRegistry>>,
     configuration_valid: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_field_names)] // The `_id` suffix distinguishes wire identities from owned objects.
+struct ProxySessionOwner {
+    tenant_id: String,
+    caller_id: String,
+    session_id: String,
+}
+
+struct ProxySessionRegistry {
+    sessions: HashMap<String, Arc<ProxyState>>,
+}
+
+impl ProxySessionRegistry {
+    #[allow(clippy::significant_drop_tightening)] // The owned guard is the session's request lease.
+    async fn begin_call(
+        &self,
+        caller: &AuthenticatedProxyCaller,
+    ) -> Result<ProxyCallContext, ProxyAdmissionError> {
+        let state = self
+            .sessions
+            .get(&caller.identity)
+            .cloned()
+            .ok_or(ProxyAdmissionError::SessionOwnership)?;
+        let owner = state
+            .session_owner
+            .as_ref()
+            .ok_or(ProxyAdmissionError::SessionOwnership)?;
+        let call_guard = Arc::clone(&state.call_gate).lock_owned().await;
+        if owner.caller_id != caller.identity
+            || state.run_context.session_id() != owner.session_id
+            || state.run_context.runtime().cancellation().is_cancelled()
+        {
+            return Err(ProxyAdmissionError::SessionOwnership);
+        }
+        let current_session_id = {
+            let manager = state.session_manager.read().await;
+            manager
+                .get_session()
+                .map(|session| session.id.clone())
+                .ok_or(ProxyAdmissionError::SessionOwnership)?
+        };
+        if current_session_id != owner.session_id {
+            return Err(ProxyAdmissionError::SessionOwnership);
+        }
+        Ok(ProxyCallContext::new(state, call_guard))
+    }
+}
+
+#[derive(Clone)]
+struct ProxyCallContext {
+    lease: Arc<ProxyCallLease>,
+}
+
+struct ProxyCallLease {
+    state: Arc<ProxyState>,
+    call_id: crate::runtime::CallId,
+    provider: StdMutex<Option<String>>,
+    _call_guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl ProxyCallContext {
+    fn new(state: Arc<ProxyState>, call_guard: tokio::sync::OwnedMutexGuard<()>) -> Self {
+        Self {
+            lease: Arc::new(ProxyCallLease {
+                state,
+                call_id: crate::runtime::CallId::new(),
+                provider: StdMutex::new(None),
+                _call_guard: call_guard,
+            }),
+        }
+    }
+
+    fn state(&self) -> &Arc<ProxyState> {
+        &self.lease.state
+    }
+
+    fn call_id(&self) -> crate::runtime::CallId {
+        self.lease.call_id
+    }
+
+    fn bind_provider(&self, provider: &str) -> Result<(), ProxyError> {
+        let mut bound = self
+            .lease
+            .provider
+            .lock()
+            .map_err(|error| ProxyError::FinalizationFailed(error.to_string()))?;
+        let result = match bound.as_deref() {
+            None => {
+                *bound = Some(provider.to_string());
+                Ok(())
+            }
+            Some(existing) if existing == provider => Ok(()),
+            Some(_) => Err(ProxyError::FinalizationFailed(
+                "proxy call attempted to change its provider binding".to_string(),
+            )),
+        };
+        drop(bound);
+        result
+    }
+
+    fn provider(&self) -> Option<String> {
+        self.lease
+            .provider
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn append_response_headers(&self, response: &mut Response) {
+        let state = self.state();
+        let owner = state
+            .session_owner
+            .as_ref()
+            .expect("authenticated proxy session must have an owner");
+        let descriptor = state.run_context.runtime().descriptor();
+        let headers = response.headers_mut();
+        for (name, value) in [
+            (TENANT_ID_RESPONSE_HEADER, owner.tenant_id.clone()),
+            (CLIENT_ID_HEADER, owner.caller_id.clone()),
+            (SESSION_ID_RESPONSE_HEADER, owner.session_id.clone()),
+            (CALL_ID_RESPONSE_HEADER, self.call_id().to_string()),
+            (RUN_ID_RESPONSE_HEADER, descriptor.run_id.to_string()),
+            (
+                WORKSPACE_GENERATION_RESPONSE_HEADER,
+                descriptor.workspace.generation.to_string(),
+            ),
+            (
+                CAPABILITY_GENERATION_RESPONSE_HEADER,
+                descriptor.capabilities.generation.to_string(),
+            ),
+            (
+                BUDGET_GENERATION_RESPONSE_HEADER,
+                descriptor.budget.generation.to_string(),
+            ),
+        ] {
+            if let Ok(value) = HeaderValue::from_str(&value) {
+                headers.insert(name, value);
+            }
+        }
+        if let Some(provider) = self.provider() {
+            if let Ok(provider) = HeaderValue::from_str(&provider) {
+                headers.insert(PROVIDER_ID_RESPONSE_HEADER, provider);
+            }
+        }
+    }
 }
 
 struct ClientAdmission {
@@ -192,15 +356,18 @@ enum ProxyAdmissionError {
     Replay,
     #[error("proxy caller admission limit exceeded")]
     RateExceeded,
+    #[error("proxy session ownership is unavailable or ambiguous")]
+    SessionOwnership,
 }
 
 impl IntoResponse for ProxyAdmissionError {
     fn into_response(self) -> Response {
         let status = match &self {
             Self::Misconfigured => StatusCode::SERVICE_UNAVAILABLE,
-            Self::MissingAuthentication | Self::InvalidAuthentication | Self::Stale => {
-                StatusCode::UNAUTHORIZED
-            }
+            Self::MissingAuthentication
+            | Self::InvalidAuthentication
+            | Self::Stale
+            | Self::SessionOwnership => StatusCode::UNAUTHORIZED,
             Self::WrongScope | Self::CrossOrigin | Self::Replay => StatusCode::FORBIDDEN,
             Self::RateExceeded => StatusCode::TOO_MANY_REQUESTS,
         };
@@ -304,6 +471,8 @@ fn header_text<'a>(
 fn valid_client_component(value: &str, maximum: usize) -> bool {
     !value.is_empty()
         && value.len() <= maximum
+        && value != "."
+        && value != ".."
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
@@ -364,6 +533,9 @@ fn validate_proxy_security(config: &crate::config::ProxyConfig) -> anyhow::Resul
     }
     let mut identities = HashSet::new();
     for client in &config.auth.clients {
+        if !valid_client_component(client.tenant_identity(), MAX_CLIENT_ID_BYTES) {
+            anyhow::bail!("proxy tenant identity contains invalid characters or exceeds its bound");
+        }
         if !valid_client_component(&client.identity, MAX_CLIENT_ID_BYTES) {
             anyhow::bail!("proxy client identity contains invalid characters or exceeds its bound");
         }
@@ -433,8 +605,18 @@ async fn authenticate_proxy_request(
                 path = request.uri().path(),
                 "Proxy caller admitted"
             );
+            let Some(sessions) = authenticator.sessions.as_ref() else {
+                return ProxyAdmissionError::Misconfigured.into_response();
+            };
+            let call = match sessions.begin_call(&caller).await {
+                Ok(call) => call,
+                Err(error) => return error.into_response(),
+            };
             request.extensions_mut().insert(caller);
-            next.run(request).await
+            request.extensions_mut().insert(call.clone());
+            let mut response = next.run(request).await;
+            call.append_response_headers(&mut response);
+            response
         }
         Err(error) => {
             warn!(
@@ -821,15 +1003,45 @@ const CANONICAL_PROXY_LIFECYCLE: &[ProxyLifecycleStage] = &[
 #[derive(Debug)]
 struct ProxyLifecycleTrace {
     route: ProxyRouteKind,
+    tenant_id: String,
+    caller_id: String,
+    session_id: String,
+    call_id: crate::runtime::CallId,
+    run_id: crate::runtime::RunId,
+    workspace_generation: crate::runtime::WorkspaceGeneration,
+    capability_generation: crate::runtime::CapabilityGeneration,
+    budget_generation: crate::runtime::BudgetGeneration,
+    provider_id: String,
     stages: Vec<ProxyLifecycleStage>,
 }
 
 impl ProxyLifecycleTrace {
-    fn new(route: ProxyRouteKind) -> Self {
-        Self {
+    fn new(
+        route: ProxyRouteKind,
+        call: &ProxyCallContext,
+        provider_id: &str,
+    ) -> Result<Self, ProxyError> {
+        let state = call.state();
+        let owner = state
+            .session_owner
+            .as_ref()
+            .ok_or(ProxyError::Unauthorized(
+                "proxy session ownership is missing",
+            ))?;
+        let descriptor = state.run_context.runtime().descriptor();
+        Ok(Self {
             route,
+            tenant_id: owner.tenant_id.clone(),
+            caller_id: owner.caller_id.clone(),
+            session_id: owner.session_id.clone(),
+            call_id: call.call_id(),
+            run_id: descriptor.run_id,
+            workspace_generation: descriptor.workspace.generation,
+            capability_generation: descriptor.capabilities.generation,
+            budget_generation: descriptor.budget.generation,
+            provider_id: provider_id.to_string(),
             stages: Vec::with_capacity(CANONICAL_PROXY_LIFECYCLE.len()),
-        }
+        })
     }
 
     fn record(&mut self, stage: ProxyLifecycleStage) -> Result<(), ProxyError> {
@@ -854,6 +1066,15 @@ impl ProxyLifecycleTrace {
         }
         debug!(
             route = self.route.as_str(),
+            tenant_id = %self.tenant_id,
+            caller_id = %self.caller_id,
+            session_id = %self.session_id,
+            call_id = %self.call_id,
+            run_id = %self.run_id,
+            workspace_generation = %self.workspace_generation,
+            capability_generation = %self.capability_generation,
+            budget_generation = %self.budget_generation,
+            provider_id = %self.provider_id,
             stages = ?self.stages,
             "Canonical proxy lifecycle completed"
         );
@@ -1333,8 +1554,7 @@ fn apply_wire_projection(
 async fn read_normalized_proxy_request(
     request: Request,
     expected_route: ProxyRouteKind,
-    max_bytes: usize,
-) -> Result<(HeaderMap, String, NormalizedProxyRequest), ProxyError> {
+) -> Result<(ProxyCallContext, HeaderMap, String, NormalizedProxyRequest), ProxyError> {
     let method = request.method().clone();
     let path = request.uri().path().to_string();
     let route = classify_proxy_route(&method, &path)?;
@@ -1344,6 +1564,13 @@ async fn read_normalized_proxy_request(
             path,
         });
     }
+    let call = request
+        .extensions()
+        .get::<ProxyCallContext>()
+        .cloned()
+        .ok_or(ProxyError::Unauthorized(
+            "authenticated proxy call identity is missing",
+        ))?;
     let content_digest = request
         .extensions()
         .get::<AuthenticatedProxyCaller>()
@@ -1356,6 +1583,7 @@ async fn read_normalized_proxy_request(
         .path_and_query()
         .map_or_else(|| request.uri().path().to_string(), ToString::to_string);
     let (parts, body) = request.into_parts();
+    let max_bytes = call.state().config.proxy.max_request_bytes;
     let bytes = axum::body::to_bytes(body, max_bytes)
         .await
         .map_err(|error| ProxyError::InvalidBody(format!("request body rejected: {error}")))?;
@@ -1368,15 +1596,17 @@ async fn read_normalized_proxy_request(
     let wire = serde_json::from_slice::<Value>(&bytes)
         .map_err(|error| ProxyError::InvalidBody(error.to_string()))?;
     let normalized = normalize_proxy_request(route, wire)?;
-    Ok((parts.headers, path_and_query, normalized))
+    Ok((call, parts.headers, path_and_query, normalized))
 }
 
 /// Create the proxy router
 pub fn create_router(state: ProxyState) -> Router {
-    let configuration_valid = validate_proxy_security(&state.config.proxy).is_ok();
+    let configuration_valid =
+        validate_proxy_security(&state.config.proxy).is_ok() && state.session_registry.is_some();
     let authenticator = ProxyAuthenticator {
         config: state.config.proxy.clone(),
         admission: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        sessions: state.session_registry.clone(),
         configuration_valid,
     };
     let protected = Router::new()
@@ -1449,7 +1679,8 @@ async fn health_check(State(state): State<ProxyState>) -> Response {
 /// [`SessionView`](crate::session::SessionView) over the active session,
 /// so building the JSON payload never deep-copies `turn_metrics` or
 /// `cumulative_usage`.
-async fn session_stats(State(state): State<ProxyState>) -> impl IntoResponse {
+async fn session_stats(Extension(call): Extension<ProxyCallContext>) -> impl IntoResponse {
+    let state = call.state();
     let sm = state.session_manager.read().await;
     Json(sm.current_view().map_or_else(
         || serde_json::json!({ "error": "No active session" }),
@@ -1492,8 +1723,11 @@ async fn auth_device_page() -> impl IntoResponse {
 }
 
 /// Start device authorization flow
-async fn auth_device_start(State(state): State<ProxyState>) -> Result<Response, ProxyError> {
+async fn auth_device_start(
+    Extension(call): Extension<ProxyCallContext>,
+) -> Result<Response, ProxyError> {
     use crate::oauth::{generate_client_binding, PkceParams};
+    let state = call.state();
 
     crate::claude_credentials::require_experimental_direct_subscription()
         .map_err(|_| ProxyError::Unauthorized("experimental direct Claude OAuth is disabled"))?;
@@ -1503,10 +1737,11 @@ async fn auth_device_start(State(state): State<ProxyState>) -> Result<Response, 
         .state
         .expose(|state| zeroize::Zeroizing::new(state.to_string()));
     let client_binding = generate_client_binding();
+    let owner_binding = oauth_owner_binding(state, &client_binding)?;
 
     state
         .oauth_store
-        .store_bound_challenge(pkce.clone(), &client_binding);
+        .store_bound_challenge(pkce.clone(), &owner_binding);
 
     // Build authorization URL via the canonical builder so OAUTH_SCOPES and
     // OAUTH_AUTHORIZE_URL remain the single source of truth.
@@ -1572,6 +1807,31 @@ fn oauth_cookie_secret(headers: &HeaderMap, name: &str) -> Option<crate::secrets
         .and_then(|value| crate::secrets::SecretString::try_from_string(value.to_string()).ok())
 }
 
+fn oauth_owner_binding(
+    state: &ProxyState,
+    browser_binding: &crate::secrets::SecretString,
+) -> Result<crate::secrets::SecretString, ProxyError> {
+    let owner = state
+        .session_owner
+        .as_ref()
+        .ok_or(ProxyError::Unauthorized(
+            "proxy session ownership is missing",
+        ))?;
+    let mut digest = Sha256::new();
+    digest.update(b"OPENCLAUDIA-PROXY-OAUTH-OWNER-V1\0");
+    digest.update(owner.tenant_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(owner.caller_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(owner.session_id.as_bytes());
+    digest.update(b"\0");
+    browser_binding.expose(|raw| digest.update(raw.as_bytes()));
+    crate::secrets::SecretString::try_from_string(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.finalize()),
+    )
+    .map_err(|_| ProxyError::Unauthorized("OAuth owner binding is invalid"))
+}
+
 fn required_non_empty_payload_string<'a>(
     payload: &'a Value,
     field: &str,
@@ -1606,11 +1866,17 @@ fn extract_device_submit_fields(payload: &Value) -> Result<(String, String), Pro
 }
 
 /// Submit authorization code from device flow
-async fn auth_device_submit(
-    State(state): State<ProxyState>,
-    request: Request,
-) -> Result<Response, ProxyError> {
+async fn auth_device_submit(request: Request) -> Result<Response, ProxyError> {
     use crate::oauth::{OAuthClient, OAuthSession};
+
+    let call = request
+        .extensions()
+        .get::<ProxyCallContext>()
+        .cloned()
+        .ok_or(ProxyError::Unauthorized(
+            "authenticated proxy call identity is missing",
+        ))?;
+    let state = call.state();
 
     let content_digest = request
         .extensions()
@@ -1634,10 +1900,11 @@ async fn auth_device_submit(
     let (code, oauth_state) = extract_device_submit_fields(&payload)?;
     let client_binding = oauth_cookie_secret(&parts.headers, OAUTH_CLIENT_COOKIE)
         .ok_or(ProxyError::Unauthorized("OAuth client binding is missing"))?;
+    let owner_binding = oauth_owner_binding(state, &client_binding)?;
 
     let pkce = state
         .oauth_store
-        .take_bound_challenge(&oauth_state, &client_binding)
+        .take_bound_challenge(&oauth_state, &owner_binding)
         .ok_or(ProxyError::Unauthorized(
             "OAuth state is invalid, expired, replayed, or belongs to another client",
         ))?;
@@ -1674,10 +1941,11 @@ async fn auth_device_submit(
         .map_err(|_| ProxyError::InvalidBody("invalid OAuth session identifier".to_string()))?;
     state
         .oauth_store
-        .try_store_bound_session(session, &client_binding)
+        .try_store_bound_session(session, &owner_binding)
         .map_err(|error| {
             ProxyError::InvalidBody(format!("Failed to persist OAuth session: {error:#}"))
         })?;
+    drop(call);
 
     info!("Device flow authentication successful");
 
@@ -1698,8 +1966,8 @@ async fn auth_device_submit(
 }
 
 /// Check authentication status
-async fn auth_status(State(state): State<ProxyState>, headers: HeaderMap) -> Response {
-    let authenticated = lookup_oauth_session_from_cookie(&headers, &state.oauth_store)
+async fn auth_status(Extension(call): Extension<ProxyCallContext>, headers: HeaderMap) -> Response {
+    let authenticated = lookup_oauth_session_from_cookie(&headers, call.state())
         .await
         .is_ok_and(|session| session.is_some());
     Json(serde_json::json!({ "authenticated": authenticated })).into_response()
@@ -1707,17 +1975,19 @@ async fn auth_status(State(state): State<ProxyState>, headers: HeaderMap) -> Res
 
 /// Revoke the current browser-bound native OAuth session.
 async fn auth_logout(
-    State(state): State<ProxyState>,
+    Extension(call): Extension<ProxyCallContext>,
     headers: HeaderMap,
 ) -> Result<Response, ProxyError> {
+    let state = call.state();
     let session_id = oauth_cookie_secret(&headers, OAUTH_SESSION_COOKIE)
         .ok_or(ProxyError::Unauthorized("OAuth session is missing"))?;
     let client_binding = oauth_cookie_secret(&headers, OAUTH_CLIENT_COOKIE)
         .ok_or(ProxyError::Unauthorized("OAuth client binding is missing"))?;
+    let owner_binding = oauth_owner_binding(state, &client_binding)?;
     let session_id = session_id.expose(|id| zeroize::Zeroizing::new(id.to_string()));
     let revoked = state
         .oauth_store
-        .revoke_session_for_client(&session_id, &client_binding)
+        .revoke_session_for_client(&session_id, &owner_binding)
         .await
         .map_err(|_| ProxyError::Unauthorized("OAuth session could not be revoked"))?;
     let mut response = Json(serde_json::json!({ "revoked": revoked })).into_response();
@@ -1855,8 +2125,8 @@ async fn model_list_json_for_state(state: &ProxyState) -> Value {
 }
 
 /// List available models for the active provider.
-async fn list_models(State(state): State<ProxyState>) -> impl IntoResponse {
-    Json(model_list_json_for_state(&state).await)
+async fn list_models(Extension(call): Extension<ProxyCallContext>) -> impl IntoResponse {
+    Json(model_list_json_for_state(call.state()).await)
 }
 
 /// Run `PreToolUse` hooks for tool calls in the response
@@ -2070,10 +2340,9 @@ fn non_system_message_snapshot(request: &ChatCompletionRequest) -> Result<Value,
 
 async fn prepare_canonical_proxy_request(
     state: &ProxyState,
+    call: &ProxyCallContext,
     mut normalized: NormalizedProxyRequest,
 ) -> Result<(NormalizedProxyRequest, String, ProxyLifecycleTrace), ProxyError> {
-    let mut trace = ProxyLifecycleTrace::new(normalized.route);
-    trace.record(ProxyLifecycleStage::Normalized)?;
     if normalized.route.preserves_opaque_state() && !normalized.wire.is_object() {
         return Err(ProxyError::InvalidBody(
             "provider-native request state must be a JSON object".to_string(),
@@ -2082,6 +2351,9 @@ async fn prepare_canonical_proxy_request(
     let provider_name = normalized
         .route
         .provider_name(state, &normalized.canonical.model);
+    call.bind_provider(&provider_name)?;
+    let mut trace = ProxyLifecycleTrace::new(normalized.route, call, &provider_name)?;
+    trace.record(ProxyLifecycleStage::Normalized)?;
     state
         .config
         .get_provider(&provider_name)
@@ -2778,7 +3050,6 @@ async fn complete_loop_iteration(state: &ProxyState) {
     let Some(control) = state.loop_control.as_ref() else {
         return;
     };
-
     let iteration = control.mark_completed_iteration();
     let session_id = {
         let sm = state.session_manager.read().await;
@@ -3171,18 +3442,12 @@ async fn enforce_token_policy(
         .map_err(|error| proxy_policy_error(&error))
 }
 
-async fn proxy_chat_completions(
-    State(state): State<ProxyState>,
-    request: Request,
-) -> Result<Response, ProxyError> {
-    let (headers, _, normalized) = read_normalized_proxy_request(
-        request,
-        ProxyRouteKind::ChatCompletions,
-        state.config.proxy.max_request_bytes,
-    )
-    .await?;
+async fn proxy_chat_completions(request: Request) -> Result<Response, ProxyError> {
+    let (call, headers, _, normalized) =
+        read_normalized_proxy_request(request, ProxyRouteKind::ChatCompletions).await?;
+    let state = Arc::clone(call.state());
     let (mut normalized, provider_name, mut trace) =
-        prepare_canonical_proxy_request(&state, normalized).await?;
+        prepare_canonical_proxy_request(&state, &call, normalized).await?;
     let delivery_mode = select_proxy_delivery_mode(&state, &mut normalized);
 
     info!(
@@ -3206,6 +3471,7 @@ async fn proxy_chat_completions(
     if delivery_mode.is_live() && raw_response.response.status().is_success() {
         return live_stream_response(
             &state,
+            &call,
             &normalized,
             &provider_name,
             raw_response,
@@ -3375,18 +3641,12 @@ pub async fn shutdown_mcp(mcp_manager: &Arc<RwLock<McpManager>>) {
 }
 
 /// Proxy completions (legacy `OpenAI` format)
-async fn proxy_completions(
-    State(state): State<ProxyState>,
-    request: Request,
-) -> Result<Response, ProxyError> {
-    let (headers, _, normalized) = read_normalized_proxy_request(
-        request,
-        ProxyRouteKind::LegacyCompletions,
-        state.config.proxy.max_request_bytes,
-    )
-    .await?;
+async fn proxy_completions(request: Request) -> Result<Response, ProxyError> {
+    let (call, headers, _, normalized) =
+        read_normalized_proxy_request(request, ProxyRouteKind::LegacyCompletions).await?;
+    let state = Arc::clone(call.state());
     let (mut normalized, provider_name, mut trace) =
-        prepare_canonical_proxy_request(&state, normalized).await?;
+        prepare_canonical_proxy_request(&state, &call, normalized).await?;
     let delivery_mode = select_proxy_delivery_mode(&state, &mut normalized);
     let (provider, api_key) = resolve_provider_credentials(&state, &headers, &provider_name)?;
     let is_stream = delivery_mode.is_live();
@@ -3416,6 +3676,7 @@ async fn proxy_completions(
     if delivery_mode.is_live() && raw.response.status().is_success() {
         return live_stream_response(
             &state,
+            &call,
             &normalized,
             &provider_name,
             raw,
@@ -3467,16 +3728,19 @@ enum AnthropicAuth {
 /// `proxy_anthropic_messages` for crosslink #386.
 async fn lookup_oauth_session_from_cookie(
     headers: &HeaderMap,
-    oauth_store: &OAuthStore,
+    state: &ProxyState,
 ) -> Result<Option<crate::oauth::OAuthSession>, crate::oauth::OAuthSessionUseError> {
     let Some(session_id) = oauth_cookie_secret(headers, OAUTH_SESSION_COOKIE) else {
         return Ok(None);
     };
     let client_binding = oauth_cookie_secret(headers, OAUTH_CLIENT_COOKIE)
         .ok_or(crate::oauth::OAuthSessionUseError::ClientBinding)?;
+    let owner_binding = oauth_owner_binding(state, &client_binding)
+        .map_err(|_| crate::oauth::OAuthSessionUseError::ClientBinding)?;
     let session_id = session_id.expose(|id| zeroize::Zeroizing::new(id.to_string()));
-    oauth_store
-        .get_session_for_use(&session_id, &client_binding)
+    state
+        .oauth_store
+        .get_session_for_use(&session_id, &owner_binding)
         .await
         .map(Some)
 }
@@ -3490,10 +3754,10 @@ async fn lookup_oauth_session_from_cookie(
 /// available. Extracted for crosslink #386.
 async fn resolve_anthropic_auth(
     headers: &HeaderMap,
-    oauth_store: &OAuthStore,
+    state: &ProxyState,
     provider: &ProviderConfig,
 ) -> Result<AnthropicAuth, ProxyError> {
-    match lookup_oauth_session_from_cookie(headers, oauth_store).await {
+    match lookup_oauth_session_from_cookie(headers, state).await {
         Ok(Some(session)) => {
             return match &session.auth_mode {
                 crate::oauth::AuthMode::BearerToken => Ok(AnthropicAuth::Oauth(session)),
@@ -3590,18 +3854,12 @@ async fn send_api_key_anthropic_messages(
 /// transformations factored into [`crate::claude_credentials`] and the
 /// per-mode send paths into [`send_oauth_anthropic_messages`] /
 /// [`send_api_key_anthropic_messages`]. See crosslink #386.
-async fn proxy_anthropic_messages(
-    State(state): State<ProxyState>,
-    request: Request,
-) -> Result<Response, ProxyError> {
-    let (headers, _, normalized) = read_normalized_proxy_request(
-        request,
-        ProxyRouteKind::AnthropicMessages,
-        state.config.proxy.max_request_bytes,
-    )
-    .await?;
+async fn proxy_anthropic_messages(request: Request) -> Result<Response, ProxyError> {
+    let (call, headers, _, normalized) =
+        read_normalized_proxy_request(request, ProxyRouteKind::AnthropicMessages).await?;
+    let state = Arc::clone(call.state());
     let (mut normalized, provider_name, mut trace) =
-        prepare_canonical_proxy_request(&state, normalized).await?;
+        prepare_canonical_proxy_request(&state, &call, normalized).await?;
     let delivery_mode = select_proxy_delivery_mode(&state, &mut normalized);
     let provider = state
         .config
@@ -3609,7 +3867,7 @@ async fn proxy_anthropic_messages(
         .ok_or_else(|| ProxyError::ProviderNotConfigured(provider_name.clone()))?;
 
     let max_bytes = state.config.proxy.max_response_bytes;
-    let auth = resolve_anthropic_auth(&headers, &state.oauth_store, provider).await?;
+    let auth = resolve_anthropic_auth(&headers, &state, provider).await?;
     if matches!(auth, AnthropicAuth::Oauth(_)) {
         crate::claude_credentials::inject_oauth_prefix_only(&mut normalized.wire)
             .map_err(|error| ProxyError::InvalidBody(error.to_string()))?;
@@ -3640,6 +3898,7 @@ async fn proxy_anthropic_messages(
     if is_stream && raw.response.status().is_success() {
         return live_stream_response(
             &state,
+            &call,
             &normalized,
             &provider_name,
             raw,
@@ -3676,10 +3935,7 @@ async fn proxy_anthropic_messages(
 /// `/v1/*` path. Classification happens before provider configuration or
 /// credentials are inspected, so an unknown shape cannot become an ambient
 /// operator-funded raw proxy.
-async fn proxy_passthrough(
-    State(state): State<ProxyState>,
-    request: Request,
-) -> Result<Response, ProxyError> {
+async fn proxy_passthrough(request: Request) -> Result<Response, ProxyError> {
     // Whitelist safe headers to forward — prevents credential leaks from
     // custom X-* headers or Authorization headers meant for other services.
     const SAFE_PASSTHROUGH_HEADERS: &[&str] = &[
@@ -3689,14 +3945,11 @@ async fn proxy_passthrough(
         "user-agent",
         "content-type",
     ];
-    let (headers, path_and_query, normalized) = read_normalized_proxy_request(
-        request,
-        ProxyRouteKind::OpenAiResponses,
-        state.config.proxy.max_request_bytes,
-    )
-    .await?;
+    let (call, headers, path_and_query, normalized) =
+        read_normalized_proxy_request(request, ProxyRouteKind::OpenAiResponses).await?;
+    let state = Arc::clone(call.state());
     let (mut normalized, provider_name, mut trace) =
-        prepare_canonical_proxy_request(&state, normalized).await?;
+        prepare_canonical_proxy_request(&state, &call, normalized).await?;
     let delivery_mode = select_proxy_delivery_mode(&state, &mut normalized);
     let (provider, api_key) = resolve_provider_credentials(&state, &headers, &provider_name)?;
 
@@ -3759,6 +4012,7 @@ async fn proxy_passthrough(
     if is_stream && raw.response.status().is_success() {
         return live_stream_response(
             &state,
+            &call,
             &normalized,
             &provider_name,
             raw,
@@ -4909,6 +5163,7 @@ struct ProxyStreamState {
     pending: VecDeque<Bytes>,
     terminal: Option<StreamTerminal>,
     state: ProxyState,
+    _call: ProxyCallContext,
     provider_budget: Option<crate::provider_budget::ProviderBudgetReservation>,
     trace: Option<ProxyLifecycleTrace>,
     received_bytes: usize,
@@ -5064,6 +5319,7 @@ impl Drop for ProxyStreamState {
 
 fn live_stream_response(
     state: &ProxyState,
+    call: &ProxyCallContext,
     normalized: &NormalizedProxyRequest,
     provider_name: &str,
     upstream: UpstreamResponse,
@@ -5092,29 +5348,32 @@ fn live_stream_response(
             }
         }
     }
-    let stream_state = ProxyStreamState {
-        upstream: Box::pin(response.bytes_stream()),
-        decoder: SseDecoder::default(),
-        translator: ProxyStreamTranslator::new(
-            normalized.route,
-            provider_name,
-            &normalized.canonical.model,
-        ),
-        pending: VecDeque::new(),
-        terminal: None,
-        state: state.clone(),
-        provider_budget: Some(provider_budget),
-        trace: Some(trace),
-        received_bytes: 0,
-        max_response_bytes: state.config.proxy.max_response_bytes,
-        done: false,
-    };
-    let stream = futures::stream::unfold(stream_state, |mut state| async move {
-        state
-            .next_output()
-            .await
-            .map(|frame| (Ok::<Bytes, std::io::Error>(frame), state))
-    });
+    let stream = futures::stream::unfold(
+        ProxyStreamState {
+            upstream: Box::pin(response.bytes_stream()),
+            decoder: SseDecoder::default(),
+            translator: ProxyStreamTranslator::new(
+                normalized.route,
+                provider_name,
+                &normalized.canonical.model,
+            ),
+            pending: VecDeque::new(),
+            terminal: None,
+            state: state.clone(),
+            _call: call.clone(),
+            provider_budget: Some(provider_budget),
+            trace: Some(trace),
+            received_bytes: 0,
+            max_response_bytes: state.config.proxy.max_response_bytes,
+            done: false,
+        },
+        |mut state| async move {
+            state
+                .next_output()
+                .await
+                .map(|frame| (Ok::<Bytes, std::io::Error>(frame), state))
+        },
+    );
     builder
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
@@ -5307,40 +5566,71 @@ async fn build_proxy_state_with_loop_control(
 ) -> anyhow::Result<ProxyState> {
     let client = crate::provider_transport::shared_client()
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-
-    // Compose host hooks above exact, explicitly approved compatibility imports.
-    let merged_hooks = load_effective_hooks(config.hooks.clone());
-    let mut hook_engine = HookEngine::new(merged_hooks);
-
-    // Compaction overrides default to "no overrides" — the per-request
-    // model-specific compactor is built in `compact_request_context` using
-    // these as a delta on top of the model defaults (crosslink #489).
-    let compactor_overrides = CompactionOverrides::default();
-
-    // Resolve launch authority once at the composition root. No tool/helper
-    // is allowed to rediscover process cwd later as an ambient fallback.
     let launch_root = std::env::current_dir()
         .map_err(|error| anyhow::anyhow!("Cannot resolve proxy workspace: {error}"))?;
+    if config.vdd.enabled {
+        config
+            .vdd
+            .validate(&config.proxy.target)
+            .map_err(|error| anyhow::anyhow!("VDD configuration error: {error}"))?;
+    }
+    let config = Arc::new(config);
+    let mut sessions = HashMap::with_capacity(config.proxy.auth.clients.len());
+    for caller in &config.proxy.auth.clients {
+        let state = build_owned_proxy_session(
+            Arc::clone(&config),
+            client.clone(),
+            &launch_root,
+            caller,
+            loop_control.clone(),
+        )
+        .await?;
+        if sessions.insert(caller.identity.clone(), state).is_some() {
+            anyhow::bail!("proxy caller identities must be unique");
+        }
+    }
+    let first = sessions
+        .values()
+        .next()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("proxy has no authenticated session owners"))?;
+    let registry = Arc::new(ProxySessionRegistry { sessions });
+    let mut root = (*first).clone();
+    root.session_registry = Some(registry);
+    Ok(root)
+}
 
-    // Initialize the canonical session before binding capabilities so the
-    // descriptor and persisted session share the same identity.
-    let mut session_manager_value = SessionManager::new(&config.session.persist_path);
+#[allow(clippy::too_many_lines)] // One owner composition is a single fail-closed capability transaction.
+async fn build_owned_proxy_session(
+    config: Arc<AppConfig>,
+    client: Client,
+    launch_root: &std::path::Path,
+    caller: &crate::config::ProxyClientConfig,
+    loop_control: Option<Arc<LoopControl>>,
+) -> anyhow::Result<Arc<ProxyState>> {
+    let persist_path = config
+        .session
+        .persist_path
+        .join("proxy")
+        .join(caller.tenant_identity())
+        .join(&caller.identity);
+    let mut session_manager_value = SessionManager::new(persist_path);
     let session_id = session_manager_value.get_or_create_session().id.clone();
     let typed_session_id = crate::state::SessionId::from_raw(&session_id)
         .map_err(|error| anyhow::anyhow!("Invalid proxy session id: {error}"))?;
-    let run_context = crate::tools::ToolRunContext::builder(typed_session_id, &launch_root)
-        .working_directory(&launch_root)
+    let run_context = crate::tools::ToolRunContext::builder(typed_session_id, launch_root)
+        .working_directory(launch_root)
         .host_startup_grants()
         .remote_actions(
             config
                 .remote_actions
                 .build_registry()
-                .map_err(|error| anyhow::anyhow!(error))?,
+                .map_err(anyhow::Error::msg)?,
         )
         .web_egress_grants(
             config
                 .build_web_egress_grants()
-                .map_err(|error| anyhow::anyhow!(error))?,
+                .map_err(anyhow::Error::msg)?,
         )
         .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
         .process(true)
@@ -5360,19 +5650,26 @@ async fn build_proxy_state_with_loop_control(
         .map_err(|error| anyhow::anyhow!("Cannot create proxy run capabilities: {error}"))?;
     let session_manager = Arc::new(RwLock::new(session_manager_value));
 
-    // Initialize plugin manager and discover plugins.
-    // crosslink #893: try_new surfaces missing-$HOME as a warning rather
-    // than degrading silently to a project-only manager.
+    let mut hook_engine = HookEngine::new(load_effective_hooks(config.hooks.clone()));
     let mut plugin_manager = match PluginManager::try_new_for_project(run_context.project_root()) {
-        Ok(pm) => pm,
-        Err(e) => {
-            warn!(error = %e, "PluginManager: falling back to project-only search");
+        Ok(manager) => manager,
+        Err(error) => {
+            warn!(
+                tenant_id = caller.tenant_identity(),
+                caller_id = %caller.identity,
+                %error,
+                "Plugin manager is limited to the owned project search path"
+            );
             PluginManager::new_for_project(run_context.project_root())
         }
     };
-    let plugin_errors = plugin_manager.discover();
-    for err in plugin_errors {
-        warn!(error = %err, "Plugin discovery error");
+    for error in plugin_manager.discover() {
+        warn!(
+            tenant_id = caller.tenant_identity(),
+            caller_id = %caller.identity,
+            %error,
+            "Plugin discovery error"
+        );
     }
     let plugin_manager = Arc::new(plugin_manager);
     plugin_manager.configure_lsp_service_for_run(&run_context);
@@ -5380,7 +5677,6 @@ async fn build_proxy_state_with_loop_control(
         .compose_hook_engine(&hook_engine)
         .map_err(anyhow::Error::new)?;
 
-    // Initialize MCP manager and connect to configured servers
     let mcp_manager = Arc::new(RwLock::new(McpManager::new_with_permissions(
         Arc::clone(&run_context),
         config.permissions.clone(),
@@ -5389,44 +5685,33 @@ async fn build_proxy_state_with_loop_control(
     let _ = crate::mcp::install_manager(&run_context, &mcp_manager);
     crate::guardrails::configure(&run_context, &config.guardrails).map_err(anyhow::Error::msg)?;
 
-    // Initialize OAuth store for Claude Max authentication
-    let oauth_store = Arc::new(OAuthStore::new());
-
-    // Initialize VDD engine if enabled
-    let vdd_engine = if config.vdd.enabled {
-        if let Err(e) = config.vdd.validate(&config.proxy.target) {
-            anyhow::bail!("VDD configuration error: {e}");
-        }
-        info!(
-            mode = %config.vdd.mode,
-            adversary = %config.vdd.adversary.provider,
-            "VDD engine enabled"
-        );
-        Some(Arc::new(tokio::sync::Mutex::new(VddEngine::new(
+    let vdd_engine = config.vdd.enabled.then(|| {
+        Arc::new(tokio::sync::Mutex::new(VddEngine::new(
             &config.vdd,
             &config,
             client.clone(),
-        ))))
-    } else {
-        debug!(
-            "VDD is disabled. To enable adversarial review, add vdd.enabled=true to config.yaml"
-        );
-        None
-    };
-
-    Ok(ProxyState {
-        config: Arc::new(config),
+        )))
+    });
+    Ok(Arc::new(ProxyState {
+        config,
         client,
         hook_engine,
         run_context,
-        compactor_overrides,
+        compactor_overrides: CompactionOverrides::default(),
         session_manager,
         plugin_manager,
         mcp_manager,
-        oauth_store,
+        oauth_store: Arc::new(OAuthStore::new()),
         vdd_engine,
         loop_control,
-    })
+        session_owner: Some(ProxySessionOwner {
+            tenant_id: caller.tenant_identity().to_string(),
+            caller_id: caller.identity.clone(),
+            session_id,
+        }),
+        call_gate: Arc::new(tokio::sync::Mutex::new(())),
+        session_registry: None,
+    }))
 }
 
 /// Connect to all MCP servers discovered through plugins.
@@ -5715,7 +6000,11 @@ async fn fire_session_start(state: &ProxyState) -> Result<String, ProxyError> {
     Ok(session_id)
 }
 
-async fn finish_proxy_runtime(state: &ProxyState, handoff: Option<&str>) -> anyhow::Result<()> {
+async fn finish_owned_proxy_session(
+    state: &ProxyState,
+    handoff: Option<&str>,
+) -> anyhow::Result<()> {
+    let _call_guard = Arc::clone(&state.call_gate).lock_owned().await;
     let session_id = {
         let sm = state.session_manager.read().await;
         sm.get_session().map(|session| session.id.clone())
@@ -5750,6 +6039,64 @@ async fn finish_proxy_runtime(state: &ProxyState, handoff: Option<&str>) -> anyh
     finalization
 }
 
+fn owned_proxy_sessions(state: &ProxyState) -> anyhow::Result<Vec<Arc<ProxyState>>> {
+    let registry = state
+        .session_registry
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("proxy session registry is unavailable"))?;
+    let mut sessions = registry.sessions.values().cloned().collect::<Vec<_>>();
+    sessions.sort_by(|left, right| {
+        let left = left
+            .session_owner
+            .as_ref()
+            .expect("registered proxy session must have an owner");
+        let right = right
+            .session_owner
+            .as_ref()
+            .expect("registered proxy session must have an owner");
+        (&left.tenant_id, &left.caller_id).cmp(&(&right.tenant_id, &right.caller_id))
+    });
+    Ok(sessions)
+}
+
+async fn fire_owned_session_starts(state: &ProxyState) -> Result<Vec<String>, ProxyError> {
+    let sessions = owned_proxy_sessions(state).map_err(|error| {
+        ProxyError::FinalizationFailed(format!("proxy session admission failed: {error}"))
+    })?;
+    let mut started = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        match fire_session_start(&session).await {
+            Ok(session_id) => started.push((session, session_id)),
+            Err(error) => {
+                for (started_session, _) in &started {
+                    if let Err(cleanup_error) =
+                        finish_owned_proxy_session(started_session, None).await
+                    {
+                        warn!(%cleanup_error, "Failed to finalize an already-started proxy session");
+                    }
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(started
+        .into_iter()
+        .map(|(_, session_id)| session_id)
+        .collect())
+}
+
+async fn finish_proxy_runtime(state: &ProxyState, handoff: Option<&str>) -> anyhow::Result<()> {
+    let mut first_error = None;
+    for session in owned_proxy_sessions(state)? {
+        if let Err(error) = finish_owned_proxy_session(&session, handoff).await {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 /// Start the proxy server.
 ///
 /// # Errors
@@ -5760,7 +6107,7 @@ pub async fn start_server(config: AppConfig) -> anyhow::Result<()> {
     validate_proxy_security(&config.proxy)?;
     let addr = format!("{}:{}", config.proxy.host, config.proxy.port);
     let state = build_proxy_state(config).await?;
-    fire_session_start(&state).await?;
+    fire_owned_session_starts(&state).await?;
 
     let app = create_router(state.clone());
 
@@ -5798,7 +6145,7 @@ pub async fn start_server_with_shutdown(
     // SessionStart hook). Any change to provisioning had to land in
     // two places — classic stovepipe. See crosslink #246.
     let state = build_proxy_state(config).await?;
-    fire_session_start(&state).await?;
+    fire_owned_session_starts(&state).await?;
 
     let app = create_router(state.clone());
 
@@ -5844,7 +6191,7 @@ pub async fn start_loop_server(config: AppConfig, max_iterations: u32) -> anyhow
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let control = Arc::new(LoopControl::new(max_iterations, shutdown_tx.clone()));
     let state = build_proxy_state_with_loop_control(config, Some(control.clone())).await?;
-    let session_id = fire_session_start(&state).await?;
+    let session_ids = fire_owned_session_starts(&state).await?;
     let app = create_router(state.clone());
 
     info!(
@@ -5888,7 +6235,7 @@ pub async fn start_loop_server(config: AppConfig, max_iterations: u32) -> anyhow
     finish_proxy_runtime(&state, Some(&handoff)).await?;
     serve_result?;
 
-    info!(completed, session_id, "Loop mode ended");
+    info!(completed, session_ids = ?session_ids, "Loop mode ended");
     Ok(())
 }
 
@@ -5896,11 +6243,17 @@ pub async fn start_loop_server(config: AppConfig, max_iterations: u32) -> anyhow
 mod tests {
     use super::*;
 
-    fn authenticate_test_request_body(request: &mut Request, body: &[u8]) {
+    fn authenticate_test_request_body(state: &ProxyState, request: &mut Request, body: &[u8]) {
         request.extensions_mut().insert(AuthenticatedProxyCaller {
             identity: "proxy-test-caller".to_string(),
             content_digest: Some(Sha256::digest(body).into()),
         });
+        let guard = Arc::clone(&state.call_gate)
+            .try_lock_owned()
+            .expect("test proxy call gate");
+        request
+            .extensions_mut()
+            .insert(ProxyCallContext::new(Arc::new(state.clone()), guard));
     }
 
     #[test]
@@ -6031,6 +6384,7 @@ auth:
         ProxyAuthenticator {
             config,
             admission: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            sessions: None,
             configuration_valid: true,
         }
     }
@@ -6199,6 +6553,11 @@ auth:
 
     fn test_proxy_state(config: crate::config::AppConfig) -> ProxyState {
         let session_path = config.session.persist_path.clone();
+        let session_owner = ProxySessionOwner {
+            tenant_id: "proxy-test-tenant".to_string(),
+            caller_id: "proxy-test-caller".to_string(),
+            session_id: test_run().session_id().to_string(),
+        };
         ProxyState {
             run_context: Arc::clone(test_run()),
             config: Arc::new(config),
@@ -6211,7 +6570,114 @@ auth:
             oauth_store: Arc::new(OAuthStore::ephemeral()),
             vdd_engine: None,
             loop_control: None,
+            session_owner: Some(session_owner),
+            call_gate: Arc::new(tokio::sync::Mutex::new(())),
+            session_registry: None,
         }
+    }
+
+    fn owned_test_proxy_state(
+        caller_id: &str,
+        tenant_id: &str,
+        workspace: &std::path::Path,
+        persistence: &std::path::Path,
+    ) -> ProxyState {
+        let config = Arc::new(minimal_config("anthropic"));
+        let run_context = crate::tools::security::test_run_context_for(workspace);
+        let mut session = crate::session::Session::new_initializer();
+        session.id = run_context.session_id().to_string();
+        let session_id = session.id.clone();
+        let mut session_manager = SessionManager::new(persistence);
+        session_manager.replace_current_session(session);
+        ProxyState {
+            config,
+            client: Client::new(),
+            hook_engine: HookEngine::new(crate::config::HooksConfig::default()),
+            run_context: Arc::clone(&run_context),
+            compactor_overrides: CompactionOverrides::default(),
+            session_manager: Arc::new(RwLock::new(session_manager)),
+            plugin_manager: Arc::new(PluginManager::with_paths(vec![])),
+            mcp_manager: Arc::new(RwLock::new(McpManager::new(run_context))),
+            oauth_store: Arc::new(OAuthStore::ephemeral()),
+            vdd_engine: None,
+            loop_control: None,
+            session_owner: Some(ProxySessionOwner {
+                tenant_id: tenant_id.to_string(),
+                caller_id: caller_id.to_string(),
+                session_id,
+            }),
+            call_gate: Arc::new(tokio::sync::Mutex::new(())),
+            session_registry: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_registry_keeps_caller_state_and_oauth_binding_isolated() {
+        let workspace_a = tempfile::tempdir().expect("caller A workspace");
+        let workspace_b = tempfile::tempdir().expect("caller B workspace");
+        let persistence = tempfile::tempdir().expect("proxy persistence");
+        let state_a = Arc::new(owned_test_proxy_state(
+            "caller-a",
+            "tenant-a",
+            workspace_a.path(),
+            &persistence.path().join("a"),
+        ));
+        let state_b = Arc::new(owned_test_proxy_state(
+            "caller-b",
+            "tenant-b",
+            workspace_b.path(),
+            &persistence.path().join("b"),
+        ));
+        let registry = ProxySessionRegistry {
+            sessions: HashMap::from([
+                ("caller-a".to_string(), Arc::clone(&state_a)),
+                ("caller-b".to_string(), Arc::clone(&state_b)),
+            ]),
+        };
+        let caller = AuthenticatedProxyCaller {
+            identity: "caller-a".to_string(),
+            content_digest: None,
+        };
+
+        let call = registry.begin_call(&caller).await.expect("caller A call");
+        assert!(Arc::ptr_eq(&call.state().run_context, &state_a.run_context));
+        assert!(Arc::clone(&state_a.call_gate).try_lock_owned().is_err());
+        let unrelated_guard = Arc::clone(&state_b.call_gate)
+            .try_lock_owned()
+            .expect("caller B remains concurrent");
+        drop(unrelated_guard);
+
+        call.state()
+            .session_manager
+            .write()
+            .await
+            .get_session_mut()
+            .expect("caller A session")
+            .request_count = 7;
+        assert_eq!(
+            state_b
+                .session_manager
+                .read()
+                .await
+                .get_session()
+                .expect("caller B session")
+                .request_count,
+            0
+        );
+
+        let browser_binding = crate::oauth::generate_client_binding();
+        let binding_a = oauth_owner_binding(&state_a, &browser_binding).expect("caller A binding");
+        let binding_b = oauth_owner_binding(&state_b, &browser_binding).expect("caller B binding");
+        let bindings_match = binding_a.expose(|left| binding_b.expose(|right| left == right));
+        assert!(!bindings_match);
+
+        drop(call);
+        assert!(Arc::clone(&state_a.call_gate).try_lock_owned().is_ok());
+    }
+
+    async fn test_proxy_call(state: &ProxyState) -> ProxyCallContext {
+        let guard = Arc::clone(&state.call_gate).lock_owned().await;
+        ProxyCallContext::new(Arc::new(state.clone()), guard)
     }
 
     fn test_chat_request(model: &str, max_tokens: Option<u32>) -> ChatCompletionRequest {
@@ -6318,7 +6784,11 @@ auth:
         ];
         for (route, wire) in cases {
             let normalized = normalize_proxy_request(route, wire).expect("normalize route");
-            let (_, _, mut trace) = prepare_canonical_proxy_request(&state, normalized)
+            let call = ProxyCallContext::new(
+                Arc::new(state.clone()),
+                Arc::clone(&state.call_gate).lock_owned().await,
+            );
+            let (_, _, mut trace) = prepare_canonical_proxy_request(&state, &call, normalized)
                 .await
                 .expect("shared pre-dispatch lifecycle");
             assert_eq!(trace.stages.as_slice(), &CANONICAL_PROXY_LIFECYCLE[..8]);
@@ -6331,7 +6801,6 @@ auth:
 
     #[tokio::test]
     async fn unsupported_passthrough_is_rejected_before_credentials_or_body() {
-        let state = test_proxy_state(minimal_config("anthropic"));
         let request = Request::builder()
             .method("POST")
             .uri("/v1/embeddings")
@@ -6339,19 +6808,18 @@ auth:
             .body(Body::from("not-json"))
             .expect("request");
 
-        let error = proxy_passthrough(State(state), request)
+        let error = proxy_passthrough(request)
             .await
             .expect_err("unknown route must fail closed");
         assert!(matches!(error, ProxyError::UnsupportedRoute { .. }));
 
-        let state = test_proxy_state(minimal_config("anthropic"));
         let request = Request::builder()
             .method("GET")
             .uri("/v1/responses")
             .header(header::AUTHORIZATION, "not-a-bearer")
             .body(Body::from("not-json"))
             .expect("request");
-        let error = proxy_passthrough(State(state), request)
+        let error = proxy_passthrough(request)
             .await
             .expect_err("unsupported method must fail closed");
         assert!(matches!(error, ProxyError::MethodNotAllowed { .. }));
@@ -6699,9 +7167,9 @@ auth:
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(request_body.clone()))
             .expect("request");
-        authenticate_test_request_body(&mut request, request_body.as_bytes());
+        authenticate_test_request_body(&state, &mut request, request_body.as_bytes());
 
-        let response = proxy_passthrough(State(state), request)
+        let response = proxy_passthrough(request)
             .await
             .expect("Responses passthrough");
         assert_eq!(response.status(), StatusCode::OK);
@@ -6983,7 +7451,7 @@ auth:
     #[tokio::test]
     async fn device_start_fails_closed_in_the_default_build() {
         let state = test_proxy_state(minimal_config("anthropic"));
-        let error = auth_device_start(State(state))
+        let error = auth_device_start(Extension(test_proxy_call(&state).await))
             .await
             .expect_err("default build must not start direct Claude OAuth");
         match error {
@@ -7002,7 +7470,7 @@ auth:
             crate::claude_credentials::EXPERIMENTAL_DIRECT_SUBSCRIPTION_ACK,
         );
         let state = test_proxy_state(minimal_config("anthropic"));
-        let response = auth_device_start(State(state.clone()))
+        let response = auth_device_start(Extension(test_proxy_call(&state).await))
             .await
             .expect("start flow");
         let set_cookie = response
@@ -7032,13 +7500,14 @@ auth:
             .as_str()
             .expect("auth url")
             .contains(urlencoding::encode(oauth_state).as_ref()));
+        let owner_binding = oauth_owner_binding(&state, &binding).expect("owner binding");
         assert!(state
             .oauth_store
-            .take_bound_challenge(oauth_state, &binding)
+            .take_bound_challenge(oauth_state, &owner_binding)
             .is_some());
         assert!(state
             .oauth_store
-            .take_bound_challenge(oauth_state, &binding)
+            .take_bound_challenge(oauth_state, &owner_binding)
             .is_none());
     }
 
@@ -7065,9 +7534,10 @@ auth:
             created_at: chrono::Utc::now(),
             user_id: None,
         };
+        let owner_binding = oauth_owner_binding(&state, &binding).expect("owner binding");
         state
             .oauth_store
-            .try_store_bound_session(session, &binding)
+            .try_store_bound_session(session, &owner_binding)
             .expect("store");
         let cookie = binding.expose(|raw| {
             format!("{OAUTH_SESSION_COOKIE}=proxy-logout-session; {OAUTH_CLIENT_COOKIE}={raw}")
@@ -7078,7 +7548,7 @@ auth:
             HeaderValue::from_str(&cookie).expect("cookie"),
         );
 
-        let response = auth_logout(State(state.clone()), headers.clone())
+        let response = auth_logout(Extension(test_proxy_call(&state).await), headers.clone())
             .await
             .expect("logout");
         let cleared: Vec<_> = response
@@ -7094,7 +7564,7 @@ auth:
             .get_session("proxy-logout-session")
             .is_none());
 
-        let repeated = auth_logout(State(state), headers)
+        let repeated = auth_logout(Extension(test_proxy_call(&state).await), headers)
             .await
             .expect("repeated logout");
         let body = axum::body::to_bytes(repeated.into_body(), 1024)
@@ -7623,7 +8093,8 @@ auth:
             ),
             pending: VecDeque::new(),
             terminal: None,
-            state,
+            state: state.clone(),
+            _call: test_proxy_call(&state).await,
             provider_budget: Some(provider_budget),
             trace: None,
             received_bytes: 0,

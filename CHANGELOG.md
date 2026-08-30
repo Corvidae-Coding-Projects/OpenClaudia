@@ -205,6 +205,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-097: Contain TUI file attachments (#1215)
+- S-093: Isolate proxy tenant and session state (#1214)
+- S-090: Bound and validate ACP transport (#1213)
 - S-096: Make TUI cancellation and shutdown real (#1212)
 - S-092: Authenticate proxy callers before credential spend (#1211)
 - S-089: Isolate ACP sessions and calls (#1210)
