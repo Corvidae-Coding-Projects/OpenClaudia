@@ -1,6 +1,6 @@
 {
   "next_display_id": 1213,
-  "next_comment_id": 1940,
+  "next_comment_id": 1941,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -30680,7 +30680,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T01:27:10.881149551Z",
-      "updated_at": "2026-08-30T03:59:44.600545869Z",
+      "updated_at": "2026-08-30T04:00:23.193027261Z",
       "closed_at": "2026-08-30T03:59:44.600538863Z",
       "labels": [
         "remediation"
@@ -30694,6 +30694,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAtXy9K2lAYsm3C8nBiH7UiPNDRwcJY7sahUmRVwphSKL3THXaKtWvzw7lm4q1Kggbmccp1nG1i78zRQBzaewnCQ=="
+        },
+        "93c4bb06-e8f6-4c5b-99af-4b3fe6450ab0": {
+          "display_id": 1940,
+          "author": "6Vw9",
+          "content": "Delivered pre-spend HMAC proxy caller authentication with scopes, replay and rate/cost/body bounds, secure binding policy, and authenticated device flow; final Rust 1.98 strict Clippy and complete locked suite pass.",
+          "created_at": "2026-08-30T04:00:23.190520272Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAAcypqWxmgwqDqd8lpEEEb5/zxX8S95qh2x02AFYbDkvyIYPZsTeR4K/YAt4bY4VwUa2XVETeMr4jJZm40DJvBw=="
         }
       }
     },
@@ -49184,11 +49193,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2377,
       "timestamp": "2026-08-30T04:00:18.657314263Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2378,
+      "timestamp": "2026-08-30T04:00:23.193027261Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T04:00:18.657314263Z",
+    "timestamp": "2026-08-30T04:00:23.193027261Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2377
+    "agent_seq": 2378
   }
 }
