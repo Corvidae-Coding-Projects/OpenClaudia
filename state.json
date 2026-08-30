@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1229,
+  "next_display_id": 1230,
   "next_comment_id": 1995,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -251,6 +251,7 @@
     "38536a89-3cba-4a44-902a-3a5e6395bede": 894,
     "39243465-c5c2-4b07-aea3-2aa2ad05f3b2": 860,
     "394ec04f-b9c9-471e-9af1-95e8922ad10b": 98,
+    "39a9bb6e-9213-4f4e-b77c-fe5f494fae76": 1229,
     "39ada03d-188e-44b6-9f24-9098bf0764ba": 1044,
     "39d0cba4-ed67-4af6-9888-8cae54d06979": 701,
     "39dce9ef-81d1-4613-a411-93aae4602ce3": 540,
@@ -7881,6 +7882,18 @@
           "signature": "U1NIU0lHAAAAAQAAAGgAAAATZWNkc2Etc2hhMi1uaXN0cDI1NgAAAAhuaXN0cDI1NgAAAEEEe0KY4l/Z7G/vfkx00kFwZtY3FjD8lde6VcPNSNT06kyL5ZUnzQGbJUMzOdlFd65s/RCzZhVJQVonLQ3yKzipGAAAABFjcm9zc2xpbmstY29tbWVudAAAAAAAAAAGc2hhNTEyAAAAYwAAABNlY2RzYS1zaGEyLW5pc3RwMjU2AAAASAAAACArsPOIoPPvWRd5o1k0j71eq6SwkHnNCtw7Xz+WJX37UQAAACBMT6vng781BYXyx4G4OeZ2wI4NGzwr9So06ib4yZgZ+Q=="
         }
       }
+    },
+    "39a9bb6e-9213-4f4e-b77c-fe5f494fae76": {
+      "uuid": "39a9bb6e-9213-4f4e-b77c-fe5f494fae76",
+      "display_id": 1229,
+      "title": "S-079: Route legacy attachments and editor input through capabilities",
+      "description": "Implement docs/remediation-slices/079-legacy-attachments-and-editor-capabilities.md. Preserve working @file and editor workflows while enforcing run capabilities, descriptor-bound snapshots, budgets, supervision, typed user/evidence authority, and consistent failure semantics.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-30T19:24:32.917109734Z",
+      "updated_at": "2026-08-30T19:24:32.917109734Z"
     },
     "39ada03d-188e-44b6-9f24-9098bf0764ba": {
       "uuid": "39ada03d-188e-44b6-9f24-9098bf0764ba",
@@ -50693,10 +50706,15 @@
       "agent_id": "6Vw9",
       "agent_seq": 2505,
       "timestamp": "2026-08-30T19:24:28.146380354Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2505,
+      "timestamp": "2026-08-30T19:24:32.917109734Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T19:24:28.146380354Z",
+    "timestamp": "2026-08-30T19:24:32.917109734Z",
     "agent_id": "6Vw9",
     "agent_seq": 2505
   }
