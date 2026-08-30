@@ -1,6 +1,6 @@
 {
   "next_display_id": 1224,
-  "next_comment_id": 1978,
+  "next_comment_id": 1979,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -25569,11 +25569,20 @@
       "parent_uuid": "5524064d-6721-4080-928b-959fe9661d77",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T11:01:21.170133736Z",
-      "updated_at": "2026-08-30T11:03:00.198384710Z",
+      "updated_at": "2026-08-30T12:29:26.690637309Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "e092abef-99b8-4aaa-9c0e-ff2d9a5d1310": {
+          "display_id": 1978,
+          "author": "6Vw9",
+          "content": "Implemented one typed transactional project-init path shared by CLI, REPL, and TUI. It emits only schema-valid inert config plus skills/, refuses incompatible collisions by default, retains exact force backups, revalidates stale plans, and publishes descriptor-relative on Linux. Verification: 5 focused transaction tests, real CLI init/collision/force/symlink tests, manual isolated binary launch, Rust 1.98 format/check/strict Clippy, 3,115 library tests plus 1 intentional ignore, and all integration harnesses passed.",
+          "created_at": "2026-08-30T12:29:26.687996189Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAic0bucsrww4sdP+mYaxdkItZNXY1z4v6CzVV6cUi5k4oDXLGlQqYEFaBTQtmdlbRjz8R4csl7Z6r9ttql8CZAg=="
+        },
         "f6d0d8f1-9275-4856-8dd9-bbe9d48d7b79": {
           "display_id": 1973,
           "author": "6Vw9",
@@ -50234,11 +50243,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2462,
       "timestamp": "2026-08-30T12:29:21.933168206Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2463,
+      "timestamp": "2026-08-30T12:29:26.690637309Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T12:29:21.933168206Z",
+    "timestamp": "2026-08-30T12:29:26.690637309Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2462
+    "agent_seq": 2463
   }
 }
