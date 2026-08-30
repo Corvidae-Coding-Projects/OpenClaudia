@@ -1,6 +1,6 @@
 {
   "next_display_id": 1230,
-  "next_comment_id": 1998,
+  "next_comment_id": 1999,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -22587,10 +22587,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T19:24:23.788934530Z",
-      "updated_at": "2026-08-30T19:24:28.146380354Z",
+      "updated_at": "2026-08-30T19:26:30.470693371Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "a84d6527-3a19-4a5a-ba81-dec813c97a6a": {
+          "display_id": 1998,
+          "author": "6Vw9",
+          "content": "Code-only Sol 5.6 xhigh worker launched. Root owns review, integration, verification, documentation, commit, publication, and CI.",
+          "created_at": "2026-08-30T19:26:30.468251463Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA1lNmQZCv7fTe0ebOhyP6eFInIND5umdRIcVKz1PBxXg5kNKoNF7Tpg0nS+1oIjXh9FjkpowaE7l1S2J//mZNDA=="
+        }
+      }
     },
     "90ccf966-61b6-4f94-9cb8-bb4394ffe719": {
       "uuid": "90ccf966-61b6-4f94-9cb8-bb4394ffe719",
@@ -50756,11 +50767,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2510,
       "timestamp": "2026-08-30T19:26:25.802712383Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2511,
+      "timestamp": "2026-08-30T19:26:30.470693371Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T19:26:25.802712383Z",
+    "timestamp": "2026-08-30T19:26:30.470693371Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2510
+    "agent_seq": 2511
   }
 }
