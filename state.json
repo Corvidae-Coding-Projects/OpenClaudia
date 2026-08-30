@@ -18164,12 +18164,13 @@
       "display_id": 1215,
       "title": "S-097: Contain TUI file attachments",
       "description": "Implement docs/remediation-slices/097-tui-attachment-containment.md as production behavior. Replace race-prone TUI @file expansion with descriptor-safe workspace snapshot reads, typed provenance and sensitivity, aggregate byte/token budgets, cancellation and explicit safe failures. Worker writes code only; root performs review, tests, documentation, commits, push, CI and cleanup.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T04:50:35.525681890Z",
-      "updated_at": "2026-08-30T05:52:00.256901010Z",
+      "updated_at": "2026-08-30T05:52:04.951363622Z",
+      "closed_at": "2026-08-30T05:52:04.951358034Z",
       "labels": [
         "remediation"
       ],
@@ -49495,11 +49496,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2394,
       "timestamp": "2026-08-30T05:52:00.256901010Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2395,
+      "timestamp": "2026-08-30T05:52:04.951363622Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T05:52:00.256901010Z",
+    "timestamp": "2026-08-30T05:52:04.951363622Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2394
+    "agent_seq": 2395
   }
 }
