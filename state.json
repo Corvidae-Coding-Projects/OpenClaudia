@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1225,
+  "next_display_id": 1226,
   "next_comment_id": 1989,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -974,6 +974,7 @@
     "db560147-e69e-4ece-a442-9f44c60bc86a": 1039,
     "db62b963-f783-402e-9ed1-5109f0e3dab1": 1106,
     "db977c88-77d7-4638-ab3a-112f6ecfe4b7": 549,
+    "dba15fb4-2643-45f3-93b3-2a064799e32f": 1225,
     "dba4012d-f3d5-4b95-9b34-c70454fd5ae0": 53,
     "dbd81851-7e7e-481e-bf5f-7cfe66af0e5d": 627,
     "dbe24c58-c749-47cc-a1c7-d42f85b65bac": 843,
@@ -32509,6 +32510,16 @@
         "868ab41e-ae82-4242-8688-42ccdf545298"
       ]
     },
+    "dba15fb4-2643-45f3-93b3-2a064799e32f": {
+      "uuid": "dba15fb4-2643-45f3-93b3-2a064799e32f",
+      "display_id": 1225,
+      "title": "Verify post-wave cleanup and remote state",
+      "status": "open",
+      "priority": "low",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-30T13:08:06.133389084Z",
+      "updated_at": "2026-08-30T13:08:06.133389084Z"
+    },
     "dba4012d-f3d5-4b95-9b34-c70454fd5ae0": {
       "uuid": "dba4012d-f3d5-4b95-9b34-c70454fd5ae0",
       "display_id": 53,
@@ -50467,11 +50478,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2485,
       "timestamp": "2026-08-30T13:07:37.087520165Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2486,
+      "timestamp": "2026-08-30T13:08:06.133389084Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T13:07:37.087520165Z",
+    "timestamp": "2026-08-30T13:08:06.133389084Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2485
+    "agent_seq": 2486
   }
 }
