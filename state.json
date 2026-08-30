@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1211,
+  "next_display_id": 1212,
   "next_comment_id": 1934,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -918,6 +918,7 @@
     "cd49b48a-bf26-4021-8747-0cf2ad5700ce": 310,
     "cd6d027d-2964-4944-9e35-d0074e6045a6": 908,
     "cd9fa7fd-628f-476b-9b2d-dbafabf16cf7": 312,
+    "ced64a84-d9f3-49f4-8032-7c4089242f83": 1211,
     "cf314e6f-dedd-40ed-8f92-5934a577dc2a": 824,
     "cf5720c0-f032-4a31-9877-bed38555548e": 1118,
     "cf799d41-a385-469d-9c2e-d9fcc088ddb0": 641,
@@ -30602,6 +30603,18 @@
       "updated_at": "2026-04-18T00:32:24.818236559Z",
       "closed_at": "2026-04-18T00:32:24.818236559Z"
     },
+    "ced64a84-d9f3-49f4-8032-7c4089242f83": {
+      "uuid": "ced64a84-d9f3-49f4-8032-7c4089242f83",
+      "display_id": 1211,
+      "title": "S-092: Authenticate proxy callers before credential spend",
+      "description": "Implement docs/remediation-slices/092-proxy-client-authentication.md as a bounded code-only worker slice. Root coordinator owns review, reconciliation, tests, docs, issue closure, commits, push, and CI.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-30T01:27:10.881149551Z",
+      "updated_at": "2026-08-30T01:27:10.881149551Z"
+    },
     "cf314e6f-dedd-40ed-8f92-5934a577dc2a": {
       "uuid": "cf314e6f-dedd-40ed-8f92-5934a577dc2a",
       "display_id": 824,
@@ -48994,11 +49007,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2358,
       "timestamp": "2026-08-30T01:27:02.074670012Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2359,
+      "timestamp": "2026-08-30T01:27:10.881149551Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T01:27:02.074670012Z",
+    "timestamp": "2026-08-30T01:27:10.881149551Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2358
+    "agent_seq": 2359
   }
 }
