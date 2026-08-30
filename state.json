@@ -1,6 +1,6 @@
 {
   "next_display_id": 1226,
-  "next_comment_id": 1989,
+  "next_comment_id": 1990,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -32522,10 +32522,21 @@
       "priority": "low",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T13:08:06.133389084Z",
-      "updated_at": "2026-08-30T13:08:10.638073008Z",
+      "updated_at": "2026-08-30T13:08:37.860142438Z",
       "labels": [
         "maintenance"
-      ]
+      ],
+      "comments": {
+        "f51cef75-35d3-47e4-a223-d9cddc3d0f3f": {
+          "display_id": 1989,
+          "author": "6Vw9",
+          "content": "Final read-only verification was blocked after the completed session had ended because no active issue existed; created #1225 and session #116 to perform the required branch, PR, resource, and worktree verification. The suggested crosslink intervene subcommand is unavailable in this installed CLI.",
+          "created_at": "2026-08-30T13:08:37.857623224Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA3uOawIyh9g2MzODP2bKcmkYqIoSpyzlJ1PnWJ4dnXma9pEzfoj/Ab2krg4ckApc6DRiYfz7dmqQbIM1Q75lICQ=="
+        }
+      }
     },
     "dba4012d-f3d5-4b95-9b34-c70454fd5ae0": {
       "uuid": "dba4012d-f3d5-4b95-9b34-c70454fd5ae0",
@@ -50500,11 +50511,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2488,
       "timestamp": "2026-08-30T13:08:16.382627176Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2489,
+      "timestamp": "2026-08-30T13:08:37.860142438Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T13:08:16.382627176Z",
+    "timestamp": "2026-08-30T13:08:37.860142438Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2488
+    "agent_seq": 2489
   }
 }
