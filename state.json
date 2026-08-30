@@ -22592,12 +22592,13 @@
       "display_id": 1228,
       "title": "S-079: Route legacy attachments and editor input through capabilities",
       "description": "Implement docs/remediation-slices/079-legacy-attachments-and-editor-capabilities.md. Preserve working @file and editor workflows while enforcing run capabilities, descriptor-bound snapshots, budgets, supervision, typed user/evidence authority, and consistent failure semantics.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T19:24:23.788934530Z",
-      "updated_at": "2026-08-30T21:22:43.381576986Z",
+      "updated_at": "2026-08-30T21:22:57.217870471Z",
+      "closed_at": "2026-08-30T21:22:57.217864632Z",
       "labels": [
         "remediation"
       ],
@@ -50826,11 +50827,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2516,
       "timestamp": "2026-08-30T21:22:52.598682793Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2517,
+      "timestamp": "2026-08-30T21:22:57.217870471Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T21:22:52.598682793Z",
+    "timestamp": "2026-08-30T21:22:57.217870471Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2516
+    "agent_seq": 2517
   }
 }
