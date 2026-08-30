@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1215,
+  "next_display_id": 1216,
   "next_comment_id": 1944,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -525,6 +525,7 @@
     "765de9dd-d4e4-456d-8b95-a676d99cbc48": 432,
     "76742510-30bf-4ffb-8173-77614c9cf47f": 207,
     "7680f34b-1a12-4ba6-b14a-14b4ca87afab": 617,
+    "7683658b-efde-4bfb-832c-3c460f983aac": 1215,
     "76a92a30-86be-4734-b061-ba6dfed2edb6": 786,
     "779e522a-6ad1-4e42-882c-ed40073fac7f": 186,
     "77b9fbe6-d3e4-4c8e-85cd-235c4301a1f6": 828,
@@ -18126,6 +18127,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA93XKQsKQMfXlEKz32xZwdlKIgInkClYL9EhBBFYKqY3xLgXDczz9SesA/yvpxZW1A/wi1dOSQF/bhgY5LltkBQ=="
         }
       }
+    },
+    "7683658b-efde-4bfb-832c-3c460f983aac": {
+      "uuid": "7683658b-efde-4bfb-832c-3c460f983aac",
+      "display_id": 1215,
+      "title": "S-097: Contain TUI file attachments",
+      "description": "Implement docs/remediation-slices/097-tui-attachment-containment.md as production behavior. Replace race-prone TUI @file expansion with descriptor-safe workspace snapshot reads, typed provenance and sensitivity, aggregate byte/token budgets, cancellation and explicit safe failures. Worker writes code only; root performs review, tests, documentation, commits, push, CI and cleanup.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-30T04:50:35.525681890Z",
+      "updated_at": "2026-08-30T04:50:35.525681890Z"
     },
     "76a92a30-86be-4734-b061-ba6dfed2edb6": {
       "uuid": "76a92a30-86be-4734-b061-ba6dfed2edb6",
@@ -49292,11 +49305,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2385,
       "timestamp": "2026-08-30T04:50:31.133525784Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2386,
+      "timestamp": "2026-08-30T04:50:35.525681890Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T04:50:31.133525784Z",
+    "timestamp": "2026-08-30T04:50:35.525681890Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2385
+    "agent_seq": 2386
   }
 }
