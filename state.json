@@ -23950,12 +23950,13 @@
       "display_id": 1224,
       "title": "Use platform mode_t for transactional init mkdirat",
       "description": "The exact-head macOS CI job for commit 9f3f6755 failed because src/tools/file/project_init.rs passes a u32 mode to libc::mkdirat, while macOS defines libc::mode_t as u16. Use libc::mode_t at the wrapper boundary, verify Rust 1.98 locally, push the corrective commit, and monitor all five exact-head checks.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T12:37:02.006003254Z",
-      "updated_at": "2026-08-30T12:38:58.426743005Z",
+      "updated_at": "2026-08-30T12:39:03.361238568Z",
+      "closed_at": "2026-08-30T12:39:03.361232854Z",
       "labels": [
         "bug"
       ],
@@ -50389,11 +50390,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2477,
       "timestamp": "2026-08-30T12:38:58.426743005Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2478,
+      "timestamp": "2026-08-30T12:39:03.361238568Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T12:38:58.426743005Z",
+    "timestamp": "2026-08-30T12:39:03.361238568Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2477
+    "agent_seq": 2478
   }
 }
