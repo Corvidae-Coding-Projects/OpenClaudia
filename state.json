@@ -1,6 +1,6 @@
 {
   "next_display_id": 1224,
-  "next_comment_id": 1975,
+  "next_comment_id": 1976,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -32848,10 +32848,21 @@
       "parent_uuid": "5524064d-6721-4080-928b-959fe9661d77",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T11:01:39.651263831Z",
-      "updated_at": "2026-08-30T11:01:44.042489008Z",
+      "updated_at": "2026-08-30T11:03:09.335128812Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "8e0a4c3d-d00f-485f-a347-de4faa5ab972": {
+          "display_id": 1975,
+          "author": "6Vw9",
+          "content": "Launched GPT-5.6 Sol xhigh code-only worker in isolated worktree s083-terminal-render. Root retains all review, tests, documentation, Git, CI, and cleanup.",
+          "created_at": "2026-08-30T11:03:09.332497583Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA6gyukllrcd5rPJe5KfsDYIshSduuIgSbZoXQaZ0wZarOeolsIC65zCSrLNWIk0Qhs7Xg1dan/GIiyY8SbMxxBQ=="
+        }
+      }
     },
     "e16ad946-4814-40cc-a467-d9916f4b56e9": {
       "uuid": "e16ad946-4814-40cc-a467-d9916f4b56e9",
@@ -50188,11 +50199,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2459,
       "timestamp": "2026-08-30T11:03:05.060098977Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2460,
+      "timestamp": "2026-08-30T11:03:09.335128812Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T11:03:05.060098977Z",
+    "timestamp": "2026-08-30T11:03:09.335128812Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2459
+    "agent_seq": 2460
   }
 }
