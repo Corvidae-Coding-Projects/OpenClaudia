@@ -331,6 +331,16 @@ pub struct PreparedPlanApproval {
     plan_realpath: PathBuf,
     previous_mode: Option<String>,
     runtime_mode_generation: u64,
+    capability_generation: u64,
+    capability_manifest_digest: String,
+    actor: crate::runtime::Actor,
+    run_id: crate::runtime::RunId,
+    budget: crate::runtime::BudgetSnapshot,
+    prepared_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    proposed_effects: Vec<PlanProposedEffect>,
+    effect_grants: Vec<crate::modes::PlanEffectGrant>,
+    unrestricted_within_run_capabilities: bool,
 }
 
 impl PreparedPlanApproval {
@@ -351,6 +361,74 @@ impl PreparedPlanApproval {
     pub const fn runtime_mode_generation(&self) -> u64 {
         self.runtime_mode_generation
     }
+
+    /// Structured effect proposal reviewed beside the exact plan bytes.
+    #[must_use]
+    pub fn proposed_effects(&self) -> &[PlanProposedEffect] {
+        &self.proposed_effects
+    }
+}
+
+/// Current immutable schema for an activated plan artifact.
+pub const APPROVED_PLAN_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+
+/// One typed proposed effect displayed to the approving user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanProposedEffect {
+    pub tool: String,
+    pub canonical: String,
+    pub effect: String,
+    pub prompt_digest: String,
+}
+
+/// Evidence that the host's interactive decision activated one exact plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanApprovalEvidence {
+    pub provenance: String,
+    pub prepared_at: DateTime<Utc>,
+    pub approved_at: DateTime<Utc>,
+    pub evidence_digest: String,
+}
+
+/// Immutable versioned artifact bound into both task state and live authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedPlanArtifact {
+    pub schema_version: u32,
+    pub artifact_generation: u64,
+    pub plan_digest: String,
+    pub task_id: String,
+    pub task_graph_generation: u64,
+    pub proposed_effects: Vec<PlanProposedEffect>,
+    pub unrestricted_within_run_capabilities: bool,
+    pub budget: crate::runtime::BudgetSnapshot,
+    pub expires_at: DateTime<Utc>,
+    pub actor: crate::runtime::Actor,
+    pub run_id: crate::runtime::RunId,
+    pub capability_generation: u64,
+    pub capability_manifest_digest: String,
+    pub prepared_runtime_mode_generation: u64,
+    pub activated_runtime_mode_generation: u64,
+    pub restored_mode: String,
+    pub evidence: PlanApprovalEvidence,
+}
+
+impl ApprovedPlanArtifact {
+    /// Stable digest over the complete artifact, including graph and
+    /// capability generations.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if serialization of this statically serializable artifact
+    /// shape fails.
+    #[must_use]
+    pub fn digest(&self) -> String {
+        let encoded = serde_json::to_vec(self)
+            .expect("approved plan artifact contains only serializable fields");
+        approved_plan_digest_bytes(&encoded)
+    }
 }
 
 /// Durable task-graph binding created by an approved plan transition.
@@ -364,14 +442,24 @@ pub struct ApprovedPlanReceipt {
     pub plan_digest: String,
     /// Runtime capability generation restored after approval.
     pub runtime_mode_generation: u64,
+    /// Digest of the complete immutable approval artifact.
+    pub artifact_digest: String,
+    /// Time after which the run-local plan authority fails closed.
+    pub expires_at: DateTime<Utc>,
+    /// Complete immutable artifact activated by this transition.
+    pub artifact: ApprovedPlanArtifact,
     /// Exact approved-plan context message to append after the resolving tool
     /// result. Frontends own transcript ordering at that protocol boundary.
     pub context_message: serde_json::Value,
 }
 
 fn approved_plan_digest(plan_content: &str) -> String {
+    approved_plan_digest_bytes(plan_content.as_bytes())
+}
+
+fn approved_plan_digest_bytes(content: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let bytes = Sha256::digest(plan_content.as_bytes());
+    let bytes = Sha256::digest(content);
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         encoded.push(char::from(HEX[usize::from(byte >> 4)]));
@@ -397,6 +485,21 @@ pub fn prepare_interactive_plan_approval(
     run: &crate::tools::ToolRunContext,
     chat_session: &crate::state::Session,
 ) -> Result<PreparedPlanApproval, String> {
+    prepare_interactive_plan_approval_with_effects(run, chat_session, &[])
+}
+
+/// Prepare the exact plan bytes and structured effect proposal that a
+/// frontend will display in one approval decision.
+///
+/// # Errors
+///
+/// Returns an error for stale plan state, an unknown proposed tool, an
+/// unavailable budget, or an artifact/expiry value outside supported bounds.
+pub fn prepare_interactive_plan_approval_with_effects(
+    run: &crate::tools::ToolRunContext,
+    chat_session: &crate::state::Session,
+    allowed_prompts: &[crate::tools::ToolAllowedPrompt],
+) -> Result<PreparedPlanApproval, String> {
     let runtime_mode = run.runtime_mode();
     if runtime_mode.class != crate::modes::RuntimeModeClass::Plan {
         return Err("runtime capability is not in plan mode".to_string());
@@ -413,13 +516,76 @@ pub fn prepare_interactive_plan_approval(
         &plan_state.plan_realpath.to_string_lossy(),
     )
     .map_err(|error| format!("failed to read the pinned plan artifact: {error}"))?;
+    let (proposed_effects, effect_grants, unrestricted_within_run_capabilities) =
+        prepare_plan_effects(allowed_prompts)?;
+    let budget = run
+        .budget()
+        .snapshot()
+        .map_err(|error| format!("failed to snapshot plan budget: {error}"))?;
+    let prepared_at = Utc::now();
+    let remaining_millis = i64::try_from(budget.remaining_elapsed_millis)
+        .map_err(|_| "plan approval expiry exceeds the supported duration".to_string())?;
+    let remaining = chrono::TimeDelta::try_milliseconds(remaining_millis)
+        .ok_or_else(|| "plan approval expiry exceeds the supported duration".to_string())?;
+    let expires_at = prepared_at
+        .checked_add_signed(remaining)
+        .ok_or_else(|| "plan approval expiry is outside the supported time range".to_string())?;
+    let descriptor = run.runtime().descriptor();
     Ok(PreparedPlanApproval {
         plan_digest: approved_plan_digest(&plan_content),
         plan_content,
         plan_realpath: plan_state.plan_realpath,
         previous_mode: plan_state.previous_mode,
         runtime_mode_generation: runtime_mode.generation,
+        capability_generation: run.generation().get(),
+        capability_manifest_digest: descriptor.capabilities.manifest_digest.to_string(),
+        actor: descriptor.actor.clone(),
+        run_id: descriptor.run_id,
+        budget,
+        prepared_at,
+        expires_at,
+        proposed_effects,
+        effect_grants,
+        unrestricted_within_run_capabilities,
     })
+}
+
+fn prepare_plan_effects(
+    allowed_prompts: &[crate::tools::ToolAllowedPrompt],
+) -> Result<
+    (
+        Vec<PlanProposedEffect>,
+        Vec<crate::modes::PlanEffectGrant>,
+        bool,
+    ),
+    String,
+> {
+    if allowed_prompts.len() > 64 {
+        return Err("a plan may propose at most 64 allowed operations".to_string());
+    }
+    let mut proposed = Vec::with_capacity(allowed_prompts.len());
+    let mut grants = Vec::with_capacity(allowed_prompts.len());
+    for prompt in allowed_prompts {
+        let tool = prompt.tool.trim().to_ascii_lowercase();
+        if tool.is_empty() || tool.len() > 128 || prompt.prompt.len() > 4_096 {
+            return Err(
+                "plan allowed operations exceed their bounded tool/prompt size".to_string(),
+            );
+        }
+        let (_, spec) = crate::tools::effect::lookup(&tool)
+            .ok_or_else(|| format!("plan proposes unknown tool '{}'", prompt.tool))?;
+        proposed.push(PlanProposedEffect {
+            tool: tool.clone(),
+            canonical: spec.canonical.to_string(),
+            effect: spec.effect.as_str().to_string(),
+            prompt_digest: approved_plan_digest(&prompt.prompt),
+        });
+        grants.push(crate::modes::PlanEffectGrant {
+            tool,
+            effect: spec.effect,
+        });
+    }
+    Ok((proposed, grants, allowed_prompts.is_empty()))
 }
 
 /// Commit a user decision for exactly one prepared plan artifact.
@@ -433,6 +599,7 @@ pub fn prepare_interactive_plan_approval(
 ///
 /// Returns an error on stale plan bytes/state, task-graph publication failure,
 /// or an invalid runtime restoration profile.
+#[allow(clippy::too_many_lines)] // Validation and publication form one auditable transaction boundary.
 pub fn commit_interactive_plan_approval(
     run: &crate::tools::ToolRunContext,
     chat_session: &crate::state::Session,
@@ -441,6 +608,18 @@ pub fn commit_interactive_plan_approval(
     allowed_prompts: &[crate::tools::ToolAllowedPrompt],
     restore_mode: crate::modes::RuntimeMode,
 ) -> Result<ApprovedPlanReceipt, String> {
+    if prepared.run_id != run.run_id()
+        || prepared.capability_generation != run.generation().get()
+        || prepared.capability_manifest_digest
+            != run
+                .runtime()
+                .descriptor()
+                .capabilities
+                .manifest_digest
+                .to_string()
+    {
+        return Err("prepared plan belongs to a different run capability generation".to_string());
+    }
     let runtime_mode = run.runtime_mode();
     if runtime_mode.class != crate::modes::RuntimeModeClass::Plan
         || runtime_mode.generation != prepared.runtime_mode_generation
@@ -466,22 +645,28 @@ pub fn commit_interactive_plan_approval(
     {
         return Err("plan artifact changed after it was displayed for approval".to_string());
     }
+    let (proposed_effects, effect_grants, unrestricted) = prepare_plan_effects(allowed_prompts)?;
+    if proposed_effects != prepared.proposed_effects
+        || effect_grants != prepared.effect_grants
+        || unrestricted != prepared.unrestricted_within_run_capabilities
+    {
+        return Err(
+            "proposed plan effects changed after they were displayed for approval".to_string(),
+        );
+    }
+    if Utc::now() >= prepared.expires_at {
+        return Err("prepared plan approval expired before activation".to_string());
+    }
+    let current_budget = run
+        .budget()
+        .snapshot()
+        .map_err(|error| format!("failed to revalidate plan budget: {error}"))?;
+    if current_budget.generation != prepared.budget.generation
+        || current_budget.limits != prepared.budget.limits
+    {
+        return Err("plan budget generation or limits changed after review".to_string());
+    }
 
-    // Validate before publishing the durable task binding. The subsequent
-    // transition can then fail only if the u64 generation space is exhausted.
-    run.validate_runtime_mode_transition(&restore_mode)?;
-    let plan_id = format!("plan-{}", chat_session.id());
-    let mut manager = task_manager
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let task_id = manager
-        .reconcile_approved_plan(&plan_id, prepared.plan_digest.clone())?
-        .id
-        .clone();
-    let task_graph_generation = manager.generation().get();
-    drop(manager);
-
-    let restored_runtime = run.transition_runtime_mode(restore_mode)?;
     let restored_agent_mode = restored_plan_agent_mode(prepared.previous_mode.as_deref());
     let allowed_operations = if allowed_prompts.is_empty() {
         String::new()
@@ -495,35 +680,141 @@ pub fn commit_interactive_plan_approval(
                 .join("\n")
         )
     };
-    let plan_content = prepared.plan_content.clone();
-    let plan_digest = prepared.plan_digest.clone();
-    let context_message = serde_json::json!({
-        "role": "system",
-        "content": format!(
-            "[Approved Implementation Plan]\nThe user has approved the following plan. Execute it step by step.\n\n{}\n\n{}",
-            plan_content,
-            allowed_operations
-        ),
-        "metadata": {
-            "openclaudia_context_source": "user_approved_plan",
-            "canonical_task_id": task_id,
-            "canonical_task_graph_generation": task_graph_generation,
-            "approved_plan_digest": plan_digest
-        }
-    });
-    chat_session.update_state(|state, _| {
-        state.modes.agent_mode = restored_agent_mode;
-        state.conversation.plan_mode = None;
-        state.conversation.approved_plan = Some(plan_content.clone());
-    });
+    let restored_mode_label = runtime_mode_label(&restore_mode);
+    let plan_id = format!("plan-{}", chat_session.id());
+    let (restored_runtime, receipt) = run.transition_plan_approval(
+        prepared.runtime_mode_generation,
+        restore_mode,
+        |activated_mode_generation| {
+            chat_session.update_state(|state, _| {
+                let active = state
+                    .conversation
+                    .plan_mode
+                    .as_ref()
+                    .filter(|plan| plan.active)
+                    .ok_or_else(|| "session is no longer in active plan mode".to_string())?;
+                if active.plan_realpath != prepared.plan_realpath
+                    || active.previous_mode != prepared.previous_mode
+                {
+                    return Err("plan approval is stale for the current session plan state".to_string());
+                }
+                let (_, final_content) = crate::tools::read_capability_text_attachment(
+                    run,
+                    &prepared.plan_realpath.to_string_lossy(),
+                )
+                .map_err(|error| format!("failed to re-read the pinned plan artifact: {error}"))?;
+                if final_content != prepared.plan_content
+                    || approved_plan_digest(&final_content) != prepared.plan_digest
+                {
+                    return Err("plan artifact changed during approval commit".to_string());
+                }
+                if run.runtime().cancellation().is_cancelled() {
+                    return Err("run was cancelled during plan approval".to_string());
+                }
+                let mut manager = task_manager
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let task_id = manager
+                    .reconcile_approved_plan(&plan_id, prepared.plan_digest.clone())?
+                    .id
+                    .clone();
+                let task_graph_generation = manager.generation().get();
+                drop(manager);
+                let approved_at = Utc::now();
+                let evidence_digest = crate::runtime::ContentDigest::sha256(format!(
+                    "{}:{}:{}:{}",
+                    prepared.plan_digest,
+                    prepared.run_id,
+                    prepared.prepared_at.to_rfc3339(),
+                    approved_at.to_rfc3339()
+                ))
+                .to_string();
+                let artifact = ApprovedPlanArtifact {
+                    schema_version: APPROVED_PLAN_ARTIFACT_SCHEMA_VERSION,
+                    artifact_generation: activated_mode_generation,
+                    plan_digest: prepared.plan_digest.clone(),
+                    task_id: task_id.clone(),
+                    task_graph_generation,
+                    proposed_effects: prepared.proposed_effects.clone(),
+                    unrestricted_within_run_capabilities: prepared
+                        .unrestricted_within_run_capabilities,
+                    budget: prepared.budget.clone(),
+                    expires_at: prepared.expires_at,
+                    actor: prepared.actor.clone(),
+                    run_id: prepared.run_id,
+                    capability_generation: prepared.capability_generation,
+                    capability_manifest_digest: prepared.capability_manifest_digest.clone(),
+                    prepared_runtime_mode_generation: prepared.runtime_mode_generation,
+                    activated_runtime_mode_generation: activated_mode_generation,
+                    restored_mode: restored_mode_label.clone(),
+                    evidence: PlanApprovalEvidence {
+                        provenance: "interactive_user".to_string(),
+                        prepared_at: prepared.prepared_at,
+                        approved_at,
+                        evidence_digest,
+                    },
+                };
+                let artifact_digest = artifact.digest();
+                let context_message = serde_json::json!({
+                    "role": "system",
+                    "content": format!(
+                        "[Approved Implementation Plan]\nThe user has approved the following plan. Execute it step by step.\n\n{}\n\n{}",
+                        prepared.plan_content,
+                        allowed_operations
+                    ),
+                    "metadata": {
+                        "openclaudia_context_source": "user_approved_plan",
+                        "canonical_task_id": task_id,
+                        "canonical_task_graph_generation": task_graph_generation,
+                        "approved_plan_digest": prepared.plan_digest,
+                        "approved_plan_artifact_digest": artifact_digest
+                    }
+                });
+                state.modes.agent_mode = restored_agent_mode;
+                state.conversation.plan_mode = None;
+                state.conversation.approved_plan = Some(prepared.plan_content.clone());
+                let binding = crate::modes::PlanExecutionBinding {
+                    artifact_digest: artifact_digest.clone(),
+                    plan_digest: prepared.plan_digest.clone(),
+                    plan_realpath: prepared.plan_realpath.clone(),
+                    run_id: prepared.run_id,
+                    capability_generation: prepared.capability_generation,
+                    capability_manifest_digest: prepared.capability_manifest_digest.clone(),
+                    budget_generation: prepared.budget.generation.get(),
+                    budget_limits: prepared.budget.limits.clone(),
+                    task_graph_generation,
+                    activated_mode_generation,
+                    expires_at: prepared.expires_at,
+                    proposed_effects: (!prepared.unrestricted_within_run_capabilities)
+                        .then(|| prepared.effect_grants.clone()),
+                };
+                Ok((
+                    ApprovedPlanReceipt {
+                        task_id,
+                        task_graph_generation,
+                        plan_digest: prepared.plan_digest.clone(),
+                        runtime_mode_generation: activated_mode_generation,
+                        artifact_digest,
+                        expires_at: prepared.expires_at,
+                        artifact,
+                        context_message,
+                    },
+                    binding,
+                ))
+            })
+        },
+    )?;
+    debug_assert_eq!(restored_runtime.generation, receipt.runtime_mode_generation);
+    Ok(receipt)
+}
 
-    Ok(ApprovedPlanReceipt {
-        task_id,
-        task_graph_generation,
-        plan_digest: prepared.plan_digest.clone(),
-        runtime_mode_generation: restored_runtime.generation,
-        context_message,
-    })
+fn runtime_mode_label(mode: &crate::modes::RuntimeMode) -> String {
+    match mode {
+        crate::modes::RuntimeMode::Behavioral(behavior) => behavior.display_name(),
+        crate::modes::RuntimeMode::Plan => "plan".to_string(),
+        crate::modes::RuntimeMode::Initializer => "initializer".to_string(),
+        crate::modes::RuntimeMode::Coordinator => "coordinator".to_string(),
+    }
 }
 
 /// An allowed prompt constraint for plan mode exit

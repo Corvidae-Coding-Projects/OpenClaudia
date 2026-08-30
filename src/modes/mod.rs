@@ -818,6 +818,53 @@ pub struct RuntimeModeSnapshot {
     /// Persistable target intent bound into this exact mode generation.
     pub scope_targets: BehaviorScopeTargets,
     bound_scope_targets: BoundBehaviorScopeTargets,
+    approved_plan: Option<PlanExecutionBinding>,
+}
+
+/// Process-local execution authority activated by one exact interactive plan
+/// approval. Durable task state records the plan version; this binding is
+/// intentionally tied to one live run and is never reconstructed on resume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlanExecutionBinding {
+    pub artifact_digest: String,
+    pub plan_digest: String,
+    pub plan_realpath: PathBuf,
+    pub run_id: crate::runtime::RunId,
+    pub capability_generation: u64,
+    pub capability_manifest_digest: String,
+    pub budget_generation: u64,
+    pub budget_limits: crate::runtime::BudgetLimits,
+    pub task_graph_generation: u64,
+    pub activated_mode_generation: u64,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    /// `None` means the reviewed proposal explicitly requested the run's full
+    /// existing capability envelope. `Some` narrows effectful calls to the
+    /// named tool/effect ceilings; read-only support calls remain available.
+    pub proposed_effects: Option<Vec<PlanEffectGrant>>,
+}
+
+/// One structured effect ceiling displayed with a plan proposal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlanEffectGrant {
+    pub tool: String,
+    pub effect: crate::tools::effect::ToolEffect,
+}
+
+impl PlanExecutionBinding {
+    pub(crate) fn allows_effect(
+        &self,
+        tool_name: &str,
+        effect: crate::tools::effect::ToolEffect,
+    ) -> bool {
+        if effect == crate::tools::effect::ToolEffect::ReadOnly {
+            return true;
+        }
+        self.proposed_effects.as_ref().is_none_or(|proposed| {
+            proposed
+                .iter()
+                .any(|grant| grant.tool.eq_ignore_ascii_case(tool_name) && effect <= grant.effect)
+        })
+    }
 }
 
 impl RuntimeModeSnapshot {
@@ -857,6 +904,18 @@ impl RuntimeModeSnapshot {
         }
     }
 
+    /// Digest of the exact plan artifact that activated this mode generation.
+    #[must_use]
+    pub fn approved_plan_artifact_digest(&self) -> Option<&str> {
+        self.approved_plan
+            .as_ref()
+            .map(|binding| binding.artifact_digest.as_str())
+    }
+
+    pub(crate) const fn approved_plan(&self) -> Option<&PlanExecutionBinding> {
+        self.approved_plan.as_ref()
+    }
+
     /// Explain why a model-visible definition is outside this exact profile.
     #[must_use]
     pub fn definition_denial(
@@ -864,7 +923,16 @@ impl RuntimeModeSnapshot {
         tool_name: &str,
         effect: crate::tools::effect::ToolEffect,
     ) -> Option<String> {
-        if profile_allows_definition(self, tool_name, effect) {
+        if self
+            .approved_plan
+            .as_ref()
+            .is_some_and(|binding| !binding.allows_effect(tool_name, effect))
+        {
+            Some(format!(
+                "approved plan generation {} does not grant this tool",
+                self.generation
+            ))
+        } else if profile_allows_definition(self, tool_name, effect) {
             None
         } else {
             Some(format!(
@@ -929,6 +997,7 @@ impl RuntimeModeAuthority {
                 class,
                 scope_targets,
                 bound_scope_targets,
+                approved_plan: None,
             }),
         })
     }
@@ -995,8 +1064,55 @@ impl RuntimeModeAuthority {
             class,
             scope_targets,
             bound_scope_targets,
+            approved_plan: None,
         };
         Ok(state.clone())
+    }
+
+    /// Commit the fallible durable/session side of a plan approval while the
+    /// current plan generation is write-locked, then publish its mode and
+    /// execution binding with one infallible state replacement.
+    ///
+    /// A callback error leaves the complete mode snapshot unchanged. Generic
+    /// mode transitions deliberately clear an older plan binding.
+    pub(crate) fn transition_plan_approval<T>(
+        &self,
+        expected_generation: u64,
+        mode: RuntimeMode,
+        commit: impl FnOnce(u64) -> Result<(T, PlanExecutionBinding), String>,
+    ) -> Result<(RuntimeModeSnapshot, T), String> {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generation != expected_generation || state.class != RuntimeModeClass::Plan {
+            return Err(format!(
+                "plan approval expected runtime plan generation {expected_generation}, observed {} ({})",
+                state.generation,
+                state.display_name()
+            ));
+        }
+        let class = validate_runtime_mode(&mode, &state.scope_targets)?;
+        if class == RuntimeModeClass::Plan {
+            return Err("approved plan must activate a non-plan execution mode".to_string());
+        }
+        let bound_scope_targets =
+            BoundBehaviorScopeTargets::bind(&self.project_root, &state.scope_targets)?;
+        let generation = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| "runtime mode generation exhausted".to_string())?;
+        let (result, approved_plan) = commit(generation)?;
+        debug_assert_eq!(approved_plan.activated_mode_generation, generation);
+        *state = RuntimeModeSnapshot {
+            generation,
+            mode,
+            class,
+            scope_targets: state.scope_targets.clone(),
+            bound_scope_targets,
+            approved_plan: Some(approved_plan),
+        };
+        Ok((state.clone(), result))
     }
 
     /// Enforce the current profile for one fully classified invocation.
@@ -1028,6 +1144,47 @@ impl RuntimeModeAuthority {
                 "Runtime mode '{}' generation {} denies tool '{}' ({})",
                 snapshot.display_name(),
                 snapshot.generation,
+                tool_name,
+                resolved.effect.as_str()
+            ))
+        }
+    }
+
+    /// Admit one call against a single locked mode/plan-authority snapshot.
+    /// This prevents a mode change from racing between plan validation and
+    /// the ordinary profile decision.
+    #[allow(clippy::significant_drop_tightening)] // One read guard binds plan validation to profile admission.
+    pub(crate) fn admit_resolved_tool_for_run(
+        &self,
+        run: &crate::tools::ToolRunContext,
+        tool_name: &str,
+        resolved: &crate::tools::effect::ResolvedEffect,
+        canonical_path: Option<&Path>,
+        arguments: &serde_json::Value,
+        plan_file: &Path,
+    ) -> Result<(), String> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(binding) = state.approved_plan() {
+            run.validate_plan_execution(binding, tool_name, resolved.effect)?;
+        }
+        if profile_allows_call(
+            &state,
+            tool_name,
+            resolved,
+            canonical_path,
+            arguments,
+            plan_file,
+            &self.project_root,
+        ) {
+            Ok(())
+        } else {
+            Err(format!(
+                "Runtime mode '{}' generation {} denies tool '{}' ({})",
+                state.display_name(),
+                state.generation,
                 tool_name,
                 resolved.effect.as_str()
             ))
@@ -1085,6 +1242,35 @@ impl RuntimeModeAuthority {
                 "Runtime mode '{}' generation {} denies direct operation '{}'",
                 snapshot.display_name(),
                 snapshot.generation,
+                operation
+            ))
+        }
+    }
+
+    #[allow(clippy::significant_drop_tightening)] // One read guard binds plan validation to direct-operation admission.
+    pub(crate) fn admit_direct_operation_for_run(
+        &self,
+        run: &crate::tools::ToolRunContext,
+        operation: &str,
+    ) -> Result<(), String> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(binding) = state.approved_plan() {
+            run.validate_plan_execution(
+                binding,
+                operation,
+                crate::tools::effect::ToolEffect::ExternalMutation,
+            )?;
+        }
+        if state.class == RuntimeModeClass::Standard {
+            Ok(())
+        } else {
+            Err(format!(
+                "Runtime mode '{}' generation {} denies direct operation '{}'",
+                state.display_name(),
+                state.generation,
                 operation
             ))
         }

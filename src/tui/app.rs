@@ -4414,6 +4414,8 @@ impl App {
                     "message": message,
                     "approved": true,
                     "plan_digest": receipt.plan_digest,
+                    "plan_artifact_digest": receipt.artifact_digest,
+                    "plan_authority_expires_at": receipt.expires_at,
                     "canonical_task_id": receipt.task_id,
                     "canonical_task_graph_generation": receipt.task_graph_generation,
                     "runtime_mode_generation": receipt.runtime_mode_generation
@@ -5225,7 +5227,11 @@ impl App {
                 }
             }
             PlanModeRequest::Exit { allowed_prompts } => {
-                match crate::session::prepare_interactive_plan_approval(&run, &self.chat_session) {
+                match crate::session::prepare_interactive_plan_approval_with_effects(
+                    &run,
+                    &self.chat_session,
+                    &allowed_prompts,
+                ) {
                     Ok(prepared) => {
                         self.messages.add(DisplayMessage::system(format!(
                             "Review plan digest {} and approve or reject it",
@@ -6880,7 +6886,9 @@ impl App {
             super::safety::EVENT_TEXT_LIMITS,
         );
         let mut body = format!("Digest: {}\n\n{}", digest.as_str(), plan_content.as_str());
-        if !plan.allowed_prompts.is_empty() {
+        if plan.allowed_prompts.is_empty() {
+            body.push_str("\n\nProposed authority: full existing capabilities of this run.\n");
+        } else {
             body.push_str("\n\nProposed allowed operations:\n");
             for prompt in plan.allowed_prompts.iter().take(64) {
                 use std::fmt::Write as _;
@@ -8862,6 +8870,14 @@ mod tests {
             response["plan_digest"]
         );
         assert_eq!(
+            context["metadata"]["approved_plan_artifact_digest"],
+            app.tool_run_context()
+                .expect("run")
+                .runtime_mode()
+                .approved_plan_artifact_digest()
+                .expect("active plan artifact")
+        );
+        assert_eq!(
             app.chat_session.agent_mode(),
             crate::state::AgentMode::Build
         );
@@ -8874,6 +8890,90 @@ mod tests {
             app.chat_session
                 .inspect_state(|state| state.conversation.approved_plan.clone()),
             Some("# Implement the feature\n".to_string())
+        );
+        let run = app.tool_run_context().expect("run");
+        let denied = run.admit_runtime_mode_tool(
+            "write_file",
+            &serde_json::json!({
+                "path": run.agent_plan_file(),
+                "content": "broader than the reviewed bash proposal"
+            }),
+        );
+        assert!(
+            denied.is_err(),
+            "a bash-only reviewed proposal must not grant workspace writes"
+        );
+        assert!(
+            run.runtime_mode()
+                .definition_denial(
+                    "write_file",
+                    crate::tools::effect::ToolEffect::WorkspaceMutation,
+                )
+                .is_some(),
+            "the provider catalog must not advertise an effect the reviewed plan denies"
+        );
+        std::fs::write(run.agent_plan_file(), "# drifted after approval\n")
+            .expect("drift plan artifact");
+        assert!(
+            run.admit_runtime_mode_tool("bash", &serde_json::json!({"command": "true"}))
+                .is_err(),
+            "changed plan bytes must invalidate the active approval"
+        );
+    }
+
+    #[test]
+    fn approved_plan_authority_dies_with_its_cancelled_run() {
+        let (project, mut app) = plan_follow_up_test_app();
+        let _ = enter_plan_through_typed_request(&mut app);
+        let run = app.tool_run_context().expect("run");
+        std::fs::write(run.agent_plan_file(), "# Execute the checked command\n")
+            .expect("write plan");
+
+        let (reply, mut response) = tokio::sync::oneshot::channel();
+        app.handle_plan_mode_request(
+            PlanModeRequest::Exit {
+                allowed_prompts: vec![crate::tools::ToolAllowedPrompt {
+                    tool: "bash".to_string(),
+                    prompt: "cargo check".to_string(),
+                }],
+            },
+            reply,
+        );
+        app.finish_plan_approval(true);
+        assert!(matches!(
+            response.try_recv().expect("plan approval reply"),
+            PlanModeReply::Completed { response, .. } if response["approved"] == true
+        ));
+
+        let _ = run
+            .runtime()
+            .cancellation()
+            .cancel(crate::runtime::CancellationReason::User);
+        let cancelled = run
+            .admit_runtime_mode_tool("bash", &serde_json::json!({"command": "cargo check"}))
+            .expect_err("cancelled run must not retain approved plan authority");
+        assert!(cancelled.contains("cancel"));
+
+        let successor = crate::tools::ToolRunContext::builder(
+            crate::state::SessionId::from_raw(app.chat_session.id()).expect("session id"),
+            project.path(),
+        )
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(std::collections::HashMap::new())
+        .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+        .process(false)
+        .network(false)
+        .secrets(false)
+        .provider("tui-plan-successor-test")
+        .build()
+        .expect("successor run");
+        assert!(
+            successor
+                .runtime_mode()
+                .approved_plan_artifact_digest()
+                .is_none(),
+            "a new run must not reconstruct the previous run's execution grant"
         );
     }
 
@@ -8915,6 +9015,43 @@ mod tests {
             cancelled.try_recv().expect("cancellation reply"),
             PlanModeReply::Cancelled { .. }
         ));
+
+        let (changed_effects, mut changed_effects_reply) = tokio::sync::oneshot::channel();
+        app.handle_plan_mode_request(
+            PlanModeRequest::Exit {
+                allowed_prompts: Vec::new(),
+            },
+            changed_effects,
+        );
+        app.pending_plan_approval
+            .as_mut()
+            .expect("pending approval")
+            .allowed_prompts
+            .push(crate::tools::ToolAllowedPrompt {
+                tool: "bash".to_string(),
+                prompt: "cargo test".to_string(),
+            });
+        app.finish_plan_approval(true);
+        assert!(matches!(
+            changed_effects_reply
+                .try_recv()
+                .expect("changed-effects reply"),
+            PlanModeReply::Completed { response, .. }
+                if response["approved"] == false && response["error"] == true
+        ));
+        assert_eq!(
+            app.task_mgr
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .generation()
+                .get(),
+            0,
+            "a changed effect proposal must not publish task state"
+        );
+        assert_eq!(
+            app.tool_run_context().expect("run").runtime_mode().class,
+            crate::modes::RuntimeModeClass::Plan
+        );
 
         let (stale, mut stale_reply) = tokio::sync::oneshot::channel();
         app.handle_plan_mode_request(

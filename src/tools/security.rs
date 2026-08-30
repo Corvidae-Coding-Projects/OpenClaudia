@@ -1303,6 +1303,39 @@ impl ToolRunContext {
         Ok(())
     }
 
+    /// Serialize a reviewed plan's durable/session publication with the
+    /// exact runtime-mode activation that makes it executable.
+    ///
+    /// The callback runs while the current mode generation and background
+    /// lifecycle are exclusively held. It must perform every fallible
+    /// publication step; only after it succeeds does the mode authority
+    /// install the returned plan binding.
+    pub(crate) fn transition_plan_approval<T>(
+        &self,
+        expected_generation: u64,
+        mode: crate::modes::RuntimeMode,
+        commit: impl FnOnce(u64) -> Result<(T, crate::modes::PlanExecutionBinding), String>,
+    ) -> Result<(crate::modes::RuntimeModeSnapshot, T), String> {
+        let _lifecycle = self
+            .background_effect_lifecycle
+            .lock()
+            .map_err(|error| format!("background-effect lifecycle is unavailable: {error}"))?;
+        if self.runtime.cancellation().is_cancelled() {
+            return Err("cancelled run cannot activate plan execution authority".to_string());
+        }
+        let shell_ids = crate::tools::BACKGROUND_SHELLS.active_ids_for_run(self);
+        let agent_ids = crate::subagent::BACKGROUND_AGENTS.active_ids_for_run(self)?;
+        if !shell_ids.is_empty() || !agent_ids.is_empty() {
+            return Err(format!(
+                "plan approval cannot activate while this run owns {} background shell(s) and {} background agent(s)",
+                shell_ids.len(),
+                agent_ids.len()
+            ));
+        }
+        self.runtime_mode
+            .transition_plan_approval(expected_generation, mode, commit)
+    }
+
     /// Enforce the active mode against a concrete classified tool call.
     ///
     /// # Errors
@@ -1316,6 +1349,7 @@ impl ToolRunContext {
     ) -> Result<(), String> {
         let snapshot = self.runtime_mode();
         if snapshot.class == crate::modes::RuntimeModeClass::Standard
+            && snapshot.approved_plan().is_none()
             && matches!(
                 &snapshot.mode,
                 crate::modes::RuntimeMode::Behavioral(mode)
@@ -1345,7 +1379,8 @@ impl ToolRunContext {
         } else {
             None
         };
-        self.runtime_mode.admit_resolved_tool(
+        self.runtime_mode.admit_resolved_tool_for_run(
+            self,
             tool_name,
             resolved,
             canonical_path.as_deref(),
@@ -1360,7 +1395,69 @@ impl ToolRunContext {
     ///
     /// Returns an error when the current runtime mode denies direct effects.
     pub fn admit_runtime_mode_direct_operation(&self, operation: &str) -> Result<(), String> {
-        self.runtime_mode.admit_direct_operation(operation)
+        self.runtime_mode
+            .admit_direct_operation_for_run(self, operation)
+    }
+
+    pub(crate) fn validate_plan_execution(
+        &self,
+        binding: &crate::modes::PlanExecutionBinding,
+        tool_name: &str,
+        effect: super::effect::ToolEffect,
+    ) -> Result<(), String> {
+        if binding.run_id != self.run_id()
+            || binding.capability_generation != self.generation.get()
+            || binding.capability_manifest_digest
+                != self
+                    .runtime
+                    .descriptor()
+                    .capabilities
+                    .manifest_digest
+                    .to_string()
+        {
+            return Err(
+                "approved plan belongs to a different run capability generation".to_string(),
+            );
+        }
+        if binding.task_graph_generation == 0 {
+            return Err("approved plan lacks a committed canonical task generation".to_string());
+        }
+        if self.runtime.cancellation().is_cancelled() {
+            return Err("approved plan authority was invalidated by run cancellation".to_string());
+        }
+        if chrono::Utc::now() >= binding.expires_at {
+            return Err("approved plan authority has expired".to_string());
+        }
+        let budget = self
+            .budget()
+            .snapshot()
+            .map_err(|error| format!("approved plan budget is unavailable: {error}"))?;
+        if budget.generation.get() != binding.budget_generation
+            || budget.limits != binding.budget_limits
+        {
+            return Err("approved plan budget generation or limits changed".to_string());
+        }
+        if binding.plan_realpath != self.agent_plan_file {
+            return Err("approved plan artifact path no longer matches this run".to_string());
+        }
+        let (_, content) = crate::tools::read_capability_text_attachment(
+            self,
+            &binding.plan_realpath.to_string_lossy(),
+        )
+        .map_err(|error| format!("approved plan artifact cannot be re-read: {error}"))?;
+        let digest = crate::runtime::ContentDigest::sha256(content.as_bytes()).to_string();
+        if digest.strip_prefix("sha256:") != Some(binding.plan_digest.as_str()) {
+            return Err("approved plan artifact changed after activation".to_string());
+        }
+        if !binding.allows_effect(tool_name, effect) {
+            return Err(format!(
+                "approved plan artifact {} does not grant effect {} through tool '{}'",
+                binding.artifact_digest,
+                effect.as_str(),
+                tool_name
+            ));
+        }
+        Ok(())
     }
 
     /// Session identifier that owns these capabilities.

@@ -1,6 +1,6 @@
 # S-080: Make plan approval an atomic capability transition
 
-Status: Planned
+Status: Implemented and deterministically verified; artifact-bound VDD receipt pending
 Effort: Medium
 Primary findings: F-114
 Workstreams: W2, W12, W17
@@ -26,4 +26,40 @@ Bind the reviewed plan bytes, task state, artifact generation, and granted execu
 
 ## Handoff
 
-Record changed artifact generations, commands/tests run, typed evidence receipts, unresolved risks, and any newly proposed slice. Completion of this slice does not imply completion of its parent workstream.
+Plan approval now prepares exact bounded plan bytes and their digest before the
+user decision. Approval publishes an immutable, versioned
+`ApprovedPlanArtifact` containing the canonical task identity and graph
+generation, proposed typed effects and prompt digests, budget snapshot, expiry,
+actor, interactive evidence, run identity, capability generation and manifest
+digest, and the prepared and activated runtime-mode generations.
+
+The transition holds the background-lifecycle and runtime-mode write guards
+while one session transaction revalidates the plan, persists the canonical
+task, constructs the artifact and approval receipt, and changes session state.
+Only after that transaction succeeds is the already-constructed capability
+binding published. Plan edits, capability or budget drift, mode-generation
+changes, expiry, and run cancellation fail closed. Generic mode changes clear
+the binding, and successor/resumed runs do not reconstruct live authority from
+persisted plan prose.
+
+Tool admission enforces the live binding for both model-dispatched and direct
+operations. Provider-visible tool definitions also omit effects denied by the
+approved plan. The CLI and TUI display the exact plan and allowed operations;
+an empty effect list is explicitly presented as the current run's existing
+capabilities rather than as an accidental deny-all or escalation.
+
+Verification used Rust 1.98.0 with `CARGO_BUILD_JOBS=2` and serialized tests:
+
+- `cargo +1.98.0 fmt --check` passed.
+- `cargo +1.98.0 check --locked --all-targets --all-features` passed.
+- `cargo +1.98.0 clippy --locked --all-targets --all-features -- -D warnings`
+  passed.
+- Focused approval, rejection, cancellation, successor-run, stale-artifact,
+  effect-ceiling, and provider-catalog tests passed.
+- `cargo +1.98.0 test --locked --all-targets --all-features --
+  --test-threads=1` passed every non-ignored target.
+
+An independent alternate-model, artifact-bound VDD receipt was not recorded for
+this implementation pass. That missing evidence is not represented as a VDD
+pass. Post-finalization receipt publication remains tracked by Crosslink #1201.
+Completion of this slice does not imply completion of its parent workstream.

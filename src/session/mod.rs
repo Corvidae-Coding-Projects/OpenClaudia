@@ -26,9 +26,11 @@ pub use pricing::{
 pub use state::{
     commit_interactive_plan_approval, get_session_context, install_interactive_plan_mode,
     is_tool_allowed_in_plan_mode, is_tool_allowed_in_plan_mode_with_policy,
-    prepare_interactive_plan_approval, AllowedPrompt, ApprovedPlanReceipt, PlanModePolicy,
-    PlanModeState, PreparedPlanApproval, TokenUsage, TurnMetrics, UsageExtras, MCP_TOOL_PREFIX,
-    PLAN_MODE_ALLOWED_TOOLS, PLUGIN_TOOL_PREFIX,
+    prepare_interactive_plan_approval, prepare_interactive_plan_approval_with_effects,
+    AllowedPrompt, ApprovedPlanArtifact, ApprovedPlanReceipt, PlanApprovalEvidence, PlanModePolicy,
+    PlanModeState, PlanProposedEffect, PreparedPlanApproval, TokenUsage, TurnMetrics, UsageExtras,
+    APPROVED_PLAN_ARTIFACT_SCHEMA_VERSION, MCP_TOOL_PREFIX, PLAN_MODE_ALLOWED_TOOLS,
+    PLUGIN_TOOL_PREFIX,
 };
 pub use task::{Task, TaskManager, TaskStatus, TaskUpdateParams, TaskUpdateStatus};
 

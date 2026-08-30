@@ -73,6 +73,14 @@ fn handle_plan_edit(
             };
             println!("\n\x1b[1;36m## Edited Plan\x1b[0m\n");
             println!("{edited_content}");
+            if allowed_prompts.is_empty() {
+                println!("\nProposed authority: full existing capabilities of this run.");
+            } else {
+                println!("\nProposed allowed operations:");
+                for prompt in allowed_prompts {
+                    println!("- {}: {}", prompt.tool, prompt.prompt);
+                }
+            }
             println!();
             print!("\x1b[1;33mApprove edited plan? [y/n]: \x1b[0m");
             io::stdout().flush().ok();
@@ -81,21 +89,23 @@ fn handle_plan_edit(
                 return ("Failed to read user input.".to_string(), false, None);
             }
             if input2.trim().to_lowercase().starts_with('y') {
-                let prepared = match openclaudia::session::prepare_interactive_plan_approval(
-                    run,
-                    chat_session,
-                ) {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        return (
+                let prepared =
+                    match openclaudia::session::prepare_interactive_plan_approval_with_effects(
+                        run,
+                        chat_session,
+                        allowed_prompts,
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            return (
                             format!(
                                 "Edited plan could not be prepared for approval: {error}. Still in plan mode."
                             ),
                             false,
                             None,
                         );
-                    }
-                };
+                        }
+                    };
                 approve_plan(
                     run,
                     chat_session,
@@ -194,8 +204,11 @@ pub fn handle_exit_plan_mode(
         }
     };
 
-    let prepared = match openclaudia::session::prepare_interactive_plan_approval(run, chat_session)
-    {
+    let prepared = match openclaudia::session::prepare_interactive_plan_approval_with_effects(
+        run,
+        chat_session,
+        allowed_prompts,
+    ) {
         Ok(prepared) => prepared,
         Err(error) => {
             return (
@@ -210,6 +223,14 @@ pub fn handle_exit_plan_mode(
     println!("\n\x1b[1;36m{}\x1b[0m", "=".repeat(60));
     println!("\x1b[1;36m## Implementation Plan\x1b[0m\n");
     println!("{plan_content}");
+    if allowed_prompts.is_empty() {
+        println!("\nProposed authority: full existing capabilities of this run.");
+    } else {
+        println!("\nProposed allowed operations:");
+        for prompt in allowed_prompts {
+            println!("- {}: {}", prompt.tool, prompt.prompt);
+        }
+    }
     println!("\x1b[1;36m{}\x1b[0m\n", "=".repeat(60));
     print!("\x1b[1;33mApprove? [y/n/edit]: \x1b[0m");
     io::stdout().flush().ok();
@@ -552,6 +573,12 @@ mod tests {
         };
 
         let first = approve("secret prose step one");
+        assert_eq!(first.artifact.digest(), first.artifact_digest);
+        assert_eq!(first.artifact.plan_digest, first.plan_digest);
+        assert_eq!(
+            first.artifact.task_graph_generation,
+            first.task_graph_generation
+        );
         let repeated = approve("secret prose step one");
         assert_eq!(repeated.task_id, first.task_id);
         assert_eq!(repeated.task_graph_generation, first.task_graph_generation);

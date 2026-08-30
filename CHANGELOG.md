@@ -206,6 +206,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix missing `permissions` field in test AppConfig initializers after merge
 
 ### Changed
+- S-080: Make plan approval an atomic capability transition (#1232)
 - S-082: Give private notes and side questions correct semantics (#1231)
 - S-078: Move print mode onto the canonical runtime (#1230)
 - S-079: Route legacy attachments and editor input through capabilities (#1228)
