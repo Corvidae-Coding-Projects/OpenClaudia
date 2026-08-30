@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1223,
+  "next_display_id": 1224,
   "next_comment_id": 1973,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -993,6 +993,7 @@
     "e073174d-d851-44e8-a8e8-84eea134c4a6": 1092,
     "e0f2c5e6-9871-4d93-81e6-06e757e91e47": 928,
     "e11700fc-2ae6-4a5f-a290-1ddafa9e85c9": 1200,
+    "e12680d7-5a15-4f5a-99b1-a620902d8ce2": 1223,
     "e16ad946-4814-40cc-a467-d9916f4b56e9": 790,
     "e1a798cc-e476-4a18-a5fa-e9bd236415a3": 986,
     "e1b8ef4e-4979-461c-940d-472e372de917": 475,
@@ -32815,6 +32816,18 @@
         "remediation"
       ]
     },
+    "e12680d7-5a15-4f5a-99b1-a620902d8ce2": {
+      "uuid": "e12680d7-5a15-4f5a-99b1-a620902d8ce2",
+      "display_id": 1223,
+      "title": "S-083: Make terminal rendering bounded and inert",
+      "description": "Implement docs/remediation-slices/083-safe-terminal-rendering.md as production behavior. Render typed events only, sanitize ANSI/OSC/control data, impose byte/line/node/compute limits before parsing/layout, and make Unicode grapheme and terminal-cell layout bounded and correct. Worker scope is production Rust code only: no tests, builds, Cargo, rustfmt, Clippy, Git, Crosslink, documentation, network, cache, or runner commands. Root owns review, reconciliation, tests, docs, signed commit/push, CI, and cleanup.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "5524064d-6721-4080-928b-959fe9661d77",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-30T11:01:39.651263831Z",
+      "updated_at": "2026-08-30T11:01:39.651263831Z"
+    },
     "e16ad946-4814-40cc-a467-d9916f4b56e9": {
       "uuid": "e16ad946-4814-40cc-a467-d9916f4b56e9",
       "display_id": 790,
@@ -50130,11 +50143,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2455,
       "timestamp": "2026-08-30T11:01:34.640734966Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2456,
+      "timestamp": "2026-08-30T11:01:39.651263831Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T11:01:34.640734966Z",
+    "timestamp": "2026-08-30T11:01:39.651263831Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2455
+    "agent_seq": 2456
   }
 }
