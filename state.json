@@ -1,6 +1,6 @@
 {
   "next_display_id": 1219,
-  "next_comment_id": 1967,
+  "next_comment_id": 1968,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -3251,10 +3251,21 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T08:30:25.144469899Z",
-      "updated_at": "2026-08-30T08:30:29.540433885Z",
+      "updated_at": "2026-08-30T09:54:19.448011828Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "fe206772-33dc-4d94-ad93-56e1cc2ce294": {
+          "display_id": 1967,
+          "author": "6Vw9",
+          "content": "Implemented immutable generation-bound TUI ProviderBinding across transport/auth/model/native continuation/VDD state, atomic provider transitions and resume, and superseded-request cancellation. Root added failure-atomic and transcript-mutation coverage. Verified 90 focused TUI tests, the full 3,102-test Rust suite, Rust 1.98 strict Clippy, policy, hygiene, dependency, and fuzz gates.",
+          "created_at": "2026-08-30T09:54:19.445104872Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA+ZCB9044qgRuf17CDQyY74AXI/PFG5OeGZWgi5wdhrkuAn9uHFho4a/nzurEhCwtsFSehLadhmrxgPZ32dZ4BQ=="
+        }
+      }
     },
     "11a61b5b-5435-4b0e-b8fd-dac426ac481e": {
       "uuid": "11a61b5b-5435-4b0e-b8fd-dac426ac481e",
@@ -49881,11 +49892,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2430,
       "timestamp": "2026-08-30T09:54:14.823022874Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2431,
+      "timestamp": "2026-08-30T09:54:19.448011828Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T09:54:14.823022874Z",
+    "timestamp": "2026-08-30T09:54:19.448011828Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2430
+    "agent_seq": 2431
   }
 }
