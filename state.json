@@ -32041,12 +32041,13 @@
       "display_id": 1226,
       "title": "S-039: Bind resume and branches to causal state",
       "description": "Implement docs/remediation-slices/039-causal-resume-and-branch-identity.md. Preserve intended branch/resume behavior while replacing project-controlled or ambiguous state with immutable causal identity, bounded validation, typed conflicts, and atomic selection.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T19:24:05.243269728Z",
-      "updated_at": "2026-08-30T21:22:33.988826950Z",
+      "updated_at": "2026-08-30T21:22:48.014062154Z",
+      "closed_at": "2026-08-30T21:22:48.014055681Z",
       "labels": [
         "remediation"
       ],
@@ -50814,11 +50815,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2514,
       "timestamp": "2026-08-30T21:22:43.381576986Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2515,
+      "timestamp": "2026-08-30T21:22:48.014062154Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T21:22:43.381576986Z",
+    "timestamp": "2026-08-30T21:22:48.014062154Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2514
+    "agent_seq": 2515
   }
 }
