@@ -1,6 +1,6 @@
 {
   "next_display_id": 1233,
-  "next_comment_id": 2021,
+  "next_comment_id": 2022,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -24277,7 +24277,7 @@
       "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
       "created_by": "6Vw9",
       "created_at": "2026-08-30T23:09:03.694117605Z",
-      "updated_at": "2026-08-30T23:47:18.787839332Z",
+      "updated_at": "2026-08-30T23:48:25.168661556Z",
       "closed_at": "2026-08-30T23:47:18.787832667Z",
       "labels": [
         "remediation"
@@ -24300,6 +24300,15 @@
           "kind": "result",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABARqQD/u+dYt95r7Gbd3rlAur21/WX4bEe+PFd3rWT1KsPRXWxUE8X+sTm4sEA9vGzg13/F0bs8lsoI1+ungiZBg=="
+        },
+        "ad300cf6-7899-4dee-8b68-b11f4466ab8c": {
+          "display_id": 2021,
+          "author": "6Vw9",
+          "content": "Delivered in signed commit c690359a4f47d530fbf098500e9b65f48cf4ac10.",
+          "created_at": "2026-08-30T23:48:25.165620337Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAl1sjuGNIhaHSRRBrZbvuYIZQZv7TEkjPBHu5dy2Su6cLn8PPwE1gGFy54WGxdzcFm5kPX0tTZSZKjVld8Z45Bw=="
         },
         "faf30432-3eaf-45d3-b265-6ac27661e059": {
           "display_id": 2019,
@@ -51240,11 +51249,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2553,
       "timestamp": "2026-08-30T23:47:23.309186783Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2554,
+      "timestamp": "2026-08-30T23:48:25.168661556Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T23:47:23.309186783Z",
+    "timestamp": "2026-08-30T23:48:25.168661556Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2553
+    "agent_seq": 2554
   }
 }
