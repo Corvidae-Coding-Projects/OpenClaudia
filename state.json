@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1214,
+  "next_display_id": 1215,
   "next_comment_id": 1944,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -388,6 +388,7 @@
     "5a42438a-14c7-496a-a1be-4d4a84175d6c": 665,
     "5ab41d6d-bd5d-407f-b9d2-8a5208b56d68": 51,
     "5ac506bb-8502-40a4-a979-ad2960f0e4cb": 1073,
+    "5ad36132-ddc8-4373-aa93-6e2cb3719576": 1214,
     "5b072c3e-0beb-4e95-9473-d3b349860613": 149,
     "5b5fc7e4-0ab1-4a99-82d1-3edb18128ea8": 342,
     "5bb5d572-ef98-4d55-b50b-2840b6b36032": 1154,
@@ -13741,6 +13742,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAFXffXXnG2zaj+IRsaB+pFal7KndaGvMOZ2Hdn1/T9BB+3W10flRa0xnxSCblonRyXTt+DSOsHqdBYGr0etXTAg=="
         }
       }
+    },
+    "5ad36132-ddc8-4373-aa93-6e2cb3719576": {
+      "uuid": "5ad36132-ddc8-4373-aa93-6e2cb3719576",
+      "display_id": 1214,
+      "title": "S-093: Isolate proxy tenant and session state",
+      "description": "Implement docs/remediation-slices/093-proxy-session-isolation.md as production behavior. Resolve authenticated proxy routes to tenant/client/session/call identities and isolate continuation, credentials, budgets, hooks, MCP, plugins, VDD, usage and cancellation. Worker writes code only; root performs review, tests, documentation, commits, push, CI and cleanup.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "46f1d200-b3c8-465c-9e83-85fa06120cb7",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-30T04:50:26.764312208Z",
+      "updated_at": "2026-08-30T04:50:26.764312208Z"
     },
     "5b072c3e-0beb-4e95-9473-d3b349860613": {
       "uuid": "5b072c3e-0beb-4e95-9473-d3b349860613",
@@ -49266,11 +49279,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2383,
       "timestamp": "2026-08-30T04:50:22.141251743Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2384,
+      "timestamp": "2026-08-30T04:50:26.764312208Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-30T04:50:22.141251743Z",
+    "timestamp": "2026-08-30T04:50:26.764312208Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2383
+    "agent_seq": 2384
   }
 }
