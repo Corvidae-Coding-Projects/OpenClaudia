@@ -1,6 +1,6 @@
 {
   "next_display_id": 1238,
-  "next_comment_id": 2036,
+  "next_comment_id": 2037,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -17636,11 +17636,20 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T02:02:03.591805308Z",
-      "updated_at": "2026-08-31T02:02:56.588346717Z",
+      "updated_at": "2026-08-31T02:10:44.637909722Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "2bcfc9b9-7e2e-440a-b61d-1f64c03db678": {
+          "display_id": 2036,
+          "author": "6Vw9",
+          "content": "Pinned acpx 0.13.2 now passed initialize, session/new, coding-mode negotiation, and sent the official session/prompt content-block array through the real OpenClaudia binary. The request reached the configured provider; the next failure was separate and downstream: Claude Agent SDK OAuth session expired and refresh failed. No proof.txt was created, so the smoke is not falsely reported as complete.",
+          "created_at": "2026-08-31T02:10:44.633725960Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAdhCbsGkgYQ+zmEca76u2dgEQaMNOxjusTl9ewZU954TAClqWF/zDKBv4LUNKSNrk6nSSRRuXpdQ5ssIZuwkkDA=="
+        },
         "a0b71155-1f4c-4276-b92d-a6282b441b2e": {
           "display_id": 2035,
           "author": "6Vw9",
@@ -51680,11 +51689,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2596,
       "timestamp": "2026-08-31T02:02:56.588346717Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2597,
+      "timestamp": "2026-08-31T02:10:44.637909722Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T02:02:56.588346717Z",
+    "timestamp": "2026-08-31T02:10:44.637909722Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2596
+    "agent_seq": 2597
   }
 }
