@@ -1,6 +1,6 @@
 {
   "next_display_id": 1237,
-  "next_comment_id": 2030,
+  "next_comment_id": 2031,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -4252,7 +4252,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T01:49:44.011089921Z",
-      "updated_at": "2026-08-31T01:57:22.259485848Z",
+      "updated_at": "2026-08-31T01:57:54.285201680Z",
       "labels": [
         "remediation"
       ],
@@ -4265,6 +4265,15 @@
           "kind": "result",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAPJ/shzglI4WajntZtMtbyIpw2q4nDvBBF2KOISYQ3BaWB1Eza9o4niOZz9m44okR4xbmE5lKl4ax+ZLKKlwfAg=="
+        },
+        "6f65b5ad-3253-4e33-ad22-78e33aea07e6": {
+          "display_id": 2030,
+          "author": "6Vw9",
+          "content": "Allow ACP alone to consume the trusted automation flag, project it into the effective launch permission posture, preserve hard host-safety and sandbox enforcement, and cover acceptance plus unchanged rejection behavior with focused Rust 1.98 tests.",
+          "created_at": "2026-08-31T01:57:54.282057678Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAbVHiVfUBFh1tTW1UyCgWnBqYasVRBf+rsfXti5wQF8j2D2DXLEZA/2zWXpBc+jMWUvIwRsfJqVEqqdYyEZqACQ=="
         },
         "dc1faaed-768e-41ca-ae41-2d2153f5e8af": {
           "display_id": 2028,
@@ -51534,11 +51543,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2581,
       "timestamp": "2026-08-31T01:57:28.512097776Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2582,
+      "timestamp": "2026-08-31T01:57:54.285201680Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T01:57:28.512097776Z",
+    "timestamp": "2026-08-31T01:57:54.285201680Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2581
+    "agent_seq": 2582
   }
 }
