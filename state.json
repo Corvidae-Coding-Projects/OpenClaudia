@@ -1,6 +1,6 @@
 {
   "next_display_id": 1243,
-  "next_comment_id": 2052,
+  "next_comment_id": 2053,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -31345,12 +31345,21 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T02:51:20.188391308Z",
-      "updated_at": "2026-08-31T03:25:45.061835849Z",
+      "updated_at": "2026-08-31T03:25:49.759080484Z",
       "labels": [
         "bug",
         "interoperability"
       ],
       "comments": {
+        "4f87590f-df7e-495c-ba73-0a37c393562f": {
+          "display_id": 2052,
+          "author": "6Vw9",
+          "content": "Implemented and verified the standard ACP session-update envelope. Rust 1.98 format and strict all-target/all-feature Clippy pass; 118 ACP lib tests plus 15 acp_config_default and 16 acp_ide_state tests pass. The exact emitted agent_message_chunk, tool_call, and tool_call_update shapes parse with the pinned @agentclientprotocol/sdk Zod schema. A real acpx@0.13.2 Claude-backed gated smoke used only OpenClaudia write_file/read_file, produced the exact 34-byte artifact sha256:08dc23d6c89cf5345f32f2e6ed43642ba5a0cc59a910a6f3e2a659ba72b166d6, reached end_turn, and emitted zero Invalid params errors.",
+          "created_at": "2026-08-31T03:25:49.755848432Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA2RCuDy41gP4qEtdTGChRyAMhtVzW1OIDTqBLaYlHqvPWLqK3a6AqTt/YTvjpWFLZ3UKNK2rL0tTPkIzX0pFaBg=="
+        },
         "f9379522-3136-4806-8afe-02e8a84e1e54": {
           "display_id": 2051,
           "author": "6Vw9",
@@ -52219,11 +52228,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2654,
       "timestamp": "2026-08-31T03:25:45.061835849Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2655,
+      "timestamp": "2026-08-31T03:25:49.759080484Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T03:25:45.061835849Z",
+    "timestamp": "2026-08-31T03:25:49.759080484Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2654
+    "agent_seq": 2655
   }
 }
