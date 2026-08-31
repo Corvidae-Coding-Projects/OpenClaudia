@@ -1,6 +1,6 @@
 {
   "next_display_id": 1243,
-  "next_comment_id": 2049,
+  "next_comment_id": 2050,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11718,7 +11718,7 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T02:30:49.831047103Z",
-      "updated_at": "2026-08-31T02:53:40.856031947Z",
+      "updated_at": "2026-08-31T03:00:00.266795342Z",
       "labels": [
         "bug",
         "remediation"
@@ -11741,6 +11741,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA1cZC2/+0WGDZHgXEqlWV9nWL65zVQRhTV2Q6qypBQsq8TW8+W3u7EcgRfD91EbBqsoU6P9F9sBrr5IagF+6+Cw=="
+        },
+        "f25a133e-b98d-4dc4-8fc1-860375bec24f": {
+          "display_id": 2049,
+          "author": "6Vw9",
+          "content": "Implemented the provider-neutral ACP verifier handoff without changing either SDK's native-tool lockdown. EveryTurn quality-gate results are now appended to the run-bound Reality Ledger before the next provider request, and the grounding contract explicitly uses exact post-change file observations plus unresolved correctness when no verifier exists. Evidence: Rust 1.98 fmt/diff checks pass; 118 serialized ACP library tests pass; 31 related ACP config/IDE integration tests pass; strict all-target/all-feature Clippy passes with CARGO_BUILD_JOBS=2. Real pinned acpx@0.13.2 smokes passed for Claude and Codex account SDKs using Claudia write_file/read_file only. A configured Claude smoke minted and hydrated proof-check TrustedVerifier receipt 7a79e7d8-e855-471d-be0c-8e120d944663 and ended with host policy decision allowed=true. Exact external proof files were independently byte/digest checked.",
+          "created_at": "2026-08-31T03:00:00.262909590Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAYlpyQI2WvNlE5w9FN4/qA0AqW0FVGW/QV1VxQjeI7AvDHsBE9F9N1N8clclyGjOhiSwPwOLQGfd4EvmnLbxjAA=="
         }
       }
     },
@@ -52139,11 +52148,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2644,
       "timestamp": "2026-08-31T02:54:00.105506163Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2645,
+      "timestamp": "2026-08-31T03:00:00.266795342Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T02:54:00.105506163Z",
+    "timestamp": "2026-08-31T03:00:00.266795342Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2644
+    "agent_seq": 2645
   }
 }
