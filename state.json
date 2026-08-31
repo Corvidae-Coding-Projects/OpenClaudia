@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1251,
+  "next_display_id": 1252,
   "next_comment_id": 2077,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -719,6 +719,7 @@
     "9d952aa9-443b-492f-9ce1-2144f74a273d": 982,
     "9da7b155-0062-42d2-9066-b50002894d16": 334,
     "9dc16440-4329-44af-b37d-c8d10fd01fb7": 463,
+    "9e0e48d9-276b-4dca-9991-ca55f01726fc": 1251,
     "9e3a1d39-c6e7-455c-aebc-fa014ca6123d": 495,
     "9e557374-009d-4049-bbb2-6bb62538c653": 91,
     "9e641b12-e984-4a5d-bfc1-81e5a898aa6f": 591,
@@ -25276,6 +25277,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA/rTcRlvaj8a2yAH6wXcKEJcfzgmm3UVEWZYmUv36gzlluv3eGjGG5Yjzs7KE2mesNftLu05SisNdETvbjHlnDQ=="
         }
       }
+    },
+    "9e0e48d9-276b-4dca-9991-ca55f01726fc": {
+      "uuid": "9e0e48d9-276b-4dca-9991-ca55f01726fc",
+      "display_id": 1251,
+      "title": "Retry classified transient account-router failures with bounded backoff",
+      "description": "Steps to reproduce:\n1. \n\nExpected: \nActual: \n\nSteps to reproduce:\n1. Run an account-backed ACP coding turn through the official Codex executable.\n2. Receive a classified transient response such as Selected model is at capacity after valid host tool work.\n3. Observe OpenClaudia terminate the entire prompt immediately.\n\nExpected: known transient capacity/rate/transport failures receive a small bounded retry count with capped jitter, cancellation and run-budget accounting, while permanent/auth/schema errors remain fail-fast.\nActual: a single capacity response discards the active turn and marks an otherwise completed workspace task as adapter failure.\n\nDo not switch models silently, bypass account limits, retry permanent errors, or use unbounded backoff.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-31T06:15:14.794986482Z",
+      "updated_at": "2026-08-31T06:15:14.794986482Z"
     },
     "9e3a1d39-c6e7-455c-aebc-fa014ca6123d": {
       "uuid": "9e3a1d39-c6e7-455c-aebc-fa014ca6123d",
@@ -52992,11 +53005,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2732,
       "timestamp": "2026-08-31T06:02:50.572595385Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2733,
+      "timestamp": "2026-08-31T06:15:14.794986482Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T06:02:50.572595385Z",
+    "timestamp": "2026-08-31T06:15:14.794986482Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2732
+    "agent_seq": 2733
   }
 }
