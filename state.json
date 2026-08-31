@@ -29738,12 +29738,13 @@
       "display_id": 1244,
       "title": "Enforce inference-only Agent SDK router boundaries",
       "description": "Claude and Codex account-backed transports must act only as model inference routers. They may authenticate through their owning executables and return schema-bound assistant text or OpenClaudia host-tool requests, but they must not load or invoke native CLI tools, skills, plugins, MCP, browser/computer, shell/edit, memory, agent, hook, or persistence surfaces. Strengthen fail-closed launch configuration and output-event validation where the installed CLIs expose gaps; preserve OpenClaudia as the sole owner of tool schemas, permissions, guardrails, Reality grounding, budgets, execution, and VDD authority. Acceptance: focused fake-executable tests prove exact constraints and reject unknown/native execution events; real Claude and Codex account smokes request a host file operation, demonstrate that only OpenClaudia executes it, and finish through the canonical tool-result loop; Rust 1.98 gates pass with CARGO_BUILD_JOBS=2.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T03:46:07.718243225Z",
-      "updated_at": "2026-08-31T04:25:27.797613758Z",
+      "updated_at": "2026-08-31T04:25:32.562039838Z",
+      "closed_at": "2026-08-31T04:25:32.562037820Z",
       "labels": [
         "architecture",
         "bug"
@@ -52513,11 +52514,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2685,
       "timestamp": "2026-08-31T04:25:27.797613758Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2686,
+      "timestamp": "2026-08-31T04:25:32.562039838Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T04:25:27.797613758Z",
+    "timestamp": "2026-08-31T04:25:32.562039838Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2685
+    "agent_seq": 2686
   }
 }
