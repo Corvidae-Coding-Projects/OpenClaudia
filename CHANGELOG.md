@@ -125,6 +125,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - TUI: every turn now dual-writes — the existing JSON snapshot at `~/.local/share/openclaudia/chat_sessions/<uuid>.json` stays for backward compat, and new entries also append to the JSONL transcript via `App::persist_transcript_tail`. Watermark tracking skips re-appending on resume
 
 ### Fixed
+- Enforce inference-only Agent SDK router boundaries (#1244)
 - Refresh bundled retrieval evidence after harness source changes (#1243)
 - Emit ACP session updates in the standard envelope (#1241)
 - Persist ACP verifier receipts for SDK router turns (#1240)
