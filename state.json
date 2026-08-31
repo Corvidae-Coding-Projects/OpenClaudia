@@ -1,6 +1,6 @@
 {
   "next_display_id": 1245,
-  "next_comment_id": 2068,
+  "next_comment_id": 2069,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -5442,7 +5442,7 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T01:41:27.171133224Z",
-      "updated_at": "2026-08-31T05:02:29.551414347Z",
+      "updated_at": "2026-08-31T05:06:29.345814489Z",
       "labels": [
         "benchmark",
         "feature"
@@ -5456,6 +5456,15 @@
           "kind": "observation",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA1lX0ePIRNtB0dw8pkr2Ft8YY2u/S32dOqo1DfcMwbY8UeeWWHAPoggOgG0947fCb2sV4WLSSxLUy6QbipmccCw=="
+        },
+        "b4e59d5c-16ad-43db-beca-77481774b355": {
+          "display_id": 2068,
+          "author": "6Vw9",
+          "content": "Terminal-Bench launch is resource-blocked by the already-running serialized Peritus Harbor campaign (230 completed, 1 running, 214 pending at the latest observation). With swap at 8/8 GiB, do not overlap a second Harbor container; prepare the OpenClaudia adapter separately and launch only after the existing campaign releases the slot.",
+          "created_at": "2026-08-31T05:06:29.342225961Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAWeSt3KuFy8gYjIcRArPNgb/2I+qub/P12JY0S91MtTK/476iwYLWAR4lYLqc5Z+zEGQSSl3OmEf+0/nABvZkDA=="
         }
       }
     },
@@ -52594,11 +52603,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2692,
       "timestamp": "2026-08-31T05:02:29.551414347Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2693,
+      "timestamp": "2026-08-31T05:06:29.345814489Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T05:02:29.551414347Z",
+    "timestamp": "2026-08-31T05:06:29.345814489Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2692
+    "agent_seq": 2693
   }
 }
