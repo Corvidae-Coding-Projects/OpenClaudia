@@ -2531,8 +2531,12 @@ impl AcpServer {
         }
     }
 
-    /// Send a session/update notification.
-    fn send_session_update(&self, session_id: &str, update_type: &str, content: &Value) {
+    /// Send a standard ACP `session/update` notification.
+    fn send_session_update(&self, session_id: &str, update: &Value) {
+        let update_type = update
+            .get("sessionUpdate")
+            .and_then(Value::as_str)
+            .unwrap_or("invalid");
         let active_call = self
             .active_call
             .as_ref()
@@ -2548,9 +2552,12 @@ impl AcpServer {
             "session/update",
             Some(json!({
                 "sessionId": session_id,
-                "callId": active_call.call_id,
-                "sessionUpdate": update_type,
-                "content": content,
+                "update": update,
+                "_meta": {
+                    "openclaudia": {
+                        "callId": active_call.call_id,
+                    }
+                },
             })),
         );
     }
@@ -3390,11 +3397,17 @@ impl AcpServer {
         if !text.is_empty() {
             self.send_session_update(
                 acp_session_id,
-                "agent_message_chunk",
                 &json!({
-                    "type": "text",
-                    "text": text,
-                    "provisional": true,
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": text,
+                    },
+                    "_meta": {
+                        "openclaudia": {
+                            "provisional": true,
+                        }
+                    },
                 }),
             );
         }
@@ -3568,11 +3581,9 @@ impl AcpServer {
             call_id: call.call_id.clone(),
         };
         self.active_call = Some(marker);
-        self.send_session_update(
-            &acp_session_id,
-            "call_started",
-            &json!({"callId": &call.call_id}),
-        );
+        // `session/prompt` already establishes the active turn. ACP has no
+        // `call_started` session-update variant; subsequent standard updates
+        // retain OpenClaudia's call correlation in their reserved `_meta`.
 
         let prompt_input = crate::hooks::HookInput::for_run(
             &run_context,
@@ -4393,11 +4404,11 @@ impl AcpServer {
 
                         self.send_session_update(
                             acp_session_id,
-                            "tool_call",
                             &json!({
+                                "sessionUpdate": "tool_call",
                                 "toolCallId": tc.id,
                                 "title": tc.name,
-                                "status": "running",
+                                "status": "in_progress",
                             }),
                         );
 
@@ -4547,7 +4558,6 @@ impl AcpServer {
 
                         self.send_session_update(
                             acp_session_id,
-                            "tool_call",
                             &acp_tool_call_update_payload(&result),
                         );
 
@@ -5665,10 +5675,17 @@ fn acp_tool_call_update_payload(result: &ToolResult) -> Value {
     let rendered = result.render_text();
     let output = crate::tools::safe_truncate(&rendered, MAX_ACP_TOOL_OUTPUT_BYTES / 2);
     let mut payload = json!({
+        "sessionUpdate": "tool_call_update",
         "toolCallId": result.tool_call_id(),
         "title": result.handler(),
         "status": status,
-        "output": output,
+        "content": [{
+            "type": "content",
+            "content": {
+                "type": "text",
+                "text": output,
+            }
+        }],
     });
     let raw_output = result.model_payload();
     if bounded_json_size(&raw_output, MAX_ACP_TOOL_OUTPUT_BYTES / 2).is_ok() {
@@ -7731,8 +7748,24 @@ memory:
         )
         .expect("session update JSON");
         assert_eq!(update["method"], "session/update");
-        assert_eq!(update["params"]["content"]["text"], "hello");
-        assert_eq!(update["params"]["content"]["provisional"], true);
+        assert_eq!(update["params"]["sessionId"], "acp-session");
+        assert_eq!(
+            update["params"]["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
+        assert_eq!(update["params"]["update"]["content"]["type"], "text");
+        assert_eq!(update["params"]["update"]["content"]["text"], "hello");
+        assert_eq!(
+            update["params"]["update"]["_meta"]["openclaudia"]["provisional"],
+            true
+        );
+        assert_eq!(update["params"]["_meta"]["openclaudia"]["callId"], "call-1");
+        assert!(
+            update["params"].get("sessionUpdate").is_none()
+                && update["params"].get("content").is_none()
+                && update["params"].get("callId").is_none(),
+            "ACP update fields must be nested in the standard update envelope"
+        );
         assert_eq!(server.provisional_output, "hello");
     }
 
@@ -9096,9 +9129,15 @@ blast_radius:
         assert_eq!(provider_payload["result"]["outcome"]["status"], "partial");
 
         let ui_payload = super::acp_tool_call_update_payload(&result);
+        assert_eq!(ui_payload["sessionUpdate"], "tool_call_update");
         assert_eq!(ui_payload["toolCallId"], "call-partial-provider");
         assert_eq!(ui_payload["status"], "failed");
-        assert_eq!(ui_payload["output"], result.render_text());
+        assert_eq!(ui_payload["content"][0]["type"], "content");
+        assert_eq!(ui_payload["content"][0]["content"]["type"], "text");
+        assert_eq!(
+            ui_payload["content"][0]["content"]["text"],
+            result.render_text()
+        );
         assert_eq!(ui_payload["rawOutput"], result.model_payload());
         assert_eq!(
             ui_payload["rawOutput"]["result"]["outcome"]["status"],
