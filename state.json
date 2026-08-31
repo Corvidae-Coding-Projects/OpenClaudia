@@ -1,6 +1,6 @@
 {
   "next_display_id": 1252,
-  "next_comment_id": 2081,
+  "next_comment_id": 2082,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -25284,13 +25284,24 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T06:15:14.794986482Z",
-      "updated_at": "2026-08-31T06:15:34.244940697Z",
+      "updated_at": "2026-08-31T07:08:12.748983771Z",
       "labels": [
         "benchmark",
         "bug",
         "provider",
         "reliability"
-      ]
+      ],
+      "comments": {
+        "15ac7551-3800-4131-a243-41a8e9fd4686": {
+          "display_id": 2081,
+          "author": "6Vw9",
+          "content": "Additional unchanged live reproductions during the baseline: task 058 completed round 1, then its continuation failed with Selected model is at capacity; task 059 failed immediately with the same classified provider error; task 060 did substantive work across two rounds but its final continuation failed with the same error. After three consecutive task endings with explicit capacity failure, the campaign was cleanly paused before task 061. Environmental-invalid rerun set is now 034, 039, 048, 049, 058, 059, 060.",
+          "created_at": "2026-08-31T07:08:12.746317402Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAkLtfIRbA0WwTElCnW3JZwKqzmzFLu2IaDBXDWniqHxJFG3kXDGeriaGZPDlNit7t2b2Fm+INSzcsHFgZhgi0Dg=="
+        }
+      }
     },
     "9e3a1d39-c6e7-455c-aebc-fa014ca6123d": {
       "uuid": "9e3a1d39-c6e7-455c-aebc-fa014ca6123d",
@@ -53093,11 +53104,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2742,
       "timestamp": "2026-08-31T06:47:56.105069612Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2743,
+      "timestamp": "2026-08-31T07:08:12.748983771Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T06:47:56.105069612Z",
+    "timestamp": "2026-08-31T07:08:12.748983771Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2742
+    "agent_seq": 2743
   }
 }
