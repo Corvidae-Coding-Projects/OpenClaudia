@@ -1,6 +1,6 @@
 {
   "next_display_id": 1244,
-  "next_comment_id": 2053,
+  "next_comment_id": 2054,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -31362,7 +31362,7 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T02:51:20.188391308Z",
-      "updated_at": "2026-08-31T03:26:29.107391995Z",
+      "updated_at": "2026-08-31T03:27:01.584615092Z",
       "labels": [
         "bug",
         "interoperability"
@@ -31376,6 +31376,15 @@
           "kind": "result",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA2RCuDy41gP4qEtdTGChRyAMhtVzW1OIDTqBLaYlHqvPWLqK3a6AqTt/YTvjpWFLZ3UKNK2rL0tTPkIzX0pFaBg=="
+        },
+        "612235af-1f4f-4f26-8c78-82de4dbf00f2": {
+          "display_id": 2053,
+          "author": "6Vw9",
+          "content": "Repair the protocol at the ACP serialization boundary: derive each notification from the pinned stable SessionNotification/SessionUpdate schema, preserve bounded OpenClaudia correlation only in reserved _meta, update focused tests to assert the exact envelope, and prove interoperability with a real acpx@0.13.2 Claude-router tool turn before publication.",
+          "created_at": "2026-08-31T03:27:01.582233973Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAP5Sbz1wwNMQTuZmisIMe7YjItNHncXt8Vjj6WzB1fHCRpwSgWRawD0F7m7LQFgnhJ1eimt2+006IMHVYOIkvAA=="
         },
         "f9379522-3136-4806-8afe-02e8a84e1e54": {
           "display_id": 2051,
@@ -52285,11 +52294,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2662,
       "timestamp": "2026-08-31T03:26:35.161591132Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2663,
+      "timestamp": "2026-08-31T03:27:01.584615092Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T03:26:35.161591132Z",
+    "timestamp": "2026-08-31T03:27:01.584615092Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2662
+    "agent_seq": 2663
   }
 }
