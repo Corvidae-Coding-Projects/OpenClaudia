@@ -12416,11 +12416,12 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T06:01:26.725480796Z",
-      "updated_at": "2026-08-31T06:01:40.909431528Z",
+      "updated_at": "2026-08-31T06:01:45.561743804Z",
       "labels": [
         "bug",
         "network",
-        "sandbox"
+        "sandbox",
+        "security"
       ]
     },
     "4aba17c7-1b3c-411b-b388-591e7001ab3c": {
@@ -52966,11 +52967,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2729,
       "timestamp": "2026-08-31T06:01:40.909431528Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2730,
+      "timestamp": "2026-08-31T06:01:45.561743804Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T06:01:40.909431528Z",
+    "timestamp": "2026-08-31T06:01:45.561743804Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2729
+    "agent_seq": 2730
   }
 }
