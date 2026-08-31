@@ -1,6 +1,6 @@
 {
   "next_display_id": 1252,
-  "next_comment_id": 2080,
+  "next_comment_id": 2081,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -34250,12 +34250,21 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T01:41:13.039848926Z",
-      "updated_at": "2026-08-31T06:47:51.023891187Z",
+      "updated_at": "2026-08-31T06:47:56.105069612Z",
       "labels": [
         "benchmark",
         "feature"
       ],
       "comments": {
+        "06201108-a0ae-4169-8aca-35428251d6bf": {
+          "display_id": 2080,
+          "author": "6Vw9",
+          "content": "[action] HarnessBench reached task 050. Correct canonical-result checkpoint: 49 result files (task 016 exception), 32 adapter-ok/17 false, mean outcome 0.702353, combined 0.701067; capacity-invalid 034/039/048/049. Task 050 recovered normally, campaign continues.",
+          "created_at": "2026-08-31T06:47:56.102624788Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAGvXR2nQCAiKG7PJ8tQgzBJxjstWqXEhDL5Ot3BSfCnf2FIcurqmJjb2CXHglz5k4Ss87Ro9seRmHP/ndz2rUDQ=="
+        },
         "343b747a-bf63-43fc-9ff3-c0236fd0bfe1": {
           "display_id": 2069,
           "author": "6Vw9",
@@ -53079,11 +53088,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2741,
       "timestamp": "2026-08-31T06:47:51.023891187Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2742,
+      "timestamp": "2026-08-31T06:47:56.105069612Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T06:47:51.023891187Z",
+    "timestamp": "2026-08-31T06:47:56.105069612Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2741
+    "agent_seq": 2742
   }
 }
