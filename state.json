@@ -1,6 +1,6 @@
 {
   "next_display_id": 1241,
-  "next_comment_id": 2045,
+  "next_comment_id": 2046,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -31799,7 +31799,7 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T02:23:19.612408959Z",
-      "updated_at": "2026-08-31T02:25:52.555022099Z",
+      "updated_at": "2026-08-31T02:31:19.283189440Z",
       "labels": [
         "bug",
         "remediation"
@@ -31822,6 +31822,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAfVoiFUk1hbt6ORnjcI3rkOv7hgDfkbtl0V3Ot+fx1xOn0YCv1yuNL48wUD1GJecBoSqkgEH3C767I9KaviZoAQ=="
+        },
+        "c5fbb4d8-7222-4684-86f6-1a04963e9704": {
+          "display_id": 2045,
+          "author": "6Vw9",
+          "content": "Normalized ACP assistant tool-call turns through one canonical constructor that retains absent prose as an empty string instead of an undecodable null. Added a regression that constructs the production message and decodes its empty-content tool call with identity intact. Rust 1.98 focused tests, 117 serialized ACP tests, fmt, and strict all-target/all-feature Clippy pass. Real pinned acpx Codex smoke now advances from empty-content list_files through write_file, read_file, and grounding_context; exact proof bytes and SHA-256 were verified. The later terminal-claim contract is separately tracked as #1240.",
+          "created_at": "2026-08-31T02:31:19.280310859Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAnFZgDV49LF1V7jtqAX7Jcz8k50KOtJVd8WxyTBvSSGtpFx0y1I9euPxbah0o0/5KRlmEPQnMDRSrRZbVnaC7Bg=="
         }
       }
     },
@@ -51965,11 +51974,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2624,
       "timestamp": "2026-08-31T02:30:58.993879546Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2625,
+      "timestamp": "2026-08-31T02:31:19.283189440Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T02:30:58.993879546Z",
+    "timestamp": "2026-08-31T02:31:19.283189440Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2624
+    "agent_seq": 2625
   }
 }
