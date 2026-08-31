@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1240,
+  "next_display_id": 1241,
   "next_comment_id": 2045,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -313,6 +313,7 @@
     "4718c93c-ed62-441a-8452-0eaeec58dd0a": 696,
     "472e5141-884b-47b9-8d75-fb15f2656ef3": 771,
     "474594f4-005e-4079-8a5a-4961a62d5ad3": 73,
+    "476d7814-be85-475b-979c-586ec374382a": 1240,
     "479a8395-3a71-4e28-9236-06bfaceaa511": 579,
     "479e043c-70f2-482a-bb5a-df441ffd0bee": 668,
     "47f54649-e961-4ac3-ae74-495497587913": 1017,
@@ -11704,6 +11705,18 @@
           "signature": "U1NIU0lHAAAAAQAAAGgAAAATZWNkc2Etc2hhMi1uaXN0cDI1NgAAAAhuaXN0cDI1NgAAAEEEe0KY4l/Z7G/vfkx00kFwZtY3FjD8lde6VcPNSNT06kyL5ZUnzQGbJUMzOdlFd65s/RCzZhVJQVonLQ3yKzipGAAAABFjcm9zc2xpbmstY29tbWVudAAAAAAAAAAGc2hhNTEyAAAAZAAAABNlY2RzYS1zaGEyLW5pc3RwMjU2AAAASQAAACBJwMW/XsEOwFfZ3JbpJpZK2aN78G6Ts1upTgUn6T5HLgAAACEAlaxUOYBS5/6nsdQHtxndPgtZPgqU1PilbCMZfMm5wsE="
         }
       }
+    },
+    "476d7814-be85-475b-979c-586ec374382a": {
+      "uuid": "476d7814-be85-475b-979c-586ec374382a",
+      "display_id": 1240,
+      "title": "Carry typed terminal claims through SDK router transports",
+      "description": "Steps to reproduce:\n1. \n\nExpected: \nActual: \n\nReal Claude and Codex ACP smokes now execute Claudia-owned tools across multiple provider turns, then both fail terminal success with: supported runtime claims require a trusted verification claim. The constrained SDK schemas currently return only content plus tool_calls, so the inference-only router has no typed channel for Claudia's final-claim/verification contract. Extend the provider-neutral router response and ACP finalization path so native SDK tools remain disabled while terminal claims can be validated against Claudia's Reality Ledger and VDD policy. Do not weaken or bypass the grounding gate.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-31T02:30:49.831047103Z",
+      "updated_at": "2026-08-31T02:30:49.831047103Z"
     },
     "479a8395-3a71-4e28-9236-06bfaceaa511": {
       "uuid": "479a8395-3a71-4e28-9236-06bfaceaa511",
@@ -51933,11 +51946,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2621,
       "timestamp": "2026-08-31T02:26:06.550404770Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2622,
+      "timestamp": "2026-08-31T02:30:49.831047103Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T02:26:06.550404770Z",
+    "timestamp": "2026-08-31T02:30:49.831047103Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2621
+    "agent_seq": 2622
   }
 }
