@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1238,
+  "next_display_id": 1239,
   "next_comment_id": 2038,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -733,6 +733,7 @@
     "a1cc8c0f-36e6-4f91-ac2a-38169882a70f": 713,
     "a1d2a228-d7bc-4d6e-9dbe-275ab38d9950": 356,
     "a21f15f3-4dec-4d38-bba1-791f66314200": 663,
+    "a2e6bbbb-5373-415b-9412-fd65db24f7d6": 1238,
     "a2f32f84-b156-4cef-86c3-0547eec38dc7": 596,
     "a33e5f49-469e-47ad-905f-61190446695c": 927,
     "a345486b-df41-4801-9f2a-7f6dc1ca041f": 1142,
@@ -25527,6 +25528,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABARHZfAqDkClItlCwyyxLIYTABTY9wl3IsItz8ftuWnaFDfsgGWmKhSviuWQSh6hfe4zbyFi+1ul5BJBk3obW1Dw=="
         }
       }
+    },
+    "a2e6bbbb-5373-415b-9412-fd65db24f7d6": {
+      "uuid": "a2e6bbbb-5373-415b-9412-fd65db24f7d6",
+      "display_id": 1238,
+      "title": "Restore Claude Agent SDK OAuth refresh for headless ACP",
+      "description": "Steps to reproduce:\n1. \n\nExpected: \nActual: \n\nA real pinned acpx 0.13.2 automation smoke now passes the global --dangerously-skip-permissions flag, ACP handshake, session creation, coding-mode negotiation, and standard content-block prompt decoding, then the configured Claude Agent SDK provider fails before any model output with: OAuth session expired and could not be refreshed. Diagnose and repair the supported existing-login refresh path without bypassing ACP, changing provider transport, or exposing credentials; prove it with a real file-writing smoke.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-31T02:13:09.833070001Z",
+      "updated_at": "2026-08-31T02:13:09.833070001Z"
     },
     "a2f32f84-b156-4cef-86c3-0547eec38dc7": {
       "uuid": "a2f32f84-b156-4cef-86c3-0547eec38dc7",
@@ -51710,11 +51723,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2598,
       "timestamp": "2026-08-31T02:11:40.131329412Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2599,
+      "timestamp": "2026-08-31T02:13:09.833070001Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T02:11:40.131329412Z",
+    "timestamp": "2026-08-31T02:13:09.833070001Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2598
+    "agent_seq": 2599
   }
 }
