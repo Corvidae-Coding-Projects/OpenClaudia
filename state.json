@@ -17644,11 +17644,12 @@
       "uuid": "6e583b73-88b7-419c-8e3c-13dbf5cdd811",
       "display_id": 1237,
       "title": "Accept standard ACP content-block prompts",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T02:02:03.591805308Z",
-      "updated_at": "2026-08-31T02:14:38.324710670Z",
+      "updated_at": "2026-08-31T02:14:42.889809432Z",
+      "closed_at": "2026-08-31T02:14:42.889802707Z",
       "labels": [
         "remediation"
       ],
@@ -51790,11 +51791,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2607,
       "timestamp": "2026-08-31T02:14:38.324710670Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2608,
+      "timestamp": "2026-08-31T02:14:42.889809432Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T02:14:38.324710670Z",
+    "timestamp": "2026-08-31T02:14:42.889809432Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2607
+    "agent_seq": 2608
   }
 }
