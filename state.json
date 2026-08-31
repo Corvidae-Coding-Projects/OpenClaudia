@@ -29799,12 +29799,13 @@
       "display_id": 1243,
       "title": "Refresh bundled retrieval evidence after harness source changes",
       "description": "Steps to reproduce:\n1. \n\nExpected: \nActual: \n\nSteps to reproduce: run cargo test --locked --all-targets --all-features -- --test-threads=1 at PR head 1a8bea1e3. Expected: the bundled retrieval-evidence evaluation matches the final repository source and all tests pass. Actual: memory::retrieval_evidence::tests::bundled_corpora_prove_every_selected_ablation_step fails with DigestMismatch for src/main.rs after earlier harness changes updated that source without refreshing the bound evidence artifact. Regenerate only the repository-owned evidence through its canonical workflow, review the changed corpus skeptically, and prove the exact failed test plus the full relevant gate.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T03:25:54.636080079Z",
-      "updated_at": "2026-08-31T03:42:48.225916238Z",
+      "updated_at": "2026-08-31T03:42:52.611045262Z",
+      "closed_at": "2026-08-31T03:42:52.611043230Z",
       "labels": [
         "bug",
         "ci"
@@ -52359,11 +52360,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2669,
       "timestamp": "2026-08-31T03:42:48.225916238Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2670,
+      "timestamp": "2026-08-31T03:42:52.611045262Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T03:42:48.225916238Z",
+    "timestamp": "2026-08-31T03:42:52.611045262Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2669
+    "agent_seq": 2670
   }
 }
