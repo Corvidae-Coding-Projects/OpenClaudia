@@ -1,6 +1,6 @@
 {
   "next_display_id": 1247,
-  "next_comment_id": 2074,
+  "next_comment_id": 2075,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -16031,12 +16031,23 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T02:53:45.500553927Z",
-      "updated_at": "2026-08-31T02:54:00.105506163Z",
+      "updated_at": "2026-08-31T05:28:39.083993842Z",
       "labels": [
         "architecture",
         "bug",
         "vdd"
-      ]
+      ],
+      "comments": {
+        "303ebeb8-75e0-48eb-85d8-df39a8434a3a": {
+          "display_id": 2074,
+          "author": "6Vw9",
+          "content": "HarnessBench multi-round evidence: the same ACP session completed round 1, resumed round 2 in coding mode, executed tool_search, then ACP returned -32603 . The second required workspace mutation was never made and the unchanged oracle scored 0.25. This provides an external reproduction of terminal-promotion authority being split from the canonical ACP/VDD path; do not weaken the gate.",
+          "created_at": "2026-08-31T05:28:39.079714320Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAaQdcIPuxpkHXTraYUjftXFVPgYHgWitLjMZIahLtWzZIvqSMwrFKOeBXrqqOVtVjGrfpfxEJfgwG19CFY2r4DQ=="
+        }
+      }
     },
     "62403f03-075f-434e-ab12-46788de19975": {
       "uuid": "62403f03-075f-434e-ab12-46788de19975",
@@ -52766,11 +52777,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2708,
       "timestamp": "2026-08-31T05:28:34.274698812Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2709,
+      "timestamp": "2026-08-31T05:28:39.083993842Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T05:28:34.274698812Z",
+    "timestamp": "2026-08-31T05:28:39.083993842Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2708
+    "agent_seq": 2709
   }
 }
