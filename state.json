@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1246,
+  "next_display_id": 1247,
   "next_comment_id": 2074,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -339,6 +339,7 @@
     "4bcd67fd-31b8-4458-a7ba-bda6f686db6b": 321,
     "4c2fb6eb-bcf8-4e95-86a2-ca2d058026fd": 745,
     "4c3507fc-59cb-47f9-bfc5-6c0c410e5720": 481,
+    "4cdf46f5-2396-4f7a-acff-845e8de6a2c4": 1246,
     "4cf0cc49-df34-44e1-bb89-e7661802ea85": 239,
     "4d9cdc7a-0a00-4231-bfd4-bd372fecc427": 825,
     "4daca27e-b7c9-4006-bdc9-1d6da2bd142e": 436,
@@ -12631,6 +12632,18 @@
         "qa-seam-tools",
         "refactor"
       ]
+    },
+    "4cdf46f5-2396-4f7a-acff-845e8de6a2c4": {
+      "uuid": "4cdf46f5-2396-4f7a-acff-845e8de6a2c4",
+      "display_id": 1246,
+      "title": "Bound deferred-tool schema and context amplification across provider turns",
+      "description": "Steps to reproduce:\n1. \n\nExpected: \nActual: \n\nSteps to reproduce:\n1. Run a normal coding task that discovers several deferred tools and makes repeated provider turns.\n2. Observe the full active schema/context payload being resent and growing until a later call exceeds the run token budget.\n\nExpected: tool discovery, active schemas, history, and Reality evidence remain semantically complete but are deduplicated/compacted so ordinary multi-tool work stays within a predictable bounded context envelope.\nActual: one observed image/tool task consumed 769,133 input tokens and requested another 265,894, exhausting the 1,000,000-token run budget before producing its files.\n\nFix general context construction and schema lifecycle; do not raise budgets, remove grounding, hide tool results, or add benchmark-specific behavior.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-31T05:28:15.197695677Z",
+      "updated_at": "2026-08-31T05:28:15.197695677Z"
     },
     "4cf0cc49-df34-44e1-bb89-e7661802ea85": {
       "uuid": "4cf0cc49-df34-44e1-bb89-e7661802ea85",
@@ -52722,11 +52735,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2703,
       "timestamp": "2026-08-31T05:28:09.672669771Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2704,
+      "timestamp": "2026-08-31T05:28:15.197695677Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T05:28:09.672669771Z",
+    "timestamp": "2026-08-31T05:28:15.197695677Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2703
+    "agent_seq": 2704
   }
 }
