@@ -4566,6 +4566,17 @@ impl AcpServer {
                         &self.model,
                         crate::config::RunAfter::EveryTurn,
                     ) {
+                        if let Err(error) = record_acp_quality_gate_observations(
+                            &run,
+                            oc_session_id,
+                            report.results(),
+                        ) {
+                            tracing::warn!(
+                                session_id = oc_session_id,
+                                %error,
+                                "failed to record ACP quality-gate observations"
+                            );
+                        }
                         if report.prevents_progress() {
                             let detail = report.reason().map_or_else(
                                 || {
@@ -5592,6 +5603,23 @@ fn record_acp_tool_result_observation(
             "failed to append ACP tool result observation to reality ledger"
         );
     }
+}
+
+fn record_acp_quality_gate_observations(
+    run: &crate::tools::ToolRunContext,
+    session_id: &str,
+    gates: &[crate::guardrails::QualityCheckResult],
+) -> Result<(), String> {
+    if gates.is_empty() {
+        return Ok(());
+    }
+    let mut ledger = crate::ledger::RealityLedger::open_project_session_for_run(run, session_id)
+        .map_err(|error| format!("opening Reality Ledger failed: {error}"))?;
+    for gate in gates {
+        crate::grounded_loop::append_quality_gate_observations(run, &mut ledger, gate)
+            .map_err(|error| format!("recording quality gate '{}' failed: {error}", gate.name()))?;
+    }
+    Ok(())
 }
 
 fn bounded_acp_tool_message(result: &ToolResult) -> Value {
@@ -7038,8 +7066,9 @@ mod search_security_tests {
 #[cfg(test)]
 mod acp_ledger_helper_tests {
     use super::{
-        acp_tool_call, record_acp_background_command_start, record_acp_tool_result_observation,
-        validate_and_render_acp_final_response, ACP_BACKGROUND_COMMAND_PENDING_STDERR,
+        acp_tool_call, record_acp_background_command_start, record_acp_quality_gate_observations,
+        record_acp_tool_result_observation, validate_and_render_acp_final_response,
+        ACP_BACKGROUND_COMMAND_PENDING_STDERR,
     };
 
     fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
@@ -7120,6 +7149,66 @@ mod acp_ledger_helper_tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn acp_quality_gate_observer_makes_trusted_receipt_available_to_next_turn() {
+        let session_id = "acp-quality-gate-ledger-test";
+        let root = tempfile::TempDir::new().expect("isolated ACP quality-gate workspace");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        let task = {
+            let mut ledger =
+                crate::ledger::RealityLedger::open_project_session_for_run(&run, session_id)
+                    .expect("initialize ACP session ledger before verifier snapshot");
+            ledger
+                .observe_user_task(&run, "create proof.txt", "test-model")
+                .expect("record ACP user task")
+        };
+        let config = crate::config::GuardrailsConfig {
+            quality_gates: Some(crate::config::QualityGatesConfig {
+                enabled: true,
+                checks: vec![crate::config::QualityCheck {
+                    name: "acp-check".to_string(),
+                    command: "sh -c 'exit 0'".to_string(),
+                    required: true,
+                }],
+                ..crate::config::QualityGatesConfig::default()
+            }),
+            ..crate::config::GuardrailsConfig::default()
+        };
+        crate::guardrails::configure(&run, &config).expect("configure ACP quality gate");
+        let gates = crate::guardrails::run_quality_gates(&run, "test-model");
+
+        record_acp_quality_gate_observations(&run, session_id, &gates)
+            .expect("record ACP quality gate");
+
+        let ledger = crate::ledger::RealityLedger::open_project_session_for_run(&run, session_id)
+            .expect("reopen session ledger");
+        let verification = ledger
+            .observations_chronological()
+            .into_iter()
+            .find(|observation| {
+                matches!(
+                    observation.kind,
+                    crate::ledger::ObservationKind::Verification { passed: true, .. }
+                )
+            })
+            .expect("trusted ACP verifier observation");
+        assert_eq!(
+            verification.provenance.trust,
+            crate::ledger::EvidenceTrust::TrustedVerifier
+        );
+        assert!(verification.provenance.is_bound_to(&run));
+        let verification_id = verification.id;
+        let packet = crate::grounded_loop::build_prompt_packet(
+            &ledger,
+            &run,
+            task,
+            crate::grounded_loop::DEFAULT_GROUNDING_INDEX_LIMIT,
+            Vec::new(),
+        )
+        .expect("build next ACP grounding packet");
+        assert!(packet.verifier_results.contains(&verification_id));
     }
 
     #[test]
