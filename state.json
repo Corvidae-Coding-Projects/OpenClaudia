@@ -1,6 +1,6 @@
 {
   "next_display_id": 1237,
-  "next_comment_id": 2028,
+  "next_comment_id": 2029,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -4252,10 +4252,21 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T01:49:44.011089921Z",
-      "updated_at": "2026-08-31T01:49:48.868127411Z",
+      "updated_at": "2026-08-31T01:51:18.285615277Z",
       "labels": [
         "remediation"
-      ]
+      ],
+      "comments": {
+        "dc1faaed-768e-41ca-ae41-2d2153f5e8af": {
+          "display_id": 2028,
+          "author": "6Vw9",
+          "content": "Reproduced: Rust 1.98 build rejects 'openclaudia --dangerously-skip-permissions acp' with an explicit root-flag error. Root cause is composition-root drift: main rejects the flag for every subcommand and cmd_acp has no launch-bypass input, although ACP already derives run-bound PermissionManager instances from effective config. Repair category: local correctness at the CLI/ACP composition root. Allow only ACP to inherit the flag, apply it to the in-memory effective config before server construction, preserve all mandatory host-safety/sandbox gates, and add CLI plus configuration-projection regressions.",
+          "created_at": "2026-08-31T01:51:18.281233557Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAzYiZ3F36+cBfelE77vhkMevBkYRoeOURNv6a6bw6y8fYW1K67vM4RenYaur1qGSIxIVXYWT5oBIX7UxFqu+rDg=="
+        }
+      }
     },
     "19ddbcb6-4e09-488a-8a45-bc58ccbd3130": {
       "uuid": "19ddbcb6-4e09-488a-8a45-bc58ccbd3130",
@@ -51484,11 +51495,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2575,
       "timestamp": "2026-08-31T01:49:54.658100242Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2576,
+      "timestamp": "2026-08-31T01:51:18.285615277Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T01:49:54.658100242Z",
+    "timestamp": "2026-08-31T01:51:18.285615277Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2575
+    "agent_seq": 2576
   }
 }
