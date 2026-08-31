@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1249,
+  "next_display_id": 1250,
   "next_comment_id": 2076,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -1002,6 +1002,7 @@
     "dc290472-e1a6-4cce-9516-5489a060af61": 439,
     "dc39e3ae-a8a0-40a8-8e3a-1b5d7bf88735": 688,
     "dc535fa3-fec8-4078-9450-0e0fa53ebe06": 456,
+    "dc6ad7f2-a83d-41da-bccd-e476ab1cced3": 1249,
     "dc735df1-4590-4257-b696-7c8cc289ae25": 947,
     "dceb59f3-8e7b-4da7-8165-24ca12280fec": 746,
     "dcfeb3e1-6d66-47ed-89d2-10f75228c280": 21,
@@ -33719,6 +33720,18 @@
         "refactor"
       ]
     },
+    "dc6ad7f2-a83d-41da-bccd-e476ab1cced3": {
+      "uuid": "dc6ad7f2-a83d-41da-bccd-e476ab1cced3",
+      "display_id": 1249,
+      "title": "Repair malformed account-router tool arguments with a bounded retry",
+      "description": "Steps to reproduce:\n1. \n\nExpected: \nActual: \n\nSteps to reproduce:\n1. Run an account-backed coding turn whose model emits a host tool call containing malformed JSON argument escaping.\n2. Observe the SDK adapter reject arguments_json and terminate the entire ACP prompt.\n\nExpected: the host preserves the invalid call as evidence, returns an explicit schema/parse correction to the same model, and allows at most one bounded repair attempt before failing with a typed error.\nActual: one malformed escape in bash arguments aborts the task before any requested workspace outputs are created.\n\nDo not execute partially parsed arguments, silently alter command semantics, add unbounded retries, or special-case benchmark inputs.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-31T05:56:33.158496893Z",
+      "updated_at": "2026-08-31T05:56:33.158496893Z"
+    },
     "dc735df1-4590-4257-b696-7c8cc289ae25": {
       "uuid": "dc735df1-4590-4257-b696-7c8cc289ae25",
       "display_id": 947,
@@ -52884,11 +52897,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2720,
       "timestamp": "2026-08-31T05:31:21.018187336Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2721,
+      "timestamp": "2026-08-31T05:56:33.158496893Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T05:31:21.018187336Z",
+    "timestamp": "2026-08-31T05:56:33.158496893Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2720
+    "agent_seq": 2721
   }
 }
