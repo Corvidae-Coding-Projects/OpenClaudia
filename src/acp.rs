@@ -209,6 +209,46 @@ fn validate_optional_bounded_string(
         .map_or(Ok(()), |value| validate_bounded_string(value, field, limit))
 }
 
+fn parse_acp_prompt_value(value: &Value) -> Result<String, String> {
+    match value {
+        Value::String(prompt) => {
+            if prompt.len() > MAX_ACP_PROMPT_BYTES {
+                return Err(format!(
+                    "prompt exceeds the {MAX_ACP_PROMPT_BYTES}-byte ACP limit"
+                ));
+            }
+            Ok(prompt.clone())
+        }
+        Value::Array(blocks) => {
+            let mut prompt = String::new();
+            for (index, block) in blocks.iter().enumerate() {
+                let block = block.as_object().ok_or_else(|| {
+                    format!("Invalid 'prompt[{index}]' content block: expected object")
+                })?;
+                let block_type = block.get("type").and_then(Value::as_str).ok_or_else(|| {
+                    format!("Invalid 'prompt[{index}].type' parameter: expected string")
+                })?;
+                if block_type != "text" {
+                    return Err(format!(
+                        "Unsupported 'prompt[{index}]' content block: only type 'text' is supported"
+                    ));
+                }
+                let text = block.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    format!("Invalid 'prompt[{index}].text' parameter: expected string")
+                })?;
+                if prompt.len().saturating_add(text.len()) > MAX_ACP_PROMPT_BYTES {
+                    return Err(format!(
+                        "prompt exceeds the {MAX_ACP_PROMPT_BYTES}-byte ACP limit"
+                    ));
+                }
+                prompt.push_str(text);
+            }
+            Ok(prompt)
+        }
+        _ => Err("Invalid 'prompt' parameter: expected string or content-block array".to_string()),
+    }
+}
+
 fn required_params_object(params: &Value) -> Result<&serde_json::Map<String, Value>, String> {
     params
         .as_object()
@@ -263,7 +303,7 @@ fn validate_json_rpc_method_schema(message: &JsonRpcMessage) -> Result<(), Strin
             let prompt = params
                 .get("prompt")
                 .ok_or_else(|| "Missing prompt".to_string())?;
-            validate_bounded_string(prompt, "prompt", MAX_ACP_PROMPT_BYTES)?;
+            let _ = parse_acp_prompt_value(prompt)?;
         }
         "session/cancel" => {
             let params = required_params_object(&message.params)?;
@@ -3375,13 +3415,10 @@ impl AcpServer {
         if session_id.is_empty() {
             return Err("sessionId must not be empty".to_string());
         }
-        let prompt = Self::required_string_param(params, "prompt", "Missing prompt")?;
-        if prompt.len() > MAX_ACP_PROMPT_BYTES {
-            return Err(format!(
-                "prompt exceeds the {MAX_ACP_PROMPT_BYTES}-byte ACP limit"
-            ));
-        }
-        Ok((session_id.to_string(), prompt.to_string()))
+        let prompt = params
+            .get("prompt")
+            .ok_or_else(|| "Missing prompt".to_string())?;
+        Ok((session_id.to_string(), parse_acp_prompt_value(prompt)?))
     }
 
     async fn prepare_prompt_run_context(
@@ -6445,6 +6482,17 @@ mod bounded_transport_tests {
     }
 
     #[test]
+    fn json_rpc_decode_accepts_standard_acp_text_prompt_blocks() {
+        let decoded = decode_json_rpc_frame(
+            br#"{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"s","prompt":[{"type":"text","text":"hello"}]}}"#,
+        )
+        .expect("standard ACP text content block");
+
+        assert_eq!(decoded.method, "session/prompt");
+        assert_eq!(decoded.params["prompt"][0]["text"], "hello");
+    }
+
+    #[test]
     fn active_json_rpc_request_ids_cannot_be_reused() {
         let mut registry = AcpCallRegistry::default();
         let id = json!("request-7");
@@ -7428,6 +7476,7 @@ mod session_mode_tests {
     use super::{
         build_acp_prompt_context, prepare_acp_session_storage, AcpActiveCallMarker, AcpServer,
         ACP_CONFIG_MODEL_ID, ACP_CONFIG_MODE_ID, INVALID_PARAMS, MAX_ACP_OUTPUT_QUEUE_FRAMES,
+        MAX_ACP_PROMPT_BYTES,
     };
     use crate::config::{AppConfig, Hook, HookEntry, HookPolicy, HooksConfig};
     use crate::hooks::HookEngine;
@@ -9830,7 +9879,7 @@ blast_radius:
     }
 
     #[tokio::test]
-    async fn session_prompt_rejects_invalid_string_fields_before_prompt_loop() {
+    async fn session_prompt_rejects_invalid_fields_before_prompt_loop() {
         for (id, params, expected) in [
             (
                 json!(1),
@@ -9845,7 +9894,17 @@ blast_radius:
             (
                 json!(3),
                 json!({"sessionId": "s", "prompt": ["hello"]}),
-                "Invalid 'prompt' parameter: expected string",
+                "Invalid 'prompt[0]' content block: expected object",
+            ),
+            (
+                json!(4),
+                json!({"sessionId": "s", "prompt": [{"type": "text", "text": 42}]}),
+                "Invalid 'prompt[0].text' parameter: expected string",
+            ),
+            (
+                json!(5),
+                json!({"sessionId": "s", "prompt": [{"type": "image", "data": "opaque"}]}),
+                "Unsupported 'prompt[0]' content block: only type 'text' is supported",
             ),
         ] {
             let (mut server, mut rx, _tmp) = test_server();
@@ -9867,6 +9926,44 @@ blast_radius:
             );
             assert_no_client_request(&mut rx, "invalid session/prompt params");
         }
+    }
+
+    #[test]
+    fn session_prompt_parser_accepts_standard_text_blocks_and_legacy_strings() {
+        let (_, standard) = AcpServer::parse_prompt_params(&json!({
+            "sessionId": "s",
+            "prompt": [
+                {"type": "text", "text": "hello "},
+                {"type": "text", "text": "world"}
+            ]
+        }))
+        .expect("standard ACP text blocks");
+        let (_, legacy) = AcpServer::parse_prompt_params(&json!({
+            "sessionId": "s",
+            "prompt": "hello world"
+        }))
+        .expect("legacy string prompt");
+
+        assert_eq!(standard, "hello world");
+        assert_eq!(legacy, standard);
+    }
+
+    #[test]
+    fn session_prompt_parser_bounds_aggregate_text_block_bytes() {
+        let first = "a".repeat(MAX_ACP_PROMPT_BYTES);
+        let error = AcpServer::parse_prompt_params(&json!({
+            "sessionId": "s",
+            "prompt": [
+                {"type": "text", "text": first},
+                {"type": "text", "text": "b"}
+            ]
+        }))
+        .expect_err("aggregate content-block prompt must remain bounded");
+
+        assert_eq!(
+            error,
+            format!("prompt exceeds the {MAX_ACP_PROMPT_BYTES}-byte ACP limit")
+        );
     }
 
     #[tokio::test]
