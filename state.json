@@ -29739,8 +29739,9 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T03:46:07.718243225Z",
-      "updated_at": "2026-08-31T03:46:12.212563765Z",
+      "updated_at": "2026-08-31T03:46:17.260978223Z",
       "labels": [
+        "architecture",
         "bug"
       ]
     },
@@ -52426,11 +52427,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2678,
       "timestamp": "2026-08-31T03:46:12.212563765Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2679,
+      "timestamp": "2026-08-31T03:46:17.260978223Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T03:46:12.212563765Z",
+    "timestamp": "2026-08-31T03:46:17.260978223Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2678
+    "agent_seq": 2679
   }
 }
