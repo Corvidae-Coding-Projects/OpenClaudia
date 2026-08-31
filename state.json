@@ -31353,13 +31353,12 @@
       "display_id": 1241,
       "title": "Emit ACP session updates in the standard envelope",
       "description": "Steps to reproduce:\n1. \n\nExpected: \nActual: \n\nSteps to reproduce:\\n1. Run a real coding turn through pinned acpx@0.13.2 with --format json.\\n2. Observe each OpenClaudia session/update notification.\\n\\nExpected: acpx accepts call_started, agent_message_chunk, tool_call, and terminal updates.\\nActual: acpx reports JSON-RPC -32602 Invalid params because OpenClaudia emits sessionUpdate and content directly under params instead of the standard update envelope.\\n\\nPreserve bounded typed tool payloads and compatibility. No tool or final text may be published before host validation.",
-      "status": "closed",
+      "status": "open",
       "priority": "high",
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T02:51:20.188391308Z",
-      "updated_at": "2026-08-31T03:26:14.435595129Z",
-      "closed_at": "2026-08-31T03:26:14.435592231Z",
+      "updated_at": "2026-08-31T03:26:29.107391995Z",
       "labels": [
         "bug",
         "interoperability"
@@ -52272,11 +52271,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2660,
       "timestamp": "2026-08-31T03:26:18.877593659Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2661,
+      "timestamp": "2026-08-31T03:26:29.107391995Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T03:26:18.877593659Z",
+    "timestamp": "2026-08-31T03:26:29.107391995Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2660
+    "agent_seq": 2661
   }
 }
