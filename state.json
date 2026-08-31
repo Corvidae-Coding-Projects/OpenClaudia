@@ -1,6 +1,6 @@
 {
   "next_display_id": 1252,
-  "next_comment_id": 2085,
+  "next_comment_id": 2086,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -34261,7 +34261,7 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T01:41:13.039848926Z",
-      "updated_at": "2026-08-31T07:10:16.672148907Z",
+      "updated_at": "2026-08-31T07:10:21.651757960Z",
       "labels": [
         "benchmark",
         "feature"
@@ -34392,6 +34392,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABACta0HNs5D3Vy8eoWKzMbGcGNA5KKwwE5HA8yFwDRlc5/+XHqQOONu51fNs6FYBHf1wqqFDTsAYcrC/CBLob0BQ=="
+        },
+        "e5823bda-e618-45f9-ad6f-cec3c78bbec3": {
+          "display_id": 2085,
+          "author": "6Vw9",
+          "content": "Paused at user request for provider availability incident. HarnessBench completed through task 060 and stopped before 061. Environmental-invalid rerun set: 034, 039, 048, 049, 058, 059, 060. Frozen exact baseline binary: /home/doll/OpenClaudia-benchmarks/state/binaries/openclaudia-98dc4327, SHA-256 48b4392015969100b3922f55168f6c2cfc78818b9144f2840034d5a96c28e1f1. Rubric bridge and tail monitor stopped. Repository code was not changed during pause handling; only pre-existing untracked benchmarks/ integration remains. Resume #1234 with the frozen binary and same model/config after service recovery, then rerun capacity-invalid cases unchanged.",
+          "created_at": "2026-08-31T07:10:21.649312139Z",
+          "kind": "handoff",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAafWhKRjQS9byyQkQxWxfsHYY1mnQL4DKHFhj/KSDNeI9Io+2cBaK7250Par1KWgygKP5rh2TurvF51I8Ql5tAw=="
         },
         "e61c5b5b-3013-4e26-b68b-aa09c07863ed": {
           "display_id": 2079,
@@ -53151,11 +53160,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2746,
       "timestamp": "2026-08-31T07:10:16.672148907Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2747,
+      "timestamp": "2026-08-31T07:10:21.651757960Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T07:10:16.672148907Z",
+    "timestamp": "2026-08-31T07:10:21.651757960Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2746
+    "agent_seq": 2747
   }
 }
