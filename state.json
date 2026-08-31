@@ -26278,8 +26278,9 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T05:27:50.199296504Z",
-      "updated_at": "2026-08-31T05:27:55.146698279Z",
+      "updated_at": "2026-08-31T05:27:59.972557934Z",
       "labels": [
+        "browser",
         "bug"
       ]
     },
@@ -52704,11 +52705,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2700,
       "timestamp": "2026-08-31T05:27:55.146698279Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2701,
+      "timestamp": "2026-08-31T05:27:59.972557934Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T05:27:55.146698279Z",
+    "timestamp": "2026-08-31T05:27:59.972557934Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2700
+    "agent_seq": 2701
   }
 }
