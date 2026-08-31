@@ -6,11 +6,24 @@ fn anthropic_auth_unavailable_message(error: impl std::fmt::Display) -> String {
     )
 }
 
+const fn apply_permission_bypass(
+    permissions: &mut config::PermissionsConfig,
+    dangerously_skip_permissions: bool,
+) {
+    if dangerously_skip_permissions {
+        // This is a launch-scoped prompt bypass from the trusted command line.
+        // PermissionManager still applies effect classification, host safety,
+        // capability confinement, and dispatch authorization when disabled.
+        permissions.enabled = false;
+    }
+}
+
 /// ACP server mode -- stdin/stdout JSON-RPC for acpx interoperability
 #[allow(clippy::too_many_lines)] // Startup keeps provider selection and its one auth carrier together.
 pub async fn cmd_acp(
     target_override: Option<String>,
     model_override: Option<String>,
+    dangerously_skip_permissions: bool,
 ) -> anyhow::Result<()> {
     if !config::config_file_exists() {
         eprintln!("No configuration found. Run 'openclaudia init' first.");
@@ -19,6 +32,7 @@ pub async fn cmd_acp(
 
     let config = match config::load_config() {
         Ok(mut c) => {
+            apply_permission_bypass(&mut c.permissions, dangerously_skip_permissions);
             if let Some(ref target) = target_override {
                 c.proxy.target.clone_from(target);
             } else if let Some(ref model) = model_override {
@@ -105,4 +119,28 @@ pub async fn cmd_acp(
         codex_agent_sdk,
     ))
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_permission_bypass;
+
+    #[test]
+    fn explicit_permission_bypass_disables_prompts_for_the_effective_launch_config() {
+        let mut permissions = openclaudia::config::PermissionsConfig::default();
+        assert!(permissions.enabled);
+
+        apply_permission_bypass(&mut permissions, true);
+
+        assert!(!permissions.enabled);
+    }
+
+    #[test]
+    fn absent_permission_bypass_preserves_the_configured_posture() {
+        let mut permissions = openclaudia::config::PermissionsConfig::default();
+
+        apply_permission_bypass(&mut permissions, false);
+
+        assert!(permissions.enabled);
+    }
 }
