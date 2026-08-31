@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1235,
+  "next_display_id": 1236,
   "next_comment_id": 2026,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -152,6 +152,7 @@
     "23236431-8d2f-42b0-b8ff-64c86a2b1619": 965,
     "23299649-8a87-4b89-86b4-1bf7e9f4bb42": 752,
     "2342dd72-0232-4da0-814f-3f4fb8c002bc": 59,
+    "237f54af-e1db-4774-8e6d-d27d39fb3dd2": 1235,
     "2393b05d-3938-418d-aaee-e70475fd2880": 104,
     "24115a93-7e63-4811-a326-7a2cab8c7271": 1013,
     "24c0bc1c-c63f-48c6-ac5f-ccaac2d81cd3": 629,
@@ -5357,6 +5358,17 @@
       "labels": [
         "feature"
       ]
+    },
+    "237f54af-e1db-4774-8e6d-d27d39fb3dd2": {
+      "uuid": "237f54af-e1db-4774-8e6d-d27d39fb3dd2",
+      "display_id": 1235,
+      "title": "Establish honest Terminal-Bench Harbor integration and baseline",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-31T01:41:27.171133224Z",
+      "updated_at": "2026-08-31T01:41:27.171133224Z"
     },
     "2393b05d-3938-418d-aaee-e70475fd2880": {
       "uuid": "2393b05d-3938-418d-aaee-e70475fd2880",
@@ -51381,11 +51393,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2566,
       "timestamp": "2026-08-31T01:41:22.503646654Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2567,
+      "timestamp": "2026-08-31T01:41:27.171133224Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T01:41:22.503646654Z",
+    "timestamp": "2026-08-31T01:41:27.171133224Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2566
+    "agent_seq": 2567
   }
 }
