@@ -1,6 +1,6 @@
 {
   "next_display_id": 1244,
-  "next_comment_id": 2056,
+  "next_comment_id": 2057,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -29804,7 +29804,7 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T03:25:54.636080079Z",
-      "updated_at": "2026-08-31T03:27:31.863163887Z",
+      "updated_at": "2026-08-31T03:42:48.225916238Z",
       "labels": [
         "bug",
         "ci"
@@ -29818,6 +29818,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAf9PuMq/8P2TEixeT3DgYAcy6iDBh3adQACVjYRmoMzHx6eEbBJ92AgNXBe/YOSbW+vHZiRGTVzlgbFfhCYZZBQ=="
+        },
+        "b7c0a420-debd-4ae1-b633-8fdee9f1cde6": {
+          "display_id": 2056,
+          "author": "6Vw9",
+          "content": "Rebound both retrieval corpora to repository revision 01116f1ce8d81ad3a839b8b3a830516ca9d50a57, updated the changed src/main.rs citation to its exact current SHA-256/byte length, regenerated the evaluation only through examples/generate_technical_memory_retrieval_evaluation.rs, and rebound the fail-closed independent-review placeholder to the exact new artifacts. Skeptical diff review found only provenance/receipt changes, citation-dependent output metrics, and the generator's existing elapsed_micros telemetry. Verification on Rust 1.98 with CARGO_BUILD_JOBS=2: cargo fmt --all -- --check; git diff --check; exact formerly failing bundled_corpora test (1/1); technical_memory_retrieval_evidence_e2e (9/9); full cargo test --locked --all-targets --all-features -- --test-threads=1 (exit 0; 3142 library tests passed, every integration/example target passed).",
+          "created_at": "2026-08-31T03:42:48.222332643Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAjx18BLtXzd4Krq51slZa+tirXr2tad/pcSjSSPgzyMK9ROjQzBJnyZGObvFu3WRntVlQIpq8bJqSiLDuXEFkBA=="
         }
       }
     },
@@ -52345,11 +52354,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2668,
       "timestamp": "2026-08-31T03:27:31.863163887Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2669,
+      "timestamp": "2026-08-31T03:42:48.225916238Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T03:27:31.863163887Z",
+    "timestamp": "2026-08-31T03:42:48.225916238Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2668
+    "agent_seq": 2669
   }
 }
