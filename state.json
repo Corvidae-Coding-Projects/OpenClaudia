@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1241,
+  "next_display_id": 1242,
   "next_comment_id": 2049,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -919,6 +919,7 @@
     "c70cf40c-9d62-41f5-84bc-c61359ba187d": 529,
     "c754298b-fc5a-471b-a051-82b23fcb6f15": 93,
     "c898920b-0eda-48c5-a0e9-b5882655cbf3": 885,
+    "c8e04915-d2ee-448c-8f58-6ce92e769deb": 1241,
     "c8f1326c-6a66-42be-81fc-888614f4ef84": 951,
     "c940b382-2640-4369-a01a-5ce41ef42c37": 728,
     "c95948bb-711e-46e1-b757-cd7dba65d754": 1065,
@@ -31297,6 +31298,18 @@
         }
       }
     },
+    "c8e04915-d2ee-448c-8f58-6ce92e769deb": {
+      "uuid": "c8e04915-d2ee-448c-8f58-6ce92e769deb",
+      "display_id": 1241,
+      "title": "Emit ACP session updates in the standard envelope",
+      "description": "Steps to reproduce:\n1. \n\nExpected: \nActual: \n\nSteps to reproduce:\\n1. Run a real coding turn through pinned acpx@0.13.2 with --format json.\\n2. Observe each OpenClaudia session/update notification.\\n\\nExpected: acpx accepts call_started, agent_message_chunk, tool_call, and terminal updates.\\nActual: acpx reports JSON-RPC -32602 Invalid params because OpenClaudia emits sessionUpdate and content directly under params instead of the standard update envelope.\\n\\nPreserve bounded typed tool payloads and compatibility. No tool or final text may be published before host validation.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-31T02:51:20.188391308Z",
+      "updated_at": "2026-08-31T02:51:20.188391308Z"
+    },
     "c8f1326c-6a66-42be-81fc-888614f4ef84": {
       "uuid": "c8f1326c-6a66-42be-81fc-888614f4ef84",
       "display_id": 951,
@@ -52064,11 +52077,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2636,
       "timestamp": "2026-08-31T02:40:49.198634174Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2637,
+      "timestamp": "2026-08-31T02:51:20.188391308Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T02:40:49.198634174Z",
+    "timestamp": "2026-08-31T02:51:20.188391308Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2636
+    "agent_seq": 2637
   }
 }
