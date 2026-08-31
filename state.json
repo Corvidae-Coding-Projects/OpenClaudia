@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1239,
+  "next_display_id": 1240,
   "next_comment_id": 2042,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -936,6 +936,7 @@
     "cc6a32ff-b404-4717-9226-d3e344302198": 94,
     "cca24a63-a7e7-42af-a856-f1c9305cf368": 323,
     "cd07353b-731c-49a5-aff7-38701dec65e8": 20,
+    "cd25e537-3d2a-4488-9971-8bcdc086cec1": 1239,
     "cd49b48a-bf26-4021-8747-0cf2ad5700ce": 310,
     "cd6d027d-2964-4944-9e35-d0074e6045a6": 908,
     "cd9fa7fd-628f-476b-9b2d-dbafabf16cf7": 312,
@@ -31761,6 +31762,18 @@
         "bug"
       ]
     },
+    "cd25e537-3d2a-4488-9971-8bcdc086cec1": {
+      "uuid": "cd25e537-3d2a-4488-9971-8bcdc086cec1",
+      "display_id": 1239,
+      "title": "Round-trip ACP tool-result history through provider turns",
+      "description": "Steps to reproduce:\n1. \n\nExpected: \nActual: \n\nA real pinned acpx 0.13.2 ACP coding smoke using the documented global permission bypass and supported Codex login successfully executed list_files, then the next provider iteration failed before inference: Invalid ACP message history: message at index 2 is invalid: data did not match any variant of untagged enum MessageContent. Repair the canonical ACP history projection so OpenClaudia-generated tool-result messages decode on the next turn without weakening bounds, identity, or failure semantics; prove with a multi-turn tool smoke.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-31T02:23:19.612408959Z",
+      "updated_at": "2026-08-31T02:23:19.612408959Z"
+    },
     "cd49b48a-bf26-4021-8747-0cf2ad5700ce": {
       "uuid": "cd49b48a-bf26-4021-8747-0cf2ad5700ce",
       "display_id": 310,
@@ -51836,11 +51849,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2612,
       "timestamp": "2026-08-31T02:23:14.423951736Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2613,
+      "timestamp": "2026-08-31T02:23:19.612408959Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T02:23:14.423951736Z",
+    "timestamp": "2026-08-31T02:23:19.612408959Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2612
+    "agent_seq": 2613
   }
 }
