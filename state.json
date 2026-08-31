@@ -31794,12 +31794,13 @@
       "display_id": 1239,
       "title": "Round-trip ACP tool-result history through provider turns",
       "description": "Steps to reproduce:\n1. \n\nExpected: \nActual: \n\nA real pinned acpx 0.13.2 ACP coding smoke using the documented global permission bypass and supported Codex login successfully executed list_files, then the next provider iteration failed before inference: Invalid ACP message history: message at index 2 is invalid: data did not match any variant of untagged enum MessageContent. Repair the canonical ACP history projection so OpenClaudia-generated tool-result messages decode on the next turn without weakening bounds, identity, or failure semantics; prove with a multi-turn tool smoke.",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T02:23:19.612408959Z",
-      "updated_at": "2026-08-31T02:32:05.019195481Z",
+      "updated_at": "2026-08-31T02:32:09.730374833Z",
+      "closed_at": "2026-08-31T02:32:09.730359915Z",
       "labels": [
         "bug",
         "remediation"
@@ -52013,11 +52014,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2630,
       "timestamp": "2026-08-31T02:32:05.019195481Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2631,
+      "timestamp": "2026-08-31T02:32:09.730374833Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T02:32:05.019195481Z",
+    "timestamp": "2026-08-31T02:32:09.730374833Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2630
+    "agent_seq": 2631
   }
 }
