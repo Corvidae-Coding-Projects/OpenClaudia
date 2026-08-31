@@ -1,6 +1,6 @@
 {
   "next_display_id": 1239,
-  "next_comment_id": 2038,
+  "next_comment_id": 2039,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -17648,11 +17648,20 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T02:02:03.591805308Z",
-      "updated_at": "2026-08-31T02:10:44.637909722Z",
+      "updated_at": "2026-08-31T02:13:35.783211754Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "02380714-53c4-4cbf-ba87-e0832adc90a1": {
+          "display_id": 2038,
+          "author": "6Vw9",
+          "content": "Implemented one bounded ACP prompt parser shared by wire-schema validation and execution. It accepts official ordered text content blocks plus legacy strings, rejects malformed/unsupported blocks before session mutation, and enforces the existing aggregate 256 KiB bound. Evidence: exact decoder regression; parser compatibility/boundary tests; 116 ACP tests pass serialized; 15 ACP config and 16 ACP IDE tests pass; Rust 1.98 strict all-target/all-feature Clippy clean; pinned acpx 0.13.2 real smoke passed this boundary and reached the downstream provider. Separate OAuth refresh failure tracked as #1238.",
+          "created_at": "2026-08-31T02:13:35.780729857Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAxB2FE5IkdnE5Eu55T8Icuy5lC9b9ksyCdSAQJK9i2JvJWz1HbY7HXxaEqV0MO09WkRhyKdlvCxVH7yCVvs98BA=="
+        },
         "2bcfc9b9-7e2e-440a-b61d-1f64c03db678": {
           "display_id": 2036,
           "author": "6Vw9",
@@ -51742,11 +51751,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2601,
       "timestamp": "2026-08-31T02:13:18.893707647Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2602,
+      "timestamp": "2026-08-31T02:13:35.783211754Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T02:13:18.893707647Z",
+    "timestamp": "2026-08-31T02:13:35.783211754Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2601
+    "agent_seq": 2602
   }
 }
