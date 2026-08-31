@@ -7,6 +7,7 @@ pub fn get_available_models(provider: &str) -> Vec<&'static str> {
 
 /// Fetch models dynamically from provider API (for OpenAI-compatible providers like LM Studio)
 pub async fn fetch_dynamic_models(
+    provider: &str,
     provider_config: &config::ProviderConfig,
     adapter: &dyn providers::ProviderAdapter,
 ) -> Option<Vec<String>> {
@@ -14,13 +15,10 @@ pub async fn fetch_dynamic_models(
         return None;
     }
 
-    let extra_headers: Vec<(String, String)> = provider_config
-        .headers
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
+    let extra_headers = provider_config.headers.clone();
 
-    match providers::fetch_models_with_headers(
+    match providers::fetch_models_for_provider_with_headers(
+        provider,
         &provider_config.base_url,
         provider_config.api_key.as_ref(),
         &extra_headers,

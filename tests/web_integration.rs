@@ -21,15 +21,17 @@
 //!
 //! Gated behind `#[ignore]`. Opt in at runtime with:
 //! ```text
-//! cargo test -p openclaudia --test web_integration -- --ignored
+//! cargo test -p openclaudia --features browser --test web_integration -- --ignored
 //! ```
 //! Set `OPENCLAUDIA_TEST_BROWSER=1` to confirm opt-in intent (tests log a warning if absent).
 
 use openclaudia::permissions::{CheckResult, PermissionManager};
 #[cfg(feature = "browser")]
 use openclaudia::web::parse_duckduckgo_results_from_html;
-use openclaudia::web::{fetch_url, fetch_with_browser, format_search_results, SearchResult};
-use serde_json::{json, Value};
+use openclaudia::web::{format_search_results, FetchResult, SearchResult};
+use serde_json::json;
+#[cfg(feature = "browser")]
+use serde_json::Value;
 use tempfile::TempDir;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -37,6 +39,15 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+async fn fetch_url(url: &str) -> Result<FetchResult, String> {
+    openclaudia::web::fetch_url(url, std::sync::Arc::clone(support::shared_run_context())).await
+}
+
+async fn fetch_with_browser(url: &str) -> Result<FetchResult, String> {
+    openclaudia::web::fetch_with_browser(url, std::sync::Arc::clone(support::shared_run_context()))
+        .await
+}
 
 /// Build a wiremock server that returns the given body and status for GET /*.
 async fn serve_body(status: u16, body: &str) -> MockServer {
@@ -232,13 +243,13 @@ fn fetch_output_format_contains_url_header() {
             arguments: r#"{"url": "not-a-url"}"#.to_string(),
         },
     };
-    let result = execute_tool(&call);
+    let result = execute_tool(support::shared_run_context(), &call);
     // Spec §1 error path: prefix check fails → error string, is_error = true.
-    assert!(result.is_error, "invalid URL must return is_error=true");
+    assert!(result.is_error(), "invalid URL must return is_error=true");
     assert!(
-        result.content.contains("Invalid URL") || result.content.contains("Missing"),
+        result.content().contains("Invalid URL") || result.content().contains("Missing"),
         "expected error message, got: {}",
-        result.content
+        result.content()
     );
 }
 
@@ -341,16 +352,17 @@ fn execute_web_fetch_prefix_check_catches_non_http() {
                 arguments: format!(r#"{{"url": "{bad_url}"}}"#),
             },
         };
-        let result = execute_tool(&call);
+        let result = execute_tool(support::shared_run_context(), &call);
         assert!(
-            result.is_error,
+            result.is_error(),
             "expected error for {bad_url}, got success: {}",
-            result.content
+            result.content()
         );
         assert!(
-            result.content.contains("Invalid URL") || result.content.contains("must start with"),
+            result.content().contains("Invalid URL")
+                || result.content().contains("must start with"),
             "wrong error message for {bad_url}: {}",
-            result.content
+            result.content()
         );
     }
 }
@@ -367,12 +379,12 @@ fn execute_web_fetch_missing_url_arg_returns_error() {
             arguments: r"{}".to_string(),
         },
     };
-    let result = execute_tool(&call);
-    assert!(result.is_error);
+    let result = execute_tool(support::shared_run_context(), &call);
+    assert!(result.is_error());
     assert!(
-        result.content.contains("Missing"),
+        result.content().contains("Missing"),
         "expected 'Missing url' error, got: {}",
-        result.content
+        result.content()
     );
 }
 
@@ -384,30 +396,59 @@ fn execute_web_fetch_missing_url_arg_returns_error() {
 // ===========================================================================
 
 #[cfg(feature = "browser")]
+fn assert_web_search_host_safety_denial(
+    result: &openclaudia::tools::ToolResult,
+    expected_reason: &str,
+) {
+    use openclaudia::tools::{ToolFailureCode, ToolOutcome, ToolRetryability};
+
+    assert!(result.is_error(), "web-search classification must deny");
+    assert!(matches!(
+        result.outcome(),
+        ToolOutcome::Error { failure }
+            if failure.code == ToolFailureCode::PermissionDenied
+                && failure.retryability == ToolRetryability::Never
+    ));
+    assert_eq!(
+        result.content(),
+        format!("Permission denied: Host safety: {expected_reason}")
+    );
+}
+
+#[cfg(feature = "browser")]
 #[test]
 fn execute_web_search_short_query_returns_error() {
     use openclaudia::tools::{execute_tool, FunctionCall, ToolCall};
 
-    for bad_query in &["", "x"] {
-        let call = ToolCall {
-            id: "shortq".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: "web_search".to_string(),
-                arguments: format!(r#"{{"query": "{bad_query}"}}"#),
-            },
-        };
-        let result = execute_tool(&call);
-        assert!(
-            result.is_error,
-            "expected error for short query {bad_query:?}"
-        );
-        assert!(
-            result.content.contains("at least 2 characters"),
-            "expected min-length message, got: {}",
-            result.content
-        );
-    }
+    let empty = ToolCall {
+        id: "empty-query".to_string(),
+        call_type: "function".to_string(),
+        function: FunctionCall {
+            name: "web_search".to_string(),
+            arguments: r#"{"query": ""}"#.to_string(),
+        },
+    };
+    let empty_result = execute_tool(support::shared_run_context(), &empty);
+    assert_web_search_host_safety_denial(
+        &empty_result,
+        "Denied: web_search tool call has malformed arguments (expected non-empty string 'query')",
+    );
+
+    let one_character = ToolCall {
+        id: "one-character-query".to_string(),
+        call_type: "function".to_string(),
+        function: FunctionCall {
+            name: "web_search".to_string(),
+            arguments: r#"{"query": "x"}"#.to_string(),
+        },
+    };
+    let short_result = execute_tool(support::shared_run_context(), &one_character);
+    assert!(short_result.is_error(), "one-character query must fail");
+    assert!(
+        short_result.content().contains("at least 2 characters"),
+        "expected min-length message, got: {}",
+        short_result.content()
+    );
 }
 
 #[cfg(feature = "browser")]
@@ -423,12 +464,12 @@ fn execute_web_search_missing_query_returns_error() {
             arguments: r"{}".to_string(),
         },
     };
-    let result = execute_tool(&call);
-    assert!(result.is_error);
+    let result = execute_tool(support::shared_run_context(), &call);
+    assert!(result.is_error());
     assert!(
-        result.content.contains("Missing"),
+        result.content().contains("Missing"),
         "expected 'Missing query' error, got: {}",
-        result.content
+        result.content()
     );
 }
 
@@ -437,11 +478,27 @@ fn execute_web_search_missing_query_returns_error() {
 fn execute_web_search_rejects_non_string_query_before_browser_launch() {
     use openclaudia::tools::{execute_tool, FunctionCall, ToolCall};
 
-    for (name, value) in [
-        ("number", json!(42)),
-        ("array", json!(["rust", "release"])),
-        ("object", json!({"q": "rust release"})),
-        ("null", Value::Null),
+    for (name, value, expected_reason) in [
+        (
+            "number",
+            json!(42),
+            "Denied: web_search tool call has malformed arguments (expected non-empty string 'query')",
+        ),
+        (
+            "array",
+            json!(["rust", "release"]),
+            "Denied: web_search tool call has malformed arguments (expected non-empty string 'query')",
+        ),
+        (
+            "object",
+            json!({"q": "rust release"}),
+            "Denied: web_search tool call has malformed arguments (expected non-empty string 'query')",
+        ),
+        (
+            "null",
+            Value::Null,
+            "Denied: Missing 'query' argument required for web_search tool call",
+        ),
     ] {
         let call = ToolCall {
             id: format!("badquery-{name}"),
@@ -454,9 +511,8 @@ fn execute_web_search_rejects_non_string_query_before_browser_launch() {
                 .to_string(),
             },
         };
-        let result = execute_tool(&call);
-        assert!(result.is_error, "query case {name} should fail");
-        assert_eq!(result.content, "Invalid 'query' argument: expected string");
+        let result = execute_tool(support::shared_run_context(), &call);
+        assert_web_search_host_safety_denial(&result, expected_reason);
     }
 }
 
@@ -483,14 +539,14 @@ fn execute_web_search_rejects_invalid_limit_before_browser_launch() {
                 .to_string(),
             },
         };
-        let result = execute_tool(&call);
-        assert!(result.is_error, "limit case {name} should fail");
+        let result = execute_tool(support::shared_run_context(), &call);
+        assert!(result.is_error(), "limit case {name} should fail");
         assert!(
             result
-                .content
+                .content()
                 .contains("web_search limit must be an integer between 1 and 10"),
             "invalid limit should fail before search backend launch; got: {}",
-            result.content
+            result.content()
         );
     }
 }
@@ -526,12 +582,12 @@ fn execute_web_search_rejects_invalid_domain_filters_before_browser_launch() {
                 .to_string(),
             },
         };
-        let result = execute_tool(&call);
-        assert!(result.is_error, "domain filter case {name} should fail");
+        let result = execute_tool(support::shared_run_context(), &call);
+        assert!(result.is_error(), "domain filter case {name} should fail");
         assert!(
-            result.content.contains(expected),
+            result.content().contains(expected),
             "invalid domain filter should fail before search backend launch; got: {}",
-            result.content
+            result.content()
         );
     }
 }
@@ -732,6 +788,173 @@ fn duckduckgo_parser_drops_ssrf_urls_before_formatting() {
 //   OPENCLAUDIA_TEST_BROWSER=1 cargo test -p openclaudia --test web_integration -- --ignored
 // ===========================================================================
 
+#[cfg(feature = "browser")]
+struct BrowserOriginFixture {
+    destination: std::net::TcpListener,
+    origin: String,
+    origin_port: u16,
+    server: std::thread::JoinHandle<Option<String>>,
+}
+
+#[cfg(feature = "browser")]
+fn spawn_browser_origin_fixture() -> BrowserOriginFixture {
+    use std::io::{Read as _, Write as _};
+
+    let destination =
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("destination bind");
+    let destination_port = destination
+        .local_addr()
+        .expect("destination address")
+        .port();
+    destination
+        .set_nonblocking(true)
+        .expect("nonblocking destination");
+    let origin_listener =
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("origin bind");
+    let origin_port = origin_listener.local_addr().expect("origin address").port();
+    origin_listener
+        .set_nonblocking(true)
+        .expect("nonblocking origin");
+    let page = format!(
+        r#"<!doctype html><title>Brokered browser</title><main>browser receipt</main>
+<script>
+fetch('http://127.0.0.1:{destination_port}/fetch');
+const xhr = new XMLHttpRequest(); xhr.open('GET', 'http://127.0.0.1:{destination_port}/xhr'); xhr.send();
+const frame = document.createElement('iframe'); frame.src = 'http://127.0.0.1:{destination_port}/frame'; document.body.appendChild(frame);
+const image = new Image(); image.src = 'http://127.0.0.1:{destination_port}/subresource';
+try {{ new WebSocket('ws://127.0.0.1:{destination_port}/socket'); }} catch (_) {{}}
+const workerSource = "fetch('http://127.0.0.1:{destination_port}/worker-fetch')";
+try {{ new Worker(URL.createObjectURL(new Blob([workerSource], {{type: 'text/javascript'}}))); }} catch (_) {{}}
+const download = document.createElement('a'); download.href = 'http://127.0.0.1:{destination_port}/download'; download.download = 'blocked'; download.target = '_blank'; download.rel = 'noopener'; document.body.appendChild(download); download.click();
+</script>"#
+    );
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            match origin_listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut request = [0_u8; 4096];
+                    let request_len = stream.read(&mut request).expect("origin request");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+                        page.len()
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .expect("origin response");
+                    return Some(String::from_utf8_lossy(&request[..request_len]).into_owned());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("origin accept: {error}"),
+            }
+        }
+    });
+    BrowserOriginFixture {
+        destination,
+        origin: format!("http://127.0.0.1:{origin_port}"),
+        origin_port,
+        server,
+    }
+}
+
+#[cfg(feature = "browser")]
+struct CookieOriginFixture {
+    origin: String,
+    server: std::thread::JoinHandle<Vec<bool>>,
+}
+
+#[cfg(feature = "browser")]
+fn spawn_cookie_origin_fixture() -> CookieOriginFixture {
+    use std::io::{Read as _, Write as _};
+
+    let listener =
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("origin bind");
+    listener.set_nonblocking(true).expect("nonblocking origin");
+    let port = listener.local_addr().expect("origin address").port();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut page_cookies = Vec::new();
+        while page_cookies.len() < 2 && std::time::Instant::now() < deadline {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("origin accept: {error}"),
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .expect("read timeout");
+            let mut request = [0_u8; 8192];
+            let request_len = stream.read(&mut request).unwrap_or(0);
+            let request = String::from_utf8_lossy(&request[..request_len]);
+            let is_page = request.starts_with("GET /page ");
+            let authenticated = request.lines().any(|line| {
+                line.to_ascii_lowercase().starts_with("cookie:") && line.contains("auth=1")
+            });
+            let (status, body, cookie) = if is_page {
+                page_cookies.push(authenticated);
+                if authenticated {
+                    ("200 OK", "authenticated", "")
+                } else {
+                    (
+                        "200 OK",
+                        "cookie-issued",
+                        "Set-Cookie: auth=1; Path=/; HttpOnly; SameSite=Lax\r\n",
+                    )
+                }
+            } else {
+                ("404 Not Found", "missing", "")
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/html\r\n{cookie}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("origin response");
+        }
+        page_cookies
+    });
+    CookieOriginFixture {
+        origin: format!("http://127.0.0.1:{port}"),
+        server,
+    }
+}
+
+#[cfg(feature = "browser")]
+struct EnvironmentRestore {
+    name: &'static str,
+    value: Option<std::ffi::OsString>,
+}
+
+#[cfg(feature = "browser")]
+impl EnvironmentRestore {
+    fn capture(name: &'static str) -> Self {
+        Self {
+            name,
+            value: std::env::var_os(name),
+        }
+    }
+}
+
+#[cfg(feature = "browser")]
+impl Drop for EnvironmentRestore {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            std::env::set_var(self.name, value);
+        } else {
+            std::env::remove_var(self.name);
+        }
+    }
+}
+
 /// Browser fetch test — requires headless Chrome.
 ///
 /// Verifies `fetch_with_browser` calls `validate_url` before launching Chrome,
@@ -745,43 +968,267 @@ async fn browser_fetch_blocks_ssrf_before_launch() {
     }
     // fetch_with_browser (src/web.rs:598) calls validate_url before Browser::new.
     // An SSRF URL must be rejected without launching Chrome.
-    let err = fetch_with_browser("http://169.254.169.254/latest/meta-data/").unwrap_err();
+    let err = fetch_with_browser("http://169.254.169.254/latest/meta-data/")
+        .await
+        .unwrap_err();
     assert!(
-        err.contains("reserved/internal") || err.contains("metadata endpoint"),
+        err.contains("private") || err.contains("metadata") || err.contains("reserved"),
         "SSRF URL not blocked before browser launch: {err}"
     );
 }
 
 /// Browser fetch test — requires headless Chrome on PATH.
+#[cfg(feature = "browser")]
 #[tokio::test]
 #[ignore = "requires headless Chrome — set OPENCLAUDIA_TEST_BROWSER=1 and run with --ignored"]
 async fn browser_fetch_success_contains_url_line() {
-    use openclaudia::tools::{execute_tool, FunctionCall, ToolCall};
+    use openclaudia::tools::{
+        execute_tool, FunctionCall, ToolCall, ToolOutcome, ToolRunContext, WorkspaceAccess,
+    };
     if std::env::var("OPENCLAUDIA_TEST_BROWSER").is_err() {
         eprintln!("OPENCLAUDIA_TEST_BROWSER not set — skipping browser fetch test");
         return;
     }
 
+    let fixture = spawn_browser_origin_fixture();
+    let origin = fixture.origin;
+    let origin_port = fixture.origin_port;
+    let grants = openclaudia::web_egress::WebEgressGrants::from_exact_web_origins([&origin])
+        .expect("exact browser origin");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let run = ToolRunContext::builder(openclaudia::state::SessionId::new(), root)
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(std::collections::HashMap::new())
+        .web_egress_grants(grants)
+        .workspace_access(WorkspaceAccess::ReadOnly)
+        .process(true)
+        .network(true)
+        .secrets(false)
+        .provider("browser-egress-test")
+        .ephemeral_background_jobs()
+        .build()
+        .expect("browser run");
+    let url = format!("{origin}/page?not-in-receipt=secret");
     let call = ToolCall {
-        id: "bfetch".to_string(),
+        id: "brokered-browser".to_string(),
         call_type: "function".to_string(),
         function: FunctionCall {
             name: "web_browser".to_string(),
-            arguments: r#"{"url": "https://example.com/"}"#.to_string(),
+            arguments: serde_json::json!({"url": url}).to_string(),
         },
     };
-    let result = execute_tool(&call);
-    if result.is_error {
-        eprintln!(
-            "Browser fetch failed (Chrome may not be installed): {}",
-            result.content
-        );
-        return;
-    }
-    // Spec §4: output contains "URL: <url>" line
+    let result = execute_tool(&run, &call);
+    let origin_request = fixture.server.join().expect("origin server");
     assert!(
-        result.content.contains("URL: https://example.com/"),
-        "URL line missing from browser fetch output: {}",
-        result.content
+        matches!(result.outcome(), ToolOutcome::Success { .. }),
+        "deterministic browser fetch failed after request {origin_request:?}: {}",
+        result.content(),
+    );
+    let origin_request = origin_request.expect("browser did not reach admitted origin");
+    assert!(result.content().contains(&format!("URL: {url}")));
+    assert!(
+        result.content().contains("browser receipt"),
+        "rendered browser output missing fixture body after request {origin_request:?}; error marker {:?}",
+        result.content().split_whitespace().find(|word| word.starts_with("ERR_"))
+    );
+    let structured = result.structured().expect("browser receipts");
+    let receipts = structured["network_receipts"]
+        .as_array()
+        .expect("receipt array");
+    assert!(receipts.iter().any(|receipt| {
+        receipt["origin"] == origin
+            && receipt["backend"] == "browser_proxy"
+            && receipt["final_peer"] == format!("127.0.0.1:{origin_port}")
+    }));
+    assert!(!structured.to_string().contains("not-in-receipt"));
+    assert!(!structured.to_string().contains("secret"));
+    let browser_receipts = structured["browser_supervision_receipts"]
+        .as_array()
+        .expect("browser supervision receipt array");
+    assert_eq!(browser_receipts.len(), 1);
+    let supervision = &browser_receipts[0];
+    assert_eq!(supervision["terminal"]["kind"], "completed");
+    assert_eq!(supervision["descendants_reaped"], true);
+    assert_eq!(supervision["ephemeral_profile"], true);
+    assert_eq!(supervision["persistent_state"], false);
+    assert_eq!(supervision["limits"]["downloads"], 0);
+    let tabs = supervision["usage"]["tabs"].as_u64().expect("tab usage");
+    let tab_limit = supervision["limits"]["tabs"].as_u64().expect("tab limit");
+    assert!(tabs > 0 && tabs <= tab_limit);
+    assert!(
+        supervision["browser_sha256"]
+            .as_str()
+            .is_some_and(|digest| digest.len() == 64),
+        "receipt must identify the exact Chromium artifact"
+    );
+    assert!(
+        matches!(fixture.destination.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "browser subresources, frames, XHR, WebSocket, workers, and downloads must not reach an ungranted private origin"
     );
 }
+
+/// Cancellation must kill and join a real stalled Chromium tree before the
+/// synchronous tool call reports terminal state.
+#[cfg(feature = "browser")]
+#[tokio::test]
+#[ignore = "requires headless Chrome — set OPENCLAUDIA_TEST_BROWSER=1 and run with --ignored"]
+async fn browser_cancellation_reaps_stalled_chromium() {
+    use openclaudia::runtime::CancellationReason;
+    use openclaudia::tools::{
+        execute_tool, FunctionCall, ToolCall, ToolOutcome, ToolRunContext, WorkspaceAccess,
+    };
+    if std::env::var("OPENCLAUDIA_TEST_BROWSER").is_err() {
+        eprintln!("OPENCLAUDIA_TEST_BROWSER not set — skipping browser cancellation test");
+        return;
+    }
+
+    let listener =
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("origin bind");
+    let port = listener.local_addr().expect("origin address").port();
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let server = std::thread::spawn(move || {
+        let (_stream, _) = listener.accept().expect("origin accept");
+        accepted_tx.send(()).expect("accepted signal");
+        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(15));
+    });
+
+    let origin = format!("http://127.0.0.1:{port}");
+    let grants = openclaudia::web_egress::WebEgressGrants::from_exact_web_origins([&origin])
+        .expect("exact browser origin");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let run = ToolRunContext::builder(openclaudia::state::SessionId::new(), root)
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(std::collections::HashMap::new())
+        .web_egress_grants(grants)
+        .workspace_access(WorkspaceAccess::ReadOnly)
+        .process(true)
+        .network(true)
+        .secrets(false)
+        .provider("browser-cancellation-test")
+        .ephemeral_background_jobs()
+        .build()
+        .expect("browser run");
+    let call = ToolCall {
+        id: "stalled-browser".to_string(),
+        call_type: "function".to_string(),
+        function: FunctionCall {
+            name: "web_browser".to_string(),
+            arguments: serde_json::json!({"url": format!("{origin}/stall")}).to_string(),
+        },
+    };
+    let worker_run = std::sync::Arc::clone(&run);
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let _ = result_tx.send(execute_tool(&worker_run, &call));
+    });
+    accepted_rx
+        .recv_timeout(std::time::Duration::from_secs(15))
+        .expect("Chromium request did not reach the admitted origin");
+    let _receipt = run
+        .runtime()
+        .cancellation()
+        .cancel(CancellationReason::User);
+    let result = result_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("browser cancellation did not reconcile before its deadline");
+    let _ = release_tx.send(());
+    server.join().expect("origin server");
+    worker.join().expect("browser tool worker");
+
+    assert!(matches!(result.outcome(), ToolOutcome::Error { .. }));
+    let recovery = match result.outcome() {
+        ToolOutcome::Error { failure } => failure
+            .recovery
+            .as_ref()
+            .expect("typed cancellation recovery"),
+        _ => panic!("cancellation unexpectedly succeeded"),
+    };
+    let supervision = &recovery["browser_supervision_receipts"][0];
+    assert_eq!(supervision["terminal"]["kind"], "cancelled");
+    assert_eq!(supervision["descendants_reaped"], true);
+}
+
+/// Explicit encrypted persistence restores a cookie into the next ephemeral
+/// Chrome profile without making ordinary browser runs persistent.
+#[cfg(feature = "browser")]
+#[tokio::test]
+#[ignore = "requires headless Chrome — set OPENCLAUDIA_TEST_BROWSER=1 and run with --ignored"]
+async fn browser_encrypted_cookie_capability_survives_profile_replacement() {
+    use base64::Engine as _;
+    use openclaudia::secrets::SecretString;
+    use openclaudia::tools::{
+        execute_tool, FunctionCall, ToolCall, ToolOutcome, ToolRunContext, WorkspaceAccess,
+    };
+    if std::env::var("OPENCLAUDIA_TEST_BROWSER").is_err() {
+        eprintln!("OPENCLAUDIA_TEST_BROWSER not set — skipping browser cookie test");
+        return;
+    }
+
+    let data = tempfile::tempdir().expect("isolated browser state");
+    let _environment = EnvironmentRestore::capture("XDG_DATA_HOME");
+    std::env::set_var("XDG_DATA_HOME", data.path());
+    let fixture = spawn_cookie_origin_fixture();
+    let origin = fixture.origin;
+    let key = SecretString::try_from_string(
+        base64::engine::general_purpose::STANDARD.encode([11_u8; 32]),
+    )
+    .expect("cookie key");
+    let grants = openclaudia::web_egress::WebEgressGrants::from_exact_web_origins([&origin])
+        .expect("exact browser origin")
+        .with_browser_persistence(
+            format!("integration-{}", std::process::id()),
+            [&origin],
+            key,
+            3_600,
+        )
+        .expect("cookie capability");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let run = ToolRunContext::builder(openclaudia::state::SessionId::new(), root)
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(std::collections::HashMap::new())
+        .web_egress_grants(grants)
+        .workspace_access(WorkspaceAccess::ReadOnly)
+        .process(true)
+        .network(true)
+        .secrets(true)
+        .provider("browser-cookie-test")
+        .ephemeral_background_jobs()
+        .build()
+        .expect("browser run");
+
+    let execute = |id: &str| {
+        let call = ToolCall {
+            id: id.to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "web_browser".to_string(),
+                arguments: serde_json::json!({"url": format!("{origin}/page")}).to_string(),
+            },
+        };
+        execute_tool(&run, &call)
+    };
+    let first = execute("cookie-first");
+    assert!(
+        matches!(first.outcome(), ToolOutcome::Success { .. }),
+        "first browser operation failed: {}",
+        first.content()
+    );
+    let second = execute("cookie-second");
+    assert!(
+        matches!(second.outcome(), ToolOutcome::Success { .. }),
+        "second browser operation failed: {}",
+        second.content()
+    );
+    assert!(second.content().contains("authenticated"));
+    assert_eq!(
+        second.structured().expect("structured receipt")["browser_supervision_receipts"][0]
+            ["persistent_state"],
+        true
+    );
+    assert_eq!(fixture.server.join().expect("origin server"), [false, true]);
+}
+mod support;

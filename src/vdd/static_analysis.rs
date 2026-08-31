@@ -1,15 +1,15 @@
-//! Static analysis execution and Crosslink issue creation.
+//! Static analysis execution for VDD reviews.
 //!
-//! Provides shell command execution with timeout for running static analysis
-//! tools, and integration with the `crosslink` library for creating issues
-//! from VDD findings (library-backed, no subprocess).
+//! Provides bounded process execution with timeout for configured analyzers.
 
+use std::ffi::OsString;
 use std::time::Duration;
-use std::{ffi::OsString, path::Path};
 
 use serde::Serialize;
 
-use super::VddError;
+use crate::vdd::transport::VddReviewBudget;
+
+const VDD_ANALYZER_TRUNCATED_MARKER: &[u8] = b"\n[VDD analyzer output truncated]\n";
 
 // ==========================================================================
 // StaticAnalysisResult
@@ -39,7 +39,13 @@ pub struct StaticAnalysisResult {
 /// config-sourced command (crosslink #277). Pipelines, redirections, and
 /// `&&`/`||` are therefore no longer supported in this entry point; callers
 /// that need them must compose subprocess invocations at the Rust level.
-pub(crate) async fn run_shell_command(command: &str, timeout: Duration) -> StaticAnalysisResult {
+#[allow(clippy::too_many_lines)] // Parsing, sandbox admission, bounded execution, and result mapping are atomic.
+pub(crate) async fn run_shell_command(
+    run: &std::sync::Arc<crate::tools::ToolRunContext>,
+    budget: &VddReviewBudget,
+    command: &str,
+    timeout: Duration,
+) -> StaticAnalysisResult {
     let tokens: Vec<String> = match shlex::split(command) {
         Some(t) if !t.is_empty() => t,
         Some(_) => {
@@ -72,23 +78,24 @@ pub(crate) async fn run_shell_command(command: &str, timeout: Duration) -> Stati
             passed: false,
         };
     };
-    let security = match crate::tools::security::current_context() {
-        Ok(security) => security,
+    let cwd = run.working_directory();
+    let args: Vec<OsString> = argv_rest.iter().map(OsString::from).collect();
+    let resolved_program = match run.resolve_executable(program) {
+        Ok(path) => path,
         Err(error) => {
             return StaticAnalysisResult {
                 command: command.to_string(),
                 exit_code: -1,
                 stdout: String::new(),
-                stderr: format!("Cannot resolve static-analysis session context: {error}"),
+                stderr: format!("Static-analysis executable unavailable: {error}"),
                 passed: false,
             };
         }
     };
-    let cwd = security.working_directory();
-    let args: Vec<OsString> = argv_rest.iter().map(OsString::from).collect();
     let sandboxed = match crate::tools::sandboxed_process_command(
+        run,
         crate::tools::SandboxProfile::StaticAnalyzer,
-        Path::new(program).as_os_str(),
+        resolved_program.as_os_str(),
         &args,
         cwd,
     ) {
@@ -103,14 +110,76 @@ pub(crate) async fn run_shell_command(command: &str, timeout: Duration) -> Stati
             };
         }
     };
-    let program_label = program.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        crate::tools::run_prepared_sandboxed_with_timeout(sandboxed, &program_label, timeout)
-    })
+    if let Err(error) = budget.begin_process() {
+        return StaticAnalysisResult {
+            command: command.to_string(),
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: format!("Static-analysis budget denied process: {error}"),
+            passed: false,
+        };
+    }
+    let timeout = match budget.remaining_time() {
+        Ok(remaining) => timeout.min(remaining),
+        Err(error) => {
+            budget.abandon_process();
+            return StaticAnalysisResult {
+                command: command.to_string(),
+                exit_code: -1,
+                stdout: String::new(),
+                stderr: error,
+                passed: false,
+            };
+        }
+    };
+    let result = crate::tools::command::run_prepared_run_owned(
+        run,
+        sandboxed,
+        program,
+        crate::tools::command::ProcessLimits::new(timeout).with_output_limit(
+            VddReviewBudget::analyzer_output_limit(),
+            VDD_ANALYZER_TRUNCATED_MARKER,
+        ),
+        None,
+    )
     .await;
 
+    let retained_bytes = match &result {
+        Ok(output) => output
+            .stdout
+            .bytes
+            .len()
+            .saturating_add(output.stderr.bytes.len()),
+        Err(error) => error.partial().map_or(0, |partial| {
+            partial
+                .stdout
+                .bytes
+                .len()
+                .saturating_add(partial.stderr.bytes.len())
+        }),
+    };
+    if let Err(error) = budget.finish_process(retained_bytes) {
+        return StaticAnalysisResult {
+            command: command.to_string(),
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: format!("Static-analysis budget reconciliation failed: {error}"),
+            passed: false,
+        };
+    }
+
     match result {
-        Ok(Ok(output)) => {
+        Ok(output) => {
+            if output.stdout.truncated || output.stderr.truncated {
+                return StaticAnalysisResult {
+                    command: command.to_string(),
+                    exit_code: output.status.code().unwrap_or(-1),
+                    stdout: String::from_utf8_lossy(&output.stdout.bytes).to_string(),
+                    stderr: "Static-analysis output exceeded the bounded review limit".to_string(),
+                    passed: false,
+                };
+            }
+            let output = output.into_std_output();
             let exit_code = output.status.code().unwrap_or(-1);
             StaticAnalysisResult {
                 command: command.to_string(),
@@ -120,89 +189,28 @@ pub(crate) async fn run_shell_command(command: &str, timeout: Duration) -> Stati
                 passed: exit_code == 0,
             }
         }
-        Ok(Err(e)) => StaticAnalysisResult {
+        Err(e) => StaticAnalysisResult {
             command: command.to_string(),
             exit_code: -1,
             stdout: String::new(),
             stderr: format!("Command failed to execute: {e}"),
             passed: false,
         },
-        Err(error) => StaticAnalysisResult {
-            command: command.to_string(),
-            exit_code: -1,
-            stdout: String::new(),
-            stderr: format!("Static-analysis worker failed: {error}"),
-            passed: false,
-        },
     }
-}
-
-// ==========================================================================
-// Crosslink Integration (library-backed)
-// ==========================================================================
-
-/// Create a crosslink issue, label it, and attach a comment via the
-/// `crosslink::db` library — no subprocess fork, no `chainlink` /
-/// `crosslink` binary required on `$PATH`. The previous
-/// `tokio::process::Command::new("chainlink")` triple has been
-/// replaced by direct calls into the same SQLite-backed
-/// `Database` the `crosslink` tool uses, so VDD findings land in
-/// the project's `.crosslink/issues.db` exactly like agent-driven
-/// `crosslink create` calls do.
-///
-/// Hopped onto `spawn_blocking` because `rusqlite::Connection` is
-/// blocking I/O — keeps the async caller's runtime free.
-///
-/// Closes crosslink #277 (shell injection via finding title) by
-/// removing the shell layer entirely; `title` / `label` / `comment`
-/// are never interpreted by any shell.
-pub(crate) async fn create_crosslink_issue(
-    title: &str,
-    label: &str,
-    comment: &str,
-) -> Result<String, VddError> {
-    let title = title.to_string();
-    let label = label.to_string();
-    // Collapse newlines so the comment renders on one logical line in
-    // the crosslink UI — matches the pre-port behaviour.
-    let collapsed_comment = comment.replace('\n', " ");
-
-    tokio::task::spawn_blocking(move || -> Result<String, VddError> {
-        let cwd = crate::tools::security::current_context()
-            .map_err(VddError::CrosslinkError)?
-            .working_directory()
-            .to_path_buf();
-        let dir = cwd.join(".crosslink");
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| VddError::CrosslinkError(format!("Failed to create .crosslink/: {e}")))?;
-        let db_path = dir.join("issues.db");
-        let db = crosslink::db::Database::open(&db_path)
-            .map_err(|e| VddError::CrosslinkError(format!("Failed to open crosslink DB: {e}")))?;
-        let id = db
-            .create_issue(&title, None, "high")
-            .map_err(|e| VddError::CrosslinkError(format!("create_issue failed: {e}")))?;
-        // Label + comment are best-effort. A label that fails to insert
-        // (e.g. trips the per-row PK because the issue already had one)
-        // shouldn't roll back the issue itself.
-        if let Err(e) = db.add_label(id, &label) {
-            tracing::warn!(issue_id = id, label = %label, "VDD: add_label failed: {e}");
-        }
-        if let Err(e) = db.add_comment(id, &collapsed_comment, "note") {
-            tracing::warn!(issue_id = id, "VDD: add_comment failed: {e}");
-        }
-        Ok(id.to_string())
-    })
-    .await
-    .map_err(|e| VddError::CrosslinkError(format!("blocking task panicked: {e}")))?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
+
     #[tokio::test]
     async fn run_shell_command_rejects_empty_command() {
-        let result = run_shell_command("   ", Duration::from_secs(1)).await;
+        let budget = VddReviewBudget::admit(test_run(), &test_config(), false).expect("budget");
+        let result = run_shell_command(test_run(), &budget, "   ", Duration::from_secs(1)).await;
 
         assert_eq!(result.exit_code, -1);
         assert_eq!(result.stderr, "Empty command");
@@ -211,10 +219,26 @@ mod tests {
 
     #[tokio::test]
     async fn run_shell_command_rejects_unbalanced_quotes() {
-        let result = run_shell_command("echo 'unterminated", Duration::from_secs(1)).await;
+        let budget = VddReviewBudget::admit(test_run(), &test_config(), false).expect("budget");
+        let result = run_shell_command(
+            test_run(),
+            &budget,
+            "echo 'unterminated",
+            Duration::from_secs(1),
+        )
+        .await;
 
         assert_eq!(result.exit_code, -1);
         assert!(result.stderr.contains("Could not parse command"));
+        assert!(!result.passed);
+    }
+
+    #[tokio::test]
+    async fn run_shell_command_reports_nonzero_analyzer_exit_as_failed() {
+        let budget = VddReviewBudget::admit(test_run(), &test_config(), false).expect("budget");
+        let result = run_shell_command(test_run(), &budget, "false", Duration::from_secs(1)).await;
+
+        assert_eq!(result.exit_code, 1);
         assert!(!result.passed);
     }
 
@@ -241,9 +265,17 @@ print("analyzer_confined=" + str(file_blocked and network_blocked).lower())
             "python3 -c {}",
             shlex::try_quote(&script).expect("quote analyzer probe")
         );
-        let result = run_shell_command(&command, Duration::from_secs(5)).await;
+        let budget = VddReviewBudget::admit(test_run(), &test_config(), false).expect("budget");
+        let result = run_shell_command(test_run(), &budget, &command, Duration::from_secs(5)).await;
         assert!(result.passed, "analyzer probe failed: {}", result.stderr);
         assert!(result.stdout.contains("analyzer_confined=true"));
         assert!(!result.stdout.contains("analyzer-secret"));
+    }
+
+    fn test_config() -> crate::config::VddConfig {
+        crate::config::VddConfig {
+            enabled: true,
+            ..crate::config::VddConfig::default()
+        }
     }
 }

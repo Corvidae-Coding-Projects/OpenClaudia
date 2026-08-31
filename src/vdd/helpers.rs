@@ -45,9 +45,27 @@ pub fn truncate_output(text: &str, max_len: usize) -> String {
     )
 }
 
-/// Format findings for injection into the next turn's context (advisory mode).
+/// Build a source-labeled reference observation for a later turn.
 #[must_use]
-pub fn format_findings_for_injection(
+pub fn findings_context_observation(
+    findings: &[Finding],
+    static_analysis: &[StaticAnalysisResult],
+) -> Option<crate::context::ContextItem> {
+    let content = format_findings_for_reference(findings, static_analysis);
+    if content.is_empty() {
+        return None;
+    }
+    Some(crate::context::ContextItem::reference(
+        "vdd.advisory",
+        crate::context::ReferenceSource::Vdd,
+        "vdd:adversary-review",
+        content,
+        crate::context::ContextFreshness::Turn,
+        700,
+    ))
+}
+
+fn format_findings_for_reference(
     findings: &[Finding],
     static_analysis: &[StaticAnalysisResult],
 ) -> String {
@@ -63,9 +81,7 @@ pub fn format_findings_for_injection(
     let mut output = String::from("<vdd-advisory>\n");
 
     if !genuine.is_empty() {
-        output.push_str(
-            "Adversarial review identified the following issues in your previous response:\n\n",
-        );
+        output.push_str("Adversarial review observations about the previous response:\n\n");
         for (i, finding) in genuine.iter().enumerate() {
             let _ = writeln!(
                 output,
@@ -85,7 +101,6 @@ pub fn format_findings_for_injection(
                 finding.description
             );
         }
-        output.push_str("\nAddress these issues in your next response.\n");
     }
 
     let failed_analysis: Vec<&StaticAnalysisResult> =
@@ -136,7 +151,7 @@ mod tests {
     fn test_format_findings_for_injection_empty() {
         let findings: Vec<Finding> = Vec::new();
         let analysis: Vec<StaticAnalysisResult> = Vec::new();
-        assert_eq!(format_findings_for_injection(&findings, &analysis), "");
+        assert!(findings_context_observation(&findings, &analysis).is_none());
     }
 
     #[test]
@@ -152,7 +167,8 @@ mod tests {
             adversary_reasoning: "User input concatenated".to_string(),
             iteration: 1,
         }];
-        let result = format_findings_for_injection(&findings, &[]);
+        let item = findings_context_observation(&findings, &[]).expect("reference observation");
+        let result = item.content();
         assert!(result.contains("<vdd-advisory>"));
         assert!(result.contains("CWE-89"));
         assert!(result.contains("SQL injection"));
@@ -172,7 +188,6 @@ mod tests {
             adversary_reasoning: String::new(),
             iteration: 1,
         }];
-        let result = format_findings_for_injection(&findings, &[]);
-        assert_eq!(result, ""); // FP-only = no injection
+        assert!(findings_context_observation(&findings, &[]).is_none());
     }
 }

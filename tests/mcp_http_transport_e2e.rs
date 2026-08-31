@@ -23,6 +23,17 @@ use std::collections::HashMap;
 use wiremock::matchers::{body_string_contains, header, method};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+fn manager_with_allowed_tool(server: &str, tool: &str) -> McpManager {
+    let mut permissions = openclaudia::config::PermissionsConfig::default();
+    permissions
+        .mcp
+        .insert(server.to_string(), vec![tool.to_string()]);
+    McpManager::new_with_permissions(
+        std::sync::Arc::clone(support::shared_run_context()),
+        permissions,
+    )
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Helpers — JSON-RPC envelope builders
 // ───────────────────────────────────────────────────────────────────────────
@@ -42,6 +53,11 @@ struct EchoIdResponder {
 
 struct SseEchoIdResponder {
     result_body: Value,
+}
+
+struct SessionEchoIdResponder {
+    result_body: Value,
+    session_id: &'static str,
 }
 
 impl Respond for EchoIdResponder {
@@ -95,6 +111,17 @@ impl Respond for SseEchoIdResponder {
     }
 }
 
+impl Respond for SessionEchoIdResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        EchoIdResponder {
+            result_body: Some(self.result_body.clone()),
+            error_body: None,
+        }
+        .respond(request)
+        .insert_header("Mcp-Session-Id", self.session_id)
+    }
+}
+
 fn init_result_body() -> Value {
     json!({
         "protocolVersion": "2024-11-05",
@@ -134,6 +161,40 @@ fn tools_list_result_body() -> Value {
                 }
             }
         ]
+    })
+}
+
+fn current_discover_result_body() -> Value {
+    json!({
+        "resultType": "complete",
+        "supportedVersions": ["2026-07-28"],
+        "capabilities": {"tools": {"listChanged": false}},
+        "ttlMs": 0,
+        "cacheScope": "private",
+        "_meta": {
+            "io.modelcontextprotocol/serverInfo": {
+                "name": "current-http-fixture",
+                "version": "1.0.0"
+            }
+        }
+    })
+}
+
+fn current_tools_list_result_body() -> Value {
+    json!({
+        "resultType": "complete",
+        "ttlMs": 0,
+        "cacheScope": "private",
+        "tools": [{
+            "name": "echo",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "trace": {"type": "string", "x-mcp-header": "Trace-Id"}
+                },
+                "required": ["trace"]
+            }
+        }]
     })
 }
 
@@ -208,7 +269,7 @@ async fn handshake_and_tools_list_round_trip_against_wiremock() {
     let mock = MockServer::start().await;
     mount_handshake(&mock).await;
 
-    let mgr = McpManager::new();
+    let mgr = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
     mgr.__test_connect_http_unchecked("test-server", &mock.uri())
         .await
         .expect("connect must succeed");
@@ -222,6 +283,76 @@ async fn handshake_and_tools_list_round_trip_against_wiremock() {
     // get_server_info returns the NAME we registered the server
     // under (not the remote serverInfo.name). Pin that contract.
     assert_eq!(registered_name, "test-server");
+}
+
+#[tokio::test]
+async fn legacy_http_json_rpc_method_not_found_at_200_enters_initialize_adapter() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("\"method\":\"server/discover\""))
+        .respond_with(echo_error(json!({
+            "code": -32601,
+            "message": "Method not found"
+        })))
+        .mount(&mock)
+        .await;
+    mount_handshake(&mock).await;
+
+    let manager = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
+    manager
+        .__test_connect_http_unchecked("legacy-200", &mock.uri())
+        .await
+        .expect("HTTP 200 method-not-found must select the legacy initialize adapter");
+    assert!(manager.is_connected("legacy-200").await);
+}
+
+#[tokio::test]
+async fn s065_current_http_round_trip_sends_required_routing_headers() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(header("MCP-Protocol-Version", "2026-07-28"))
+        .and(header("Mcp-Method", "server/discover"))
+        .and(body_string_contains(
+            "io.modelcontextprotocol/protocolVersion",
+        ))
+        .and(body_string_contains(
+            "io.modelcontextprotocol/clientCapabilities",
+        ))
+        .respond_with(echo_result(current_discover_result_body()))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(header("MCP-Protocol-Version", "2026-07-28"))
+        .and(header("Mcp-Method", "tools/list"))
+        .and(body_string_contains("progressToken"))
+        .respond_with(echo_result(current_tools_list_result_body()))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(header("MCP-Protocol-Version", "2026-07-28"))
+        .and(header("Mcp-Method", "tools/call"))
+        .and(header("Mcp-Name", "echo"))
+        .and(header("Mcp-Param-Trace-Id", "trace-value"))
+        .respond_with(echo_result(json!({
+            "resultType": "complete",
+            "content": [{"type": "text", "text": "CURRENT"}],
+            "structuredContent": {"ok": true}
+        })))
+        .mount(&mock)
+        .await;
+
+    let manager = manager_with_allowed_tool("current", "echo");
+    manager
+        .__test_connect_http_unchecked("current", &mock.uri())
+        .await
+        .expect("current HTTP discovery");
+    let result = manager
+        .call_tool("mcp__current__echo", json!({"trace": "trace-value"}))
+        .await
+        .expect("current HTTP tool call");
+    assert_eq!(result["content"][0]["text"], "CURRENT");
+    assert_eq!(result["structuredContent"]["ok"], true);
 }
 
 #[tokio::test]
@@ -251,7 +382,7 @@ async fn http_connect_sends_static_headers_on_handshake_requests() {
         ("Authorization".to_string(), "Bearer test-token".to_string()),
         ("X-Mcp-Team".to_string(), "openclaudia".to_string()),
     ]);
-    let mgr = McpManager::new();
+    let mgr = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
     mgr.__test_connect_http_unchecked_with_headers("hdr", &mock.uri(), &headers)
         .await
         .expect("connect with headers");
@@ -273,7 +404,7 @@ async fn call_tool_returns_server_result_through_transport() {
         .mount(&mock)
         .await;
 
-    let mgr = McpManager::new();
+    let mgr = manager_with_allowed_tool("srv", "echo");
     mgr.__test_connect_http_unchecked("srv", &mock.uri())
         .await
         .expect("connect");
@@ -303,7 +434,7 @@ async fn call_tool_accepts_streamable_http_sse_response_body() {
         .mount(&mock)
         .await;
 
-    let mgr = McpManager::new();
+    let mgr = manager_with_allowed_tool("srv", "echo");
     mgr.__test_connect_http_unchecked("srv", &mock.uri())
         .await
         .expect("connect");
@@ -336,7 +467,7 @@ async fn call_tool_propagates_jsonrpc_error_response() {
         .mount(&mock)
         .await;
 
-    let mgr = McpManager::new();
+    let mgr = manager_with_allowed_tool("srv", "echo");
     mgr.__test_connect_http_unchecked("srv", &mock.uri())
         .await
         .expect("connect");
@@ -363,7 +494,7 @@ async fn call_tool_with_unknown_tool_name_returns_error_without_http_call() {
     // fail with a transport error rather than the
     // "tool not found" error we expect.
 
-    let mgr = McpManager::new();
+    let mgr = manager_with_allowed_tool("srv", "definitely-not-a-tool");
     mgr.__test_connect_http_unchecked("srv", &mock.uri())
         .await
         .expect("connect");
@@ -387,7 +518,7 @@ async fn call_tool_with_unknown_tool_name_returns_error_without_http_call() {
 
 #[tokio::test]
 async fn call_tool_with_unknown_server_returns_error() {
-    let mgr = McpManager::new();
+    let mgr = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
     let outcome = mgr
         .call_tool("mcp__nonexistent-server__tool", json!({}))
         .await;
@@ -408,7 +539,7 @@ async fn disconnect_removes_server_from_manager() {
     let mock = MockServer::start().await;
     mount_handshake(&mock).await;
 
-    let mgr = McpManager::new();
+    let mgr = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
     mgr.__test_connect_http_unchecked("srv", &mock.uri())
         .await
         .expect("connect");
@@ -419,6 +550,58 @@ async fn disconnect_removes_server_from_manager() {
         mgr.get_server_info("srv").await.is_none(),
         "disconnect MUST drop the server entry"
     );
+}
+
+#[tokio::test]
+async fn disconnect_terminates_an_owned_legacy_http_session() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("\"method\":\"server/discover\""))
+        .respond_with(echo_error(json!({
+            "code": -32601,
+            "message": "Method not found"
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("\"method\":\"initialize\""))
+        .respond_with(SessionEchoIdResponder {
+            result_body: init_result_body(),
+            session_id: "owned-session",
+        })
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains(
+            "\"method\":\"notifications/initialized\"",
+        ))
+        .and(header("Mcp-Session-Id", "owned-session"))
+        .respond_with(echo_result(json!({})))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("\"method\":\"tools/list\""))
+        .and(header("Mcp-Session-Id", "owned-session"))
+        .respond_with(echo_result(tools_list_result_body()))
+        .mount(&mock)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(header("Mcp-Session-Id", "owned-session"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let manager = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
+    manager
+        .__test_connect_http_unchecked("session", &mock.uri())
+        .await
+        .expect("session server connects");
+    manager
+        .disconnect("session")
+        .await
+        .expect("disconnect terminates the session");
+    mock.verify().await;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -433,7 +616,7 @@ async fn http_5xx_during_initialize_propagates_as_mcp_error() {
         .mount(&mock)
         .await;
 
-    let mgr = McpManager::new();
+    let mgr = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
     let outcome = mgr.__test_connect_http_unchecked("srv", &mock.uri()).await;
     assert!(
         outcome.is_err(),
@@ -448,7 +631,7 @@ async fn http_404_during_initialize_propagates_as_mcp_error() {
         .respond_with(ResponseTemplate::new(404))
         .mount(&mock)
         .await;
-    let mgr = McpManager::new();
+    let mgr = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
     let outcome = mgr.__test_connect_http_unchecked("srv", &mock.uri()).await;
     assert!(outcome.is_err(), "HTTP 404 MUST surface as McpError");
 }
@@ -464,10 +647,11 @@ async fn non_json_response_body_during_handshake_errors() {
         .respond_with(ResponseTemplate::new(200).set_body_string("not json at all"))
         .mount(&mock)
         .await;
-    let mgr = McpManager::new();
+    let mgr = McpManager::new(std::sync::Arc::clone(support::shared_run_context()));
     let outcome = mgr.__test_connect_http_unchecked("srv", &mock.uri()).await;
     assert!(
         outcome.is_err(),
         "non-JSON body MUST error (not silently parse to default)"
     );
 }
+mod support;

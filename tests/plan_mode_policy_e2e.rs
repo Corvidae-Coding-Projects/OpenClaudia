@@ -11,6 +11,7 @@ use openclaudia::session::{
     is_tool_allowed_in_plan_mode, is_tool_allowed_in_plan_mode_with_policy, PlanModePolicy,
     PlanModeState, PLAN_MODE_ALLOWED_TOOLS,
 };
+use openclaudia::{modes::RuntimeMode, modes::RuntimeModeAuthority, tools::effect};
 use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
@@ -105,13 +106,13 @@ fn enter_refuses_directory_as_plan_file() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn allowlist_admits_every_documented_read_only_tool() {
-    let (_dir, plan) = make_plan_file();
+fn plan_profile_exposes_every_documented_observation_tool() {
+    let authority = RuntimeModeAuthority::new(RuntimeMode::Plan).expect("plan profile");
     for tool in PLAN_MODE_ALLOWED_TOOLS {
-        let allowed = is_tool_allowed_in_plan_mode(tool, &plan, &json!({}));
+        let (_, spec) = effect::lookup(tool).expect("documented tool must be classified");
         assert!(
-            allowed,
-            "documented allow-listed tool {tool:?} MUST be admitted in plan mode"
+            authority.definition_denial(tool, spec.effect).is_none(),
+            "documented tool {tool:?} MUST be visible in plan mode"
         );
     }
 }

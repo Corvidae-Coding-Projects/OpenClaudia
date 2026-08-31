@@ -20,7 +20,37 @@ const SSE_TEXT_ONLY: &str = concat!(
     "data: {\"type\":\"content_block_stop\"}\n\n",
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},",
     "\"usage\":{\"output_tokens\":5}}\n\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
     "data: [DONE]\n\n",
+);
+
+const SSE_RESPONSES_COMPLETED: &str = concat!(
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_fixture\"}}\n\n",
+    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+    "data: {\"type\":\"response.output_item.done\",\"item\":{",
+    "\"id\":\"rs_fixture\",\"type\":\"reasoning\",",
+    "\"encrypted_content\":\"encrypted-fixture\"}}\n\n",
+    "data: {\"type\":\"response.output_item.done\",\"item\":{",
+    "\"id\":\"msg_fixture\",\"type\":\"message\",\"role\":\"assistant\",",
+    "\"status\":\"completed\",\"phase\":\"final_answer\",",
+    "\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}}\n\n",
+    "data: {\"type\":\"response.completed\",\"response\":{",
+    "\"id\":\"resp_fixture\",\"status\":\"completed\",\"output\":[",
+    "{\"id\":\"rs_fixture\",\"type\":\"reasoning\",",
+    "\"encrypted_content\":\"encrypted-fixture\"},",
+    "{\"id\":\"msg_fixture\",\"type\":\"message\",\"role\":\"assistant\",",
+    "\"status\":\"completed\",\"phase\":\"final_answer\",",
+    "\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}],",
+    "\"usage\":{\"input_tokens\":9,\"output_tokens\":4}}}\n\n",
+    "data: [DONE]\n\n",
+);
+
+const SSE_RESPONSES_COMPLETED_WITHOUT_DELTAS: &str = concat!(
+    "data: {\"type\":\"response.completed\",\"response\":{",
+    "\"id\":\"resp_terminal_only\",\"status\":\"completed\",\"output\":[",
+    "{\"id\":\"msg_terminal_only\",\"type\":\"message\",\"role\":\"assistant\",",
+    "\"status\":\"completed\",\"phase\":\"final_answer\",",
+    "\"content\":[{\"type\":\"output_text\",\"text\":\"terminal truth\"}]}]}}\n\n",
 );
 
 // ── B3: SSE parse + tool-accumulation contract ────────────────────────────────
@@ -134,13 +164,21 @@ async fn b1_retry_max_matches_cc_10_attempts() {
     let endpoint = format!("{}/v1/messages", server.uri());
     let request_body = serde_json::json!({"model": "claude-sonnet-4-6", "messages": []});
     let (tx, _rx) = std::sync::mpsc::channel();
+    let headers = openclaudia::secrets::SensitiveHeaders::new();
 
     let result = openclaudia::pipeline::run_turn(openclaudia::pipeline::RunTurnParams {
+        run_context: std::sync::Arc::clone(support::shared_run_context()),
         client: &client,
         endpoint: &endpoint,
-        headers: &[],
+        headers: &headers,
+        claude_agent_sdk: None,
+        codex_agent_sdk: None,
+        effort_level: "medium",
         request_body: &request_body,
         provider: "anthropic",
+        model_identity: "claude-sonnet-4-6",
+        provider_native_state: None,
+        assistant_message_ordinal: 0,
         memory_db: None,
         app_config: None,
         permission_mgr: None,
@@ -198,13 +236,21 @@ async fn b1_503_is_retried() {
     let endpoint = format!("{}/v1/messages", server.uri());
     let request_body = serde_json::json!({"model": "claude-sonnet-4-6", "messages": []});
     let (tx, _rx) = std::sync::mpsc::channel();
+    let headers = openclaudia::secrets::SensitiveHeaders::new();
 
     let result = openclaudia::pipeline::run_turn(openclaudia::pipeline::RunTurnParams {
+        run_context: std::sync::Arc::clone(support::shared_run_context()),
         client: &client,
         endpoint: &endpoint,
-        headers: &[],
+        headers: &headers,
+        claude_agent_sdk: None,
+        codex_agent_sdk: None,
+        effort_level: "medium",
         request_body: &request_body,
         provider: "anthropic",
+        model_identity: "claude-sonnet-4-6",
+        provider_native_state: None,
+        assistant_message_ordinal: 0,
         memory_db: None,
         app_config: None,
         permission_mgr: None,
@@ -262,13 +308,21 @@ async fn b1_retry_after_zero_retries_without_sleep() {
     // Capture events to verify the retry is a structured side-band event
     // instead of provider-visible assistant text.
     let (tx, rx) = std::sync::mpsc::channel();
+    let headers = openclaudia::secrets::SensitiveHeaders::new();
 
     let result = openclaudia::pipeline::run_turn(openclaudia::pipeline::RunTurnParams {
+        run_context: std::sync::Arc::clone(support::shared_run_context()),
         client: &client,
         endpoint: &endpoint,
-        headers: &[],
+        headers: &headers,
+        claude_agent_sdk: None,
+        codex_agent_sdk: None,
+        effort_level: "medium",
         request_body: &request_body,
         provider: "anthropic",
+        model_identity: "claude-sonnet-4-6",
+        provider_native_state: None,
+        assistant_message_ordinal: 0,
         memory_db: None,
         app_config: None,
         permission_mgr: None,
@@ -345,13 +399,21 @@ async fn b1_408_is_retried() {
     let endpoint = format!("{}/v1/messages", server.uri());
     let request_body = serde_json::json!({"model": "claude-sonnet-4-6", "messages": []});
     let (tx, _rx) = std::sync::mpsc::channel();
+    let headers = openclaudia::secrets::SensitiveHeaders::new();
 
     let result = openclaudia::pipeline::run_turn(openclaudia::pipeline::RunTurnParams {
+        run_context: std::sync::Arc::clone(support::shared_run_context()),
         client: &client,
         endpoint: &endpoint,
-        headers: &[],
+        headers: &headers,
+        claude_agent_sdk: None,
+        codex_agent_sdk: None,
+        effort_level: "medium",
         request_body: &request_body,
         provider: "anthropic",
+        model_identity: "claude-sonnet-4-6",
+        provider_native_state: None,
+        assistant_message_ordinal: 0,
         memory_db: None,
         app_config: None,
         permission_mgr: None,
@@ -368,6 +430,210 @@ async fn b1_408_is_retried() {
 
     assert!(result.is_ok(), "408 must be retried and succeed on 2nd try");
 }
+
+#[tokio::test]
+async fn responses_completed_stream_returns_lossless_native_state() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(SSE_RESPONSES_COMPLETED),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let result = openclaudia::pipeline::run_turn(openclaudia::pipeline::RunTurnParams {
+        run_context: std::sync::Arc::clone(support::shared_run_context()),
+        client: &reqwest::Client::new(),
+        endpoint: &format!("{}/responses", server.uri()),
+        headers: &openclaudia::secrets::SensitiveHeaders::new(),
+        claude_agent_sdk: None,
+        codex_agent_sdk: None,
+        effort_level: "medium",
+        request_body: &serde_json::json!({
+            "model": "gpt-5.5",
+            "input": [{"role": "user", "content": "hello"}],
+            "store": false,
+            "stream": true
+        }),
+        provider: "openai",
+        model_identity: "gpt-5.5",
+        provider_native_state: None,
+        assistant_message_ordinal: 1,
+        memory_db: None,
+        app_config: None,
+        permission_mgr: None,
+        transient_allowed_tool_rules: &[],
+        hook_engine: None,
+        policy_enforcer: None,
+        task_mgr: std::sync::Arc::new(std::sync::Mutex::new(
+            openclaudia::session::TaskManager::new(),
+        )),
+        session_id: None,
+        tx,
+    })
+    .await
+    .expect("completed Responses stream");
+
+    assert_eq!(result.content, "hello");
+    assert_eq!(result.usage.input_tokens, 9);
+    assert_eq!(result.usage.output_tokens, 4);
+    let state = result
+        .provider_native_state
+        .expect("completed stream must return native state");
+    assert_eq!(state.generation().get(), 1);
+    let encoded = serde_json::to_string(&state).expect("serialize state");
+    assert!(encoded.contains("resp_fixture"));
+    assert!(encoded.contains("encrypted-fixture"));
+    assert!(encoded.contains("final_answer"));
+}
+
+#[tokio::test]
+async fn responses_eof_before_completed_is_not_a_successful_turn() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+                ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let result = openclaudia::pipeline::run_turn(openclaudia::pipeline::RunTurnParams {
+        run_context: std::sync::Arc::clone(support::shared_run_context()),
+        client: &reqwest::Client::new(),
+        endpoint: &format!("{}/responses", server.uri()),
+        headers: &openclaudia::secrets::SensitiveHeaders::new(),
+        claude_agent_sdk: None,
+        codex_agent_sdk: None,
+        effort_level: "medium",
+        request_body: &serde_json::json!({"model": "gpt-5.5", "input": [], "store": false}),
+        provider: "openai",
+        model_identity: "gpt-5.5",
+        provider_native_state: None,
+        assistant_message_ordinal: 0,
+        memory_db: None,
+        app_config: None,
+        permission_mgr: None,
+        transient_allowed_tool_rules: &[],
+        hook_engine: None,
+        policy_enforcer: None,
+        task_mgr: std::sync::Arc::new(std::sync::Mutex::new(
+            openclaudia::session::TaskManager::new(),
+        )),
+        session_id: None,
+        tx: std::sync::mpsc::channel().0,
+    })
+    .await
+    .expect_err("EOF before response.completed must fail");
+    assert!(result.contains("before response.completed"), "{result}");
+}
+
+#[tokio::test]
+async fn responses_completed_output_recovers_text_when_delta_events_are_absent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(SSE_RESPONSES_COMPLETED_WITHOUT_DELTAS),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let result = openclaudia::pipeline::run_turn(openclaudia::pipeline::RunTurnParams {
+        run_context: std::sync::Arc::clone(support::shared_run_context()),
+        client: &reqwest::Client::new(),
+        endpoint: &format!("{}/responses", server.uri()),
+        headers: &openclaudia::secrets::SensitiveHeaders::new(),
+        claude_agent_sdk: None,
+        codex_agent_sdk: None,
+        effort_level: "medium",
+        request_body: &serde_json::json!({"model": "gpt-5.5", "input": [], "store": false}),
+        provider: "openai",
+        model_identity: "gpt-5.5",
+        provider_native_state: None,
+        assistant_message_ordinal: 0,
+        memory_db: None,
+        app_config: None,
+        permission_mgr: None,
+        transient_allowed_tool_rules: &[],
+        hook_engine: None,
+        policy_enforcer: None,
+        task_mgr: std::sync::Arc::new(std::sync::Mutex::new(
+            openclaudia::session::TaskManager::new(),
+        )),
+        session_id: None,
+        tx: std::sync::mpsc::channel().0,
+    })
+    .await
+    .expect("terminal-only Responses stream");
+
+    assert_eq!(result.content, "terminal truth");
+    assert!(result.provider_native_state.is_some());
+}
+
+#[tokio::test]
+async fn responses_streamed_text_without_terminal_output_is_rejected() {
+    let server = MockServer::start().await;
+    let stream = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ghost text\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{",
+        "\"id\":\"resp_tool_only\",\"status\":\"completed\",\"output\":[",
+        "{\"id\":\"fc_tool_only\",\"type\":\"function_call\",",
+        "\"call_id\":\"call_tool_only\",\"name\":\"bash\",",
+        "\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}]}}\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(stream),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let result = openclaudia::pipeline::run_turn(openclaudia::pipeline::RunTurnParams {
+        run_context: std::sync::Arc::clone(support::shared_run_context()),
+        client: &reqwest::Client::new(),
+        endpoint: &format!("{}/responses", server.uri()),
+        headers: &openclaudia::secrets::SensitiveHeaders::new(),
+        claude_agent_sdk: None,
+        codex_agent_sdk: None,
+        effort_level: "medium",
+        request_body: &serde_json::json!({"model": "gpt-5.5", "input": [], "store": false}),
+        provider: "openai",
+        model_identity: "gpt-5.5",
+        provider_native_state: None,
+        assistant_message_ordinal: 0,
+        memory_db: None,
+        app_config: None,
+        permission_mgr: None,
+        transient_allowed_tool_rules: &[],
+        hook_engine: None,
+        policy_enforcer: None,
+        task_mgr: std::sync::Arc::new(std::sync::Mutex::new(
+            openclaudia::session::TaskManager::new(),
+        )),
+        session_id: None,
+        tx: std::sync::mpsc::channel().0,
+    })
+    .await
+    .expect_err("provisional text absent from terminal output must fail");
+
+    assert!(result.contains("disagrees with streamed"), "{result}");
+}
+
+mod support;
 
 // ── B3: process_sse_event pure-function contract ──────────────────────────────
 
@@ -409,7 +675,7 @@ fn b3_process_sse_event_thinking_end() {
     );
 }
 
-/// B3 — `process_sse_event` returns `SseAction::Thinking` for delta inside thinking block.
+/// B3 — raw Anthropic thinking is classified as private provider material.
 #[test]
 fn b3_process_sse_event_thinking_delta() {
     use openclaudia::pipeline::{process_sse_event, SseAction};
@@ -424,8 +690,8 @@ fn b3_process_sse_event_thinking_delta() {
 
     let action = process_sse_event(&event, true, &mut ant, &mut oai);
     match action {
-        SseAction::Thinking(text) => assert_eq!(text, "pondering..."),
-        other => panic!("expected SseAction::Thinking, got {other:?}"),
+        SseAction::PrivateReasoning(text) => assert_eq!(text, "pondering..."),
+        other => panic!("expected private reasoning, got {other:?}"),
     }
 }
 
@@ -462,8 +728,8 @@ fn b3_process_sse_event_openai_reasoning_content_delta() {
 
     let action = process_sse_event(&event, false, &mut ant, &mut oai);
     match action {
-        SseAction::Reasoning(text) => assert_eq!(text, "thinking"),
-        other => panic!("expected SseAction::Reasoning, got {other:?}"),
+        SseAction::PrivateReasoning(text) => assert_eq!(text, "thinking"),
+        other => panic!("expected private reasoning, got {other:?}"),
     }
 }
 
@@ -488,7 +754,7 @@ fn b3_process_sse_event_reasoning_details_delta() {
 
     let action = process_sse_event(&event, false, &mut ant, &mut oai);
     match action {
-        SseAction::Reasoning(text) => assert_eq!(text, "first second"),
-        other => panic!("expected SseAction::Reasoning, got {other:?}"),
+        SseAction::PrivateReasoning(text) => assert_eq!(text, "first second"),
+        other => panic!("expected private reasoning, got {other:?}"),
     }
 }

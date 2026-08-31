@@ -5,18 +5,18 @@
 //! incoming permission requests per-teammate and serves them in
 //! arrival order so the user sees exactly one prompt at a time.
 //! An "always-allow for this run" cache records `a` replies per
-//! teammate, tool, and target so one teammate or target can't widen
+//! teammate, tool, and exact normalized arguments so one teammate or
+//! invocation can't widen
 //! permissions for another.
 //!
 //! Phase 1 ships the queue data structures + tests. Phase 3 wires
 //! the bridge into the event loop as the sole receiver of teammate
 //! `PermissionRequest` events.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use super::teammate::TeammateId;
-
-type ToolTargetCache = HashMap<String, HashSet<String>>;
+use crate::permissions::{ApprovalProvenance, LocalApprovalCache, LocalApprovalDecision};
 
 /// A permission request from a specific teammate, parked in the leader
 /// bridge's FIFO until a decision is made.
@@ -59,15 +59,9 @@ impl std::fmt::Debug for QueuedPermission {
 pub struct LeaderPermissionBridge {
     /// FIFO of pending prompts.
     pending: VecDeque<QueuedPermission>,
-    /// Per-teammate cache of always-allowed tool targets. The outer
-    /// `HashMap<TeammateId, _>`, tool map, and target `HashSet<String>`
-    /// give O(1) expected lookup in `is_always_allowed` (crosslink
-    /// #808) while keeping the cache scoped to the specific target the
-    /// user approved.
-    ///
-    /// Keyed per teammate → tool → target so `a` replies don't leak
-    /// across teammates, tools, or commands/paths.
-    always_allowed: HashMap<TeammateId, ToolTargetCache>,
+    /// Per-teammate exact, expiring approval receipts. Raw commands, paths,
+    /// and arguments are never retained as map keys.
+    always_allowed: HashMap<TeammateId, LocalApprovalCache>,
 }
 
 impl LeaderPermissionBridge {
@@ -100,35 +94,40 @@ impl LeaderPermissionBridge {
         self.pending.pop_front()
     }
 
-    /// Record an "always allow" decision for one teammate, tool, and target.
-    /// Future requests from that teammate for the same tool and target bypass
-    /// the queue; different targets still require permission.
+    /// Record an "always allow" decision for one teammate, tool, and complete
+    /// normalized argument object. Future requests bypass the queue only when
+    /// every argument is identical; changing file content while retaining the
+    /// same path still requires permission.
     pub fn always_allow(
         &mut self,
         teammate: TeammateId,
         tool_name: impl Into<String>,
-        target: impl Into<String>,
+        arguments: impl Into<String>,
     ) {
         self.always_allowed
             .entry(teammate)
             .or_default()
-            .entry(tool_name.into())
-            .or_default()
-            .insert(target.into());
+            .remember_allowed(
+                &tool_name.into(),
+                &arguments.into(),
+                ApprovalProvenance::CoordinatorLeader,
+            );
     }
 
     /// Check the always-allow cache. True → the request should
     /// skip enqueuing and resolve immediately as `Allow`.
     ///
-    /// O(1) expected — the target `HashSet<String>` lookup goes through
-    /// `HashSet::contains(&str)`, so borrowed lookup values never have
-    /// to be cloned (crosslink #808).
     #[must_use]
-    pub fn is_always_allowed(&self, teammate: &TeammateId, tool_name: &str, target: &str) -> bool {
+    pub fn is_always_allowed(
+        &mut self,
+        teammate: &TeammateId,
+        tool_name: &str,
+        arguments: &str,
+    ) -> bool {
         self.always_allowed
-            .get(teammate)
-            .and_then(|tools| tools.get(tool_name))
-            .is_some_and(|targets| targets.contains(target))
+            .get_mut(teammate)
+            .and_then(|approvals| approvals.decision(tool_name, arguments))
+            == Some(LocalApprovalDecision::Allowed)
     }
 }
 
@@ -346,7 +345,7 @@ mod phase2_spec_pins {
     /// B4-deny-3: `always_allow` for unknown tool name → not cached.
     #[test]
     fn b4_always_allow_unknown_tool_not_cached() {
-        let bridge = LeaderPermissionBridge::new();
+        let mut bridge = LeaderPermissionBridge::new();
         let tm = TeammateId::new();
         assert!(
             !bridge.is_always_allowed(&tm, "nonexistent_tool", "anything"),

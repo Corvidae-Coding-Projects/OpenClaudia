@@ -18,9 +18,8 @@ use openclaudia::providers::api_key::{
 };
 use openclaudia::tools::is_sensitive_env_pub as is_sensitive_env;
 
-/// A realistic-shaped Anthropic key (40 chars) — long enough
-/// that redaction shows head + tail rather than collapsing to
-/// `<redacted>`.
+/// A realistic-shaped Anthropic key used to prove no formatting path retains
+/// even a stable credential fingerprint.
 const SAMPLE_KEY: &str = "sk-ant-api03-PRODUCTION-SECRET-VALUE_X1Y";
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -29,36 +28,24 @@ const SAMPLE_KEY: &str = "sk-ant-api03-PRODUCTION-SECRET-VALUE_X1Y";
 
 #[test]
 fn redact_api_key_collapses_short_inputs_to_redacted() {
-    // Under 10 chars: the format `<head>…<tail>` would leave
-    // too little obscured, so the impl collapses to a marker.
     for short in &["", "abc", "sk-ant", "123456789"] {
         let out = redact_api_key(short);
         assert_eq!(
-            out, "<redacted>",
+            out, REDACTED_PLACEHOLDER,
             "short input {short:?} must redact to the marker; got {out:?}"
         );
     }
 }
 
 #[test]
-fn redact_api_key_keeps_head_and_tail_only() {
+fn redact_api_key_long_input_reveals_no_fingerprint() {
     let out = redact_api_key(SAMPLE_KEY);
-    // The redaction shape is `<first-4-chars>…<last-4-chars>`.
+    assert_eq!(out, REDACTED_PLACEHOLDER);
     assert!(
-        out.starts_with("sk-a"),
-        "head 4 chars must survive: {out:?}"
+        !out.contains("sk-a"),
+        "secret prefix MUST NOT leak: {out:?}"
     );
-    assert!(
-        out.ends_with("X1Y") || out.ends_with("1Y"),
-        "tail 4 chars must survive: {out:?}"
-    );
-    // The ellipsis MUST be present.
-    assert!(out.contains('…'), "must include the ellipsis: {out:?}");
-    // The full secret MUST NOT appear in the redacted output.
-    assert!(
-        !out.contains("PRODUCTION-SECRET-VALUE"),
-        "secret middle MUST NOT appear in redaction: {out:?}"
-    );
+    assert!(!out.contains("X1Y"), "secret suffix MUST NOT leak: {out:?}");
 }
 
 #[test]
@@ -82,8 +69,7 @@ fn redact_api_key_does_not_carry_secret_in_any_substring() {
 fn api_key_display_uses_redacted_form() {
     let key = ApiKey::try_from_string(SAMPLE_KEY.to_string()).expect("valid key");
     let display = format!("{key}");
-    assert!(!display.contains("PRODUCTION-SECRET-VALUE"));
-    assert!(display.contains('…'));
+    assert_eq!(display, REDACTED_PLACEHOLDER);
 }
 
 #[test]
@@ -94,8 +80,7 @@ fn api_key_debug_uses_redacted_form_with_wrapper() {
         debug.starts_with("ApiKey("),
         "Debug must wrap in ApiKey(...); got {debug:?}"
     );
-    assert!(!debug.contains("PRODUCTION-SECRET-VALUE"));
-    assert!(debug.contains('…'));
+    assert_eq!(debug, format!("ApiKey({REDACTED_PLACEHOLDER})"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -106,10 +91,8 @@ fn api_key_debug_uses_redacted_form_with_wrapper() {
 fn api_key_json_serialize_emits_exact_redacted_placeholder() {
     let key = ApiKey::try_from_string(SAMPLE_KEY.to_string()).expect("valid key");
     let json = serde_json::to_string(&key).expect("serialize");
-    // The serialize impl emits the documented opaque marker —
-    // NOT the ellipsis Display form. Tests pattern-match on
-    // the public REDACTED_PLACEHOLDER constant so a future
-    // marker rename surfaces here.
+    // Tests pattern-match on the public REDACTED_PLACEHOLDER constant so a
+    // future marker rename surfaces here.
     assert!(
         !json.contains("PRODUCTION-SECRET-VALUE"),
         "raw secret MUST NOT appear; got {json}"

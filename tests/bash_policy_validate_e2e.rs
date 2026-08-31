@@ -1,21 +1,18 @@
-//! End-to-end tests for `tools::bash::policy::is_safe_for_auto_allow`,
-//! `validate_command`, `dangerous_shell_construct`, and the
-//! `MAX_COMMAND_LEN` cap.
+//! End-to-end tests for the Bash deny-only defence-in-depth policy:
+//! `validate_command`, `dangerous_shell_construct`, environment scrubbing,
+//! and the `MAX_COMMAND_LEN` cap.
 //!
 //! Sprint 84 of the verification effort. Sprint 23 covered the
 //! denylist + env-scrub paths; sprint 9
-//! (`tools_security_e2e`) covered the attack catalog;
-//! this file fills `is_safe_for_auto_allow` allowlist matrix
-//! and the `dangerous_shell_construct` per-pattern coverage
-//! that previous sprints walked at a higher level.
+//! (`tools_security_e2e`) covered the attack catalog. This file pins the
+//! structural diagnostic catalog without treating it as effect authority.
 
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
 use openclaudia::tools::{
-    dangerous_shell_construct, is_safe_for_auto_allow, is_sensitive_env_pub, validate_command,
-    MAX_COMMAND_LEN,
+    dangerous_shell_construct, is_sensitive_env_pub, validate_command, MAX_COMMAND_LEN,
 };
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -63,114 +60,6 @@ fn validate_command_denylisted_command_errors_with_explanation() {
         err.contains("denylist") || err.contains("rejected"),
         "MUST surface denylist refusal; got {err:?}"
     );
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Section B — is_safe_for_auto_allow allowlist matrix
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn is_safe_for_documented_filesystem_inspectors() {
-    for cmd in &["ls", "ls -la", "pwd", "stat /tmp", "du -sh /tmp", "df -h"] {
-        assert!(
-            is_safe_for_auto_allow(cmd),
-            "filesystem inspector {cmd:?} MUST be auto-allowable"
-        );
-    }
-}
-
-#[test]
-fn is_safe_for_documented_text_reads() {
-    for cmd in &[
-        "cat README.md",
-        "head -n 10 file",
-        "tail -f log",
-        "wc -l file",
-        "less file",
-        "xxd file.bin",
-    ] {
-        assert!(
-            is_safe_for_auto_allow(cmd),
-            "text read {cmd:?} MUST be auto-allowable"
-        );
-    }
-}
-
-#[test]
-fn is_safe_for_path_prefixed_programs() {
-    // /usr/bin/ls strips path prefix and matches "ls".
-    assert!(is_safe_for_auto_allow("/usr/bin/ls -la"));
-    assert!(is_safe_for_auto_allow("/bin/cat file"));
-}
-
-#[test]
-fn is_unsafe_for_destructive_commands() {
-    for cmd in &["rm file.txt", "mv a b", "cp a b", "touch new.txt"] {
-        assert!(
-            !is_safe_for_auto_allow(cmd),
-            "destructive {cmd:?} MUST NOT be auto-allowable"
-        );
-    }
-}
-
-#[test]
-fn is_unsafe_for_compound_commands_even_with_safe_legs() {
-    // Even when both legs are safe, compounding requires confirmation.
-    assert!(!is_safe_for_auto_allow("ls && pwd"));
-    assert!(!is_safe_for_auto_allow("ls ; pwd"));
-    assert!(!is_safe_for_auto_allow("ls || pwd"));
-}
-
-#[test]
-fn is_unsafe_for_pipe_to_interpreter() {
-    assert!(!is_safe_for_auto_allow("cat file | sh"));
-    assert!(!is_safe_for_auto_allow("ls | bash"));
-    assert!(!is_safe_for_auto_allow("cat script.py | python"));
-}
-
-#[test]
-fn is_unsafe_for_command_substitution() {
-    assert!(!is_safe_for_auto_allow("ls $(pwd)"));
-    assert!(!is_safe_for_auto_allow("cat `ls`"));
-}
-
-#[test]
-fn is_unsafe_for_redirection() {
-    assert!(!is_safe_for_auto_allow("cat file > output"));
-    assert!(!is_safe_for_auto_allow("ls >> log"));
-}
-
-#[test]
-fn is_unsafe_for_eval_exec_source() {
-    assert!(!is_safe_for_auto_allow("eval 'ls'"));
-    assert!(!is_safe_for_auto_allow("exec ls"));
-    assert!(!is_safe_for_auto_allow("source ./script.sh"));
-}
-
-#[test]
-fn is_unsafe_for_find_with_exec() {
-    assert!(!is_safe_for_auto_allow("find . -exec rm {} \\;"));
-    assert!(!is_safe_for_auto_allow("find . -delete"));
-}
-
-#[test]
-fn is_unsafe_for_sudo_prefixed_safe_command() {
-    // Documented: sudo is NOT on the allowlist; even `sudo ls`
-    // requires confirmation.
-    assert!(!is_safe_for_auto_allow("sudo ls"));
-}
-
-#[test]
-fn is_unsafe_for_empty_or_whitespace_command() {
-    assert!(!is_safe_for_auto_allow(""));
-    assert!(!is_safe_for_auto_allow("   "));
-    assert!(!is_safe_for_auto_allow("\t"));
-}
-
-#[test]
-fn is_unsafe_when_validate_command_fails_due_to_length() {
-    let huge: String = std::iter::repeat_n('a', MAX_COMMAND_LEN + 1).collect();
-    assert!(!is_safe_for_auto_allow(&huge));
 }
 
 // ───────────────────────────────────────────────────────────────────────────

@@ -12,34 +12,18 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::registry::{registry, ToolContext};
-use openclaudia::tools::SessionIdGuard;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-fn dispatch_write(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("write_file", args, &mut ctx)
-        .expect("write_file must be registered")
-}
+mod support;
 
-fn dispatch_read(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("read_file", args, &mut ctx)
-        .expect("read_file must be registered")
+fn dispatch_write(args: &HashMap<String, Value>) -> (String, bool) {
+    support::legacy(&support::dispatch_tool_result_for_run(
+        support::shared_run_context(),
+        "write_file",
+        args,
+    ))
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -48,6 +32,38 @@ fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
         m.insert((*k).to_string(), v.clone());
     }
     m
+}
+
+fn snapshot_from_read_output(output: &str) -> String {
+    output
+        .rsplit_once("File snapshot: generation=")
+        .and_then(|(_, suffix)| suffix.split(',').next())
+        .filter(|generation| generation.starts_with("sha256:"))
+        .expect("successful read must expose a snapshot generation")
+        .to_string()
+}
+
+fn read_snapshot_for_run(
+    run: &std::sync::Arc<openclaudia::tools::ToolRunContext>,
+    path: &str,
+) -> String {
+    let result = support::dispatch_tool_result_for_run(
+        run,
+        "read_file",
+        &args_with(&[("path", json!(path))]),
+    );
+    let (output, is_error) = support::legacy(&result);
+    assert!(!is_error, "read_file must succeed: {output}");
+    snapshot_from_read_output(&output)
+}
+
+fn assert_path_classification_denial(message: &str) {
+    assert!(message.contains("Host safety"), "got {message:?}");
+    assert!(message.contains("'path'"), "got {message:?}");
+    assert!(
+        message.contains("malformed arguments") || message.contains("Missing"),
+        "got {message:?}"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -69,10 +85,7 @@ fn path_arg_as_number_returns_validation_error() {
     let args = args_with(&[("path", json!(42)), ("content", json!("body"))]);
     let (msg, is_err) = dispatch_write(&args);
     assert!(is_err);
-    assert!(
-        msg.contains("Invalid 'path' argument: expected string"),
-        "non-string path MUST surface path type validation; got {msg:?}"
-    );
+    assert_path_classification_denial(&msg);
 }
 
 #[test]
@@ -80,7 +93,7 @@ fn path_arg_as_array_returns_validation_error() {
     let args = args_with(&[("path", json!(["x"])), ("content", json!("body"))]);
     let (msg, is_err) = dispatch_write(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'path' argument: expected string"));
+    assert_path_classification_denial(&msg);
 }
 
 #[test]
@@ -88,7 +101,7 @@ fn path_arg_as_object_returns_validation_error() {
     let args = args_with(&[("path", json!({"k": "v"})), ("content", json!("body"))]);
     let (msg, is_err) = dispatch_write(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'path' argument: expected string"));
+    assert_path_classification_denial(&msg);
 }
 
 #[test]
@@ -96,7 +109,7 @@ fn path_arg_as_null_returns_validation_error() {
     let args = args_with(&[("path", Value::Null), ("content", json!("body"))]);
     let (msg, is_err) = dispatch_write(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'path' argument: expected string"));
+    assert_path_classification_denial(&msg);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -143,10 +156,11 @@ fn relative_path_is_accepted_and_resolved_to_session_root() {
 
 #[test]
 fn write_file_records_diff_observation_when_session_ledger_is_active() {
-    let _session_guard = openclaudia::tools::SessionIdGuard::set("writeledger");
+    let run = support::test_run_context(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+    let session_id = run.session_id().to_string();
     let ledger = Arc::new(Mutex::new(openclaudia::ledger::RealityLedger::new()));
     let _ledger_guard =
-        openclaudia::ledger::install_active_ledger_for_session("writeledger", Arc::clone(&ledger));
+        openclaudia::ledger::install_active_ledger_for_session(&session_id, Arc::clone(&ledger));
 
     let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("ledger_write.txt");
@@ -154,7 +168,8 @@ fn write_file_records_diff_observation_when_session_ledger_is_active() {
         ("path", json!(path.to_str().unwrap())),
         ("content", json!("created\n")),
     ]);
-    let (msg, is_err) = dispatch_write(&args);
+    let result = support::dispatch_tool_result_for_run(&run, "write_file", &args);
+    let (msg, is_err) = support::legacy(&result);
     assert!(!is_err, "write should succeed: {msg}");
 
     let observation = {
@@ -174,7 +189,19 @@ fn write_file_records_diff_observation_when_session_ledger_is_active() {
         &vec![path.canonicalize().unwrap().to_string_lossy().to_string()]
     );
     assert!(patch.contains("+created"));
-    assert_eq!(observation.authority, openclaudia::ledger::Authority::Git);
+    assert_eq!(
+        observation.provenance.trust,
+        openclaudia::ledger::EvidenceTrust::RuntimeObserved
+    );
+    assert_eq!(
+        observation.provenance.source,
+        openclaudia::ledger::EvidenceSource::WorkspaceDiff
+    );
+    assert!(observation.provenance.is_bound_to(&run));
+    assert!(matches!(
+        observation.provenance.artifact,
+        Some(openclaudia::ledger::ArtifactBinding::Diff { .. })
+    ));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -298,8 +325,8 @@ fn overwrite_existing_file_without_prior_read_errors() {
     let (msg, is_err) = dispatch_write(&args);
     assert!(is_err, "overwrite without prior read MUST be refused");
     assert!(
-        msg.contains("must read") && msg.contains("before overwriting"),
-        "MUST surface #968 message; got {msg:?}"
+        msg.contains("No current snapshot exists"),
+        "MUST surface the snapshot-bound overwrite message; got {msg:?}"
     );
     // Error MUST hint at the corrective action.
     assert!(
@@ -316,31 +343,85 @@ fn overwrite_existing_file_without_prior_read_errors() {
 
 #[test]
 fn failed_read_does_not_satisfy_overwrite_gate() {
-    let _session_guard = SessionIdGuard::set("failed-read-overwrite-gate");
     let dir = tempfile::TempDir::new_in(".").expect("tempdir");
+    let run = support::test_run_context(dir.path());
     let path = dir.path().join("empty.png");
     std::fs::write(&path, "").expect("create empty image");
     let path_str = path.to_str().expect("utf8 path");
 
-    let (read_msg, read_err) = dispatch_read(&args_with(&[("path", json!(path_str))]));
+    let read_args = args_with(&[("path", json!(path_str))]);
+    let read_result = support::dispatch_tool_result_for_run(&run, "read_file", &read_args);
+    let (read_msg, read_err) = support::legacy(&read_result);
     assert!(read_err, "empty image read must fail: {read_msg}");
 
-    let (write_msg, write_err) = dispatch_write(&args_with(&[
-        ("path", json!(path_str)),
-        ("content", json!("new content")),
-    ]));
+    let write_args = args_with(&[("path", json!(path_str)), ("content", json!("new content"))]);
+    let write_result = support::dispatch_tool_result_for_run(&run, "write_file", &write_args);
+    let (write_msg, write_err) = support::legacy(&write_result);
     assert!(
         write_err,
         "failed read must not unlock overwrite gate: {write_msg}"
     );
     assert!(
-        write_msg.contains("must read") && write_msg.contains("before overwriting"),
-        "overwrite gate should still require a successful read; got {write_msg:?}"
+        write_msg.contains("No current snapshot exists") && write_msg.contains("read_file"),
+        "overwrite gate should still require a successful snapshot read; got {write_msg:?}"
     );
     assert_eq!(
         std::fs::read_to_string(&path).expect("read back"),
         "",
         "failed-read path must remain untouched"
+    );
+}
+
+#[test]
+fn overwrite_uses_the_generation_returned_by_the_read_dispatch() {
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
+    let run = support::test_run_context(dir.path());
+    let path = dir.path().join("overwrite.txt");
+    std::fs::write(&path, "old content\n").expect("create fixture");
+    let path_str = path.to_str().expect("utf8 path");
+    let snapshot = read_snapshot_for_run(&run, path_str);
+
+    let args = args_with(&[
+        ("path", json!(path_str)),
+        ("content", json!("new content\n")),
+        ("expected_snapshot", json!(snapshot)),
+    ]);
+    let result = support::dispatch_tool_result_for_run(&run, "write_file", &args);
+
+    assert!(!result.is_error(), "overwrite must succeed: {result:?}");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read back"),
+        "new content\n"
+    );
+}
+
+#[test]
+fn one_byte_change_after_read_dispatch_returns_typed_conflict() {
+    let dir = tempfile::TempDir::new_in(".").expect("tempdir");
+    let run = support::test_run_context(dir.path());
+    let path = dir.path().join("concurrent.txt");
+    std::fs::write(&path, "alpha\n").expect("create fixture");
+    let path_str = path.to_str().expect("utf8 path");
+    let snapshot = read_snapshot_for_run(&run, path_str);
+    std::fs::write(&path, "alphb\n").expect("concurrent one-byte change");
+
+    let args = args_with(&[
+        ("path", json!(path_str)),
+        ("content", json!("replacement\n")),
+        ("expected_snapshot", json!(snapshot)),
+    ]);
+    let result = support::dispatch_tool_result_for_run(&run, "write_file", &args);
+
+    assert!(matches!(
+        result.outcome(),
+        openclaudia::tools::ToolOutcome::Error { failure }
+            if failure.code == openclaudia::tools::ToolFailureCode::Conflict
+                && failure.retryability == openclaudia::tools::ToolRetryability::Safe
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read back"),
+        "alphb\n",
+        "the concurrent generation must remain untouched"
     );
 }
 

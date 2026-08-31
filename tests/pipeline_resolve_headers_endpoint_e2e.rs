@@ -1,7 +1,7 @@
 //! End-to-end tests for `pipeline::resolve_endpoint` and
 //! `pipeline::resolve_headers` — dispatch through adapter
-//! based on provider + handling of the OAuth
-//! `claude_code_token` path (no API key required).
+//! based on provider + deterministic containment of the experimental direct
+//! `claude_code_token` path.
 //!
 //! Sprint 119 of the verification effort. Sprint 70
 //! (`pipeline_helpers_e2e`) covered `build_*_request` per
@@ -15,9 +15,32 @@
 
 use openclaudia::pipeline::{resolve_endpoint, resolve_headers};
 use openclaudia::providers::{ApiKey, ProviderError};
+use openclaudia::secrets::{OAuthToken, SensitiveHeaders};
 
 fn key() -> ApiKey {
     ApiKey::try_from_string("sk-test-key-123".to_string()).expect("valid")
+}
+
+fn token() -> OAuthToken {
+    OAuthToken::try_from_string("oauth-token".to_string()).expect("valid token")
+}
+
+#[cfg(feature = "experimental-claude-subscription-auth")]
+fn enable_direct_experiment() {
+    std::env::set_var(
+        openclaudia::claude_credentials::EXPERIMENTAL_DIRECT_SUBSCRIPTION_ENV,
+        openclaudia::claude_credentials::EXPERIMENTAL_DIRECT_SUBSCRIPTION_ACK,
+    );
+}
+
+fn extras(values: &[(&str, &str)]) -> SensitiveHeaders {
+    let mut headers = SensitiveHeaders::new();
+    for (name, value) in values {
+        headers
+            .insert_literal(name, (*value).to_string())
+            .expect("valid extra header");
+    }
+    headers
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -103,14 +126,17 @@ fn resolve_endpoint_strips_trailing_v1_from_base_url_before_appending() {
 // Section B — resolve_endpoint (OAuth claude_code_token path)
 // ───────────────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "experimental-claude-subscription-auth")]
 #[test]
 fn resolve_endpoint_with_claude_code_token_routes_through_oauth_path() {
+    enable_direct_experiment();
     // Token-provided path bypasses adapter dispatch.
+    let token = token();
     let endpoint = resolve_endpoint(
         "anthropic",
         "claude-sonnet-4-5",
         "https://api.anthropic.com",
-        Some("oauth-token-value"),
+        Some(&token),
     )
     .expect("ok");
     // OAuth endpoint is provider-determined; just verify
@@ -125,11 +151,10 @@ fn resolve_endpoint_with_claude_code_token_routes_through_oauth_path() {
 #[test]
 fn resolve_headers_anthropic_uses_x_api_key_header() {
     let api_key = key();
-    let headers = resolve_headers("anthropic", Some(&api_key), None, &[]).expect("ok");
+    let headers =
+        resolve_headers("anthropic", Some(&api_key), None, &SensitiveHeaders::new()).expect("ok");
     // Anthropic adapter uses x-api-key.
-    let has_xapikey = headers
-        .iter()
-        .any(|(k, _)| k.eq_ignore_ascii_case("x-api-key"));
+    let has_xapikey = headers.contains_name("x-api-key");
     assert!(
         has_xapikey,
         "anthropic MUST emit x-api-key header; got {headers:?}"
@@ -139,10 +164,9 @@ fn resolve_headers_anthropic_uses_x_api_key_header() {
 #[test]
 fn resolve_headers_openai_uses_authorization_bearer() {
     let api_key = key();
-    let headers = resolve_headers("openai", Some(&api_key), None, &[]).expect("ok");
-    let has_bearer = headers
-        .iter()
-        .any(|(k, v)| k.eq_ignore_ascii_case("authorization") && v.starts_with("Bearer "));
+    let headers =
+        resolve_headers("openai", Some(&api_key), None, &SensitiveHeaders::new()).expect("ok");
+    let has_bearer = headers.matches_value("authorization", "Bearer sk-test-key-123");
     assert!(
         has_bearer,
         "openai MUST emit Authorization: Bearer; got {headers:?}"
@@ -152,7 +176,12 @@ fn resolve_headers_openai_uses_authorization_bearer() {
 #[test]
 fn resolve_headers_unknown_provider_with_api_key_errors() {
     let api_key = key();
-    let outcome = resolve_headers("nonexistent", Some(&api_key), None, &[]);
+    let outcome = resolve_headers(
+        "nonexistent",
+        Some(&api_key),
+        None,
+        &SensitiveHeaders::new(),
+    );
     assert!(matches!(
         outcome.unwrap_err(),
         ProviderError::UnknownProvider { .. }
@@ -161,25 +190,22 @@ fn resolve_headers_unknown_provider_with_api_key_errors() {
 
 #[test]
 fn resolve_headers_no_api_key_no_token_returns_only_extras() {
-    let extras = vec![("X-Custom".to_string(), "value".to_string())];
+    let extras = extras(&[("X-Custom", "value")]);
     let headers = resolve_headers("anthropic", None, None, &extras).expect("ok");
     // Only the extras passed through (no provider auth).
     assert_eq!(headers.len(), 1);
-    assert_eq!(headers[0].0, "X-Custom");
-    assert_eq!(headers[0].1, "value");
+    assert!(headers.matches_value("X-Custom", "value"));
 }
 
 #[test]
 fn resolve_headers_extras_appended_after_auth_headers() {
     let api_key = key();
-    let extras = vec![("X-Extra".to_string(), "value".to_string())];
+    let extras = extras(&[("X-Extra", "value")]);
     let headers = resolve_headers("openai", Some(&api_key), None, &extras).expect("ok");
-    assert!(headers.iter().any(|(k, _)| k == "X-Extra"));
+    assert!(headers.matches_value("X-Extra", "value"));
     // Auth header is still present.
     assert!(
-        headers
-            .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case("authorization")),
+        headers.contains_name("authorization"),
         "auth header MUST survive when extras appended"
     );
 }
@@ -187,51 +213,85 @@ fn resolve_headers_extras_appended_after_auth_headers() {
 #[test]
 fn resolve_headers_multiple_extras_all_appended() {
     let api_key = key();
-    let extras = vec![
-        ("X-A".to_string(), "1".to_string()),
-        ("X-B".to_string(), "2".to_string()),
-        ("X-C".to_string(), "3".to_string()),
-    ];
+    let extras = extras(&[("X-A", "1"), ("X-B", "2"), ("X-C", "3")]);
     let headers = resolve_headers("openai", Some(&api_key), None, &extras).expect("ok");
-    assert!(headers.iter().any(|(k, _)| k == "X-A"));
-    assert!(headers.iter().any(|(k, _)| k == "X-B"));
-    assert!(headers.iter().any(|(k, _)| k == "X-C"));
+    assert!(headers.matches_value("X-A", "1"));
+    assert!(headers.matches_value("X-B", "2"));
+    assert!(headers.matches_value("X-C", "3"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
 // Section D — resolve_headers (OAuth claude_code_token path)
 // ───────────────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "experimental-claude-subscription-auth")]
 #[test]
 fn resolve_headers_with_oauth_token_bypasses_adapter_dispatch() {
+    enable_direct_experiment();
     // claude_code_token path skips get_adapter — so an
     // unknown provider name with a token MUST NOT error.
+    let token = token();
     let outcome = resolve_headers(
         "any-name-token-bypasses-this",
         None,
-        Some("oauth-token"),
-        &[],
+        Some(&token),
+        &SensitiveHeaders::new(),
     );
     assert!(outcome.is_ok());
     let headers = outcome.unwrap();
     assert!(!headers.is_empty(), "OAuth path MUST inject auth headers");
 }
 
+#[cfg(feature = "experimental-claude-subscription-auth")]
 #[test]
 fn resolve_headers_oauth_path_extras_still_appended() {
-    let extras = vec![("X-Custom".to_string(), "v".to_string())];
-    let headers = resolve_headers("any", None, Some("oauth-token"), &extras).expect("ok");
-    assert!(headers.iter().any(|(k, _)| k == "X-Custom"));
+    enable_direct_experiment();
+    let extras = extras(&[("X-Custom", "v")]);
+    let token = token();
+    let headers = resolve_headers("any", None, Some(&token), &extras).expect("ok");
+    assert!(headers.matches_value("X-Custom", "v"));
 }
 
+#[cfg(feature = "experimental-claude-subscription-auth")]
 #[test]
 fn resolve_headers_token_takes_precedence_over_api_key() {
+    enable_direct_experiment();
     // When BOTH are supplied, token wins (per documented contract).
     let api_key = key();
-    let headers = resolve_headers("openai", Some(&api_key), Some("oauth-token"), &[]).expect("ok");
-    // OAuth path bypasses adapter dispatch — verify no
-    // adapter-specific x-api-key header is emitted.
-    let _ = headers;
+    let token = token();
+    let headers = resolve_headers(
+        "openai",
+        Some(&api_key),
+        Some(&token),
+        &SensitiveHeaders::new(),
+    )
+    .expect("ok");
+    assert!(headers.matches_value("authorization", "Bearer oauth-token"));
+    assert!(!headers.contains_name("x-api-key"));
+}
+
+#[cfg(not(feature = "experimental-claude-subscription-auth"))]
+#[test]
+fn direct_subscription_endpoint_and_headers_fail_closed_in_the_default_build() {
+    let direct_token = token();
+    let endpoint = resolve_endpoint(
+        "anthropic",
+        "claude-sonnet-4-5",
+        "https://api.anthropic.com",
+        Some(&direct_token),
+    )
+    .expect_err("default endpoint selection must reject a direct subscription token");
+    let headers = resolve_headers(
+        "anthropic",
+        None,
+        Some(&direct_token),
+        &SensitiveHeaders::new(),
+    )
+    .expect_err("default header selection must reject a direct subscription token");
+    for error in [endpoint, headers] {
+        assert!(matches!(error, ProviderError::Unsupported(_)));
+        assert!(error.to_string().contains("not compiled"));
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -267,7 +327,7 @@ fn endpoint_and_headers_both_succeed_for_documented_provider_matrix() {
             endpoint.is_ok(),
             "endpoint MUST resolve for known provider {provider:?}"
         );
-        let headers = resolve_headers(provider, Some(&api_key), None, &[]);
+        let headers = resolve_headers(provider, Some(&api_key), None, &SensitiveHeaders::new());
         assert!(
             headers.is_ok(),
             "headers MUST resolve for known provider {provider:?}"
@@ -279,7 +339,7 @@ fn endpoint_and_headers_both_succeed_for_documented_provider_matrix() {
 fn endpoint_and_headers_both_error_for_unknown_provider() {
     let api_key = key();
     let endpoint = resolve_endpoint("xyz", "m", "https://x.com", None);
-    let headers = resolve_headers("xyz", Some(&api_key), None, &[]);
+    let headers = resolve_headers("xyz", Some(&api_key), None, &SensitiveHeaders::new());
     assert!(endpoint.is_err());
     assert!(headers.is_err());
 }

@@ -7,10 +7,9 @@ pub mod plan_mode;
 pub mod review;
 pub mod session_io;
 pub mod slash;
-pub mod vim;
 
 use anyhow::Context;
-pub use openclaudia::state::{AgentMode, Session};
+pub use openclaudia::state::Session;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -33,7 +32,13 @@ pub fn get_sessions_dir() -> PathBuf {
 
 /// Save a chat session to disk
 pub fn save_chat_session(session: &Session) -> anyhow::Result<()> {
-    let path = chat_session_path(&session.id())?;
+    save_chat_session_in_dir(session, &get_sessions_dir())
+}
+
+fn save_chat_session_in_dir(session: &Session, directory: &Path) -> anyhow::Result<()> {
+    validate_chat_session_id(&session.id())?;
+    openclaudia::file_error::create_dir_all(directory)?;
+    let path = directory.join(format!("{}.json", session.id()));
     let _ = session.refresh_estimated_tokens();
     openclaudia::file_error::write_json_pretty_atomic(path, session)?;
     Ok(())
@@ -227,6 +232,28 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn first_session_save_creates_the_missing_compatibility_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("session parent");
+        let directory = root.path().join("missing/chat_sessions");
+        let session = test_session();
+        save_chat_session_in_dir(&session, &directory).expect("first session save");
+
+        let path = directory.join(format!("{}.json", session.id()));
+        assert!(path.is_file());
+        assert_eq!(
+            std::fs::metadata(path)
+                .expect("session metadata")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+    }
+
     #[test]
     fn budget_state_is_owned_by_the_session_store() {
         let session = test_session();
@@ -260,17 +287,12 @@ mod tests {
     #[test]
     fn apply_loaded_keeps_subscribers_and_emits_session_boundary() {
         let mut current = test_session();
-        current.update_state(|state, _| {
-            state.identity.session_id =
-                openclaudia::state::SessionId::from_raw_unchecked("current");
-        });
+        current.set_id("current".to_string());
         current.push_message(serde_json::json!({"role": "user"}));
         let mut subscription = current.state_store().subscribe_log_lag();
 
         let loaded = test_session();
-        loaded.update_state(|state, _| {
-            state.identity.session_id = openclaudia::state::SessionId::from_raw_unchecked("loaded");
-        });
+        loaded.set_id("loaded".to_string());
         current.apply_loaded(&loaded);
 
         assert!(matches!(
@@ -298,20 +320,18 @@ mod tests {
     }
 
     #[test]
-    fn read_chat_session_file_reports_invalid_stored_id() {
+    fn read_chat_session_file_rejects_invalid_stored_id_during_decode() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("invalid-id.json");
         let session = test_session();
-        session.update_state(|state, _| {
-            state.identity.session_id =
-                openclaudia::state::SessionId::from_raw_unchecked("../outside");
-        });
-        fs::write(&path, serde_json::to_string(&session).unwrap()).unwrap();
+        let mut invalid = serde_json::to_value(&session).expect("serialize valid fixture");
+        invalid["session_state"]["identity"]["session_id"] = serde_json::json!("../outside");
+        fs::write(&path, serde_json::to_string(&invalid).unwrap()).unwrap();
 
         let err = read_chat_session_file(&path).expect_err("invalid stored id must be an error");
 
         assert!(
-            err.to_string().contains("invalid chat session id"),
+            err.to_string().contains("failed to parse chat session"),
             "unexpected error: {err}"
         );
     }
@@ -322,9 +342,7 @@ mod tests {
         let valid_path = tmp.path().join("valid.json");
         let corrupt_path = tmp.path().join("corrupt.json");
         let valid = test_session();
-        valid.update_state(|state, _| {
-            state.identity.session_id = openclaudia::state::SessionId::from_raw_unchecked("valid");
-        });
+        valid.set_id("valid".to_string());
         fs::write(&valid_path, serde_json::to_string(&valid).unwrap()).unwrap();
         fs::write(&corrupt_path, "{not-json").unwrap();
 
@@ -351,9 +369,7 @@ mod tests {
         let target = tmp.path().join("target");
         let link = tmp.path().join("linked.json");
         let session = test_session();
-        session.update_state(|state, _| {
-            state.identity.session_id = openclaudia::state::SessionId::from_raw_unchecked("linked");
-        });
+        session.set_id("linked".to_string());
         fs::write(&target, serde_json::to_vec(&session).unwrap()).unwrap();
         symlink(target, &link).unwrap();
 

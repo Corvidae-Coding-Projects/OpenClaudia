@@ -1,8 +1,15 @@
-//! Background job scheduling — crosslink #168 Phase 1.
+//! Preserved background-job mechanics — unavailable in production.
 //!
-//! Implements a scheduling skeleton and one concrete background job:
-//! **memory consolidation** (prune expired short-term entries and
-//! deduplicate archival memories with identical content).
+//! `OpenClaudia` does not construct or tick this scheduler in a production
+//! frontend. The synchronous scheduler lacks lifecycle ownership, durable
+//! leases, cancellation, budgets, and safe transactional job semantics, so
+//! [`crate::services::lifecycle_service_catalog`] classifies it as
+//! `Unavailable`. The implementation remains available for isolated tests and
+//! the follow-up slices that will complete it.
+//!
+//! The module contains a scheduling skeleton and one concrete background job:
+//! **memory consolidation** (prune expired short-term entries and produce a
+//! bounded, non-destructive review trace for possible semantic duplicates).
 //!
 //! ## Design
 //!
@@ -10,18 +17,15 @@
 //!   A job receives an [`Arc<MemoryDb>`] (the only shared resource
 //!   needed for Phase 1) and returns a [`JobOutcome`] describing what
 //!   happened.
-//! - [`JobScheduler`] holds a list of registered jobs plus a monotonic
-//!   clock of when each last ran. Callers invoke [`JobScheduler::tick`]
-//!   from whatever driving loop they own (e.g., the idle poller in
-//!   the session layer). The scheduler is deliberately **synchronous and
-//!   not tokio-aware** — the tick takes < 1 ms for typical databases,
-//!   and async wrapping is Phase 2's concern.
+//! - [`JobScheduler`] holds a list of registered jobs plus a monotonic clock of
+//!   when each last ran. Its synchronous [`JobScheduler::tick`] method is a
+//!   testable primitive, not a production lifecycle.
 //! - [`MemoryConsolidationJob`] is the only concrete job shipped in
 //!   Phase 1. It:
 //!   1. Prunes expired short-term sessions and activities via
 //!      [`MemoryDb::cleanup_expired_short_term`].
-//!   2. Deduplicates archival memories whose content is byte-for-byte
-//!      identical (keeping the most recently updated copy).
+//!   2. Preserves distinct logical memories even when their content is
+//!      byte-for-byte identical. Equal prose is not an equivalence proof.
 //!
 //! ## Phase 2 follow-up
 //!
@@ -47,7 +51,8 @@ pub struct JobOutcome {
     pub job_name: &'static str,
     /// Number of records that were removed or merged.
     pub records_pruned: usize,
-    /// Number of records that were deduplicated (merged into canonical).
+    /// Number of causally proven revision reconciliations or summaries. Equal
+    /// prose is never counted as a merge.
     pub records_deduped: usize,
 }
 
@@ -79,20 +84,17 @@ pub trait BackgroundJob: Send + Sync {
 
 // ── Memory consolidation job ─────────────────────────────────────────────────
 
-/// Prunes expired short-term memory and deduplicates identical archival entries.
+/// Prunes expired short-term memory and reviews possible archival duplicates.
 ///
 /// Runs two passes:
 /// 1. **Expiry pass** — delegates to [`MemoryDb::cleanup_expired_short_term`]
 ///    which deletes sessions and activities older than 48 hours.
-/// 2. **Dedup pass** — loads all archival memories, groups them by exact
-///    content string, and deletes all but the most-recently-updated copy
-///    within each group.
+/// 2. **Review pass** — loads a bounded set of archival memories and reports
+///    equal-content records that intentionally remain separate logical facts.
 ///
-/// The dedup pass uses a simple `HashMap<String, (id, updated_at)>` so
-/// it is O(n) in memory-entry count. For very large databases (> 10 k
-/// entries) a SQL-level dedup (`GROUP BY content HAVING COUNT(*) > 1`)
-/// would be faster, but the current database size ceiling in practice is
-/// a few hundred rows.
+/// Revision retries and replicas already converge idempotently by immutable
+/// record digest in [`MemoryDb`]. Consolidation does not invent an equivalence
+/// relation from prose or timestamps.
 pub struct MemoryConsolidationJob;
 
 impl BackgroundJob for MemoryConsolidationJob {
@@ -110,11 +112,11 @@ impl BackgroundJob for MemoryConsolidationJob {
             "memory_consolidation: short-term prune complete"
         );
 
-        // Pass 2 — deduplicate identical archival entries.
-        let records_deduped = dedup_archival(db)?;
+        // Pass 2 — bounded, non-destructive duplicate review.
+        let records_deduped = review_archival_equivalence(db)?;
         tracing::debug!(
             records_deduped,
-            "memory_consolidation: archival dedup complete"
+            "memory_consolidation: archival equivalence review complete"
         );
 
         Ok(JobOutcome {
@@ -127,17 +129,14 @@ impl BackgroundJob for MemoryConsolidationJob {
 
 // ── Plugin auto-update job (#652) + delisting auto-uninstall (#658) ─────────
 
-/// Background poll for plugin updates (CC parity, crosslink #652).
+/// Preserved plugin-update job shape (CC parity, crosslink #652).
 ///
-/// Walks the snapshot of installed plugins on every tick and emits a
-/// structured `plugin_autoupdate_check` event per plugin. Mirrors
-/// `pluginAutoupdate.ts` from CC.
+/// Walks the supplied snapshot and emits an explicit *unavailable* diagnostic;
+/// it performs no marketplace request and never claims that it polled or
+/// updated a plugin.
 ///
-/// Phase 1 scope: scheduling slot only — the actual version-check +
-/// signed-update download lands alongside the marketplace transport
-/// layer (tracked in #652's runtime follow-up). Until then, `run`
-/// emits one event per plugin so operators can observe the polling
-/// cadence without yet downloading anything.
+/// The actual version check and signed transactional update remain owned by
+/// S-061/S-062/S-084. Production does not schedule this job.
 pub struct PluginAutoupdateJob {
     /// Discovery snapshot supplied by the caller — a list of
     /// `(plugin_id, current_version)` pairs. Cloned out of the live
@@ -162,11 +161,11 @@ impl BackgroundJob for PluginAutoupdateJob {
 
     fn run(&self, _db: &Arc<MemoryDb>) -> Result<JobOutcome> {
         for (plugin_id, version) in &self.plugins {
-            tracing::info!(
+            tracing::debug!(
                 event = "plugin_autoupdate_check",
                 plugin_id,
                 current_version = version.as_deref().unwrap_or("unknown"),
-                "polled plugin source for available update"
+                "plugin update check unavailable; no marketplace request was made"
             );
         }
         Ok(JobOutcome {
@@ -177,11 +176,11 @@ impl BackgroundJob for PluginAutoupdateJob {
     }
 }
 
-/// Background poll for plugin delisting (CC parity, crosslink #658).
+/// Preserved plugin-delisting job shape (CC parity, crosslink #658).
 ///
-/// Detects plugins delisted from their source marketplace and emits an
-/// actionable event so the operator can decide on uninstall. Mirrors
-/// `pluginBlocklist.ts::detectAndUninstallDelistedPlugins`.
+/// Emits an explicit *unavailable* diagnostic for each supplied snapshot. It
+/// performs no marketplace request and never claims that it checked or removed
+/// a plugin.
 ///
 /// Phase 1 scope mirrors [`PluginAutoupdateJob`]: scheduling slot now,
 /// marketplace transport later. The job is parameterised with the same
@@ -206,11 +205,11 @@ impl BackgroundJob for PluginDelistingJob {
 
     fn run(&self, _db: &Arc<MemoryDb>) -> Result<JobOutcome> {
         for (plugin_id, source) in &self.plugins {
-            tracing::info!(
+            tracing::debug!(
                 event = "plugin_delisting_check",
                 plugin_id,
                 source,
-                "polled marketplace for delisting status"
+                "plugin delisting check unavailable; no marketplace request was made"
             );
         }
         Ok(JobOutcome {
@@ -221,62 +220,59 @@ impl BackgroundJob for PluginDelistingJob {
     }
 }
 
-/// Remove duplicate archival memory entries that share identical content.
-/// Keeps the entry with the latest `updated_at` timestamp; deletes the rest.
-/// Returns the count of deleted rows.
-fn dedup_archival(db: &Arc<MemoryDb>) -> Result<usize> {
+/// Review equal-content records without calling them equivalent.
+///
+/// The immutable revision layer handles exact retry identity. Separate logical
+/// IDs are preserved even if their content bytes match because source, scope,
+/// authorship, and applicability can differ. A future explicit merge operation
+/// must carry a reviewed equivalence proof; this background job has none.
+fn review_archival_equivalence(db: &Arc<MemoryDb>) -> Result<usize> {
     use std::collections::HashMap;
 
-    // (content → (canonical_id, canonical_updated_at, [duplicate_ids]))
-    // We build the map in one list pass to avoid N+1 queries.
-    let all = db.memory_list(usize::MAX)?;
-
-    // Group: content → (best_id, best_updated_at, all_ids_in_group)
-    let mut groups: HashMap<String, (i64, String, Vec<i64>)> = HashMap::new();
+    const REVIEW_LIMIT: usize = 4_096;
+    let all = db.memory_list(REVIEW_LIMIT + 1)?;
+    anyhow::ensure!(
+        all.len() <= REVIEW_LIMIT,
+        "memory consolidation review budget exceeded"
+    );
+    let mut groups: HashMap<String, Vec<crate::memory::LogicalMemoryId>> = HashMap::new();
     for entry in all {
-        let rec = groups
+        groups
             .entry(entry.content.clone())
-            .or_insert_with(|| (entry.id, entry.updated_at.clone(), vec![entry.id]));
-        // Track all ids so we can delete the non-canonical ones.
-        if !rec.2.contains(&entry.id) {
-            rec.2.push(entry.id);
-        }
-        // Promote to canonical if this entry is newer.
-        if entry.updated_at > rec.1 {
-            rec.0 = entry.id;
-            rec.1.clone_from(&entry.updated_at);
+            .or_default()
+            .push(entry.logical_id);
+    }
+    for logical_ids in groups.values().filter(|ids| ids.len() > 1) {
+        tracing::debug!(
+            event = "memory_consolidation_distinct_equal_content",
+            record_count = logical_ids.len(),
+            "equal content retained because logical identity/provenance differ"
+        );
+        if logical_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            anyhow::bail!("duplicate logical identity escaped revision reconciliation");
         }
     }
-
-    let mut deleted = 0_usize;
-    for (_content, (canonical_id, _ts, all_ids)) in groups {
-        for dup_id in all_ids {
-            if dup_id != canonical_id && db.memory_delete(dup_id)? {
-                deleted += 1;
-            }
-        }
-    }
-    Ok(deleted)
+    Ok(0)
 }
 
 // ── AgentSummary job (crosslink #635) ───────────────────────────────────────
 
-/// Periodic background summarisation of subagent state.
+/// Preserved background summarisation prototype for subagent state.
 ///
-/// Crosslink #635 — subagents accumulate per-task state (todo lists, tool
+/// Crosslink #635 — subagents accumulate per-task state (task lists, tool
 /// outputs, intermediate notes) that the parent agent rarely re-reads
 /// verbatim. This job condenses each completed subagent task's metadata
 /// into a single archival memory row tagged `agent-summary`, so the
 /// parent's `memory_search` can recall "what did the subagent do for
 /// task X?" without paging through the original turns.
 ///
-/// The job is intentionally minimal at this landing — it walks the
+/// This is not a production summarizer. It walks the
 /// memory database for rows tagged with `subagent-task:*` (the
 /// established subagent-record tag) and folds same-task rows into a
-/// single canonical summary row. The folding heuristic is the same one
-/// `extract_and_persist_memories` uses: first paragraph for asks, last
-/// paragraph for conclusions. Adding richer NLP-level summarisation is
-/// follow-up work; the dispatch seam here is what's contracted.
+/// single archival row. The prototype concatenates bounded source bodies; it
+/// does not perform a semantic summary. Safe activation requires the canonical
+/// task evidence, provenance, review, and transactional work in
+/// S-052/S-053/S-055.
 pub struct AgentSummaryJob;
 
 impl BackgroundJob for AgentSummaryJob {
@@ -286,9 +282,8 @@ impl BackgroundJob for AgentSummaryJob {
 
     fn run(&self, db: &Arc<MemoryDb>) -> Result<JobOutcome> {
         // Pull every row currently in archival memory and pick out the
-        // ones carrying a `subagent-task:*` tag. The job is rate-limited
-        // by the scheduler's interval, so a list-everything pass is
-        // acceptable here.
+        // ones carrying a `subagent-task:*` tag. This unbounded list pass is
+        // preserved prototype behavior and must not be production-scheduled.
         let rows = db.memory_list(usize::MAX)?;
         let mut by_task: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
@@ -367,7 +362,8 @@ struct ScheduledJob {
 
 /// Runs registered [`BackgroundJob`]s on a time-based schedule.
 ///
-/// The scheduler is **synchronous** — callers drive it by calling
+/// This type is an unavailable library/test primitive, not a production
+/// scheduler. It is **synchronous** — callers drive it by calling
 /// [`tick`][`JobScheduler::tick`] from their own event / idle loop.
 /// This keeps the implementation free of `tokio` dependencies so it
 /// compiles in unit-test harnesses that don't start a runtime.
@@ -549,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    fn consolidation_deduplicates_archival_entries() {
+    fn consolidation_preserves_equal_content_with_distinct_identity() {
         let tmp = TempDir::new().unwrap();
         let db = make_db(&tmp);
 
@@ -563,68 +559,32 @@ mod tests {
         let id_unique = db.memory_save("unique content", &[]).unwrap();
 
         let outcome = MemoryConsolidationJob.run(&db).unwrap();
-        assert_eq!(outcome.records_deduped, 1, "one duplicate must be removed");
+        assert_eq!(outcome.records_deduped, 0);
 
-        // The canonical entry survives; the other duplicate is gone.
-        // 2 survive: one from the dup group + the unique entry.
+        let left = db.memory_get(id_a).unwrap().unwrap();
+        let right = db.memory_get(id_b).unwrap().unwrap();
+        assert_ne!(left.logical_id, right.logical_id);
         let survivor_count = [id_a, id_b, id_unique]
             .iter()
             .filter_map(|&id| db.memory_get(id).unwrap())
             .count();
-        assert_eq!(survivor_count, 2);
+        assert_eq!(survivor_count, 3);
     }
 
     #[test]
-    fn consolidation_keeps_most_recently_updated_duplicate() {
+    fn consolidation_never_uses_timestamp_as_equivalence_proof() {
         let tmp = TempDir::new().unwrap();
         let db = make_db(&tmp);
 
-        // Insert two rows with the same content but distinct timestamps so
-        // we can assert which one survives. `datetime('now')` has 1-second
-        // resolution; using raw SQL with explicit offsets guarantees the gap
-        // without relying on wall-clock ticks.
-        // Crosslink #464 dropped the `tags` column from archival_memory in
-        // favour of the `archival_memory_tags` junction table.  These raw
-        // inserts therefore name only the columns that still exist on the
-        // base table; tag assignment is exercised by the dedicated #464
-        // tests in memory.rs.
-        db.execute_raw(
-            "INSERT INTO archival_memory (content, created_at, updated_at) \
-             VALUES ('same content', \
-             datetime('now', '-10 seconds'), datetime('now', '-10 seconds'))",
-        )
-        .unwrap();
-        // Capture the id just inserted.
-        let all_before = db.memory_list(10).unwrap();
-        let id_older = all_before
-            .iter()
-            .find(|e| e.content == "same content")
-            .unwrap()
-            .id;
-
-        // Insert the newer duplicate with a strictly later timestamp.
-        db.execute_raw(
-            "INSERT INTO archival_memory (content, created_at, updated_at) \
-             VALUES ('same content', \
-             datetime('now'), datetime('now'))",
-        )
-        .unwrap();
-        let all_after = db.memory_list(10).unwrap();
-        let id_newer = all_after
-            .iter()
-            .find(|e| e.content == "same content" && e.id != id_older)
-            .unwrap()
-            .id;
+        let id_older = db.memory_save("same content", &[]).unwrap();
+        let id_newer = db.memory_save("temporary", &[]).unwrap();
+        db.memory_update(id_newer, "same content").unwrap();
 
         let outcome = MemoryConsolidationJob.run(&db).unwrap();
-        assert_eq!(outcome.records_deduped, 1);
+        assert_eq!(outcome.records_deduped, 0);
 
-        // The older entry must be gone; the newer one must survive.
-        assert!(
-            db.memory_get(id_older).unwrap().is_none(),
-            "older dup removed"
-        );
-        assert!(db.memory_get(id_newer).unwrap().is_some(), "newer dup kept");
+        assert!(db.memory_get(id_older).unwrap().is_some());
+        assert!(db.memory_get(id_newer).unwrap().is_some());
     }
 
     #[test]

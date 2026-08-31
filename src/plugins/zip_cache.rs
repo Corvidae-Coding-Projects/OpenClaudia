@@ -8,12 +8,11 @@
 //! that hash so the host can resolve, verify, and extract without
 //! touching the network.
 //!
-//! This module ships the schema and the integrity-check half of that
-//! contract: the cache index, lookup, write, and verify-on-read paths.
-//! The actual `.zip` extraction is deliberately deferred until a `zip`
-//! crate is added to the workspace (tracked in #656's runtime
-//! follow-up); the cache file format is stable so today's writes will
-//! be readable by the extracting consumer.
+//! Cache reads are content-addressed and extraction is bounded before any
+//! package enters the plugin transaction staging area. Archives may contain
+//! the package at their root or under one wrapper directory; traversal,
+//! links, special entries, duplicate paths, and decompression overruns fail
+//! closed.
 //!
 //! On-disk layout (under `~/.openclaudia/plugins/cache/`):
 //!
@@ -29,8 +28,9 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashSet};
+use std::io::{Cursor, Read as _, Write as _};
+use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
 /// Errors surfaced by the zip-cache module. Returned as a single typed
@@ -56,7 +56,16 @@ pub enum ZipCacheError {
     /// Index file failed to deserialize.
     #[error("cache index corrupt: {0}")]
     Index(#[from] serde_json::Error),
+    /// The archive is malformed or violates package extraction bounds.
+    #[error("cached archive rejected: {0}")]
+    Archive(String),
 }
+
+const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_EXTRACTED_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_EXTRACTED_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES: usize = 4_096;
+const MAX_ARCHIVE_DEPTH: usize = 16;
 
 /// One cached archive entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -153,6 +162,12 @@ impl ZipCache {
     /// [`ZipCacheError::Index`] when the existing index is corrupt, and
     /// [`ZipCacheError::Io`] for any filesystem error.
     pub fn put(&self, entry: CacheEntry, bytes: &[u8]) -> Result<(), ZipCacheError> {
+        validate_digest(&entry.sha256)?;
+        if bytes.len() as u64 > MAX_ARCHIVE_BYTES {
+            return Err(ZipCacheError::Archive(format!(
+                "compressed archive exceeds {MAX_ARCHIVE_BYTES} bytes"
+            )));
+        }
         let actual = sha256_hex(bytes);
         if actual != entry.sha256 {
             return Err(ZipCacheError::IntegrityMismatch {
@@ -180,14 +195,26 @@ impl ZipCache {
     ///   don't hash to the expected sha256.
     /// * [`ZipCacheError::Io`] on filesystem failure.
     pub fn get_verified(&self, sha256: &str) -> Result<Vec<u8>, ZipCacheError> {
+        validate_digest(sha256)?;
         let path = self.archive_path(sha256);
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(ZipCacheError::Missing(sha256.to_string()));
             }
             Err(e) => return Err(ZipCacheError::Io(e)),
         };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(ZipCacheError::Archive(
+                "cached archive must be a real regular file".to_string(),
+            ));
+        }
+        if metadata.len() > MAX_ARCHIVE_BYTES {
+            return Err(ZipCacheError::Archive(format!(
+                "compressed archive exceeds {MAX_ARCHIVE_BYTES} bytes"
+            )));
+        }
+        let bytes = std::fs::read(&path)?;
         let actual = sha256_hex(&bytes);
         if actual != sha256 {
             return Err(ZipCacheError::IntegrityMismatch {
@@ -198,12 +225,257 @@ impl ZipCache {
         Ok(bytes)
     }
 
+    /// Return the index metadata bound to one cached digest.
+    ///
+    /// # Errors
+    /// Returns a cache miss when the digest has no index entry, or the same
+    /// validation/index failures as [`Self::read_index`].
+    pub fn entry(&self, sha256: &str) -> Result<CacheEntry, ZipCacheError> {
+        validate_digest(sha256)?;
+        let entry = self
+            .read_index()?
+            .remove(sha256)
+            .ok_or_else(|| ZipCacheError::Missing(sha256.to_string()))?;
+        if entry.sha256 != sha256 {
+            return Err(ZipCacheError::Archive(
+                "cache index key and entry digest disagree".to_string(),
+            ));
+        }
+        Ok(entry)
+    }
+
+    /// Verify and safely materialize a cached package archive into a new
+    /// transaction staging directory.
+    ///
+    /// # Errors
+    /// Returns an archive rejection for unsafe paths, links, special entries,
+    /// unsupported layouts, duplicate paths, or size/count/depth overruns.
+    pub fn materialize_verified(
+        &self,
+        sha256: &str,
+        destination: &Path,
+    ) -> Result<(), ZipCacheError> {
+        let bytes = self.get_verified(sha256)?;
+        if destination.exists() {
+            return Err(ZipCacheError::Archive(format!(
+                "staging destination already exists: {}",
+                destination.display()
+            )));
+        }
+        let result = extract_archive(&bytes, destination);
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(destination);
+        }
+        result
+    }
+
     /// True iff `sha256` is currently present on disk (does NOT
     /// re-verify the bytes — use [`Self::get_verified`] for that).
     #[must_use]
     pub fn contains(&self, sha256: &str) -> bool {
-        self.archive_path(sha256).is_file()
+        validate_digest(sha256).is_ok() && self.archive_path(sha256).is_file()
     }
+}
+
+fn validate_digest(sha256: &str) -> Result<(), ZipCacheError> {
+    if sha256.len() == 64
+        && sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(ZipCacheError::Archive(
+            "cache digest must be 64 lowercase hexadecimal characters".to_string(),
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct ArchiveEntry {
+    index: usize,
+    path: PathBuf,
+    size: u64,
+    is_dir: bool,
+    unix_mode: Option<u32>,
+}
+
+fn normalized_entry_path(file: &zip::read::ZipFile<'_, Cursor<&[u8]>>) -> Option<PathBuf> {
+    let enclosed = file.enclosed_name()?;
+    let mut normalized = PathBuf::new();
+    for component in enclosed.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    (!normalized.as_os_str().is_empty()).then_some(normalized)
+}
+
+fn archive_wrapper(entries: &[ArchiveEntry]) -> Result<Option<PathBuf>, ZipCacheError> {
+    let root_manifest = entries.iter().any(|entry| {
+        !entry.is_dir
+            && (entry.path == Path::new("plugin.json")
+                || entry.path == Path::new(".claude-plugin/plugin.json"))
+    });
+    if root_manifest {
+        return Ok(None);
+    }
+    let wrapper = entries
+        .iter()
+        .find_map(|entry| entry.path.components().next())
+        .and_then(|component| match component {
+            Component::Normal(name) => Some(PathBuf::from(name)),
+            _ => None,
+        })
+        .ok_or_else(|| ZipCacheError::Archive("archive contains no package entries".to_string()))?;
+    if !entries.iter().all(|entry| entry.path.starts_with(&wrapper)) {
+        return Err(ZipCacheError::Archive(
+            "archive has no single package root".to_string(),
+        ));
+    }
+    let wrapped_manifest = entries.iter().any(|entry| {
+        !entry.is_dir
+            && (entry.path == wrapper.join("plugin.json")
+                || entry.path == wrapper.join(".claude-plugin/plugin.json"))
+    });
+    if !wrapped_manifest {
+        return Err(ZipCacheError::Archive(
+            "archive contains no plugin manifest at its package root".to_string(),
+        ));
+    }
+    Ok(Some(wrapper))
+}
+
+type InspectedArchive<'a> = (
+    zip::ZipArchive<Cursor<&'a [u8]>>,
+    Vec<ArchiveEntry>,
+    Option<PathBuf>,
+);
+
+fn inspect_archive(bytes: &[u8]) -> Result<InspectedArchive<'_>, ZipCacheError> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|error| ZipCacheError::Archive(error.to_string()))?;
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        return Err(ZipCacheError::Archive(format!(
+            "archive contains more than {MAX_ARCHIVE_ENTRIES} entries"
+        )));
+    }
+    let mut entries = Vec::with_capacity(archive.len());
+    let mut paths = HashSet::new();
+    let mut declared_bytes = 0_u64;
+    for index in 0..archive.len() {
+        let file = archive
+            .by_index(index)
+            .map_err(|error| ZipCacheError::Archive(error.to_string()))?;
+        if file.encrypted() {
+            return Err(ZipCacheError::Archive(
+                "encrypted cache entries are unsupported".to_string(),
+            ));
+        }
+        if file.is_symlink() || (!file.is_file() && !file.is_dir()) {
+            return Err(ZipCacheError::Archive(format!(
+                "archive entry is a link or special file: {}",
+                file.name()
+            )));
+        }
+        let path = normalized_entry_path(&file).ok_or_else(|| {
+            ZipCacheError::Archive(format!("unsafe archive entry path: {}", file.name()))
+        })?;
+        if path.components().count() > MAX_ARCHIVE_DEPTH {
+            return Err(ZipCacheError::Archive(format!(
+                "archive entry exceeds depth {MAX_ARCHIVE_DEPTH}: {}",
+                path.display()
+            )));
+        }
+        if !paths.insert(path.clone()) {
+            return Err(ZipCacheError::Archive(format!(
+                "archive contains duplicate path: {}",
+                path.display()
+            )));
+        }
+        if file.size() > MAX_EXTRACTED_FILE_BYTES {
+            return Err(ZipCacheError::Archive(format!(
+                "archive entry exceeds {MAX_EXTRACTED_FILE_BYTES} bytes: {}",
+                path.display()
+            )));
+        }
+        declared_bytes = declared_bytes.checked_add(file.size()).ok_or_else(|| {
+            ZipCacheError::Archive("archive expanded size overflowed".to_string())
+        })?;
+        if declared_bytes > MAX_EXTRACTED_BYTES {
+            return Err(ZipCacheError::Archive(format!(
+                "archive expands beyond {MAX_EXTRACTED_BYTES} bytes"
+            )));
+        }
+        entries.push(ArchiveEntry {
+            index,
+            path,
+            size: file.size(),
+            is_dir: file.is_dir(),
+            unix_mode: file.unix_mode(),
+        });
+    }
+    let wrapper = archive_wrapper(&entries)?;
+    Ok((archive, entries, wrapper))
+}
+
+fn extract_archive(bytes: &[u8], destination: &Path) -> Result<(), ZipCacheError> {
+    let (mut archive, entries, wrapper) = inspect_archive(bytes)?;
+    std::fs::create_dir(destination)?;
+    let mut extracted_bytes = 0_u64;
+    for metadata in entries {
+        let relative = wrapper.as_ref().map_or(metadata.path.as_path(), |prefix| {
+            metadata
+                .path
+                .strip_prefix(prefix)
+                .unwrap_or(metadata.path.as_path())
+        });
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let output_path = destination.join(relative);
+        if metadata.is_dir {
+            std::fs::create_dir_all(&output_path)?;
+            continue;
+        }
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut input = archive
+            .by_index(metadata.index)
+            .map_err(|error| ZipCacheError::Archive(error.to_string()))?;
+        let mut output = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&output_path)?;
+        let copied = std::io::copy(
+            &mut input.by_ref().take(MAX_EXTRACTED_FILE_BYTES + 1),
+            &mut output,
+        )?;
+        if copied != metadata.size || copied > MAX_EXTRACTED_FILE_BYTES {
+            return Err(ZipCacheError::Archive(format!(
+                "archive entry size changed while extracting: {}",
+                metadata.path.display()
+            )));
+        }
+        extracted_bytes = extracted_bytes.checked_add(copied).ok_or_else(|| {
+            ZipCacheError::Archive("archive extracted size overflowed".to_string())
+        })?;
+        if extracted_bytes > MAX_EXTRACTED_BYTES {
+            return Err(ZipCacheError::Archive(format!(
+                "archive expands beyond {MAX_EXTRACTED_BYTES} bytes"
+            )));
+        }
+        output.flush()?;
+        #[cfg(unix)]
+        if let Some(mode) = metadata.unix_mode {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&output_path, std::fs::Permissions::from_mode(mode & 0o777))?;
+        }
+    }
+    Ok(())
 }
 
 /// Compute the lowercase-hex SHA-256 of `bytes`. Shared helper so the
@@ -225,6 +497,18 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let cursor = Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        for (name, contents) in entries {
+            writer
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .expect("start ZIP entry");
+            writer.write_all(contents).expect("write ZIP entry");
+        }
+        writer.finish().expect("finish ZIP").into_inner()
+    }
 
     fn fresh() -> (TempDir, ZipCache) {
         let tmp = TempDir::new().unwrap();
@@ -251,6 +535,49 @@ mod tests {
         let read = cache.get_verified(&sha).expect("get succeeds");
         assert_eq!(read, bytes);
         assert!(cache.contains(&sha));
+    }
+
+    #[test]
+    fn materialize_verified_accepts_one_wrapper_and_strips_it() {
+        let (_tmp, cache) = fresh();
+        let bytes = archive(&[
+            (
+                "release/.claude-plugin/plugin.json",
+                br#"{"name":"cached-plugin","version":"1.0.0"}"#,
+            ),
+            ("release/commands/run.md", b"run it"),
+        ]);
+        let sha = sha256_hex(&bytes);
+        cache.put(entry(&sha), &bytes).expect("cache archive");
+        let destination = cache.root.join("stage");
+
+        cache
+            .materialize_verified(&sha, &destination)
+            .expect("extract archive");
+
+        assert!(destination.join(".claude-plugin/plugin.json").is_file());
+        assert!(destination.join("commands/run.md").is_file());
+        assert!(!destination.join("release").exists());
+    }
+
+    #[test]
+    fn materialize_verified_rejects_traversal_without_residue() {
+        let (_tmp, cache) = fresh();
+        let bytes = archive(&[
+            (".claude-plugin/plugin.json", br#"{"name":"cached-plugin"}"#),
+            ("../escape", b"no"),
+        ]);
+        let sha = sha256_hex(&bytes);
+        cache.put(entry(&sha), &bytes).expect("cache archive");
+        let destination = cache.root.join("stage");
+
+        let error = cache
+            .materialize_verified(&sha, &destination)
+            .expect_err("traversal must fail");
+
+        assert!(matches!(error, ZipCacheError::Archive(_)));
+        assert!(!destination.exists());
+        assert!(!cache.root.join("escape").exists());
     }
 
     #[test]

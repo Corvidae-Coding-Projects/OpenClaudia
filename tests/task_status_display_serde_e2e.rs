@@ -1,6 +1,5 @@
 //! End-to-end tests for `session::TaskStatus` —
-//! `Display` (`pending` / `in_progress` / `completed`),
-//! `snake_case` serde, and `PartialEq`/`Clone` derive.
+//! `Display`, `snake_case` serde, and the complete typed lifecycle.
 //!
 //! Sprint 206 of the verification effort. Sprint 30/etc.
 //! covered `Task` management via `TaskManager`; this file
@@ -12,6 +11,14 @@
 
 use openclaudia::session::TaskStatus;
 use serde_json::{json, Value};
+
+const ALL_STATUSES: [TaskStatus; 5] = [
+    TaskStatus::Pending,
+    TaskStatus::InProgress,
+    TaskStatus::Completed,
+    TaskStatus::Failed,
+    TaskStatus::Canceled,
+];
 
 // ───────────────────────────────────────────────────────────────────────────
 // Section A — Display
@@ -31,6 +38,12 @@ fn display_in_progress_renders_snake_case_in_progress() {
 #[test]
 fn display_completed_renders_lowercase_completed() {
     assert_eq!(TaskStatus::Completed.to_string(), "completed");
+}
+
+#[test]
+fn display_failure_states_use_canonical_lowercase_strings() {
+    assert_eq!(TaskStatus::Failed.to_string(), "failed");
+    assert_eq!(TaskStatus::Canceled.to_string(), "canceled");
 }
 
 #[test]
@@ -60,6 +73,20 @@ fn in_progress_serializes_with_snake_case_underscore() {
 fn completed_serializes_as_lowercase_completed() {
     let v: Value = serde_json::to_value(TaskStatus::Completed).expect("ser");
     assert_eq!(v, json!("completed"));
+}
+
+#[test]
+fn failure_states_round_trip_from_canonical_strings() {
+    for (status, wire) in [
+        (TaskStatus::Failed, "failed"),
+        (TaskStatus::Canceled, "canceled"),
+    ] {
+        assert_eq!(serde_json::to_value(status).expect("ser"), json!(wire));
+        assert_eq!(
+            serde_json::from_value::<TaskStatus>(json!(wire)).expect("de"),
+            status
+        );
+    }
 }
 
 #[test]
@@ -116,17 +143,13 @@ fn empty_string_rejected_on_deserialize() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section D — Round-trip across all 3 variants
+// Section D — Round-trip across the complete lifecycle
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn all_three_variants_round_trip_through_json() {
-    for variant in [
-        TaskStatus::Pending,
-        TaskStatus::InProgress,
-        TaskStatus::Completed,
-    ] {
-        let json = serde_json::to_value(&variant).expect("ser");
+fn all_variants_round_trip_through_json() {
+    for variant in ALL_STATUSES {
+        let json = serde_json::to_value(variant).expect("ser");
         let back: TaskStatus = serde_json::from_value(json).expect("de");
         assert_eq!(back, variant, "round-trip failed for {variant:?}");
     }
@@ -135,13 +158,9 @@ fn all_three_variants_round_trip_through_json() {
 #[test]
 fn display_and_serde_agree_on_wire_string_for_every_variant() {
     // PINS: Display string equals the JSON wire string.
-    for variant in [
-        TaskStatus::Pending,
-        TaskStatus::InProgress,
-        TaskStatus::Completed,
-    ] {
+    for variant in ALL_STATUSES {
         let display_str = variant.to_string();
-        let serde_str = serde_json::to_value(&variant)
+        let serde_str = serde_json::to_value(variant)
             .expect("ser")
             .as_str()
             .expect("str")
@@ -151,21 +170,23 @@ fn display_and_serde_agree_on_wire_string_for_every_variant() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section E — PartialEq + Clone
+// Section E — PartialEq + Copy
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn clone_preserves_variant() {
+fn copy_preserves_variant() {
     let original = TaskStatus::InProgress;
-    let cloned = original.clone();
-    assert_eq!(cloned, original);
+    let copied = original;
+    assert_eq!(copied, original);
 }
 
 #[test]
-fn three_variants_pairwise_distinct_under_partial_eq() {
-    assert_ne!(TaskStatus::Pending, TaskStatus::InProgress);
-    assert_ne!(TaskStatus::InProgress, TaskStatus::Completed);
-    assert_ne!(TaskStatus::Pending, TaskStatus::Completed);
+fn variants_are_pairwise_distinct_under_partial_eq() {
+    for (index, left) in ALL_STATUSES.iter().enumerate() {
+        for right in &ALL_STATUSES[index + 1..] {
+            assert_ne!(left, right);
+        }
+    }
 }
 
 #[test]

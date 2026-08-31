@@ -101,8 +101,8 @@ impl LocalShellTask {
     /// and a subsequent spawn evicted it), this is a no-op — the
     /// coordinator-side record is preserved so observers don't see a
     /// disappearing task.
-    pub fn refresh_from_manager(&mut self) -> bool {
-        for (id, _cmd, running) in BACKGROUND_SHELLS.list() {
+    pub fn refresh_from_manager(&mut self, run: &crate::tools::ToolRunContext) -> bool {
+        for (id, _cmd, running) in BACKGROUND_SHELLS.list(run) {
             if id == self.shell_id {
                 let new_state = if running {
                     LocalShellTaskState::Running
@@ -212,7 +212,7 @@ mod tests {
         // shell_id that won't exist in BACKGROUND_SHELLS — refresh
         // must leave the local state untouched.
         let mut task = LocalShellTask::new("ghost-id-zzzz", "cmd", None);
-        assert!(!task.refresh_from_manager());
+        assert!(!task.refresh_from_manager(crate::tools::security::test_run_context()));
         assert_eq!(task.state(), &LocalShellTaskState::Running);
     }
 

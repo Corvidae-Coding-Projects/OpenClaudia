@@ -7,7 +7,10 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::slash_commands::{all_commands, SlashCommand, SlashSection, SLASH_SECTIONS};
+use openclaudia::command_registry::{
+    registry as command_registry, CommandFrontend, CommandId, CommandParseError,
+};
+use openclaudia::slash_commands::{all_commands, SLASH_SECTIONS};
 use openclaudia::subagent::AgentType;
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -292,7 +295,7 @@ fn slash_sections_table_is_non_empty() {
 
 #[test]
 fn every_section_has_title_and_non_empty_commands() {
-    for section in SLASH_SECTIONS {
+    for section in SLASH_SECTIONS.iter() {
         assert!(!section.title.is_empty(), "section title MUST be non-empty");
         assert!(
             !section.commands.is_empty(),
@@ -337,9 +340,12 @@ fn all_commands_iter_traverses_every_section() {
 #[test]
 fn slash_table_includes_canonical_core_commands() {
     let invocations: Vec<&str> = all_commands().map(|c| c.invocation).collect();
-    // Per the in-source canonical-commands sanity test —
-    // verify the public face honors those expectations too.
-    for canonical in &["/help, /?", "/new, /clear", "/exit, /quit", "/sessions"] {
+    for canonical in &[
+        "/help, /?",
+        "/new, /clear",
+        "/exit, /quit, /q",
+        "/sessions, /list",
+    ] {
         assert!(
             invocations.contains(canonical),
             "canonical command {canonical:?} MUST appear in SLASH_SECTIONS; \
@@ -349,19 +355,51 @@ fn slash_table_includes_canonical_core_commands() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section I — SlashCommand + SlashSection compile-time shape
+// Section I — canonical typed registry behavior
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn slash_command_and_section_types_are_copy_clone_friendly() {
-    // Both types derive Copy + Clone — verify by value-clone.
-    let cmd_count = SLASH_SECTIONS[0].commands.len();
-    assert!(cmd_count > 0);
-    let first: SlashCommand = SLASH_SECTIONS[0].commands[0];
-    let copy = first;
-    assert_eq!(copy.invocation, first.invocation);
+fn aliases_resolve_to_the_same_typed_handler() {
+    let registry = command_registry();
+    for alias in ["/new", "/clear"] {
+        let proposal = registry
+            .parse(alias, CommandFrontend::LegacyCli)
+            .expect("new-session spelling must parse");
+        assert_eq!(proposal.id(), CommandId::New);
+    }
+    for alias in ["/continue", "/load", "/resume"] {
+        let proposal = registry
+            .parse(alias, CommandFrontend::Tui)
+            .expect("session-resume spelling must parse");
+        assert_eq!(proposal.id(), CommandId::Continue);
+    }
+}
 
-    let section: SlashSection = SLASH_SECTIONS[0];
-    let section_copy = section;
-    assert_eq!(section_copy.title, section.title);
+#[test]
+fn frontend_availability_is_enforced_during_pure_parsing() {
+    assert!(matches!(
+        command_registry().parse("/connect", CommandFrontend::Tui),
+        Err(CommandParseError::FrontendUnavailable {
+            name,
+            frontend: CommandFrontend::Tui,
+        }) if name == "connect"
+    ));
+    assert!(matches!(
+        command_registry().parse("/provider", CommandFrontend::LegacyCli),
+        Err(CommandParseError::FrontendUnavailable {
+            name,
+            frontend: CommandFrontend::LegacyCli,
+        }) if name == "provider"
+    ));
+}
+
+#[test]
+fn plugin_commands_are_namespaced_typed_proposals() {
+    let proposal = command_registry()
+        .parse("/formatter:fix src/main.rs", CommandFrontend::LegacyCli)
+        .expect("namespaced plugin command must parse");
+    assert_eq!(proposal.id(), CommandId::DynamicPlugin);
+    assert_eq!(proposal.namespace(), Some("formatter"));
+    assert_eq!(proposal.component(), Some("fix"));
+    assert_eq!(proposal.arguments_text(), "src/main.rs");
 }

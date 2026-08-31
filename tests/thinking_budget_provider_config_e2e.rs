@@ -228,7 +228,7 @@ fn provider_config_with_api_key_validates_format() {
 api_key: "sk-test-key-12345""#;
     let config: ProviderConfig = serde_yaml::from_str(yaml).expect("de");
     let api_key = config.api_key.expect("api_key MUST be Some");
-    assert_eq!(api_key.as_str(), "sk-test-key-12345");
+    assert!(api_key.matches("sk-test-key-12345"));
 }
 
 #[test]
@@ -262,10 +262,9 @@ headers:
 ";
     let config: ProviderConfig = serde_yaml::from_str(yaml).expect("de");
     assert_eq!(config.headers.len(), 2);
-    assert_eq!(
-        config.headers.get("X-Custom-Header").map(String::as_str),
-        Some("custom-value")
-    );
+    assert!(config
+        .headers
+        .matches_value("X-Custom-Header", "custom-value"));
 }
 
 #[test]
@@ -316,8 +315,5 @@ thinking:
         cloned.thinking.budget_tokens,
         original.thinking.budget_tokens
     );
-    assert_eq!(
-        cloned.api_key.map(|k| k.as_str().to_string()),
-        original.api_key.map(|k| k.as_str().to_string())
-    );
+    assert_eq!(cloned.api_key, original.api_key);
 }

@@ -9,19 +9,22 @@ use tracing::{debug, info, warn};
 
 use crate::config::{AppConfig, VddConfig, VddMode};
 use crate::providers::{get_adapter, ApiKey};
-use crate::proxy::ChatCompletionRequest;
+use crate::proxy::{ChatCompletionRequest, ChatMessage, MessageContent};
 use crate::session::TokenUsage;
 
 use crate::vdd::confabulation::{ConfabulationTracker, FindingIdentity};
-use crate::vdd::error::{VddAdvisoryResult, VddBlockingResult, VddError, VddResult};
+use crate::vdd::error::{
+    VddAdvisoryResult, VddBlockingResult, VddBlockingTextResult, VddError, VddResult,
+};
 use crate::vdd::finding::{Finding, FindingStatus};
-use crate::vdd::helpers::{extract_user_task, format_findings_for_injection};
+use crate::vdd::helpers::{extract_user_task, findings_context_observation};
 use crate::vdd::prompts::{build_adversary_request, build_revision_request};
 use crate::vdd::review::{AdversaryReview, VddIteration, VddSession};
-use crate::vdd::sink::{create_crosslink_issues, persist_session};
 use crate::vdd::static_analysis::{run_shell_command, StaticAnalysisResult};
-use crate::vdd::transport::{send_to_adversary, send_to_builder, VddProviderAuth};
-use crate::vdd::triage::{parse_findings, triage_findings, TriageContext};
+use crate::vdd::transport::{send_to_adversary, send_to_builder, VddProviderAuth, VddReviewBudget};
+use crate::vdd::triage::{
+    parse_findings_detailed, triage_findings, ParseFindingsOutcome, TriageContext,
+};
 
 /// The core VDD engine that orchestrates adversarial review loops.
 pub struct VddEngine {
@@ -46,6 +49,7 @@ pub struct VddEngine {
 #[derive(Debug, Clone, Copy)]
 pub struct BuilderProvider<'a> {
     pub name: &'a str,
+    pub model: Option<&'a str>,
     pub api_key: Option<&'a ApiKey>,
     pub auth: Option<&'a VddProviderAuth>,
 }
@@ -56,6 +60,7 @@ impl<'a> BuilderProvider<'a> {
     pub const fn new(name: &'a str, api_key: Option<&'a ApiKey>) -> Self {
         Self {
             name,
+            model: None,
             api_key,
             auth: None,
         }
@@ -67,9 +72,17 @@ impl<'a> BuilderProvider<'a> {
     pub const fn with_auth(name: &'a str, auth: &'a VddProviderAuth) -> Self {
         Self {
             name,
+            model: None,
             api_key: None,
             auth: Some(auth),
         }
+    }
+
+    /// Bind the exact builder model selected for a decoded-text frontend.
+    #[must_use]
+    pub const fn with_model(mut self, model: &'a str) -> Self {
+        self.model = Some(model);
+        self
     }
 }
 
@@ -77,6 +90,7 @@ impl<'a> BuilderProvider<'a> {
 /// `run_iteration` can take a single argument without tripping the
 /// `too_many_arguments` lint.
 struct IterationContext<'a> {
+    budget: &'a VddReviewBudget,
     builder_text: &'a str,
     original_task: &'a str,
     static_results: &'a [StaticAnalysisResult],
@@ -85,7 +99,19 @@ struct IterationContext<'a> {
     builder: BuilderProvider<'a>,
 }
 
+struct BlockingLoopOutput {
+    final_text: String,
+    final_response: Option<Value>,
+    session: VddSession,
+    crosslink_issues: Vec<String>,
+    provider_receipts: Vec<crate::vdd::VddProviderCallReceipt>,
+}
+
 impl VddEngine {
+    pub(crate) const fn config(&self) -> &VddConfig {
+        &self.config
+    }
+
     #[must_use]
     pub fn new(config: &VddConfig, app_config: &AppConfig, client: Client) -> Self {
         Self {
@@ -111,6 +137,27 @@ impl VddEngine {
         }
     }
 
+    /// Verify one exact supervised-worker artifact through a fresh canonical
+    /// verifier run with an alternate provider, endpoint, and model family.
+    ///
+    /// This returns only a proposed verification receipt. It cannot approve,
+    /// publish, commit, close, complete, or mutate the reviewed artifact.
+    pub async fn verify_worker_artifact(
+        &self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
+        request: &crate::vdd::CanonicalVddRequest,
+    ) -> crate::vdd::CanonicalVddReceipt {
+        crate::vdd::canonical::run_canonical_verification(
+            run,
+            &self.client,
+            &self.app_config,
+            &self.config,
+            self.adversary_auth.as_ref(),
+            request,
+        )
+        .await
+    }
+
     /// Simplified entry point for chat loop integration.
     /// Takes the builder text and user task, plus builder auth for the
     /// AI verification agent (which uses the builder's provider, not the
@@ -120,18 +167,18 @@ impl VddEngine {
     /// Returns an error if the adversary request fails or the response cannot be parsed.
     pub async fn review_text(
         &self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
         builder_text: &str,
         user_task: &str,
         builder: BuilderProvider<'_>,
     ) -> Result<VddAdvisoryResult, VddError> {
-        if !self.config.enabled || builder_text.len() < 100 {
-            // Disabled, or response too short to be code worth reviewing —
-            // return an empty result rather than spending an adversary call.
+        if !self.config.enabled {
             return Ok(VddAdvisoryResult {
                 findings: vec![],
-                context_injection: String::new(),
+                context_observation: None,
                 static_analysis: vec![],
                 tokens_used: TokenUsage::default(),
+                provider_receipts: Vec::new(),
             });
         }
 
@@ -141,7 +188,10 @@ impl VddEngine {
             "VDD: Starting adversarial review"
         );
 
-        self.single_pass_review(builder_text, user_task, builder)
+        run.require(crate::tools::ToolResource::Network)?;
+        run.require(crate::tools::ToolResource::Secrets)?;
+
+        self.single_pass_review(run, builder_text, user_task, builder)
             .await
     }
 
@@ -150,19 +200,20 @@ impl VddEngine {
     /// (chat-loop entry, takes the user task directly) and [`Self::advisory_review`]
     /// (proxy entry, derives the user task from the upstream request).
     ///
-    /// Callers are responsible for short-circuiting on disabled/empty inputs and
-    /// for emitting the "starting review" log line — both arms historically had
-    /// different conditions around those.
+    /// Callers are responsible for short-circuiting on disabled inputs and for
+    /// emitting the "starting review" log line.
     ///
     /// Crosslink #746: previously duplicated verbatim across the two callers.
     async fn single_pass_review(
         &self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
         builder_text: &str,
         user_task: &str,
         builder: BuilderProvider<'_>,
     ) -> Result<VddAdvisoryResult, VddError> {
+        let budget = VddReviewBudget::admit(run, &self.config, false)?;
         // Run static analysis
-        let static_results = self.run_static_analysis().await;
+        let static_results = self.run_static_analysis(run, &budget).await?;
 
         // Build and send adversary request
         let adversary_request = build_adversary_request(
@@ -175,6 +226,7 @@ impl VddEngine {
         );
 
         let (adversary_text, tokens_used) = send_to_adversary(
+            &budget,
             &self.client,
             &self.config,
             &self.app_config,
@@ -184,21 +236,22 @@ impl VddEngine {
         .await?;
 
         // Parse and triage findings (AI verifier uses builder's provider)
-        let mut findings = parse_findings(&adversary_text, 1);
+        let mut findings = parse_terminal_findings(&adversary_text, 1)?;
         let triage_ctx = TriageContext {
+            budget: &budget,
             client: &self.client,
             config: &self.config,
             app_config: &self.app_config,
             previous_fps: &[],
             builder_code: builder_text,
             builder_provider: builder.name,
+            builder_model: builder.model,
             builder_api_key: builder.api_key,
             builder_auth: builder.auth,
         };
         triage_findings(&mut findings, &triage_ctx).await;
 
-        // Build context injection string
-        let context_injection = format_findings_for_injection(&findings, &static_results);
+        let context_observation = findings_context_observation(&findings, &static_results);
 
         let genuine_count = findings
             .iter()
@@ -213,9 +266,10 @@ impl VddEngine {
 
         Ok(VddAdvisoryResult {
             findings,
-            context_injection,
+            context_observation,
             static_analysis: static_results,
             tokens_used,
+            provider_receipts: budget.provider_receipts(),
         })
     }
 
@@ -226,6 +280,7 @@ impl VddEngine {
     /// Returns an error if the adversary request or builder revision fails.
     pub async fn process_response(
         &self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
         builder_response: &Value,
         original_request: &ChatCompletionRequest,
         builder: BuilderProvider<'_>,
@@ -263,29 +318,31 @@ impl VddEngine {
             ));
         }
 
-        // Skip VDD for very short responses (likely simple answers, not code)
-        if builder_text.len() < 100 {
-            return Ok(VddResult::Skipped(
-                "Response too short for adversarial review".to_string(),
-            ));
-        }
-
         info!(
             mode = %self.config.mode,
             adversary = %self.config.adversary.provider,
             "VDD: Starting adversarial review"
         );
 
+        run.require(crate::tools::ToolResource::Network)?;
+        run.require(crate::tools::ToolResource::Secrets)?;
+
         match self.config.mode {
             VddMode::Advisory => {
                 let result = self
-                    .advisory_review(&builder_text, original_request, builder)
+                    .advisory_review(run, &builder_text, original_request, builder)
                     .await?;
                 Ok(VddResult::Advisory(result))
             }
             VddMode::Blocking => {
                 let result = self
-                    .blocking_loop(builder_response, &builder_text, original_request, builder)
+                    .blocking_loop(
+                        run,
+                        builder_response,
+                        &builder_text,
+                        original_request,
+                        builder,
+                    )
                     .await?;
                 Ok(VddResult::Blocking(result))
             }
@@ -295,28 +352,131 @@ impl VddEngine {
     /// Advisory mode: single adversary pass, return findings for context injection.
     ///
     /// Thin wrapper over [`Self::single_pass_review`] — extracts the user task
-    /// from the upstream `ChatCompletionRequest` and forwards. The disabled /
-    /// short-text gate is already enforced by [`Self::process_response`] before
-    /// this is called, so we do not re-check it here.
+    /// from the upstream `ChatCompletionRequest` and forwards. The disabled and
+    /// empty-response gates are already enforced by [`Self::process_response`]
+    /// before this is called, so we do not re-check them here.
     async fn advisory_review(
         &self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
         builder_text: &str,
         original_request: &ChatCompletionRequest,
         builder: BuilderProvider<'_>,
     ) -> Result<VddAdvisoryResult, VddError> {
         let original_task = extract_user_task(original_request);
-        self.single_pass_review(builder_text, &original_task, builder)
+        self.single_pass_review(run, builder_text, &original_task, builder)
             .await
     }
 
     /// Blocking mode: full adversarial loop until convergence.
     async fn blocking_loop(
         &self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
         initial_builder_response: &Value,
         initial_builder_text: &str,
         original_request: &ChatCompletionRequest,
         builder: BuilderProvider<'_>,
     ) -> Result<VddBlockingResult, VddError> {
+        let builder_adapter =
+            get_adapter(builder.name).map_err(|e| VddError::ConfigError(e.to_string()))?;
+        let initial_builder_tokens = builder_adapter
+            .extract_token_usage(initial_builder_response)
+            .unwrap_or_default();
+        let output = self
+            .blocking_loop_core(
+                run,
+                initial_builder_text,
+                Some(initial_builder_response.clone()),
+                initial_builder_tokens,
+                original_request,
+                builder,
+            )
+            .await?;
+        Ok(VddBlockingResult {
+            final_response: output
+                .final_response
+                .unwrap_or_else(|| initial_builder_response.clone()),
+            session: output.session,
+            crosslink_issues: output.crosslink_issues,
+            provider_receipts: output.provider_receipts,
+        })
+    }
+
+    /// Run the full blocking revision/convergence loop for a frontend that has
+    /// already decoded the provider response into exact text.
+    pub(crate) async fn review_text_blocking(
+        &self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
+        builder_text: &str,
+        user_task: &str,
+        builder: BuilderProvider<'_>,
+    ) -> Result<VddBlockingTextResult, VddError> {
+        if !self.config.enabled || self.config.mode != VddMode::Blocking {
+            return Err(VddError::ConfigError(
+                "text blocking review requires enabled blocking VDD configuration".to_string(),
+            ));
+        }
+        run.require(crate::tools::ToolResource::Network)?;
+        run.require(crate::tools::ToolResource::Secrets)?;
+        let model = builder
+            .model
+            .or_else(|| {
+                self.app_config
+                    .providers
+                    .get(builder.name)
+                    .and_then(|provider| provider.model.as_deref())
+            })
+            .filter(|model| !model.trim().is_empty())
+            .ok_or_else(|| {
+                VddError::ConfigError(format!(
+                    "Builder model is unavailable for blocking text revision through '{}'",
+                    builder.name
+                ))
+            })?;
+        let original_request = ChatCompletionRequest {
+            model: model.to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: MessageContent::Text(user_task.to_string()),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                extra: std::collections::HashMap::new(),
+            }],
+            temperature: None,
+            max_tokens: Some(crate::DEFAULT_MAX_TOKENS),
+            stream: Some(false),
+            tools: None,
+            tool_choice: None,
+            extra: std::collections::HashMap::new(),
+        };
+        let output = self
+            .blocking_loop_core(
+                run,
+                builder_text,
+                None,
+                TokenUsage::default(),
+                &original_request,
+                builder,
+            )
+            .await?;
+        Ok(VddBlockingTextResult {
+            final_text: output.final_text,
+            session: output.session,
+            crosslink_issues: output.crosslink_issues,
+            provider_receipts: output.provider_receipts,
+        })
+    }
+
+    async fn blocking_loop_core(
+        &self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
+        initial_builder_text: &str,
+        initial_builder_response: Option<Value>,
+        initial_builder_tokens: TokenUsage,
+        original_request: &ChatCompletionRequest,
+        builder: BuilderProvider<'_>,
+    ) -> Result<BlockingLoopOutput, VddError> {
+        let budget = VddReviewBudget::admit(run, &self.config, true)?;
         let mut session = VddSession::new(VddMode::Blocking);
         let mut tracker = ConfabulationTracker::new(
             f64::from(self.config.thresholds.false_positive_rate),
@@ -325,7 +485,7 @@ impl VddEngine {
 
         let original_task = extract_user_task(original_request);
         let mut current_builder_text = initial_builder_text.to_string();
-        let mut current_builder_response = initial_builder_response.clone();
+        let mut current_builder_response = initial_builder_response;
         let mut previous_fps: Vec<FindingIdentity> = Vec::new();
 
         // Crosslink #483 + #487: charge the INITIAL builder response's
@@ -338,11 +498,6 @@ impl VddEngine {
         // the blocking loop has no graceful "skip" semantics here (we're
         // already past `advisory_review`'s skip gate), so we bubble it up
         // as `ConfigError`.
-        let builder_adapter =
-            get_adapter(builder.name).map_err(|e| VddError::ConfigError(e.to_string()))?;
-        let initial_builder_tokens = builder_adapter
-            .extract_token_usage(initial_builder_response)
-            .unwrap_or_default();
         session.builder_tokens.accumulate(&initial_builder_tokens);
 
         for iteration in 1..=self.config.thresholds.max_iterations {
@@ -352,9 +507,10 @@ impl VddEngine {
                 "VDD blocking: iteration"
             );
 
-            let static_results = self.run_static_analysis().await;
+            let static_results = self.run_static_analysis(run, &budget).await?;
 
             let iteration_ctx = IterationContext {
+                budget: &budget,
                 builder_text: &current_builder_text,
                 original_task: &original_task,
                 static_results: &static_results,
@@ -394,7 +550,9 @@ impl VddEngine {
             }
             match self
                 .revise_builder_response(
+                    &budget,
                     original_request,
+                    &current_builder_text,
                     &findings,
                     iteration,
                     builder,
@@ -404,7 +562,7 @@ impl VddEngine {
             {
                 Ok(Some((revised_text, revised_response))) => {
                     current_builder_text = revised_text;
-                    current_builder_response = revised_response;
+                    current_builder_response = Some(revised_response);
                 }
                 Ok(None) => break, // Revision recorded a failure and asked us to stop
                 Err(e) => return Err(e),
@@ -412,12 +570,15 @@ impl VddEngine {
         }
 
         self.finalize_unconverged_session(&mut session);
-        let crosslink_issues = self.create_issues_and_persist(&session).await;
 
-        Ok(VddBlockingResult {
+        Ok(BlockingLoopOutput {
+            final_text: current_builder_text,
             final_response: current_builder_response,
             session,
-            crosslink_issues,
+            // Issue projection is intentionally deferred until host-owned
+            // finalization has bound the exact candidate and terminal verdict.
+            crosslink_issues: Vec::new(),
+            provider_receipts: budget.provider_receipts(),
         })
     }
 
@@ -471,9 +632,12 @@ impl VddEngine {
     /// * `Ok(None)` — revision failed; the failure has been recorded on the
     ///   session and the caller should break out of the loop.
     /// * `Err(_)` — unrecoverable error.
+    #[allow(clippy::too_many_arguments)] // Revision binds the complete current iteration and its shared budget/session authority.
     async fn revise_builder_response(
         &self,
+        budget: &VddReviewBudget,
         original_request: &ChatCompletionRequest,
+        prior_builder_text: &str,
         findings: &[Finding],
         iteration: u32,
         builder: BuilderProvider<'_>,
@@ -484,10 +648,15 @@ impl VddEngine {
             .filter(|f| f.status == FindingStatus::Genuine)
             .collect();
 
-        let revision_request =
-            build_revision_request(original_request, &genuine_findings, iteration);
+        let revision_request = build_revision_request(
+            original_request,
+            prior_builder_text,
+            &genuine_findings,
+            iteration,
+        );
 
         match send_to_builder(
+            budget,
             &self.client,
             &self.config,
             &self.app_config,
@@ -551,6 +720,7 @@ impl VddEngine {
             ctx.iteration,
         );
         let (adversary_text, adversary_tokens) = send_to_adversary(
+            ctx.budget,
             &self.client,
             &self.config,
             &self.app_config,
@@ -560,14 +730,16 @@ impl VddEngine {
         .await?;
 
         // Step 2: Parse and triage findings (including AI verification)
-        let mut findings = parse_findings(&adversary_text, ctx.iteration);
+        let mut findings = parse_terminal_findings(&adversary_text, ctx.iteration)?;
         let triage_ctx = TriageContext {
+            budget: ctx.budget,
             client: &self.client,
             config: &self.config,
             app_config: &self.app_config,
             previous_fps: ctx.previous_fps,
             builder_code: ctx.builder_text,
             builder_provider: ctx.builder.name,
+            builder_model: ctx.builder.model,
             builder_api_key: ctx.builder.api_key,
             builder_auth: ctx.builder.auth,
         };
@@ -611,58 +783,37 @@ impl VddEngine {
         Ok((genuine_count, fp_count, findings))
     }
 
-    /// Create Chainlink issues for the session's genuine findings and
-    /// persist the session if configured. Extracted from
-    /// [`Self::blocking_loop`] purely to keep that function under the
-    /// project's 100-line limit; behaviour is unchanged.
-    async fn create_issues_and_persist(&self, session: &VddSession) -> Vec<String> {
-        let all_genuine: Vec<&Finding> = session
-            .iterations
-            .iter()
-            .flat_map(|i| &i.adversary_review.findings)
-            .filter(|f| f.status == FindingStatus::Genuine)
-            .collect();
-
-        let crosslink_issues = if all_genuine.is_empty() {
-            Vec::new()
-        } else {
-            match create_crosslink_issues(&all_genuine).await {
-                Ok(ids) => ids,
-                Err(e) => {
-                    warn!("VDD: Crosslink issue creation failed: {}", e);
-                    Vec::new()
-                }
-            }
-        };
-
-        if self.config.tracking.persist {
-            if let Err(e) = persist_session(&self.config.tracking.path, session) {
-                warn!("VDD: Session persistence failed: {}", e);
-            }
-        }
-
-        crosslink_issues
-    }
-
     /// Run configured static analysis commands.
-    async fn run_static_analysis(&self) -> Vec<StaticAnalysisResult> {
+    async fn run_static_analysis(
+        &self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
+        budget: &VddReviewBudget,
+    ) -> Result<Vec<StaticAnalysisResult>, VddError> {
         if !self.config.static_analysis.enabled {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // Determine commands: use explicit config, or auto-detect if enabled
         let commands: Vec<String> = if !self.config.static_analysis.commands.is_empty() {
             self.config.static_analysis.commands.clone()
         } else if self.config.static_analysis.auto_detect {
-            let detected = crate::guardrails::get_auto_detected_commands();
+            let detected = crate::guardrails::get_auto_detected_commands(run);
             if detected.is_empty() {
                 debug!("VDD: No static analysis commands configured or auto-detected");
-                return Vec::new();
+                return Ok(Vec::new());
             }
             detected
         } else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
+
+        if commands.len() > crate::config::VddStaticAnalysis::MAX_COMMANDS {
+            return Err(VddError::ConfigError(format!(
+                "Auto-detected {} analyzers, exceeding the VDD limit of {}",
+                commands.len(),
+                crate::config::VddStaticAnalysis::MAX_COMMANDS
+            )));
+        }
 
         let mut results = Vec::new();
         let timeout = Duration::from_secs(self.config.static_analysis.timeout_seconds);
@@ -670,17 +821,49 @@ impl VddEngine {
         for command in &commands {
             debug!(command = %command, "VDD: Running static analysis");
 
-            let result = run_shell_command(command, timeout).await;
+            let result = run_shell_command(run, budget, command, timeout).await;
             info!(
                 command = %command,
                 passed = result.passed,
                 exit_code = result.exit_code,
                 "VDD: Static analysis complete"
             );
+            if result.exit_code == -1
+                || result
+                    .stderr
+                    .contains("output exceeded the bounded review limit")
+            {
+                if result.stderr.contains("timed out") {
+                    return Err(VddError::StaticAnalysisTimeout {
+                        command: command.clone(),
+                        timeout: timeout.as_secs(),
+                    });
+                }
+                return Err(VddError::AdversaryRequestFailed(format!(
+                    "Static-analysis transport failed for '{command}': {}",
+                    result.stderr
+                )));
+            }
             results.push(result);
         }
 
-        results
+        Ok(results)
+    }
+}
+
+fn parse_terminal_findings(response: &str, iteration: u32) -> Result<Vec<Finding>, VddError> {
+    match parse_findings_detailed(response, iteration) {
+        ParseFindingsOutcome::NoFindings => Ok(Vec::new()),
+        ParseFindingsOutcome::Findings(findings) if findings.is_empty() => {
+            Err(VddError::ParseError(
+                "empty findings require an explicit NO_FINDINGS terminal assessment".to_string(),
+            ))
+        }
+        ParseFindingsOutcome::Findings(findings) => Ok(findings),
+        ParseFindingsOutcome::ParseError { kind } => Err(VddError::ParseError(format!(
+            "adversary returned {} instead of a terminal findings report",
+            kind.as_str()
+        ))),
     }
 }
 
@@ -703,6 +886,41 @@ mod tests {
     use super::*;
     use crate::providers::get_adapter;
     use serde_json::json;
+
+    #[test]
+    fn terminal_finding_parser_accepts_only_explicit_consistent_outcomes() {
+        let clean = r#"{"findings": [], "assessment": "NO_FINDINGS"}"#;
+        assert!(parse_terminal_findings(clean, 1)
+            .expect("explicit clean report")
+            .is_empty());
+
+        let defect = r#"{
+            "findings": [{"severity": "HIGH", "description": "reachable defect"}],
+            "assessment": "FINDINGS_PRESENT"
+        }"#;
+        assert_eq!(
+            parse_terminal_findings(defect, 1)
+                .expect("explicit defect report")
+                .len(),
+            1
+        );
+
+        for invalid in [
+            "",
+            "not json",
+            r#"{"findings": []}"#,
+            r#"{"findings": [], "assessment": "FINDINGS_PRESENT"}"#,
+            r#"{"findings": [{"description": "hidden defect"}], "assessment": "NO_FINDINGS"}"#,
+        ] {
+            assert!(
+                matches!(
+                    parse_terminal_findings(invalid, 1),
+                    Err(VddError::ParseError(_))
+                ),
+                "invalid terminal response was accepted: {invalid}"
+            );
+        }
+    }
 
     // ── Crosslink #483 + #487 ───────────────────────────────────────────────
     //

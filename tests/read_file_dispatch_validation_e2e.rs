@@ -12,21 +12,14 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::registry::{registry, ToolContext};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+mod support;
+
 fn dispatch_read(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("read_file", args, &mut ctx)
-        .expect("read_file must be registered")
+    support::dispatch_tool("read_file", args)
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -56,7 +49,9 @@ fn path_arg_as_number_returns_validation_error() {
     let args = args_with(&[("path", json!(42))]);
     let (msg, is_err) = dispatch_read(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'path' argument: expected string"));
+    assert!(msg.contains("Host safety"));
+    assert!(msg.contains("malformed arguments"));
+    assert!(msg.contains("'path'"));
 }
 
 #[test]
@@ -64,7 +59,9 @@ fn path_arg_as_array_returns_validation_error() {
     let args = args_with(&[("path", json!(["a", "b"]))]);
     let (msg, is_err) = dispatch_read(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'path' argument: expected string"));
+    assert!(msg.contains("Host safety"));
+    assert!(msg.contains("malformed arguments"));
+    assert!(msg.contains("'path'"));
 }
 
 #[test]
@@ -72,7 +69,8 @@ fn path_arg_as_null_returns_validation_error() {
     let args = args_with(&[("path", Value::Null)]);
     let (msg, is_err) = dispatch_read(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'path' argument: expected string"));
+    assert!(msg.contains("Host safety"));
+    assert!(msg.contains("Missing 'path' argument"));
 }
 
 #[test]
@@ -87,7 +85,10 @@ fn pdf_pages_arg_as_number_returns_validation_error() {
     ]);
     let (msg, is_err) = dispatch_read(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'pages' argument: expected string"));
+    assert!(
+        msg.contains("pages") && msg.contains("string"),
+        "typed validation must identify pages and its required type: {msg}"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -112,7 +113,10 @@ fn nonexistent_path_errors_with_stat_message() {
     let (msg, is_err) = dispatch_read(&args);
     assert!(is_err);
     assert!(
-        msg.contains("Cannot stat") || msg.contains("Failed") || msg.contains("not found"),
+        msg.contains("Cannot stat")
+            || msg.contains("Failed")
+            || msg.to_ascii_lowercase().contains("not_found")
+            || msg.to_ascii_lowercase().contains("not found"),
         "MUST surface stat / not-found error; got {msg:?}"
     );
     // Error MUST echo the offending path so model can self-correct.
@@ -149,10 +153,11 @@ fn read_simple_text_file_returns_content_with_line_numbers() {
 
 #[test]
 fn read_file_records_observation_when_session_ledger_is_active() {
-    let _session_guard = openclaudia::tools::SessionIdGuard::set("readledger");
+    let run = support::test_run_context(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+    let session_id = run.session_id().to_string();
     let ledger = Arc::new(Mutex::new(openclaudia::ledger::RealityLedger::new()));
     let _ledger_guard =
-        openclaudia::ledger::install_active_ledger_for_session("readledger", Arc::clone(&ledger));
+        openclaudia::ledger::install_active_ledger_for_session(&session_id, Arc::clone(&ledger));
 
     let dir = tempfile::TempDir::new_in(".").expect("tempdir");
     let path = dir.path().join("ledgered.txt");
@@ -163,8 +168,15 @@ fn read_file_records_observation_when_session_ledger_is_active() {
         ("offset", json!(1)),
         ("limit", json!(2)),
     ]);
-    let (msg, is_err) = dispatch_read(&args);
+    let result = support::dispatch_tool_result_for_run(&run, "read_file", &args);
+    let (msg, is_err) = support::legacy(&result);
     assert!(!is_err, "read should succeed: {msg}");
+    assert!(
+        msg.contains(
+            "File snapshot: generation=sha256:e49c81e2d2f84e259d40e2fb8192f3bcd198b355184845d76d8f58807d0d78ee, bytes=11"
+        ),
+        "public snapshot must bind the exact bytes recorded in the ledger: {msg}"
+    );
 
     let observation = {
         let ledger = ledger.lock().expect("ledger lock");
@@ -193,9 +205,18 @@ fn read_file_records_observation_when_session_ledger_is_active() {
     );
     assert!(excerpt.contains("alpha"));
     assert_eq!(
-        observation.authority,
-        openclaudia::ledger::Authority::Filesystem
+        observation.provenance.trust,
+        openclaudia::ledger::EvidenceTrust::RuntimeObserved
     );
+    assert_eq!(
+        observation.provenance.source,
+        openclaudia::ledger::EvidenceSource::FilesystemRead
+    );
+    assert!(observation.provenance.is_bound_to(&run));
+    assert!(matches!(
+        observation.provenance.artifact,
+        Some(openclaudia::ledger::ArtifactBinding::File { .. })
+    ));
 }
 
 #[test]

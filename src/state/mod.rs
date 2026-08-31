@@ -13,6 +13,8 @@
 //! them out of [`SessionState`] keeps the serde shape bounded.
 
 pub mod categories;
+pub mod causal;
+mod local_events;
 pub mod persist;
 pub mod session;
 pub mod store;
@@ -20,6 +22,18 @@ pub mod store;
 pub use categories::{
     AgentMode, BudgetsState, Conversation, EffortLevel, IdeDiagnostic, IdeSelection, IdeState,
     Identity, ModesState, PermissionsState, SessionId, TranscriptState, UiState,
+};
+pub use causal::{
+    decode_branch_proposal, BranchProposal, BranchSource, CausalStateError, PreparedBranch,
+    SessionCausalState,
+};
+pub use local_events::{
+    LocalEventError, LocalEventRetention, LocalEventSensitivity, LocalEventStateError,
+    PrivateEventId, PrivateEventOwner, PrivateNoteDeletionReceipt, PrivateNoteEvent,
+    PrivateNoteProjection, PrivateNoteProjectionReceipt, PrivateProjectionAuthority,
+    PrivateProjectionConsentId, SessionLocalState, SideQuestionAttempt, SideQuestionAttemptId,
+    SideQuestionFailureCode, SideQuestionLaunch, SideQuestionOutcome, SideQuestionResultId,
+    SideQuestionResultRef, UserNoteProjectionConsent, MAX_SIDE_QUESTION_RESULT_BYTES,
 };
 pub use persist::{SessionDocument, SessionStateV1};
 pub use session::{validate_session_file, validate_session_id, Session};
@@ -38,11 +52,18 @@ pub struct SessionState {
     pub conversation: Conversation,
     pub ui: UiState,
     pub modes: ModesState,
+    /// Live invocation authority. This field is process-local and is never
+    /// serialized into a conversation/session document.
+    #[serde(skip)]
     pub permissions: PermissionsState,
     pub budgets: BudgetsState,
     #[serde(default)]
     pub ide: IdeState,
     pub transcript: TranscriptState,
+    /// User-owned local events that are never projected into ordinary
+    /// conversation, provider-native continuation, exports, or memory.
+    #[serde(default, skip_serializing_if = "SessionLocalState::is_empty")]
+    pub local: SessionLocalState,
 }
 
 impl SessionState {
@@ -65,6 +86,7 @@ impl SessionState {
             budgets: BudgetsState::default(),
             ide: IdeState::default(),
             transcript,
+            local: SessionLocalState::default(),
         }
     }
 }
@@ -88,6 +110,7 @@ mod tests {
         assert!(!state.identity.session_id.as_str().is_empty());
         assert!(state.conversation.messages.is_empty());
         assert_eq!(state.transcript.watermark, 0);
+        assert!(state.local.is_empty());
     }
 
     #[test]
@@ -107,7 +130,7 @@ mod tests {
     }
 
     #[test]
-    fn serde_roundtrip_is_lossless() {
+    fn serde_roundtrip_preserves_non_authority_state() {
         let mut state = SessionState::new(std::path::PathBuf::from("/x"));
         state.conversation.messages.push(serde_json::json!({
             "role": "user",
@@ -124,5 +147,22 @@ mod tests {
         assert_eq!(round.budgets.effort_level, state.budgets.effort_level);
         assert!(round.ui.plan_mode.has_exited);
         assert_eq!(round.ide.active_file, state.ide.active_file);
+        assert!(round.local.is_empty());
+    }
+
+    #[test]
+    fn serialized_state_omits_live_permission_authority() {
+        let mut state = SessionState::new(std::path::PathBuf::from("/x"));
+        state.permissions.bypass_mode = true;
+        state.permissions.trust_accepted = true;
+        state.permissions.persistence_disabled = true;
+
+        let encoded = serde_json::to_value(&state).unwrap();
+        assert!(encoded.get("permissions").is_none());
+
+        let decoded: SessionState = serde_json::from_value(encoded).unwrap();
+        assert!(!decoded.permissions.bypass_mode);
+        assert!(!decoded.permissions.trust_accepted);
+        assert!(!decoded.permissions.persistence_disabled);
     }
 }

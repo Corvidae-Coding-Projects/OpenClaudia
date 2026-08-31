@@ -31,6 +31,16 @@ pub fn cmd_config() -> anyhow::Result<()> {
             println!("Session:");
             println!("  Timeout: {} minutes", config.session.timeout_minutes);
             println!("  Persist path: {}", config.session.persist_path.display());
+            println!();
+            println!("Technical memory:");
+            println!(
+                "  Team: {}",
+                config
+                    .memory
+                    .team_id
+                    .as_ref()
+                    .map_or("not selected", openclaudia::team_memory::TeamId::as_str)
+            );
             Ok(())
         }
         Err(e) => {

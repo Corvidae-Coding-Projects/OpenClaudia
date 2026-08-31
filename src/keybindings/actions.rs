@@ -45,6 +45,53 @@ pub enum KeyAction {
     None,
 }
 
+impl KeyAction {
+    /// Canonical slash command used by both interactive frontends for this
+    /// action. Cancellation is contextual and `None` is deliberately unbound.
+    #[must_use]
+    pub const fn command_name(&self) -> Option<&'static str> {
+        match self {
+            Self::NewSession | Self::Clear => Some("new"),
+            Self::ListSessions => Some("sessions"),
+            Self::Export => Some("export"),
+            Self::CopyResponse => Some("copy"),
+            Self::Editor => Some("editor"),
+            Self::Models => Some("models"),
+            Self::ToggleMode => Some("plan"),
+            Self::Status => Some("status"),
+            Self::Help => Some("help"),
+            Self::Exit => Some("exit"),
+            Self::Undo => Some("undo"),
+            Self::Redo => Some("redo"),
+            Self::Compact => Some("compact"),
+            Self::Cancel | Self::None => None,
+        }
+    }
+
+    /// Stable user-facing label used by generated effective-key help.
+    #[must_use]
+    pub const fn description(&self) -> &'static str {
+        match self {
+            Self::NewSession => "New session",
+            Self::ListSessions => "List sessions",
+            Self::Export => "Export conversation",
+            Self::CopyResponse => "Copy last response",
+            Self::Editor => "Open external editor",
+            Self::Models => "Show or switch models",
+            Self::ToggleMode => "Toggle Build/Plan mode",
+            Self::Cancel => "Cancel current operation",
+            Self::Status => "Show status",
+            Self::Help => "Show help",
+            Self::Clear => "Clear conversation",
+            Self::Exit => "Exit application",
+            Self::Undo => "Undo last exchange",
+            Self::Redo => "Redo last exchange",
+            Self::Compact => "Compact conversation",
+            Self::None => "Disabled",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

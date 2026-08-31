@@ -13,8 +13,8 @@
 //!     `OPENCLAUDIA_ALLOW_OUT_OF_ROOT` escape hatch is set.
 //!   - **Symlink defence** — a symlink at the target path is
 //!     refused even when both the link and its target live inside
-//!     the project root (so traversal-via-symlink can't bypass the
-//!     allowed-roots check by pointing into the project tree).
+//!     the project root, and an existing parent-directory symlink is
+//!     diagnosed before the descriptor-bound storage operation.
 //!   - **Lexical `..` traversal** — `<project>/../../etc/passwd`
 //!     and `<project>/legit/../../../../etc/passwd` both refused.
 //!   - **Empty / NUL-byte inputs** — refused with the canonical
@@ -151,6 +151,24 @@ fn symlink_pointing_outside_project_root_is_refused() {
     assert!(
         matches!(outcome, Err(PathValidationError::SymlinkRejected { .. })),
         "symlink → /etc/passwd must be refused; got {outcome:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_symlink_pointing_outside_project_root_is_refused() {
+    let dir = tempdir().expect("project root");
+    let outside = tempdir().expect("outside root");
+    let linked_parent = dir.path().join("linked-parent");
+    std::os::unix::fs::symlink(outside.path(), &linked_parent).expect("parent symlink");
+
+    let outcome = validate_persist_path(&linked_parent.join("state.json"), dir.path());
+    assert_eq!(
+        outcome,
+        Err(PathValidationError::SymlinkRejected {
+            path: linked_parent.display().to_string(),
+        }),
+        "configuration diagnostics must expose the parent-link problem; the later write still requires a descriptor capability"
     );
 }
 

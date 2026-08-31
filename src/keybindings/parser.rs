@@ -5,7 +5,7 @@
 //! runtime resolver.
 
 /// A single parsed keystroke such as `ctrl-x` or `alt-shift-n`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ParsedKeystroke {
     /// The base key name (e.g. "x", "n", "f2", "tab").
     pub key: String,
@@ -35,40 +35,78 @@ impl ParsedKeystroke {
         }
 
         let parts: Vec<&str> = s.split('-').collect();
+        if parts.iter().any(|part| part.is_empty()) {
+            return None;
+        }
 
         let mut ctrl = false;
         let mut alt = false;
         let mut shift = false;
-        let mut key_parts: Vec<&str> = Vec::new();
+        let mut key = None;
 
-        for (i, part) in parts.iter().enumerate() {
-            match *part {
-                "ctrl" => ctrl = true,
-                "alt" => alt = true,
-                "shift" => shift = true,
+        for part in parts {
+            match part {
+                "ctrl" if key.is_none() && !ctrl => ctrl = true,
+                "alt" if key.is_none() && !alt => alt = true,
+                "shift" if key.is_none() && !shift => shift = true,
+                "ctrl" | "alt" | "shift" => return None,
                 _ => {
-                    // Everything from here to the end is the key name
-                    // (handles keys like "f2" which have no dash, but also
-                    // allows for future keys that might contain dashes if
-                    // they are not modifier names).
-                    key_parts = parts[i..].to_vec();
-                    break;
+                    if key.is_some() {
+                        return None;
+                    }
+                    key = canonical_key_name(part);
                 }
             }
         }
 
-        // If all segments were modifiers, there is no key name.
-        if key_parts.is_empty() {
-            return None;
-        }
-
-        let key = key_parts.join("-");
-
         Some(Self {
-            key,
+            key: key?,
             ctrl,
             alt,
             shift,
+        })
+    }
+
+    /// Convert one real crossterm key event into the same canonical shape used
+    /// by configuration parsing. Unsupported terminal-only modifier families
+    /// return `None` so the frontend can pass the event through unchanged.
+    #[must_use]
+    pub fn from_key_event(event: &crossterm::event::KeyEvent) -> Option<Self> {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        if event
+            .modifiers
+            .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META)
+        {
+            return None;
+        }
+
+        let (key, back_tab) = match event.code {
+            KeyCode::Backspace => ("backspace".to_string(), false),
+            KeyCode::Enter => ("enter".to_string(), false),
+            KeyCode::Left => ("left".to_string(), false),
+            KeyCode::Right => ("right".to_string(), false),
+            KeyCode::Up => ("up".to_string(), false),
+            KeyCode::Down => ("down".to_string(), false),
+            KeyCode::Home => ("home".to_string(), false),
+            KeyCode::End => ("end".to_string(), false),
+            KeyCode::PageUp => ("pageup".to_string(), false),
+            KeyCode::PageDown => ("pagedown".to_string(), false),
+            KeyCode::Tab => ("tab".to_string(), false),
+            KeyCode::BackTab => ("tab".to_string(), true),
+            KeyCode::Delete => ("delete".to_string(), false),
+            KeyCode::Insert => ("insert".to_string(), false),
+            KeyCode::F(number @ 1..=24) => (format!("f{number}"), false),
+            KeyCode::Char(character) => (character.to_lowercase().collect::<String>(), false),
+            KeyCode::Esc => ("escape".to_string(), false),
+            _ => return None,
+        };
+
+        Some(Self {
+            key,
+            ctrl: event.modifiers.contains(KeyModifiers::CONTROL),
+            alt: event.modifiers.contains(KeyModifiers::ALT),
+            shift: back_tab || event.modifiers.contains(KeyModifiers::SHIFT),
         })
     }
 
@@ -90,6 +128,25 @@ impl ParsedKeystroke {
     }
 }
 
+fn canonical_key_name(raw: &str) -> Option<String> {
+    let named = match raw {
+        "esc" | "escape" => Some("escape"),
+        "return" | "enter" => Some("enter"),
+        "tab" | "backspace" | "delete" | "insert" | "home" | "end" | "pageup" | "pagedown"
+        | "up" | "down" | "left" | "right" => Some(raw),
+        _ => None,
+    };
+    if let Some(named) = named {
+        return Some(named.to_string());
+    }
+    if let Some(number) = raw.strip_prefix('f').and_then(|n| n.parse::<u8>().ok()) {
+        return (1..=24).contains(&number).then(|| format!("f{number}"));
+    }
+    let mut characters = raw.chars();
+    let character = characters.next()?;
+    characters.next().is_none().then(|| character.to_string())
+}
+
 /// Parse a chord string (space-separated keystrokes) into a sequence.
 ///
 /// For example `"ctrl-x n"` produces two `ParsedKeystroke` values, while
@@ -97,7 +154,7 @@ impl ParsedKeystroke {
 #[must_use]
 pub fn parse_chord(s: &str) -> Option<Vec<ParsedKeystroke>> {
     let parts: Vec<&str> = s.split_whitespace().collect();
-    if parts.is_empty() {
+    if parts.is_empty() || parts.len() > 4 {
         return None;
     }
     let keystrokes: Option<Vec<ParsedKeystroke>> =

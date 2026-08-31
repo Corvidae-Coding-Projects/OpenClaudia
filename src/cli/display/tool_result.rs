@@ -1,102 +1,84 @@
-//! Centralized tool result display with per-tool formatting.
+//! Typed tool-result display.  Presentation follows [`ToolDisplay`] and never
+//! scans ordinary text for control or diff markers.
 
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
 use crossterm::ExecutableCommand;
+use openclaudia::tools::{ToolDisplay, ToolResult};
+use openclaudia::tui::safety::{
+    sanitize_terminal_label, sanitize_terminal_text, EVENT_TEXT_LIMITS,
+};
 use std::io;
 
 use super::diff;
 
 /// Display a tool result in the terminal with per-tool formatting.
-pub fn display_tool_result(tool_name: &str, content: &str, is_error: bool) {
+///
+/// # Errors
+///
+/// Returns the first terminal write error.
+pub fn display_tool_result(result: &ToolResult) -> io::Result<()> {
     let mut stdout = io::stdout();
+    let content = result.content();
 
-    if content.is_empty() {
-        return;
+    if matches!(result.display(), ToolDisplay::Hidden) || content.is_empty() {
+        return Ok(());
     }
 
-    // Errors always get full display in red
-    if is_error {
-        let _ = stdout.execute(SetForegroundColor(Color::Red));
-        let lines: Vec<&str> = content.lines().collect();
-        let max = 30.min(lines.len());
-        for line in &lines[..max] {
-            let _ = stdout.execute(Print(format!("    {line}\n")));
-        }
-        if lines.len() > max {
-            let _ = stdout.execute(Print(format!(
-                "    ... ({} more lines)\n",
-                lines.len() - max
-            )));
-        }
-        let _ = stdout.execute(ResetColor);
-        return;
+    if result.is_error() {
+        stdout.execute(SetForegroundColor(Color::Red))?;
+        print_limited(&mut stdout, content, 30)?;
+        stdout.execute(ResetColor)?;
+        return Ok(());
     }
 
-    // Check for embedded diff data
-    if let Some(diff_data) = extract_diff_block(content) {
-        diff::render_color_diff(&diff_data.path, &diff_data.old_text, &diff_data.new_text);
-        // Also show the success message (first line before the diff block)
-        if let Some(msg) = content.split("@@DIFF_START@@").next() {
-            let msg = msg.trim();
-            if !msg.is_empty() {
-                let _ = stdout.execute(SetForegroundColor(Color::Green));
-                let _ = stdout.execute(Print(format!("    {msg}\n")));
-                let _ = stdout.execute(ResetColor);
+    if let ToolDisplay::Diff {
+        summary,
+        diff: data,
+    } = result.display()
+    {
+        diff::render_color_diff(&data.path, &data.old_text, &data.new_text)?;
+        if !summary.trim().is_empty() {
+            let summary = sanitize_terminal_text(summary.trim(), EVENT_TEXT_LIMITS);
+            stdout.execute(SetForegroundColor(Color::Green))?;
+            stdout.execute(Print(format!("    {}\n", summary.as_str())))?;
+            stdout.execute(ResetColor)?;
+        }
+        return Ok(());
+    }
+
+    let max_lines = match result.display() {
+        ToolDisplay::Text { max_lines } => *max_lines,
+        ToolDisplay::Auto | ToolDisplay::Diff { .. } | ToolDisplay::Hidden => {
+            match result.handler() {
+                "bash" | "bash_output" => 25,
+                "read_file" | "grep" | "glob" | "list_files" => 15,
+                "write_file" => 3,
+                _ => 20,
             }
         }
-        return;
-    }
-
-    // Per-tool display strategies
-    let max_lines = match tool_name {
-        "bash" | "bash_output" => 25,
-        "read_file" | "grep" | "glob" | "list_files" => 15,
-        "write_file" => 3,
-        _ => 20,
     };
-
-    let color = match tool_name {
+    let handler = sanitize_terminal_label(result.handler());
+    let color = match handler.as_str() {
         "write_file" | "edit_file" => Color::Green,
         "bash" | "bash_output" => Color::White,
         _ => Color::DarkGrey,
     };
 
-    let _ = stdout.execute(SetForegroundColor(color));
-    let lines: Vec<&str> = content.lines().collect();
-    let show = max_lines.min(lines.len());
-    for line in &lines[..show] {
-        let _ = stdout.execute(Print(format!("    {line}\n")));
-    }
-    if lines.len() > show {
-        let _ = stdout.execute(SetForegroundColor(Color::DarkGrey));
-        let _ = stdout.execute(Print(format!(
-            "    ... ({} more lines)\n",
-            lines.len() - show
-        )));
-    }
-    let _ = stdout.execute(ResetColor);
+    stdout.execute(SetForegroundColor(color))?;
+    print_limited(&mut stdout, content, max_lines)?;
+    stdout.execute(ResetColor)?;
+    Ok(())
 }
 
-struct DiffBlock {
-    path: String,
-    old_text: String,
-    new_text: String,
-}
-
-fn extract_diff_block(content: &str) -> Option<DiffBlock> {
-    let start = content.find("@@DIFF_START@@")?;
-    let end = content.find("@@DIFF_END@@")?;
-    let json_str = content[start + "@@DIFF_START@@".len()..end].trim();
-    let v: serde_json::Value = match serde_json::from_str(json_str) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("\x1b[33mWarning: failed to parse diff block JSON: {e}\x1b[0m");
-            return None;
-        }
-    };
-    Some(DiffBlock {
-        path: v["path"].as_str()?.to_string(),
-        old_text: v["old"].as_str()?.to_string(),
-        new_text: v["new"].as_str()?.to_string(),
-    })
+fn print_limited(stdout: &mut io::Stdout, content: &str, max_lines: usize) -> io::Result<()> {
+    let content = sanitize_terminal_text(content, EVENT_TEXT_LIMITS);
+    let mut lines = content.as_str().lines();
+    for line in lines.by_ref().take(max_lines) {
+        stdout.execute(Print(format!("    {line}\n")))?;
+    }
+    if lines.next().is_some() || content.was_truncated() {
+        stdout.execute(SetForegroundColor(Color::DarkGrey))?;
+        stdout.execute(Print("    … (additional output omitted)\n"))?;
+    }
+    Ok(())
 }

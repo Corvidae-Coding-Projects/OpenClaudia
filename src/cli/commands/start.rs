@@ -1,4 +1,4 @@
-use openclaudia::{config, guardrails, proxy};
+use openclaudia::{config, proxy};
 use tracing::{error, info};
 
 /// Start the proxy server
@@ -30,8 +30,6 @@ pub async fn cmd_start(
     if let Some(t) = target {
         config.proxy.target = t;
     }
-
-    guardrails::configure(&config.guardrails);
 
     let Some(provider) = config.active_provider() else {
         error!(

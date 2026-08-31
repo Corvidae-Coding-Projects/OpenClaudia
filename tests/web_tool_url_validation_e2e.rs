@@ -12,9 +12,10 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::registry::{registry, ToolContext};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+
+mod support;
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
     let mut m = HashMap::new();
@@ -25,28 +26,21 @@ fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
 }
 
 fn execute_web_fetch(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("web_fetch", args, &mut ctx)
-        .expect("web_fetch must be registered")
+    support::dispatch_tool("web_fetch", args)
 }
 
 #[cfg(feature = "browser")]
 fn execute_web_browser(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("web_browser", args, &mut ctx)
-        .expect("web_browser must be registered")
+    support::dispatch_tool("web_browser", args)
+}
+
+fn assert_url_classification_denial(message: &str) {
+    assert!(message.contains("Host safety"), "got {message:?}");
+    assert!(message.contains("'url'"), "got {message:?}");
+    assert!(
+        message.contains("malformed arguments") || message.contains("Missing"),
+        "got {message:?}"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -164,7 +158,7 @@ fn execute_web_fetch_url_as_number_returns_error() {
     let args = args_with(&[("url", json!(42))]);
     let (msg, is_err) = execute_web_fetch(&args);
     assert!(is_err, "non-string url MUST be rejected");
-    assert_eq!(msg, "Invalid 'url' argument: expected string");
+    assert_url_classification_denial(&msg);
 }
 
 #[test]
@@ -172,7 +166,7 @@ fn execute_web_fetch_url_as_array_returns_error() {
     let args = args_with(&[("url", json!(["x", "y"]))]);
     let (msg, is_err) = execute_web_fetch(&args);
     assert!(is_err);
-    assert_eq!(msg, "Invalid 'url' argument: expected string");
+    assert_url_classification_denial(&msg);
 }
 
 #[test]
@@ -180,7 +174,7 @@ fn execute_web_fetch_url_as_object_returns_error() {
     let args = args_with(&[("url", json!({"x": "y"}))]);
     let (msg, is_err) = execute_web_fetch(&args);
     assert!(is_err);
-    assert_eq!(msg, "Invalid 'url' argument: expected string");
+    assert_url_classification_denial(&msg);
 }
 
 #[test]
@@ -188,7 +182,7 @@ fn execute_web_fetch_url_as_null_returns_error() {
     let args = args_with(&[("url", Value::Null)]);
     let (msg, is_err) = execute_web_fetch(&args);
     assert!(is_err);
-    assert_eq!(msg, "Invalid 'url' argument: expected string");
+    assert_url_classification_denial(&msg);
 }
 
 #[cfg(feature = "browser")]
@@ -197,7 +191,7 @@ fn execute_web_browser_url_as_number_returns_error() {
     let args = args_with(&[("url", json!(42))]);
     let (msg, is_err) = execute_web_browser(&args);
     assert!(is_err, "non-string browser url MUST be rejected");
-    assert_eq!(msg, "Invalid 'url' argument: expected string");
+    assert_url_classification_denial(&msg);
 }
 
 #[test]

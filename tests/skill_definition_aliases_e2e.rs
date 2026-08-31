@@ -286,19 +286,16 @@ fn round_trip_serialize_then_deserialize_preserves_aliased_fields() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section F — Extra fields tolerated (forward compat)
+// Section F — Unknown schema fields are rejected
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn extra_unknown_fields_tolerated_when_deserializing() {
+fn extra_unknown_fields_rejected_when_deserializing() {
     let outcome: Result<SkillDefinition, _> = serde_json::from_value(json!({
         "name": "x",
         "description": "y",
         "unknown_future_field": "ignored",
         "another_extra": 42
     }));
-    assert!(
-        outcome.is_ok(),
-        "unknown fields MUST be tolerated for forward compat"
-    );
+    assert!(outcome.is_err(), "unknown fields MUST be rejected");
 }

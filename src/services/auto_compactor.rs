@@ -26,17 +26,17 @@
 //!
 //! ## Why a service and not just a fn
 //!
-//! Keeping this in `services::` puts it in the same dispatch graph as
-//! `analytics` / `feature_flags` etc., so future call sites can lift it
-//! out of `ServiceRegistry` instead of constructing one ad-hoc. The
-//! current registry doesn't carry an `AutoCompactor` slot yet (the
-//! compactor needs per-request configuration that `ServiceRegistry`'s
-//! shared-instance model doesn't fit), but the dependency direction is
-//! correct: services depend on compaction, not the other way around.
+//! The proxy constructs this typed owner per request because model-specific
+//! compaction overrides do not fit a shared global registry. Its production
+//! disposition is recorded in `services::lifecycle_service_catalog`; keeping
+//! the dependency explicit avoids hiding request authority in a service
+//! locator.
 
 use std::sync::Arc;
 
-use crate::compaction::{CompactionError, CompactionResult, ContextCompactor};
+use crate::compaction::{
+    CompactionError, CompactionResult, ContextCompactor, RequestTokenMeasurement,
+};
 use crate::hooks::HookEngine;
 use crate::memory::MemoryDb;
 use crate::proxy::ChatCompletionRequest;
@@ -91,16 +91,14 @@ impl AutoCompactor {
     pub fn should_compact(
         &self,
         request: &ChatCompletionRequest,
-        actual_input_tokens: Option<usize>,
+        measurement: Option<RequestTokenMeasurement>,
     ) -> bool {
         match self.policy {
-            AutoCompactPolicy::Auto => self
-                .compactor
-                .needs_compaction(request, actual_input_tokens),
+            AutoCompactPolicy::Auto => self.compactor.needs_compaction(request, measurement),
             AutoCompactPolicy::AlwaysOverBudget => {
                 let analysis = self
                     .compactor
-                    .analyze_with_hint(request, actual_input_tokens);
+                    .analyze_with_measurement(request, measurement);
                 analysis.current_tokens >= analysis.max_tokens
             }
         }
@@ -115,21 +113,23 @@ impl AutoCompactor {
     pub async fn auto_compact(
         &self,
         request: &mut ChatCompletionRequest,
-        actual_input_tokens: Option<usize>,
+        measurement: Option<RequestTokenMeasurement>,
         hook_engine: Option<&HookEngine>,
+        run_context: &std::sync::Arc<crate::tools::ToolRunContext>,
         session_id: Option<&str>,
         memory_db: Option<Arc<MemoryDb>>,
     ) -> Result<Option<CompactionResult>, CompactionError> {
-        if !self.should_compact(request, actual_input_tokens) {
+        if !self.should_compact(request, measurement) {
             return Ok(None);
         }
         let result = self
             .compactor
-            .compact_with_hint(
+            .compact_with_measurement(
                 request,
                 hook_engine,
+                run_context,
                 session_id,
-                actual_input_tokens,
+                measurement,
                 memory_db,
             )
             .await?;
@@ -147,6 +147,7 @@ impl AutoCompactor {
         request: &mut ChatCompletionRequest,
         target_tokens: usize,
         hook_engine: Option<&HookEngine>,
+        run_context: &std::sync::Arc<crate::tools::ToolRunContext>,
         session_id: Option<&str>,
         memory_db: Option<Arc<MemoryDb>>,
     ) -> Result<Option<CompactionResult>, CompactionError> {
@@ -155,7 +156,14 @@ impl AutoCompactor {
         }
         let result = self
             .compactor
-            .microcompact(request, target_tokens, hook_engine, session_id, memory_db)
+            .microcompact(
+                request,
+                target_tokens,
+                hook_engine,
+                run_context,
+                session_id,
+                memory_db,
+            )
             .await?;
         Ok(Some(result))
     }
@@ -167,6 +175,10 @@ mod tests {
     use crate::compaction::CompactionConfig;
     use crate::proxy::{ChatMessage, MessageContent};
     use std::collections::HashMap;
+
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
 
     fn small_request() -> ChatCompletionRequest {
         ChatCompletionRequest {
@@ -212,7 +224,7 @@ mod tests {
         let ac = AutoCompactor::auto(compactor);
         let mut req = small_request();
         let result = ac
-            .auto_compact(&mut req, None, None, None, None)
+            .auto_compact(&mut req, None, None, test_run(), None, None)
             .await
             .unwrap();
         assert!(result.is_none());

@@ -41,6 +41,13 @@ impl ProviderAdapter for QwenAdapter {
         self.0.name()
     }
 
+    fn state_contract(
+        &self,
+        protocol: crate::runtime::ProviderWireProtocol,
+    ) -> Result<&'static crate::runtime::ProviderStateContract, ProviderError> {
+        self.0.state_contract(protocol)
+    }
+
     fn transform_request(&self, request: &ChatCompletionRequest) -> Result<Value, ProviderError> {
         self.0.transform_request(request)
     }
@@ -61,7 +68,7 @@ impl ProviderAdapter for QwenAdapter {
         self.0.chat_endpoint(model)
     }
 
-    fn get_headers(&self, api_key: &ApiKey) -> Vec<(String, String)> {
+    fn get_headers(&self, api_key: &ApiKey) -> crate::secrets::SensitiveHeaders {
         self.0.get_headers(api_key)
     }
 

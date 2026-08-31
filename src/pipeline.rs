@@ -5,17 +5,22 @@
 
 use crate::config::{AppConfig, ThinkingConfig};
 use crate::memory::MemoryDb;
-use crate::permissions::{PermissionManager, PermissionRule};
+use crate::permissions::{
+    ApprovalProvenance, AuthorizationResult, ExecutionPermit, PermissionManager, PermissionRule,
+};
+use crate::provider_transport::{self, RequestReplaySafety};
 use crate::providers::{
-    anthropic_rejects_manual_thinking, apply_anthropic_adaptive_thinking,
-    convert_messages_to_anthropic_checked, convert_tool_definitions_to_anthropic_checked,
-    convert_tools_to_gemini_functions, extract_gemini_text_content, get_adapter,
+    apply_anthropic_adaptive_thinking, convert_messages_to_anthropic_checked,
+    convert_tool_definitions_to_anthropic_checked, get_adapter, ReasoningProfile,
 };
 use crate::proxy::{self, normalize_base_url};
 use crate::services::policy::{PolicyEnforcer, PolicyError};
 use crate::session::TokenUsage;
 use crate::tools::{self, AnthropicToolAccumulator, ToolCall, ToolCallAccumulator};
-use crate::tui::events::{ApiRetryKind, AppEvent, PermissionResponse};
+use crate::tui::events::{
+    ApiRetryKind, AppEvent, PermissionResponse, PlanModeReply, PlanModeRequest,
+};
+use base64::Engine as _;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde_json::Value;
@@ -32,6 +37,121 @@ macro_rules! send_event {
     };
 }
 
+#[cfg(test)]
+mod provider_terminal_outcome_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn done_without_finish_reason_is_not_success() {
+        let mut terminal = ChatStreamTerminal::new("openai");
+        terminal
+            .observe(&json!({"choices": [{"delta": {"content": "partial"}}]}))
+            .expect("text delta is valid");
+        terminal.observe_done();
+
+        let error = terminal.finish().expect_err("terminal reason is required");
+        assert!(error.contains("without a valid terminal reason"), "{error}");
+    }
+
+    #[test]
+    fn valid_finish_reason_survives_transport_eof() {
+        let mut terminal = ChatStreamTerminal::new("openai-compatible");
+        terminal
+            .observe(&json!({
+                "choices": [{"delta": {}, "finish_reason": "stop"}]
+            }))
+            .expect("known terminal reason");
+
+        assert_eq!(
+            terminal.finish().expect("finish reason is terminal"),
+            ProviderTerminalOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn anthropic_requires_message_stop_after_stop_reason() {
+        let mut terminal = ChatStreamTerminal::new("anthropic");
+        terminal
+            .observe(&json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"}
+            }))
+            .expect("known stop reason");
+
+        let error = terminal.finish().expect_err("message_stop is required");
+        assert!(error.contains("before message_stop"), "{error}");
+    }
+
+    #[test]
+    fn anthropic_message_stop_commits_normal_completion() {
+        let mut terminal = ChatStreamTerminal::new("anthropic");
+        terminal
+            .observe(&json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"}
+            }))
+            .expect("known stop reason");
+        terminal
+            .observe(&json!({"type": "message_stop"}))
+            .expect("message_stop");
+
+        assert_eq!(
+            terminal.finish().expect("complete Anthropic stream"),
+            ProviderTerminalOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn length_and_refusal_are_typed_non_success_outcomes() {
+        let mut length = ChatStreamTerminal::new("openai");
+        length
+            .observe(&json!({
+                "choices": [{"delta": {}, "finish_reason": "length"}]
+            }))
+            .expect("known length reason");
+        let outcome = length.finish().expect("typed terminal outcome");
+        assert_eq!(outcome, ProviderTerminalOutcome::LengthLimited);
+        assert!(ensure_provider_turn_succeeded(outcome, 0).is_err());
+
+        let mut refusal = ChatStreamTerminal::new("openai");
+        refusal
+            .observe(&json!({
+                "choices": [{
+                    "delta": {"refusal": "cannot comply"},
+                    "finish_reason": "stop"
+                }]
+            }))
+            .expect("refusal delta");
+        let outcome = refusal.finish().expect("typed terminal outcome");
+        assert_eq!(outcome, ProviderTerminalOutcome::Refused);
+        assert!(ensure_provider_turn_succeeded(outcome, 0).is_err());
+    }
+
+    #[test]
+    fn nonstream_chat_requires_terminal_reason_and_matching_tools() {
+        let missing = json!({
+            "choices": [{"message": {"role": "assistant", "content": "partial"}}]
+        });
+        assert!(validate_chat_completion_terminal(&missing).is_err());
+
+        let tool_turn = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{"id": "call_1"}]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        assert_eq!(
+            validate_chat_completion_terminal(&tool_turn).expect("matching tool terminal"),
+            ProviderTerminalOutcome::ToolCalls
+        );
+    }
+}
+
 /// Send an event to the TUI from a non-Result context (tool execution loop).
 /// Returns from the enclosing function with current results if channel is dead.
 macro_rules! send_event_or_break {
@@ -43,14 +163,279 @@ macro_rules! send_event_or_break {
     };
 }
 
+/// Provider-authored terminal state for one completed model turn.
+///
+/// Text and reasoning deltas are provisional until one of these states has
+/// been decoded from the provider protocol. Only [`Self::Completed`] and
+/// [`Self::ToolCalls`] are successful application outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderTerminalOutcome {
+    /// The provider completed a normal assistant response.
+    Completed,
+    /// The provider completed the turn by requesting tools.
+    ToolCalls,
+    /// The provider stopped because its output limit was reached.
+    LengthLimited,
+    /// The provider explicitly refused the request.
+    Refused,
+    /// The provider filtered or suppressed the response.
+    ContentFiltered,
+}
+
+impl std::fmt::Display for ProviderTerminalOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Completed => "completed",
+            Self::ToolCalls => "tool_calls",
+            Self::LengthLimited => "length_limited",
+            Self::Refused => "refused",
+            Self::ContentFiltered => "content_filtered",
+        })
+    }
+}
+
+/// Require a provider terminal state that agrees with the decoded tool calls.
+///
+/// # Errors
+///
+/// Returns an error for refusal/filter/length outcomes or when the terminal
+/// reason disagrees with the response structure.
+pub fn ensure_provider_turn_succeeded(
+    outcome: ProviderTerminalOutcome,
+    tool_call_count: usize,
+) -> Result<(), String> {
+    match outcome {
+        ProviderTerminalOutcome::Completed if tool_call_count == 0 => Ok(()),
+        ProviderTerminalOutcome::Completed => Err(format!(
+            "Provider reported a normal completion but returned {tool_call_count} tool call(s)"
+        )),
+        ProviderTerminalOutcome::ToolCalls if tool_call_count > 0 => Ok(()),
+        ProviderTerminalOutcome::ToolCalls => {
+            Err("Provider reported tool calls but returned no complete tool call".to_string())
+        }
+        ProviderTerminalOutcome::LengthLimited => {
+            Err("Provider response stopped at its output limit".to_string())
+        }
+        ProviderTerminalOutcome::Refused => Err("Provider refused the request".to_string()),
+        ProviderTerminalOutcome::ContentFiltered => {
+            Err("Provider filtered the response".to_string())
+        }
+    }
+}
+
+fn classify_provider_finish_reason(
+    reason: &str,
+    refusal_observed: bool,
+) -> Result<ProviderTerminalOutcome, String> {
+    let normalized = reason.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "stop" | "end_turn" | "stop_sequence" if refusal_observed => {
+            Ok(ProviderTerminalOutcome::Refused)
+        }
+        "stop" | "end_turn" | "stop_sequence" => Ok(ProviderTerminalOutcome::Completed),
+        "tool_calls" | "tool_use" | "function_call" => Ok(ProviderTerminalOutcome::ToolCalls),
+        "length" | "max_tokens" | "model_context_window_exceeded" => {
+            Ok(ProviderTerminalOutcome::LengthLimited)
+        }
+        "refusal" | "refused" => Ok(ProviderTerminalOutcome::Refused),
+        "content_filter" | "content_filtered" | "safety" | "safety_blocked" | "recitation"
+        | "blocklist" => Ok(ProviderTerminalOutcome::ContentFiltered),
+        "" => Err("Provider emitted an empty terminal reason".to_string()),
+        _ => Err(format!(
+            "Provider emitted unknown terminal reason {reason:?}"
+        )),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatStreamProtocol {
+    Anthropic,
+    OpenAiCompatible,
+}
+
+/// Shared terminal-state tracker for Anthropic and OpenAI-compatible chat SSE.
+///
+/// Frontends may render deltas while streaming, but must call [`Self::finish`]
+/// before committing them as assistant history or reporting success.
+#[derive(Debug)]
+pub struct ChatStreamTerminal {
+    protocol: ChatStreamProtocol,
+    outcome: Option<ProviderTerminalOutcome>,
+    refusal_observed: bool,
+    protocol_complete: bool,
+}
+
+impl ChatStreamTerminal {
+    #[must_use]
+    pub fn new(provider: &str) -> Self {
+        Self {
+            protocol: if provider.trim().eq_ignore_ascii_case("anthropic") {
+                ChatStreamProtocol::Anthropic
+            } else {
+                ChatStreamProtocol::OpenAiCompatible
+            },
+            outcome: None,
+            refusal_observed: false,
+            protocol_complete: false,
+        }
+    }
+
+    /// Observe an SSE `event:` name when the frontend parses frames manually.
+    /// Eventsource-based callers normally receive the equivalent JSON event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a provider error event is observed.
+    pub fn observe_event_name(&mut self, event: &str) -> Result<(), String> {
+        match event.trim() {
+            "message_stop" => {
+                self.protocol_complete = true;
+                Ok(())
+            }
+            "error" => Err("Provider emitted an SSE error event".to_string()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Observe one decoded provider SSE data object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for provider error envelopes, unknown terminal reasons,
+    /// or contradictory terminal states.
+    pub fn observe(&mut self, json: &Value) -> Result<(), String> {
+        if let Some(error) = json.get("error") {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| error.as_str())
+                .filter(|message| !message.is_empty())
+                .unwrap_or("provider stream error");
+            return Err(format!("Provider stream error: {message}"));
+        }
+
+        if let Some(event_type) = json.get("type").and_then(Value::as_str) {
+            match event_type {
+                "error" => return Err("Provider emitted an SSE error event".to_string()),
+                "message_stop" => self.protocol_complete = true,
+                "message_delta" => {
+                    if let Some(reason) = json
+                        .get("delta")
+                        .and_then(|delta| delta.get("stop_reason"))
+                        .and_then(Value::as_str)
+                    {
+                        let outcome =
+                            classify_provider_finish_reason(reason, self.refusal_observed)?;
+                        self.record_outcome(outcome)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(choice) = json
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+        {
+            self.refusal_observed |= choice
+                .get("delta")
+                .and_then(|delta| delta.get("refusal"))
+                .and_then(Value::as_str)
+                .is_some_and(|refusal| !refusal.is_empty());
+            if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                let outcome = classify_provider_finish_reason(reason, self.refusal_observed)?;
+                self.record_outcome(outcome)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark an OpenAI-compatible `[DONE]` sentinel.
+    pub fn observe_done(&mut self) {
+        if self.protocol == ChatStreamProtocol::OpenAiCompatible {
+            self.protocol_complete = true;
+        }
+    }
+
+    /// Return the validated provider terminal outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stream ended without a terminal reason, or an
+    /// Anthropic stream omitted its required `message_stop` event.
+    pub fn finish(self) -> Result<ProviderTerminalOutcome, String> {
+        let outcome = self
+            .outcome
+            .ok_or_else(|| "Provider stream ended without a valid terminal reason".to_string())?;
+        if self.protocol == ChatStreamProtocol::Anthropic && !self.protocol_complete {
+            return Err("Anthropic stream ended before message_stop".to_string());
+        }
+        Ok(outcome)
+    }
+
+    fn record_outcome(&mut self, outcome: ProviderTerminalOutcome) -> Result<(), String> {
+        if let Some(previous) = self.outcome {
+            if previous != outcome {
+                return Err(format!(
+                    "Provider stream emitted contradictory terminal reasons: {previous} then {outcome}"
+                ));
+            }
+        } else {
+            self.outcome = Some(outcome);
+        }
+        Ok(())
+    }
+}
+
+/// Classify a complete OpenAI-compatible chat response.
+///
+/// # Errors
+///
+/// Returns an error when the first choice lacks a terminal reason, carries an
+/// unknown/non-success reason, or disagrees with its tool-call payload.
+pub fn validate_chat_completion_terminal(
+    response: &Value,
+) -> Result<ProviderTerminalOutcome, String> {
+    let choice = response
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .ok_or_else(|| "Provider response is missing choices[0]".to_string())?;
+    let message = choice
+        .get("message")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Provider response choices[0] is missing message".to_string())?;
+    let refusal_observed = message
+        .get("refusal")
+        .and_then(Value::as_str)
+        .is_some_and(|refusal| !refusal.is_empty());
+    let reason = choice
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            "Provider response choices[0] is missing a terminal finish_reason".to_string()
+        })?;
+    let outcome = classify_provider_finish_reason(reason, refusal_observed)?;
+    let tool_call_count = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    ensure_provider_turn_succeeded(outcome, tool_call_count)?;
+    Ok(outcome)
+}
+
 /// Outcome of a single conversation turn (one API round-trip + tool execution).
 #[derive(Debug)]
 pub struct TurnResult {
     /// Full response text accumulated during streaming.
     pub content: String,
-    /// Provider reasoning content accumulated during streaming, when the
-    /// upstream exposes it separately from visible text.
-    pub reasoning_content: Option<String>,
+    /// Provider-sanctioned reasoning summary, when the upstream explicitly
+    /// distinguishes it from raw reasoning and continuation state.
+    pub reasoning_summary: Option<crate::runtime::ReasoningSummary>,
+    /// Raw, memory-only provider continuation for the next compatible
+    /// tool-loop hop. This value is never part of portable session state.
+    pub provider_reasoning_continuation: Option<crate::runtime::ProviderReasoningContinuation>,
     /// Structured tool calls returned by the model.
     pub tool_calls: Vec<ToolCall>,
     /// Tool result messages to append to the conversation history.
@@ -59,11 +444,14 @@ pub struct TurnResult {
     pub usage: TokenUsage,
     /// Whether the model returned tool calls that need a follow-up API call.
     pub needs_followup: bool,
+    /// Validated provider terminal state for this turn.
+    pub terminal_outcome: ProviderTerminalOutcome,
     /// Normalized finish reason surfaced to the caller, when the provider
     /// reports one. `None` for normal stop on streams that do not propagate
     /// a distinct termination cause through this layer.
     ///
-    /// Values currently emitted by [`handle_google_response`] (crosslink #788):
+    /// Values currently emitted by [`decode_provider_native_json_turn`]
+    /// (crosslink #788):
     /// - `Some("safety_blocked")` — Gemini set `finishReason` to `SAFETY`,
     ///   `RECITATION`, or `BLOCKLIST`. Text may be empty; callers should
     ///   surface a user-visible error rather than treating this as a normal
@@ -72,6 +460,38 @@ pub struct TurnResult {
     /// - `Some("stop")` — explicit `STOP` from the provider.
     /// - `Some(other)` — verbatim pass-through for unrecognized reasons.
     pub finish_reason: Option<String>,
+    /// Complete provider-owned continuation after this turn, when the wire
+    /// protocol requires native state. Construction and bounds validation
+    /// happen before tool effects are dispatched.
+    pub provider_native_state: Option<crate::runtime::ProviderNativeState>,
+    /// Exact run-scoped services to use for an immediate agentic follow-up.
+    /// This stays host-local and is never projected into provider state.
+    pub(crate) execution_bindings: Option<TurnExecutionBindings>,
+}
+
+pub(crate) struct TurnExecutionBindings {
+    pub(crate) run_context: Arc<tools::ToolRunContext>,
+    pub(crate) permission_mgr: Option<Arc<PermissionManager>>,
+    pub(crate) task_mgr: Arc<Mutex<crate::session::TaskManager>>,
+    pub(crate) speculation: Arc<crate::speculation::SpeculationCoordinator>,
+}
+
+impl std::fmt::Debug for TurnExecutionBindings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TurnExecutionBindings")
+            .field("run_id", &self.run_context.run_id())
+            .field("generation", &self.run_context.generation())
+            .field("has_permission_manager", &self.permission_mgr.is_some())
+            .field("speculation", &self.speculation)
+            .finish_non_exhaustive()
+    }
+}
+
+struct ToolCallBatch {
+    results: Vec<Value>,
+    has_tools: bool,
+    bindings: TurnExecutionBindings,
 }
 
 // ─── Request building ───────────────────────────────────────────────────────
@@ -93,6 +513,23 @@ impl WireApi {
     }
 }
 
+/// Return the portable ordinal for the next assistant message.
+///
+/// Provider-native continuation binds to this stable projection so
+/// request-scoped system, grounding, and verifier context cannot shift it.
+///
+/// # Errors
+///
+/// Returns an error only if the platform cannot represent the message count as
+/// `u64`.
+pub fn next_assistant_message_ordinal(messages: &[Value]) -> Result<u64, String> {
+    let count = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) != Some("system"))
+        .count();
+    u64::try_from(count).map_err(|_| "portable conversation ordinal overflow".to_string())
+}
+
 /// Build an Anthropic-format request body.
 ///
 /// If `prompt_blocks` is provided, the system prompt is emitted as a
@@ -108,14 +545,31 @@ pub fn build_anthropic_request(
     model: &str,
     messages: &[Value],
     effort_level: &str,
-    claude_code_token: Option<&str>,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
     prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+) -> Result<Value, String> {
+    build_anthropic_request_with_tools(
+        model,
+        messages,
+        effort_level,
+        claude_code_token,
+        prompt_blocks,
+        &tools::get_all_tool_definitions(true),
+    )
+}
+
+fn build_anthropic_request_with_tools(
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+    openai_tools: &Value,
 ) -> Result<Value, String> {
     let anthropic_messages =
         convert_messages_to_anthropic_checked(messages).map_err(|e| e.to_string())?;
-    let openai_tools = tools::get_all_tool_definitions(true);
     let anthropic_tools =
-        convert_tool_definitions_to_anthropic_checked(&openai_tools).map_err(|e| e.to_string())?;
+        convert_tool_definitions_to_anthropic_checked(openai_tools).map_err(|e| e.to_string())?;
 
     let mut req = serde_json::json!({
         "model": model,
@@ -141,32 +595,45 @@ pub fn build_anthropic_request(
     }
 
     if claude_code_token.is_some() {
-        crate::claude_credentials::inject_system_prompt(&mut req);
+        crate::claude_credentials::inject_oauth_prefix_only(&mut req)
+            .map_err(|error| error.to_string())?;
     }
 
     // Apply effort level. `high` / `max` switch Anthropic into thinking mode.
-    // Newer models (Fable/Mythos, Opus 4.8/4.7) reject manual thinking
-    // budgets, so they use the adaptive-thinking + output_config.effort
-    // shape. Older/manual-capable models keep the Claude Code budget path.
+    // Models with exact adaptive evidence use adaptive thinking; models with
+    // exact manual evidence keep the Claude Code budget path. Unknown models
+    // receive no optional thinking fields.
     // MAX_THINKING_TOKENS env var overrides manual budgets outright. See
     // `crate::thinking` for the precedence chain and keyword-trigger logic
     // (ultrathink / think ultra hard).
     match effort_level {
         "high" | "max" | "xhigh" => {
-            if anthropic_rejects_manual_thinking(model) {
-                apply_anthropic_adaptive_thinking(&mut req, model, Some(effort_level));
-                req["max_tokens"] = serde_json::json!(40_000);
-            } else if let Some(budget) =
-                crate::thinking::anthropic_thinking_budget(Some(effort_level))
-            {
-                req["thinking"] = serde_json::json!({
-                    "type": "enabled",
-                    "budget_tokens": budget,
-                });
-                // Headroom for the thinking block plus the answer. Claude
-                // Code uses max_tokens > budget_tokens; 40k covers 32k
-                // thinking + ~8k answer comfortably.
-                req["max_tokens"] = serde_json::json!(40_000);
+            let profile = crate::providers::resolve_model("anthropic", model)
+                .capabilities()
+                .reasoning_profile;
+            match profile {
+                ReasoningProfile::AnthropicAdaptive => {
+                    apply_anthropic_adaptive_thinking(&mut req, model, Some(effort_level));
+                    req["max_tokens"] = serde_json::json!(40_000);
+                }
+                ReasoningProfile::AnthropicManual => {
+                    if let Some(budget) =
+                        crate::thinking::anthropic_thinking_budget(Some(effort_level))
+                    {
+                        req["thinking"] = serde_json::json!({
+                            "type": "enabled",
+                            "budget_tokens": budget,
+                        });
+                        // Headroom for the thinking block plus the answer.
+                        req["max_tokens"] = serde_json::json!(40_000);
+                    }
+                }
+                _ => {
+                    tracing::warn!(
+                        model,
+                        "thinking requested without current Anthropic model-capability evidence; omitting thinking controls",
+                    );
+                }
             }
         }
         "low" => {
@@ -185,12 +652,27 @@ pub fn build_anthropic_request(
 /// `xhigh` tier.
 #[must_use]
 pub fn build_openai_request(model: &str, messages: &[Value], effort_level: &str) -> Value {
+    build_openai_request_with_tools(
+        model,
+        messages,
+        effort_level,
+        &tools::get_all_tool_definitions(true),
+    )
+}
+
+fn build_openai_request_with_tools(
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    tool_definitions: &Value,
+) -> Value {
+    let messages = openai_chat_messages_with_native_attachments(messages);
     let mut req = serde_json::json!({
         "model": model,
         "messages": messages,
         "max_tokens": crate::DEFAULT_MAX_TOKENS,
         "stream": true,
-        "tools": tools::get_all_tool_definitions(true)
+        "tools": tool_definitions
     });
     match effort_level {
         "none" | "minimal" | "low" | "medium" | "high" | "xhigh" => {
@@ -202,6 +684,54 @@ pub fn build_openai_request(model: &str, messages: &[Value], effort_level: &str)
         _ => {}
     }
     req
+}
+
+fn openai_chat_messages_with_native_attachments(messages: &[Value]) -> Vec<Value> {
+    let mut projected = Vec::with_capacity(messages.len());
+    for message in messages {
+        let mut message = message.clone();
+        let raw_attachments = message
+            .as_object_mut()
+            .and_then(|object| object.remove(tools::TOOL_ATTACHMENTS_MESSAGE_KEY));
+        projected.push(message);
+        let Some(raw_attachments) = raw_attachments else {
+            continue;
+        };
+        match tools::resolve_tool_attachments(Some(&raw_attachments)) {
+            Ok(attachments) => {
+                let mut content = vec![serde_json::json!({
+                    "type": "text",
+                    "text": "Native media returned by the immediately preceding tool result."
+                })];
+                for attachment in attachments {
+                    if !attachment.media_type.starts_with("image/") {
+                        content.push(serde_json::json!({
+                            "type": "text",
+                            "text": format!(
+                                "Unsupported OpenAI Chat Completions attachment: {} ({})",
+                                attachment.media_type, attachment.digest
+                            )
+                        }));
+                        continue;
+                    }
+                    let encoded =
+                        base64::engine::general_purpose::STANDARD.encode(attachment.bytes.as_ref());
+                    content.push(serde_json::json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!("data:{};base64,{encoded}", attachment.media_type)
+                        }
+                    }));
+                }
+                projected.push(serde_json::json!({"role": "user", "content": content}));
+            }
+            Err(error) => projected.push(serde_json::json!({
+                "role": "user",
+                "content": format!("Native tool attachment is unavailable: {error}")
+            })),
+        }
+    }
+    projected
 }
 
 fn text_from_message_content(content: &Value) -> Result<String, String> {
@@ -223,7 +753,7 @@ fn text_from_message_content(content: &Value) -> Result<String, String> {
     Ok(text)
 }
 
-fn response_input_message(role: &str, text: &str) -> Value {
+fn response_input_message(role: &str, text: &str, ordinal: u64) -> Value {
     let item_type = if role == "assistant" {
         "output_text"
     } else {
@@ -232,30 +762,93 @@ fn response_input_message(role: &str, text: &str) -> Value {
     serde_json::json!({
         "type": "message",
         "role": role,
-        "content": [{"type": item_type, "text": text}]
+        "content": [{"type": item_type, "text": text}],
+        "_openclaudia_message_ordinal": ordinal
     })
 }
 
-fn responses_input_items(messages: &[Value]) -> Result<(String, Vec<Value>), String> {
+fn responses_tool_output(message: &Value, content: String) -> Value {
+    let attachment_resolution =
+        tools::resolve_tool_attachments(message.get(tools::TOOL_ATTACHMENTS_MESSAGE_KEY));
+    if matches!(&attachment_resolution, Ok(attachments) if attachments.is_empty()) {
+        return Value::String(content);
+    }
+
+    let mut output = vec![serde_json::json!({
+        "type": "input_text",
+        "text": content,
+    })];
+    match attachment_resolution {
+        Ok(attachments) => {
+            for attachment in attachments {
+                if !attachment.media_type.starts_with("image/") {
+                    output.push(serde_json::json!({
+                        "type": "input_text",
+                        "text": format!(
+                            "OpenAI Responses cannot replay {} tool attachment {}",
+                            attachment.media_type, attachment.digest
+                        )
+                    }));
+                    continue;
+                }
+                let encoded =
+                    base64::engine::general_purpose::STANDARD.encode(attachment.bytes.as_ref());
+                output.push(serde_json::json!({
+                    "type": "input_image",
+                    "image_url": format!("data:{};base64,{encoded}", attachment.media_type),
+                    "detail": "auto",
+                }));
+            }
+        }
+        Err(error) => output.push(serde_json::json!({
+            "type": "input_text",
+            "text": format!("Native tool attachment unavailable: {error}")
+        })),
+    }
+    Value::Array(output)
+}
+
+fn take_responses_ordinal(next: &mut u64) -> Result<u64, String> {
+    let ordinal = *next;
+    *next = (*next)
+        .checked_add(1)
+        .ok_or_else(|| "Responses history ordinal overflow".to_string())?;
+    Ok(ordinal)
+}
+
+fn responses_input_items(messages: &[Value]) -> Result<(String, Vec<Value>, Vec<Value>), String> {
     let mut instructions = Vec::new();
     let mut input = Vec::new();
+    let mut history = Vec::new();
+    let mut next_ordinal = 0_u64;
 
     for (index, msg) in messages.iter().enumerate() {
         let role = msg
             .get("role")
             .and_then(Value::as_str)
             .ok_or_else(|| format!("message at index {index} missing string 'role': {msg}"))?;
-        let content = text_from_message_content(msg.get("content").unwrap_or(&Value::Null))?;
+        let content_value = msg.get("content").unwrap_or(&Value::Null);
+        let content = if role == "assistant" && content_value.is_null() {
+            String::new()
+        } else {
+            text_from_message_content(content_value)?
+        };
         match role {
             "system" => {
                 if !content.is_empty() {
                     instructions.push(content);
                 }
             }
-            "user" => input.push(response_input_message("user", &content)),
+            "user" => {
+                let ordinal = take_responses_ordinal(&mut next_ordinal)?;
+                history.push(serde_json::json!({"ordinal": ordinal, "role": role}));
+                input.push(response_input_message("user", &content, ordinal));
+            }
             "assistant" => {
+                let ordinal = take_responses_ordinal(&mut next_ordinal)?;
+                history.push(serde_json::json!({"ordinal": ordinal, "role": role}));
                 if !content.is_empty() {
-                    input.push(response_input_message("assistant", &content));
+                    input.push(response_input_message("assistant", &content, ordinal));
                 }
                 if let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) {
                     for call in tool_calls {
@@ -287,21 +880,26 @@ fn responses_input_items(messages: &[Value]) -> Result<(String, Vec<Value>), Str
                             "type": "function_call",
                             "name": name,
                             "arguments": arguments,
-                            "call_id": call_id
+                            "call_id": call_id,
+                            "_openclaudia_message_ordinal": ordinal
                         }));
                     }
                 }
             }
             "tool" => {
+                let ordinal = take_responses_ordinal(&mut next_ordinal)?;
+                history.push(serde_json::json!({"ordinal": ordinal, "role": role}));
                 let call_id = msg
                     .get("tool_call_id")
                     .and_then(Value::as_str)
                     .filter(|id| !id.is_empty())
                     .ok_or_else(|| format!("tool message missing tool_call_id: {msg}"))?;
+                let output = responses_tool_output(msg, content);
                 input.push(serde_json::json!({
                     "type": "function_call_output",
                     "call_id": call_id,
-                    "output": content
+                    "output": output,
+                    "_openclaudia_message_ordinal": ordinal
                 }));
             }
             other => {
@@ -312,7 +910,7 @@ fn responses_input_items(messages: &[Value]) -> Result<(String, Vec<Value>), Str
         }
     }
 
-    Ok((instructions.join("\n\n"), input))
+    Ok((instructions.join("\n\n"), input, history))
 }
 
 fn responses_tools_from_openai_tools(openai_tools: &Value) -> Result<Vec<Value>, String> {
@@ -372,18 +970,44 @@ pub fn build_openai_responses_request(
     messages: &[Value],
     effort_level: &str,
 ) -> Result<Value, String> {
-    let (instructions, input) = responses_input_items(messages)?;
-    let tools = responses_tools_from_openai_tools(&tools::get_all_tool_definitions(true))?;
+    let mut request = build_openai_responses_request_draft_with_tools(
+        model,
+        messages,
+        effort_level,
+        &tools::get_all_tool_definitions(true),
+    )?;
+    crate::providers::finalize_responses_request(&mut request)?;
+    Ok(request)
+}
+
+fn build_openai_responses_request_draft_with_tools(
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    openai_tools: &Value,
+) -> Result<Value, String> {
+    let (instructions, input, history) = responses_input_items(messages)?;
+    let tools = responses_tools_from_openai_tools(openai_tools)?;
     let mut req = serde_json::json!({
         "model": model,
         "input": input,
         "stream": true,
         "store": false,
-        "tools": tools,
-        "tool_choice": "auto",
-        "parallel_tool_calls": true,
-        "include": ["reasoning.encrypted_content"]
+        "include": ["reasoning.encrypted_content"],
+        // Responses owns its opaque compaction continuation. Trigger before
+        // the model ceiling so the returned `compaction` item can be replayed
+        // losslessly on the next stateless request.
+        "context_management": [{
+            "type": "compaction",
+            "compact_threshold": crate::compaction::get_context_window(model).saturating_mul(4) / 5
+        }],
+        "_openclaudia_responses_history": history
     });
+    if !tools.is_empty() {
+        req["tools"] = Value::Array(tools);
+        req["tool_choice"] = Value::String("auto".to_string());
+        req["parallel_tool_calls"] = Value::Bool(true);
+    }
     if !instructions.is_empty() {
         req["instructions"] = Value::String(instructions);
     }
@@ -404,6 +1028,34 @@ pub fn build_chat_completion_request(
     model: &str,
     messages: &[Value],
 ) -> Result<proxy::ChatCompletionRequest, String> {
+    build_chat_completion_request_with_tools(
+        model,
+        messages,
+        &tools::get_all_tool_definitions(true),
+    )
+}
+
+/// Build the canonical policy-accounting request with the same progressive
+/// definitions the exact run will publish to the provider.
+///
+/// # Errors
+///
+/// Returns an error if the run-owned catalog cannot be published or a message
+/// cannot be represented as a typed chat-completions message.
+pub fn build_chat_completion_request_for_run(
+    run: &tools::ToolRunContext,
+    model: &str,
+    messages: &[Value],
+) -> Result<proxy::ChatCompletionRequest, String> {
+    let snapshot = tools::get_progressive_tool_definitions(run, messages, true)?;
+    build_chat_completion_request_with_tools(model, messages, &snapshot.definitions_value())
+}
+
+fn build_chat_completion_request_with_tools(
+    model: &str,
+    messages: &[Value],
+    tool_definitions: &Value,
+) -> Result<proxy::ChatCompletionRequest, String> {
     let messages = messages
         .iter()
         .enumerate()
@@ -413,7 +1065,7 @@ pub fn build_chat_completion_request(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let tools = tools::get_all_tool_definitions(true)
+    let tools = tool_definitions
         .as_array()
         .ok_or_else(|| "built-in tool definitions must be a JSON array".to_string())?
         .clone();
@@ -459,8 +1111,17 @@ fn build_adapter_request(
     model: &str,
     messages: &[Value],
     effort_level: &str,
+    tool_definitions: &Value,
 ) -> Result<Value, String> {
-    let request = build_chat_completion_request(model, messages)?;
+    let mut request = build_chat_completion_request_with_tools(model, messages, tool_definitions)?;
+    if provider.trim().eq_ignore_ascii_case("ollama") {
+        // The canonical agent loops consume one complete JSON response. Keep
+        // Ollama's NDJSON streaming protocol out of this path until the
+        // bounded transport slice owns a native stream state machine.
+        request.stream = Some(false);
+        return crate::providers::OllamaAdapter::transform_request_draft(&request)
+            .map_err(|error| error.to_string());
+    }
     let adapter = get_adapter(provider).map_err(|e| e.to_string())?;
     let body = thinking_config_for_pipeline_effort(provider, effort_level).map_or_else(
         || adapter.transform_request(&request),
@@ -476,63 +1137,44 @@ fn build_adapter_request(
 /// Returns an error if the built-in tool definitions cannot be represented as
 /// Gemini function declarations.
 pub fn build_google_request(messages: &[Value], effort_level: &str) -> Result<Value, String> {
-    let openai_tools = tools::get_all_tool_definitions(true);
-    let tools_vec = openai_tools
-        .as_array()
-        .ok_or_else(|| "built-in tool definitions must be a JSON array".to_string())?;
-    let functions = convert_tools_to_gemini_functions(tools_vec).map_err(|e| e.to_string())?;
+    let model = crate::providers::default_model_for_target("google")
+        .ok_or_else(|| "Google provider has no maintained default model".to_string())?;
+    build_google_request_with_tools(
+        model,
+        messages,
+        effort_level,
+        &tools::get_all_tool_definitions(true),
+    )
+}
 
-    let mut contents = Vec::new();
-    let mut system_parts: Vec<String> = Vec::new();
-    for (msg_index, msg) in messages.iter().enumerate() {
-        let role = msg.get("role").and_then(Value::as_str).ok_or_else(|| {
-            format!("Google message at index {msg_index} missing string 'role': {msg}")
-        })?;
-        let text = msg.get("content").and_then(Value::as_str).ok_or_else(|| {
-            format!("Google message at index {msg_index} missing string 'content': {msg}")
-        })?;
-        if role == "system" {
-            if !text.is_empty() {
-                system_parts.push(text.to_string());
-            }
-            continue;
-        }
-        let gemini_role = match role {
-            "assistant" => "model",
-            "user" | "tool" => "user",
-            _ => {
+fn build_google_request_with_tools(
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    openai_tools: &Value,
+) -> Result<Value, String> {
+    for (message_index, message) in messages.iter().enumerate() {
+        if let Some(role) = message.get("role").and_then(Value::as_str) {
+            if !matches!(role, "system" | "user" | "assistant" | "tool") {
                 return Err(format!(
-                    "Google message at index {msg_index} has unsupported role '{role}': {msg}"
+                    "Google message at index {message_index} has unsupported role {role:?}"
                 ));
             }
-        };
-        contents.push(serde_json::json!({
-            "role": gemini_role,
-            "parts": [{"text": text}]
-        }));
+        }
     }
-
-    // Gemini takes `thinkingConfig.thinkingBudget` inside
-    // generationConfig. When effort is high/max we hand it the Claude
-    // Code ULTRATHINK constant, clamped to Gemini's documented ceiling.
-    let mut generation_config = serde_json::json!({"maxOutputTokens": 4096});
-    if matches!(effort_level, "high" | "max") {
-        const GEMINI_THINKING_CAP: u32 = 32_768;
-        let budget = crate::thinking::anthropic_thinking_budget(Some(effort_level))
-            .unwrap_or(crate::thinking::ULTRATHINK_BUDGET_TOKENS)
-            .min(GEMINI_THINKING_CAP);
-        generation_config["thinkingConfig"] = serde_json::json!({"thinkingBudget": budget});
+    let mut request = build_chat_completion_request_with_tools(model, messages, openai_tools)?;
+    request.max_tokens = Some(4096);
+    let mut thinking = thinking_config_for_pipeline_effort("google", effort_level);
+    if let Some(thinking) = thinking.as_mut() {
+        // Preserve the established Gemini high/max budget (including the
+        // MAX_THINKING_TOKENS override) while using the canonical adapter.
+        thinking.budget_tokens = crate::thinking::anthropic_thinking_budget(Some(effort_level));
     }
-    let mut req = serde_json::json!({
-        "contents": contents,
-        "generationConfig": generation_config,
-        "tools": [{"functionDeclarations": functions}]
-    });
-    let system_text = (!system_parts.is_empty()).then(|| system_parts.join("\n\n"));
-    if let Some(sys) = system_text {
-        req["systemInstruction"] = serde_json::json!({"parts": [{"text": sys}]});
-    }
-    Ok(req)
+    crate::providers::GoogleAdapter::transform_request_draft_with_thinking(
+        &request,
+        thinking.as_ref(),
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Build the appropriate request body for the given provider.
@@ -549,7 +1191,7 @@ pub fn build_request(
     model: &str,
     messages: &[Value],
     effort_level: &str,
-    claude_code_token: Option<&str>,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
     prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
 ) -> Result<Value, String> {
     build_request_for_wire(
@@ -560,6 +1202,64 @@ pub fn build_request(
         effort_level,
         claude_code_token,
         prompt_blocks,
+    )
+}
+
+/// Build a chat-completions request from the exact run-owned progressive tool
+/// catalog rather than the compatibility full-catalog baseline.
+///
+/// # Errors
+///
+/// Returns an error when catalog publication, provider lookup, or provider
+/// request conversion fails.
+pub fn build_request_for_run(
+    run: &tools::ToolRunContext,
+    provider: &str,
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+) -> Result<Value, String> {
+    build_request_for_run_with_state(
+        run,
+        provider,
+        model,
+        messages,
+        effort_level,
+        claude_code_token,
+        prompt_blocks,
+        None,
+    )
+}
+
+/// Build a chat-completions request and apply exact provider-native state.
+///
+/// # Errors
+///
+/// Returns an error when state identity, protocol, or adapter capabilities do
+/// not permit a lossless request.
+#[allow(clippy::too_many_arguments)]
+pub fn build_request_for_run_with_state(
+    run: &tools::ToolRunContext,
+    provider: &str,
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+    provider_native_state: Option<&crate::runtime::ProviderNativeState>,
+) -> Result<Value, String> {
+    build_request_for_wire_for_run_with_state(
+        run,
+        WireApi::ChatCompletions,
+        provider,
+        model,
+        messages,
+        effort_level,
+        claude_code_token,
+        prompt_blocks,
+        provider_native_state,
     )
 }
 
@@ -575,25 +1275,312 @@ pub fn build_request_for_wire(
     model: &str,
     messages: &[Value],
     effort_level: &str,
-    claude_code_token: Option<&str>,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
     prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+) -> Result<Value, String> {
+    build_request_for_wire_with_tools(
+        wire_api,
+        provider,
+        model,
+        messages,
+        effort_level,
+        claude_code_token,
+        prompt_blocks,
+        &tools::get_all_tool_definitions(true),
+        None,
+    )
+}
+
+/// Build the provider request from one exact run-owned progressive catalog
+/// snapshot. This is the production path for TUI and legacy frontends.
+///
+/// # Errors
+///
+/// Returns an error when catalog publication, message conversion, provider
+/// lookup, or provider-specific request conversion fails.
+#[allow(clippy::too_many_arguments)]
+pub fn build_request_for_wire_for_run(
+    run: &tools::ToolRunContext,
+    wire_api: WireApi,
+    provider: &str,
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+) -> Result<Value, String> {
+    build_request_for_wire_for_run_with_state(
+        run,
+        wire_api,
+        provider,
+        model,
+        messages,
+        effort_level,
+        claude_code_token,
+        prompt_blocks,
+        None,
+    )
+}
+
+/// Build the provider request from an exact progressive catalog and optional
+/// provider-native state.
+///
+/// # Errors
+///
+/// Returns an error when state cannot be applied losslessly or normal request
+/// construction fails.
+#[allow(clippy::too_many_arguments)]
+pub fn build_request_for_wire_for_run_with_state(
+    run: &tools::ToolRunContext,
+    wire_api: WireApi,
+    provider: &str,
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+    provider_native_state: Option<&crate::runtime::ProviderNativeState>,
+) -> Result<Value, String> {
+    build_request_for_wire_for_run_with_additional_and_state(
+        run,
+        wire_api,
+        provider,
+        model,
+        messages,
+        effort_level,
+        claude_code_token,
+        prompt_blocks,
+        &[],
+        provider_native_state,
+    )
+}
+
+/// Build a run-owned provider request with already-validated dynamic
+/// definitions. The progressive catalog retains source digests and strips
+/// host-only registration metadata before provider conversion.
+///
+/// # Errors
+///
+/// Returns an error when catalog publication or provider request conversion
+/// rejects a malformed, stale, unavailable, or oversized definition set.
+#[allow(clippy::too_many_arguments)]
+pub fn build_request_for_wire_for_run_with_additional(
+    run: &tools::ToolRunContext,
+    wire_api: WireApi,
+    provider: &str,
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+    additional: &[Value],
+) -> Result<Value, String> {
+    build_request_for_wire_for_run_with_additional_and_state(
+        run,
+        wire_api,
+        provider,
+        model,
+        messages,
+        effort_level,
+        claude_code_token,
+        prompt_blocks,
+        additional,
+        None,
+    )
+}
+
+/// Build a run-owned provider request and apply an exact provider-native state
+/// envelope after provider conversion.
+///
+/// # Errors
+///
+/// Returns an error when catalog publication or provider conversion fails, or
+/// when native state cannot be applied losslessly to the selected identity and
+/// protocol.
+#[allow(clippy::too_many_arguments)]
+pub fn build_request_for_wire_for_run_with_additional_and_state(
+    run: &tools::ToolRunContext,
+    wire_api: WireApi,
+    provider: &str,
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+    additional: &[Value],
+    provider_native_state: Option<&crate::runtime::ProviderNativeState>,
+) -> Result<Value, String> {
+    let snapshot =
+        tools::get_progressive_tool_definitions_with_additional(run, messages, true, additional)?;
+    build_request_for_wire_with_tools(
+        wire_api,
+        provider,
+        model,
+        messages,
+        effort_level,
+        claude_code_token,
+        prompt_blocks,
+        &snapshot.definitions_value(),
+        provider_native_state,
+    )
+}
+
+/// Build a provider request from an exact frontend-owned tool definition set.
+///
+/// ACP and child runs publish capability-filtered catalogs that must not be
+/// widened back to the process-wide registry during provider conversion. This
+/// entry point shares the canonical wire builder and continuation adapter while
+/// preserving that exact catalog boundary.
+///
+/// # Errors
+///
+/// Returns an error when the selected wire conversion, tool definitions, or
+/// provider-native state cannot be represented losslessly.
+#[allow(clippy::too_many_arguments)]
+pub fn build_request_for_wire_with_exact_tools_and_state(
+    wire_api: WireApi,
+    provider: &str,
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+    tool_definitions: &[Value],
+    provider_native_state: Option<&crate::runtime::ProviderNativeState>,
+) -> Result<Value, String> {
+    let tool_definitions = Value::Array(tool_definitions.to_vec());
+    build_request_for_wire_with_tools(
+        wire_api,
+        provider,
+        model,
+        messages,
+        effort_level,
+        claude_code_token,
+        prompt_blocks,
+        &tool_definitions,
+        provider_native_state,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_request_for_wire_with_tools(
+    wire_api: WireApi,
+    provider: &str,
+    model: &str,
+    messages: &[Value],
+    effort_level: &str,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    prompt_blocks: Option<&crate::prompt::SystemPromptBlocks>,
+    tool_definitions: &Value,
+    provider_native_state: Option<&crate::runtime::ProviderNativeState>,
 ) -> Result<Value, String> {
     // Resolve ultrathink keyword / env override against the base effort
     // so every provider path sees the same effective level (Claude Code
     // does the same in `resolveAppliedEffort`). If env says `unset` /
     // `auto`, `medium` flows through as the request builders' no-op
     // effort level, omitting provider effort hints.
-    let resolved = crate::thinking::resolve_effort(effort_level, messages);
-    let effective = resolved.as_deref().unwrap_or("medium");
-    if wire_api == WireApi::OpenAiResponses {
-        return build_openai_responses_request(model, messages, effective);
+    let mut portable_messages = messages.to_vec();
+    for message in &mut portable_messages {
+        crate::runtime::redact_reasoning_for_provider_request(message);
     }
-    match provider.to_ascii_lowercase().as_str() {
-        "anthropic" => {
-            build_anthropic_request(model, messages, effective, claude_code_token, prompt_blocks)
+    let resolved = crate::thinking::resolve_effort(effort_level, &portable_messages);
+    let effective = resolved.as_deref().unwrap_or("medium");
+    let prepared_messages =
+        prompt_blocks.map(|context| context.prepare_json_messages(&portable_messages));
+    let effective_messages = prepared_messages
+        .as_deref()
+        .unwrap_or(portable_messages.as_slice());
+    let mut body = if wire_api == WireApi::OpenAiResponses {
+        build_openai_responses_request_draft_with_tools(
+            model,
+            effective_messages,
+            effective,
+            tool_definitions,
+        )?
+    } else {
+        match provider.to_ascii_lowercase().as_str() {
+            "anthropic" => build_anthropic_request_with_tools(
+                model,
+                effective_messages,
+                effective,
+                claude_code_token,
+                prompt_blocks,
+                tool_definitions,
+            ),
+            "google" | "gemini" => build_google_request_with_tools(
+                model,
+                effective_messages,
+                effective,
+                tool_definitions,
+            ),
+            _ => build_adapter_request(
+                provider,
+                model,
+                effective_messages,
+                effective,
+                tool_definitions,
+            ),
+        }?
+    };
+    if let Some(state) = provider_native_state {
+        apply_provider_native_state_to_request(wire_api, provider, model, &mut body, state)?;
+    }
+    if wire_api == WireApi::OpenAiResponses {
+        crate::providers::finalize_responses_request(&mut body)?;
+    } else {
+        match provider.trim().to_ascii_lowercase().as_str() {
+            "google" | "gemini" => {
+                crate::providers::GoogleAdapter::finalize_request(&mut body)
+                    .map_err(|error| error.to_string())?;
+            }
+            "ollama" => {
+                crate::providers::OllamaAdapter::finalize_request(&mut body)
+                    .map_err(|error| error.to_string())?;
+            }
+            _ => {}
         }
-        "google" | "gemini" => build_google_request(messages, effective),
-        _ => build_adapter_request(provider, model, messages, effective),
+    }
+    Ok(body)
+}
+
+/// Validate and apply provider-native state to a provider request assembled by
+/// a frontend-specific follow-up path.
+///
+/// # Errors
+///
+/// Returns an error for provider/model/protocol drift, unsupported facets, or
+/// an adapter that has not implemented lossless native-state application.
+pub fn apply_provider_native_state_to_request(
+    wire_api: WireApi,
+    provider: &str,
+    model: &str,
+    request: &mut Value,
+    state: &crate::runtime::ProviderNativeState,
+) -> Result<(), String> {
+    let protocol = provider_wire_protocol(wire_api, provider);
+    state
+        .validate_binding(provider, model, protocol)
+        .map_err(|error| error.to_string())?;
+    let adapter = get_adapter(provider).map_err(|error| error.to_string())?;
+    adapter
+        .apply_provider_native_state(request, state)
+        .map_err(|error| error.to_string())
+}
+
+/// Resolve the concrete provider-owned protocol for one outbound request.
+#[must_use]
+pub fn provider_wire_protocol(
+    wire_api: WireApi,
+    provider: &str,
+) -> crate::runtime::ProviderWireProtocol {
+    if wire_api == WireApi::OpenAiResponses {
+        return crate::runtime::ProviderWireProtocol::OpenAiResponses;
+    }
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "anthropic" => crate::runtime::ProviderWireProtocol::AnthropicMessages,
+        "google" | "gemini" => crate::runtime::ProviderWireProtocol::GeminiGenerateContent,
+        "ollama" => crate::runtime::ProviderWireProtocol::OllamaChat,
+        _ => crate::runtime::ProviderWireProtocol::OpenAiChatCompletions,
     }
 }
 
@@ -612,7 +1599,7 @@ pub fn resolve_endpoint(
     provider: &str,
     model: &str,
     base_url: &str,
-    claude_code_token: Option<&str>,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
 ) -> Result<String, crate::providers::ProviderError> {
     resolve_endpoint_for_wire(
         WireApi::ChatCompletions,
@@ -634,21 +1621,24 @@ pub fn resolve_endpoint_for_wire(
     provider: &str,
     model: &str,
     base_url: &str,
-    claude_code_token: Option<&str>,
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
 ) -> Result<String, crate::providers::ProviderError> {
-    if wire_api == WireApi::OpenAiResponses {
-        return Ok(format!("{}/responses", normalize_base_url(base_url)));
-    }
-    if claude_code_token.is_some() {
-        Ok(crate::claude_credentials::get_oauth_endpoint(model))
+    let endpoint = if wire_api == WireApi::OpenAiResponses {
+        format!("{}/responses", normalize_base_url(base_url))
+    } else if claude_code_token.is_some() {
+        crate::claude_credentials::get_oauth_endpoint(model)
+            .map_err(|error| crate::providers::ProviderError::Unsupported(error.to_string()))?
     } else {
         let adapter = get_adapter(provider)?;
-        Ok(format!(
+        format!(
             "{}{}",
             normalize_base_url(base_url),
             adapter.chat_endpoint(model)
-        ))
-    }
+        )
+    };
+    provider_transport::validate_endpoint(provider, &endpoint)
+        .map_err(|error| crate::providers::ProviderError::RequestFailed(error.to_string()))?;
+    Ok(endpoint)
 }
 
 /// Build the headers needed for the API request.
@@ -668,18 +1658,19 @@ pub fn resolve_endpoint_for_wire(
 pub fn resolve_headers(
     provider: &str,
     api_key: Option<&crate::providers::ApiKey>,
-    claude_code_token: Option<&str>,
-    extra_headers: &[(String, String)],
-) -> Result<Vec<(String, String)>, crate::providers::ProviderError> {
+    claude_code_token: Option<&crate::secrets::OAuthToken>,
+    extra_headers: &crate::secrets::SensitiveHeaders,
+) -> Result<crate::secrets::SensitiveHeaders, crate::providers::ProviderError> {
     let mut headers = if let Some(token) = claude_code_token {
         crate::claude_credentials::get_oauth_headers(token)
+            .map_err(|error| crate::providers::ProviderError::Unsupported(error.to_string()))?
     } else if let Some(key) = api_key {
         let adapter = get_adapter(provider)?;
         adapter.get_headers(key)
     } else {
-        Vec::new()
+        crate::secrets::SensitiveHeaders::new()
     };
-    headers.extend(extra_headers.iter().cloned());
+    headers.extend(extra_headers);
     Ok(headers)
 }
 
@@ -688,11 +1679,27 @@ pub fn resolve_headers(
 /// Parameters for [`run_turn`]. Bundled to keep the call-site argument count
 /// within clippy's `too_many_arguments` limit.
 pub struct RunTurnParams<'a> {
+    pub run_context: Arc<tools::ToolRunContext>,
     pub client: &'a reqwest::Client,
     pub endpoint: &'a str,
-    pub headers: &'a [(String, String)],
+    pub headers: &'a crate::secrets::SensitiveHeaders,
+    /// Supported subscription transport owned by Anthropic's unmodified
+    /// executable. When present, no provider HTTP request is made here.
+    pub claude_agent_sdk: Option<&'a crate::claude_agent_sdk::ClaudeAgentSdk>,
+    /// Supported account transport owned by `OpenAI`'s pinned Codex runtime.
+    /// When present, no provider HTTP request is made here.
+    pub codex_agent_sdk: Option<&'a crate::codex_agent_sdk::CodexAgentSdk>,
+    /// Provider reasoning effort forwarded to transports that expose it
+    /// outside the request body (currently the Claude Agent SDK).
+    pub effort_level: &'a str,
     pub request_body: &'a Value,
     pub provider: &'a str,
+    pub model_identity: &'a str,
+    /// Native continuation used to construct this request, if any.
+    pub provider_native_state: Option<&'a crate::runtime::ProviderNativeState>,
+    /// Non-system portable-message ordinal for the assistant turn returned by
+    /// this request.
+    pub assistant_message_ordinal: u64,
     pub memory_db: Option<Arc<MemoryDb>>,
     pub app_config: Option<Arc<AppConfig>>,
     pub permission_mgr: Option<Arc<PermissionManager>>,
@@ -709,17 +1716,20 @@ pub struct RunTurnParams<'a> {
     pub tx: mpsc::Sender<AppEvent>,
 }
 
+fn should_emit_live_assistant_text(app_config: Option<&AppConfig>) -> bool {
+    !app_config.is_some_and(|config| config.vdd.enabled)
+}
+
 // ---------------------------------------------------------------------------
 // Retry classifier + backoff helpers (crosslink #592, #595, #596, #597)
 // ---------------------------------------------------------------------------
 
 /// Maximum retry attempts for transient API errors.
 ///
-/// Matches CC's `withRetry.ts::DEFAULT_MAX_RETRIES` (10). Per crosslink
-/// #592 — was previously 3, which gave up too quickly on rate-limit
-/// surges that 10 attempts of jittered exponential backoff would have
-/// ridden out.
-pub const MAX_API_RETRIES: u32 = 10;
+/// Preserves the established ten-retry compatibility ceiling. S-048 adds a
+/// shared monotonic retry window, so immediate/short provider recovery keeps
+/// working while long backoff sequences terminate within a wall-clock budget.
+pub const MAX_API_RETRIES: u32 = provider_transport::MAX_PROVIDER_ATTEMPTS - 1;
 
 /// HTTP status codes that warrant a retry. Matches CC's
 /// `withRetry.ts` transient-status set:
@@ -730,84 +1740,20 @@ pub const MAX_API_RETRIES: u32 = 10;
 ///   * 529 — Anthropic-specific "service overloaded"
 #[must_use]
 pub const fn is_retryable_status(status: u16) -> bool {
-    matches!(status, 408 | 409 | 429 | 500 | 502 | 503 | 504 | 529)
+    let Ok(status) = reqwest::StatusCode::from_u16(status) else {
+        return false;
+    };
+    provider_transport::should_retry_status(status, RequestReplaySafety::Idempotent)
 }
 
 /// Transport-layer errors that warrant a retry.
 ///
-/// `ConnectionReset` and `BrokenPipe` are the canonical "TCP/TLS
-/// dropped under us" signals every long-lived streaming client sees;
-/// both are transient. Per crosslink #597.
+/// The broad compatibility classifier is retained for idempotent operations.
+/// Model POSTs use the stricter admission-only policy inside
+/// [`send_with_retry`] so ambiguous mid-request disconnects are not replayed.
 #[must_use]
 pub fn is_transient_transport_error(err: &reqwest::Error) -> bool {
-    use std::io;
-    // Walk the source chain looking for an io::Error whose kind is
-    // ConnectionReset or BrokenPipe. reqwest doesn't surface these
-    // structurally so source-chain inspection is the supported path.
-    let mut cur: &dyn std::error::Error = err;
-    loop {
-        if let Some(ioerr) = cur.downcast_ref::<io::Error>() {
-            if matches!(
-                ioerr.kind(),
-                io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
-            ) {
-                return true;
-            }
-        }
-        match cur.source() {
-            Some(next) => cur = next,
-            None => return false,
-        }
-    }
-}
-
-/// Exponential backoff (base = `2^(attempt+1)` seconds) with ±25% jitter,
-/// per crosslink #596 — when many clients hit the same 429 they must not
-/// all retry in lockstep and re-collide. Returns a wait in seconds.
-///
-/// The jitter is deterministic on a thread-local RNG path (we use
-/// `std::time::Instant::now()` nanos as the jitter source so unit tests
-/// observe non-equal sleeps without needing a `rand` dependency).
-fn backoff_with_jitter(attempt: u32) -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let base = 2u64.saturating_pow(attempt + 1);
-    // Jitter range is ±25% of base, minimum ±1 so attempt=0 still
-    // produces some spread between concurrent retriers.
-    let max_jitter = std::cmp::max(base / 4, 1);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::from(d.subsec_nanos()));
-    let jitter = nanos % (max_jitter * 2 + 1); // 0..=2*max_jitter
-                                               // Apply jitter as an unsigned offset around the base. Adding
-                                               // `jitter` then subtracting `max_jitter` keeps everything unsigned
-                                               // and saturates at 1 (we never want a 0-second sleep on a stuck
-                                               // transient).
-    let raw = base.saturating_add(jitter).saturating_sub(max_jitter);
-    raw.max(1)
-}
-
-fn retry_jitter_seed() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::from(d.subsec_nanos()))
-}
-
-const fn retry_after_with_jitter_from(
-    retry_after_secs: u64,
-    jitter_seed: u64,
-) -> std::time::Duration {
-    let base_ms = retry_after_secs.saturating_mul(1_000);
-    if base_ms == 0 {
-        return std::time::Duration::ZERO;
-    }
-    let max_jitter_ms = base_ms / 4;
-    let jitter_ms = jitter_seed % (max_jitter_ms + 1);
-    std::time::Duration::from_millis(base_ms.saturating_add(jitter_ms))
-}
-
-fn retry_after_with_jitter(retry_after_secs: u64) -> std::time::Duration {
-    retry_after_with_jitter_from(retry_after_secs, retry_jitter_seed())
+    provider_transport::should_retry_error(err, RequestReplaySafety::Idempotent)
 }
 
 /// Map a model name to a lighter sibling that's suitable as a fallback when
@@ -853,71 +1799,103 @@ pub fn overload_fallback_for(model: &str) -> &'static str {
     ""
 }
 
+/// Emit retry metadata without mixing it into model-authored stream content.
+fn emit_api_retry(
+    tx: &mpsc::Sender<AppEvent>,
+    kind: ApiRetryKind,
+    attempt: u32,
+    wait: std::time::Duration,
+    status: Option<u16>,
+) {
+    let delay_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+    let _ = tx.send(AppEvent::ApiRetry {
+        kind,
+        attempt,
+        max_attempts: MAX_API_RETRIES + 1,
+        delay_ms,
+        status,
+    });
+}
+
 /// Drive the API request through up to `MAX_API_RETRIES` attempts,
 /// classifying transient transport errors and retryable HTTP statuses
 /// per crosslink #595/#596/#597. Each retry emits a structured
 /// `tracing::warn!` (`target="openclaudia::retry"`, `event="api_retry"`)
 /// so log consumers can bucket retry pressure programmatically. The
-/// user-facing `AppEvent::StreamText` retry marker is preserved for
-/// REPL/TUI compatibility.
+/// user-facing retry state is emitted through [`AppEvent::ApiRetry`] so host
+/// status cannot be confused with model-authored stream content.
 ///
 /// When the loop exhausts [`MAX_API_RETRIES`] on a 529 ("service
 /// overloaded") status, the function additionally emits
 /// [`AppEvent::OverloadFallback`] with an advisory model hint so the
 /// orchestrator can suggest or automatically switch to a lighter
 /// sibling. See crosslink #598.
+#[allow(clippy::too_many_lines)] // Retry admission, diagnostics, and terminal response ownership form one transaction.
 async fn send_with_retry(
+    run: &tools::ToolRunContext,
     client: &reqwest::Client,
     endpoint: &str,
-    headers: &[(String, String)],
+    headers: &crate::secrets::SensitiveHeaders,
     request_body: &Value,
     tx: &mpsc::Sender<AppEvent>,
 ) -> Result<reqwest::Response, String> {
+    let deadline = tokio::time::Instant::now() + provider_transport::RETRY_WINDOW;
     let mut response = None;
     for attempt in 0..=MAX_API_RETRIES {
-        let mut req = client.post(endpoint).json(request_body);
-        for (key, value) in headers {
-            req = req.header(key, value);
+        let req = headers
+            .apply(client.post(endpoint).json(request_body))
+            .map_err(|error| error.to_string())?;
+        if attempt > 0 {
+            crate::provider_budget::record_provider_retry(run)
+                .map_err(|error| format!("Run budget denied provider retry: {error}"))?;
         }
 
-        let resp = match req.send().await {
+        let resp = match provider_transport::send_until(req, deadline).await {
             Ok(r) => r,
-            Err(e) if attempt < MAX_API_RETRIES && is_transient_transport_error(&e) => {
-                let wait_secs = backoff_with_jitter(attempt);
+            Err(error)
+                if attempt < MAX_API_RETRIES
+                    && error.retryable(RequestReplaySafety::AdmissionOnly) =>
+            {
+                let wait = provider_transport::retry_delay(attempt, None);
                 tracing::warn!(
                     target: "openclaudia::retry",
                     event = "api_retry",
                     kind = "transport",
                     attempt = attempt + 1,
                     max_attempts = MAX_API_RETRIES + 1,
-                    wait_secs,
-                    error = %e,
+                    wait_ms = wait.as_millis(),
+                    error = %error,
                     "transient transport error, retrying"
                 );
-                let _ = tx.send(AppEvent::ApiRetry {
-                    kind: ApiRetryKind::Transport,
-                    attempt: attempt + 1,
-                    max_attempts: MAX_API_RETRIES + 1,
-                    delay_ms: wait_secs.saturating_mul(1_000),
-                    status: None,
-                });
-                tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+                emit_api_retry(tx, ApiRetryKind::Transport, attempt + 1, wait, None);
+                if tokio::time::Instant::now() + wait >= deadline {
+                    return Err(
+                        "provider retry window exhausted before the next attempt".to_string()
+                    );
+                }
+                tokio::time::sleep(wait).await;
                 continue;
             }
-            Err(e) => return Err(format!("Request failed: {e}")),
+            Err(error) => {
+                return Err(format!(
+                    "Request failed: {}",
+                    headers.sanitize_diagnostic(&error.to_string())
+                ));
+            }
         };
         let status = resp.status().as_u16();
 
-        if is_retryable_status(status) && attempt < MAX_API_RETRIES {
-            let wait = resp
+        if provider_transport::should_retry_status(
+            resp.status(),
+            RequestReplaySafety::AdmissionOnly,
+        ) && attempt < MAX_API_RETRIES
+        {
+            let retry_after = resp
                 .headers()
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
-                .map_or_else(
-                    || std::time::Duration::from_secs(backoff_with_jitter(attempt)),
-                    retry_after_with_jitter,
-                );
+                .map(str::to_string);
+            let wait = provider_transport::retry_delay(attempt, retry_after.as_deref());
             tracing::warn!(
                 target: "openclaudia::retry",
                 event = "api_retry",
@@ -928,14 +1906,10 @@ async fn send_with_retry(
                 wait_ms = wait.as_millis(),
                 "transient API status, retrying"
             );
-            let delay_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
-            let _ = tx.send(AppEvent::ApiRetry {
-                kind: ApiRetryKind::Status,
-                attempt: attempt + 1,
-                max_attempts: MAX_API_RETRIES + 1,
-                delay_ms,
-                status: Some(status),
-            });
+            emit_api_retry(tx, ApiRetryKind::Status, attempt + 1, wait, Some(status));
+            if tokio::time::Instant::now() + wait >= deadline {
+                return Err("provider retry window exhausted before the next attempt".to_string());
+            }
             tokio::time::sleep(wait).await;
             continue;
         }
@@ -965,8 +1939,11 @@ async fn send_with_retry(
                     model_hint: hint.to_string(),
                 });
             }
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("API error {status}: {body}"));
+            let body = crate::secrets::read_bounded_diagnostic_body(resp)
+                .await
+                .unwrap_or_else(|_| zeroize::Zeroizing::new(String::new()));
+            let diagnostic = headers.sanitize_diagnostic(&body);
+            return Err(format!("API error {status}: {diagnostic}"));
         }
 
         response = Some(resp);
@@ -975,31 +1952,7 @@ async fn send_with_retry(
     response.ok_or_else(|| "Max retries exceeded".to_string())
 }
 
-/// Run one turn of the conversation: send request, stream response, execute tools.
-///
-/// Sends `AppEvent` variants through `tx` as they occur so the TUI can update
-/// in real time. Returns a `TurnResult` describing what happened.
-///
-/// # Errors
-///
-/// Returns `Err` if the HTTP request itself fails (network error, etc.).
-pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
-    let RunTurnParams {
-        client,
-        endpoint,
-        headers,
-        request_body,
-        provider,
-        memory_db,
-        app_config,
-        permission_mgr,
-        transient_allowed_tool_rules,
-        hook_engine,
-        policy_enforcer,
-        task_mgr,
-        session_id,
-        tx,
-    } = p;
+fn trace_run_turn_request(endpoint: &str, request_body: &Value) {
     tracing::info!(
         endpoint,
         model = request_body
@@ -1017,18 +1970,217 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
         has_tools = request_body
             .get("tools")
             .and_then(|v| v.as_array())
-            .is_some_and(|a| !a.is_empty()),
+            .is_some_and(|tools| !tools.is_empty()),
         "Sending API request"
     );
+}
 
-    // Send request with retry on transient errors. See `send_with_retry`
-    // for the per-attempt classification logic (crosslink #592 #595 #596 #597).
-    let response = send_with_retry(client, endpoint, headers, request_body, &tx).await?;
+/// Run one turn of the conversation: send request, stream response, execute tools.
+///
+/// Sends `AppEvent` variants through `tx` as they occur so the TUI can update
+/// in real time. Returns a `TurnResult` describing what happened.
+///
+/// # Errors
+///
+/// Returns `Err` if the HTTP request itself fails (network error, etc.).
+#[allow(clippy::too_many_lines)] // One provider turn owns reservation, transport, response handling, and settlement.
+pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
+    run_turn_with_speculation(p, None).await
+}
 
-    // For Google, handle non-streaming JSON response
-    if provider == "google" {
-        return handle_google_response(
+/// TUI follow-up entry point that carries the exact run-owned speculation
+/// coordinator without exposing internal optimization state in the public
+/// `RunTurnParams` compatibility surface.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn run_turn_with_speculation(
+    p: RunTurnParams<'_>,
+    speculation: Option<Arc<crate::speculation::SpeculationCoordinator>>,
+) -> Result<TurnResult, String> {
+    let RunTurnParams {
+        run_context,
+        client,
+        endpoint,
+        headers,
+        claude_agent_sdk,
+        codex_agent_sdk,
+        effort_level,
+        request_body,
+        provider,
+        model_identity,
+        provider_native_state,
+        assistant_message_ordinal,
+        memory_db,
+        app_config,
+        permission_mgr,
+        transient_allowed_tool_rules,
+        hook_engine,
+        policy_enforcer,
+        task_mgr,
+        session_id,
+        tx,
+    } = p;
+    let mut request_body = request_body.clone();
+    let emit_live_assistant_text = should_emit_live_assistant_text(app_config.as_deref());
+    let configured_max_output = app_config.as_ref().map_or(0, |config| {
+        u64::from(config.session.token_tracking.max_output_tokens)
+    });
+    let provider_budget = crate::provider_budget::reserve_provider_call(
+        &run_context,
+        provider,
+        model_identity,
+        &mut request_body,
+        configured_max_output,
+    )
+    .map_err(|error| format!("Run budget denied provider call: {error}"))?;
+    trace_run_turn_request(endpoint, &request_body);
+    let speculation = speculation
+        .filter(|coordinator| coordinator.is_bound_to(&run_context))
+        .unwrap_or_else(|| {
+            Arc::new(crate::speculation::SpeculationCoordinator::for_run(
+                &run_context,
+            ))
+        });
+    let speculative_read = speculation.start(&run_context);
+
+    if let Some(sdk) = codex_agent_sdk {
+        let sdk_turn = match sdk.complete_turn(&request_body, effort_level).await {
+            Ok(turn) => turn,
+            Err(error) => {
+                provider_budget.finish_unknown().map_err(|budget_error| {
+                    format!(
+                        "Codex SDK request failed: {error}; budget reconciliation failed: {budget_error}"
+                    )
+                })?;
+                return Err(format!("Codex SDK request failed: {error}"));
+            }
+        };
+        provider_budget
+            .reconcile(&sdk_turn.usage)
+            .map_err(|error| format!("Provider budget reconciliation failed: {error}"))?;
+        if emit_live_assistant_text && !sdk_turn.content.is_empty() {
+            tx.send(AppEvent::StreamText(sdk_turn.content.clone()))
+                .map_err(|_| "API event receiver closed during Codex SDK turn".to_string())?;
+        }
+        let terminal_outcome = if sdk_turn.tool_calls.is_empty() {
+            ProviderTerminalOutcome::Completed
+        } else {
+            ProviderTerminalOutcome::ToolCalls
+        };
+        ensure_provider_turn_succeeded(terminal_outcome, sdk_turn.tool_calls.len())?;
+        let tool_batch = execute_tool_calls_for_tui(
+            run_context,
+            speculation,
+            speculative_read,
+            &sdk_turn.tool_calls,
+            memory_db,
+            app_config,
+            permission_mgr,
+            transient_allowed_tool_rules,
+            hook_engine,
+            policy_enforcer,
+            task_mgr,
+            session_id.as_deref(),
+            model_identity,
+            &tx,
+        )
+        .await;
+        return Ok(TurnResult {
+            content: sdk_turn.content,
+            reasoning_summary: None,
+            provider_reasoning_continuation: None,
+            tool_calls: sdk_turn.tool_calls,
+            tool_results: tool_batch.results,
+            usage: sdk_turn.usage,
+            needs_followup: tool_batch.has_tools,
+            terminal_outcome,
+            finish_reason: None,
+            provider_native_state: None,
+            execution_bindings: Some(tool_batch.bindings),
+        });
+    }
+
+    if let Some(sdk) = claude_agent_sdk {
+        let sdk_turn = match sdk.complete_turn(&request_body, effort_level).await {
+            Ok(turn) => turn,
+            Err(error) => {
+                provider_budget.finish_unknown().map_err(|budget_error| {
+                    format!(
+                        "Claude Agent SDK request failed: {error}; budget reconciliation failed: {budget_error}"
+                    )
+                })?;
+                return Err(format!("Claude Agent SDK request failed: {error}"));
+            }
+        };
+        provider_budget
+            .reconcile(&sdk_turn.usage)
+            .map_err(|error| format!("Provider budget reconciliation failed: {error}"))?;
+        if emit_live_assistant_text && !sdk_turn.content.is_empty() {
+            tx.send(AppEvent::StreamText(sdk_turn.content.clone()))
+                .map_err(|_| {
+                    "API event receiver closed during Claude Agent SDK turn".to_string()
+                })?;
+        }
+        let terminal_outcome = if sdk_turn.tool_calls.is_empty() {
+            ProviderTerminalOutcome::Completed
+        } else {
+            ProviderTerminalOutcome::ToolCalls
+        };
+        ensure_provider_turn_succeeded(terminal_outcome, sdk_turn.tool_calls.len())?;
+        let tool_batch = execute_tool_calls_for_tui(
+            run_context,
+            speculation,
+            speculative_read,
+            &sdk_turn.tool_calls,
+            memory_db,
+            app_config,
+            permission_mgr,
+            transient_allowed_tool_rules,
+            hook_engine,
+            policy_enforcer,
+            task_mgr,
+            session_id.as_deref(),
+            model_identity,
+            &tx,
+        )
+        .await;
+        return Ok(TurnResult {
+            content: sdk_turn.content,
+            reasoning_summary: None,
+            provider_reasoning_continuation: None,
+            tool_calls: sdk_turn.tool_calls,
+            tool_results: tool_batch.results,
+            usage: sdk_turn.usage,
+            needs_followup: tool_batch.has_tools,
+            terminal_outcome,
+            finish_reason: None,
+            provider_native_state: None,
+            execution_bindings: Some(tool_batch.bindings),
+        });
+    }
+
+    let response =
+        match send_with_retry(&run_context, client, endpoint, headers, &request_body, &tx).await {
+            Ok(response) => response,
+            Err(error) => {
+                provider_budget.finish_unknown().map_err(|budget_error| {
+                    format!("{error}; budget reconciliation failed: {budget_error}")
+                })?;
+                return Err(error);
+            }
+        };
+
+    let result = if matches!(
+        provider.trim().to_ascii_lowercase().as_str(),
+        "google" | "gemini" | "ollama"
+    ) {
+        handle_provider_native_json_response(
+            run_context,
+            speculation,
+            speculative_read,
             response,
+            provider,
+            provider_native_state,
+            assistant_message_ordinal,
             memory_db,
             app_config,
             permission_mgr,
@@ -1037,15 +2189,22 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
             policy_enforcer.clone(),
             task_mgr.clone(),
             session_id.clone(),
+            model_identity,
+            headers,
             &tx,
         )
-        .await;
-    }
-
-    if request_body.get("input").is_some() && request_body.get("messages").is_none() {
-        return stream_responses_sse_response(SseStreamParams {
+        .await
+    } else if request_body.get("input").is_some() && request_body.get("messages").is_none() {
+        stream_responses_sse_response(SseStreamParams {
+            run_context,
+            speculation,
+            speculative_read,
             response,
+            headers,
             provider,
+            model_identity,
+            provider_native_state,
+            assistant_message_ordinal,
             memory_db,
             app_config,
             permission_mgr,
@@ -1056,24 +2215,44 @@ pub async fn run_turn(p: RunTurnParams<'_>) -> Result<TurnResult, String> {
             session_id,
             tx: &tx,
         })
-        .await;
+        .await
+    } else {
+        stream_sse_response(SseStreamParams {
+            run_context,
+            speculation,
+            speculative_read,
+            response,
+            headers,
+            provider,
+            model_identity,
+            provider_native_state,
+            assistant_message_ordinal,
+            memory_db,
+            app_config,
+            permission_mgr,
+            transient_allowed_tool_rules,
+            hook_engine,
+            policy_enforcer,
+            task_mgr,
+            session_id,
+            tx: &tx,
+        })
+        .await
+    };
+    match result {
+        Ok(turn) => {
+            provider_budget
+                .reconcile(&turn.usage)
+                .map_err(|error| format!("Provider budget reconciliation failed: {error}"))?;
+            Ok(turn)
+        }
+        Err(error) => {
+            provider_budget.finish_unknown().map_err(|budget_error| {
+                format!("{error}; budget reconciliation failed: {budget_error}")
+            })?;
+            Err(error)
+        }
     }
-
-    // Stream SSE response (Anthropic / OpenAI format)
-    stream_sse_response(SseStreamParams {
-        response,
-        provider,
-        memory_db,
-        app_config,
-        permission_mgr,
-        transient_allowed_tool_rules,
-        hook_engine,
-        policy_enforcer,
-        task_mgr,
-        session_id,
-        tx: &tx,
-    })
-    .await
 }
 
 /// Outcome of classifying the top-level `finishReason` from a Gemini
@@ -1162,6 +2341,7 @@ pub fn classify_google_finish_reason(
     }
 }
 
+#[cfg(test)]
 fn google_response_parts(gemini_json: &Value) -> Result<&[Value], String> {
     let candidate = gemini_json
         .get("candidates")
@@ -1176,62 +2356,17 @@ fn google_response_parts(gemini_json: &Value) -> Result<&[Value], String> {
         .ok_or_else(|| format!("Gemini candidate missing content.parts array: {candidate}"))
 }
 
+#[cfg(test)]
 fn extract_google_text(parts: &[Value]) -> Result<String, String> {
-    extract_gemini_text_content(parts).map_err(|e| e.to_string())
-}
-
-/// Extract structured tool calls from Gemini `content.parts`.
-fn extract_google_tool_calls_from_parts(parts: &[Value]) -> Result<Vec<ToolCall>, String> {
-    let mut calls = Vec::new();
-
-    for part in parts {
-        let Some(fc) = part.get("functionCall") else {
-            continue;
-        };
-
-        if !fc.is_object() {
-            return Err(format!("Gemini functionCall must be an object: {fc}"));
-        }
-
-        let name = fc
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|name| !name.is_empty())
-            .ok_or_else(|| format!("Gemini functionCall missing non-empty string 'name': {fc}"))?
-            .to_string();
-
-        let args = fc
-            .get("args")
-            .ok_or_else(|| format!("Gemini functionCall missing object 'args': {fc}"))?;
-
-        if !args.is_object() {
-            return Err(format!(
-                "Gemini functionCall has non-object 'args': expected JSON object, got {}",
-                json_value_type_name(args)
-            ));
-        }
-
-        let args = serde_json::to_string(args).map_err(|e| {
-            format!("Gemini functionCall has unserializable 'args': {e}; functionCall: {fc}")
-        })?;
-
-        calls.push(ToolCall {
-            id: format!("call_{}", uuid::Uuid::new_v4()),
-            call_type: "function".to_string(),
-            function: tools::FunctionCall {
-                name,
-                arguments: args,
-            },
-        });
-    }
-
-    Ok(calls)
+    crate::providers::extract_gemini_text_content(parts).map_err(|e| e.to_string())
 }
 
 /// Extract structured tool calls from a Gemini non-streaming response.
 #[cfg(test)]
 fn extract_google_tool_calls(gemini_json: &Value) -> Result<Vec<ToolCall>, String> {
-    extract_google_tool_calls_from_parts(google_response_parts(gemini_json)?)
+    crate::providers::GeminiGenerateContentTurnOutput::new(gemini_json)
+        .and_then(|output| output.tool_calls(0))
+        .map_err(|error| error.to_string())
 }
 
 const fn json_value_type_name(value: &Value) -> &'static str {
@@ -1259,10 +2394,175 @@ fn extract_google_usage(gemini_json: &Value) -> (u64, u64) {
     (input, output)
 }
 
-/// Handle a non-streaming Google Gemini response.
+/// A completed native-JSON provider turn before frontend-owned effects run.
+///
+/// This deliberately omits `Debug`: the exact native state may include
+/// provider-private reasoning material.
+pub struct ProviderNativeJsonDecodedTurn {
+    pub content: String,
+    pub reasoning_summary: Option<crate::runtime::ReasoningSummary>,
+    pub tool_calls: Vec<ToolCall>,
+    pub usage: TokenUsage,
+    pub terminal_outcome: ProviderTerminalOutcome,
+    pub finish_reason: Option<String>,
+    /// Exact model identity proven by the native response or provider-owned
+    /// model-specific route.
+    pub resolved_model: String,
+    pub provider_native_state: crate::runtime::ProviderNativeState,
+}
+
+/// Decode and advance one complete Gemini `GenerateContent` or Ollama Chat JSON
+/// response before any frontend dispatches its projected tool calls.
+///
+/// # Errors
+///
+/// Returns an error for upstream error envelopes, malformed/incomplete native
+/// output, unsupported provider identity, or invalid continuation advancement.
+// Keeping both native protocols in one match makes their terminal-state
+// differences visible at the shared continuation boundary.
+#[allow(clippy::too_many_lines)]
+pub fn decode_provider_native_json_turn(
+    provider: &str,
+    model_identity: &str,
+    response: &Value,
+    previous_state: Option<&crate::runtime::ProviderNativeState>,
+    assistant_message_ordinal: u64,
+) -> Result<ProviderNativeJsonDecodedTurn, String> {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "google" | "gemini" => {
+            if let Some(error) = response.get("error") {
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .filter(|message| !message.is_empty())
+                    .ok_or_else(|| "Gemini API error is missing a message".to_string())?;
+                let code = error.get("code").and_then(Value::as_u64).unwrap_or(0);
+                return Err(format!("Gemini API error ({code}): {message}"));
+            }
+            let output = crate::providers::GeminiGenerateContentTurnOutput::new(response)
+                .map_err(|error| error.to_string())?;
+            let content = output.text().map_err(|error| error.to_string())?;
+            let tool_calls = output
+                .tool_calls(assistant_message_ordinal)
+                .map_err(|error| error.to_string())?;
+            let provider_native_state = crate::providers::advance_gemini_generate_content_state(
+                provider,
+                model_identity,
+                previous_state,
+                assistant_message_ordinal,
+                &output,
+            )
+            .map_err(|error| error.to_string())?;
+            let classification = classify_google_finish_reason(response, content.len());
+            let finish_reason = classification.finish_reason.as_deref().ok_or_else(|| {
+                "Gemini response is missing candidates[0].finishReason".to_string()
+            })?;
+            let mut terminal_outcome = classify_provider_finish_reason(finish_reason, false)?;
+            if terminal_outcome == ProviderTerminalOutcome::Completed && !tool_calls.is_empty() {
+                terminal_outcome = ProviderTerminalOutcome::ToolCalls;
+            }
+            let (input_tokens, output_tokens) = extract_google_usage(response);
+            Ok(ProviderNativeJsonDecodedTurn {
+                content,
+                reasoning_summary: None,
+                tool_calls,
+                usage: TokenUsage {
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                terminal_outcome,
+                finish_reason: classification.finish_reason,
+                resolved_model: model_identity.to_string(),
+                provider_native_state,
+            })
+        }
+        "ollama" => {
+            if let Some(error) = response.get("error") {
+                let message = error
+                    .as_str()
+                    .or_else(|| error.get("message").and_then(Value::as_str))
+                    .filter(|message| !message.is_empty())
+                    .ok_or_else(|| "Ollama API error is missing a message".to_string())?;
+                return Err(format!("Ollama API error: {message}"));
+            }
+            let output = crate::providers::OllamaChatTurnOutput::new(response)
+                .map_err(|error| error.to_string())?;
+            let resolved_model = response
+                .get("model")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Ollama response lost its validated model identity".to_string())?
+                .to_string();
+            if !output.done() {
+                return Err("Ollama response ended before done=true".to_string());
+            }
+            let tool_calls = output
+                .tool_calls(assistant_message_ordinal)
+                .map_err(|error| error.to_string())?;
+            let provider_native_state = crate::providers::advance_ollama_chat_state(
+                provider,
+                model_identity,
+                previous_state,
+                assistant_message_ordinal,
+                &output,
+            )
+            .map_err(|error| error.to_string())?;
+            let finish_reason = if tool_calls.is_empty() {
+                Some(
+                    response
+                        .get("done_reason")
+                        .and_then(Value::as_str)
+                        .filter(|reason| !reason.is_empty())
+                        .unwrap_or("stop")
+                        .to_string(),
+                )
+            } else {
+                Some("tool_calls".to_string())
+            };
+            let terminal_outcome = if tool_calls.is_empty() {
+                classify_provider_finish_reason(finish_reason.as_deref().unwrap_or("stop"), false)?
+            } else {
+                ProviderTerminalOutcome::ToolCalls
+            };
+            Ok(ProviderNativeJsonDecodedTurn {
+                content: output.text().to_string(),
+                reasoning_summary: None,
+                tool_calls,
+                usage: TokenUsage {
+                    input_tokens: response
+                        .get("prompt_eval_count")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    output_tokens: response
+                        .get("eval_count")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                terminal_outcome,
+                finish_reason,
+                resolved_model,
+                provider_native_state,
+            })
+        }
+        other => Err(format!(
+            "provider {other:?} does not use the canonical native JSON decoder"
+        )),
+    }
+}
+
+/// Handle a non-streaming provider-native JSON response.
 #[allow(clippy::too_many_arguments)]
-async fn handle_google_response(
+async fn handle_provider_native_json_response(
+    run_context: Arc<tools::ToolRunContext>,
+    speculation: Arc<crate::speculation::SpeculationCoordinator>,
+    speculative_read: Option<crate::speculation::SpeculationHandle>,
     response: reqwest::Response,
+    provider: &str,
+    previous_state: Option<&crate::runtime::ProviderNativeState>,
+    assistant_message_ordinal: u64,
     memory_db: Option<Arc<MemoryDb>>,
     app_config: Option<Arc<AppConfig>>,
     permission_mgr: Option<Arc<PermissionManager>>,
@@ -1271,49 +2571,58 @@ async fn handle_google_response(
     policy_enforcer: Option<Arc<PolicyEnforcer>>,
     task_mgr: Arc<Mutex<crate::session::TaskManager>>,
     session_id: Option<String>,
+    model_identity: &str,
+    headers: &crate::secrets::SensitiveHeaders,
     tx: &mpsc::Sender<AppEvent>,
 ) -> Result<TurnResult, String> {
-    let body = response.text().await.unwrap_or_default();
-    let gemini_json: Value =
-        serde_json::from_str(&body).map_err(|e| format!("Failed to parse Gemini response: {e}"))?;
+    let native_json: Value =
+        provider_transport::read_json_capped(response, provider_transport::MAX_JSON_RESPONSE_BYTES)
+            .await
+            .map_err(|error| format!("Failed to parse {provider} JSON response: {error}"))?;
+    let decoded = decode_provider_native_json_turn(
+        provider,
+        model_identity,
+        &native_json,
+        previous_state,
+        assistant_message_ordinal,
+    )
+    .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
 
-    // Check for Gemini error responses
-    if let Some(error) = gemini_json.get("error") {
-        let msg = error
-            .get("message")
-            .and_then(Value::as_str)
-            .filter(|message| !message.is_empty())
-            .ok_or_else(|| {
-                format!("Gemini API error missing non-empty string 'message': {error}")
-            })?;
-        let code = error
-            .get("code")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        return Err(format!("Gemini API error ({code}): {msg}"));
+    if matches!(
+        provider.trim().to_ascii_lowercase().as_str(),
+        "google" | "gemini"
+    ) {
+        if let Some(message) =
+            classify_google_finish_reason(&native_json, decoded.content.len()).user_error
+        {
+            send_event!(
+                tx,
+                AppEvent::ApiError(headers.sanitize_diagnostic(&message))
+            );
+        }
+    }
+    if should_emit_live_assistant_text(app_config.as_deref()) && !decoded.content.is_empty() {
+        send_event!(tx, AppEvent::StreamText(decoded.content.clone()));
     }
 
-    let parts = google_response_parts(&gemini_json)?;
-    let text = extract_google_text(parts)?;
-
-    // #788: surface Gemini SAFETY / RECITATION / BLOCKLIST blocks via the pure helper.
-    let GoogleFinishClassification {
+    let ProviderNativeJsonDecodedTurn {
+        content,
+        reasoning_summary,
+        tool_calls,
+        usage,
+        terminal_outcome,
         finish_reason,
-        user_error,
-    } = classify_google_finish_reason(&gemini_json, text.len());
-    if let Some(msg) = user_error {
-        send_event!(tx, AppEvent::ApiError(msg));
-    }
+        resolved_model: _,
+        provider_native_state,
+    } = decoded;
 
-    if !text.is_empty() {
-        send_event!(tx, AppEvent::StreamText(text.clone()));
-    }
-
-    let tool_calls = extract_google_tool_calls_from_parts(parts)?;
-    let (input_tokens, output_tokens) = extract_google_usage(&gemini_json);
+    ensure_provider_turn_succeeded(terminal_outcome, tool_calls.len())?;
 
     // Execute tool calls if any
-    let (tool_results, needs_followup) = execute_tool_calls_for_tui(
+    let tool_batch = execute_tool_calls_for_tui(
+        run_context,
+        speculation,
+        speculative_read,
         &tool_calls,
         memory_db,
         app_config,
@@ -1323,27 +2632,23 @@ async fn handle_google_response(
         policy_enforcer,
         task_mgr,
         session_id.as_deref(),
+        model_identity,
         tx,
     )
     .await;
 
-    if !needs_followup {
-        send_event!(tx, AppEvent::ResponseDone);
-    }
-
     Ok(TurnResult {
-        content: text,
-        reasoning_content: None,
+        content,
+        reasoning_summary,
+        provider_reasoning_continuation: None,
         tool_calls,
-        tool_results,
-        usage: TokenUsage {
-            input_tokens,
-            output_tokens,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-        },
-        needs_followup,
+        tool_results: tool_batch.results,
+        usage,
+        needs_followup: tool_batch.has_tools,
+        terminal_outcome,
         finish_reason,
+        provider_native_state: Some(provider_native_state),
+        execution_bindings: Some(tool_batch.bindings),
     })
 }
 
@@ -1424,8 +2729,15 @@ fn handle_sse_timeout(
 /// stages need; the param struct mirrors the established
 /// [`RunTurnParams`] pattern.
 struct SseStreamParams<'a> {
+    run_context: Arc<tools::ToolRunContext>,
+    speculation: Arc<crate::speculation::SpeculationCoordinator>,
+    speculative_read: Option<crate::speculation::SpeculationHandle>,
     response: reqwest::Response,
+    headers: &'a crate::secrets::SensitiveHeaders,
     provider: &'a str,
+    model_identity: &'a str,
+    provider_native_state: Option<&'a crate::runtime::ProviderNativeState>,
+    assistant_message_ordinal: u64,
     memory_db: Option<Arc<MemoryDb>>,
     app_config: Option<Arc<AppConfig>>,
     permission_mgr: Option<Arc<PermissionManager>>,
@@ -1437,10 +2749,20 @@ struct SseStreamParams<'a> {
     tx: &'a mpsc::Sender<AppEvent>,
 }
 
+// Streaming, terminal validation, and provisional rendering share one ordered
+// state machine; extracting a phase would obscure the commit boundary.
+#[allow(clippy::too_many_lines)]
 async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, String> {
     let SseStreamParams {
+        run_context,
+        speculation,
+        speculative_read,
         response,
+        headers,
         provider,
+        model_identity,
+        provider_native_state: _,
+        assistant_message_ordinal: _,
         memory_db,
         app_config,
         permission_mgr,
@@ -1451,12 +2773,18 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
         session_id,
         tx,
     } = p;
-    let mut stream = response.bytes_stream().eventsource();
+    let emit_live_assistant_text = should_emit_live_assistant_text(app_config.as_deref());
+    let mut stream = provider_transport::bounded_byte_stream(
+        response,
+        provider_transport::MAX_STREAM_RESPONSE_BYTES,
+    )
+    .eventsource();
     let mut full_content = String::new();
-    let mut reasoning_content = String::new();
+    let mut provider_reasoning_continuation = String::new();
     let mut tool_accumulator = ToolCallAccumulator::new();
     let mut anthropic_accumulator = AnthropicToolAccumulator::new();
     let mut stream_usage = TokenUsage::default();
+    let mut terminal = ChatStreamTerminal::new(provider);
     let mut in_thinking_block = false;
     let mut last_data_time = std::time::Instant::now();
     let stream_timeout = std::time::Duration::from_secs(proxy::SSE_STREAM_TIMEOUT_SECS);
@@ -1465,51 +2793,71 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
         let sse = match tokio::time::timeout(stream_timeout, stream.next()).await {
             Ok(Some(Ok(sse))) => sse,
             Ok(Some(Err(e))) => {
-                send_event!(tx, AppEvent::ApiError(format!("Stream error: {e}")));
-                break;
+                let message = format!("Stream error: {e}");
+                send_event!(tx, AppEvent::ApiError(message.clone().into()));
+                return Err(message);
             }
             Ok(None) => break,
             Err(_) => {
                 handle_sse_timeout(last_data_time.elapsed().as_secs(), full_content.len(), tx)?;
-                break;
+                return Err(format!(
+                    "Provider stream timed out after {} seconds",
+                    proxy::SSE_STREAM_TIMEOUT_SECS
+                ));
             }
         };
 
         last_data_time = std::time::Instant::now();
         if sse.data == "[DONE]" {
+            terminal.observe_done();
             break;
         }
-
-        if let Ok(json) = serde_json::from_str::<Value>(&sse.data) {
-            // Extract usage BEFORE the accumulator (both can process the same event)
-            if let Some(usage) = proxy::extract_usage_from_sse_event(&json) {
-                stream_usage.accumulate(&usage);
-            }
-
-            let action = process_sse_event(
-                &json,
-                in_thinking_block,
-                &mut anthropic_accumulator,
-                &mut tool_accumulator,
-            );
-            dispatch_sse_action(
-                action,
-                SseActionDispatch {
-                    full_content: &mut full_content,
-                    reasoning_content: &mut reasoning_content,
-                    in_thinking_block: &mut in_thinking_block,
-                    tx,
-                },
-            )?;
+        let json = serde_json::from_str::<Value>(&sse.data).map_err(|error| {
+            headers
+                .sanitize_diagnostic(&format!("Malformed provider SSE event: {error}"))
+                .to_string()
+        })?;
+        terminal
+            .observe(&json)
+            .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
+        // Extract usage BEFORE the accumulator (both can process the same event)
+        if let Some(usage) = proxy::extract_usage_from_sse_event(&json) {
+            stream_usage.accumulate(&usage);
         }
+
+        let action = process_sse_event(
+            &json,
+            in_thinking_block,
+            &mut anthropic_accumulator,
+            &mut tool_accumulator,
+        );
+        dispatch_sse_action(
+            action,
+            SseActionDispatch {
+                full_content: &mut full_content,
+                provider_reasoning_continuation: &mut provider_reasoning_continuation,
+                in_thinking_block: &mut in_thinking_block,
+                emit_live_assistant_text,
+                tx,
+            },
+        )?;
     }
 
+    let terminal_outcome = terminal
+        .finish()
+        .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
+
     finalize_sse_stream(SseFinalize {
+        run_context,
+        speculation,
+        speculative_read,
         provider,
+        model_identity,
         full_content,
-        reasoning_content,
+        provider_reasoning_continuation,
         tool_accumulator,
         anthropic_accumulator,
+        terminal_outcome,
         stream_usage,
         memory_db,
         app_config,
@@ -1526,35 +2874,32 @@ async fn stream_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, Strin
 
 struct SseActionDispatch<'a> {
     full_content: &'a mut String,
-    reasoning_content: &'a mut String,
+    provider_reasoning_continuation: &'a mut String,
     in_thinking_block: &'a mut bool,
+    emit_live_assistant_text: bool,
     tx: &'a mpsc::Sender<AppEvent>,
 }
 
 fn dispatch_sse_action(action: SseAction, ctx: SseActionDispatch<'_>) -> Result<(), String> {
     let SseActionDispatch {
         full_content,
-        reasoning_content,
+        provider_reasoning_continuation,
         in_thinking_block,
+        emit_live_assistant_text,
         tx,
     } = ctx;
     match action {
         SseAction::Text(text) => {
-            send_event!(tx, AppEvent::StreamText(text.clone()));
+            if emit_live_assistant_text {
+                send_event!(tx, AppEvent::StreamText(text.clone()));
+            }
             full_content.push_str(&text);
         }
-        SseAction::Thinking(text) => {
-            send_event!(tx, AppEvent::StreamThinking(text));
-        }
-        SseAction::Reasoning(text) => {
-            let display_text = merge_reasoning_delta(reasoning_content, &text);
-            if !display_text.is_empty() {
-                send_event!(tx, AppEvent::StreamThinking(display_text));
-            }
+        SseAction::PrivateReasoning(text) => {
+            let _ = merge_reasoning_delta(provider_reasoning_continuation, &text);
         }
         SseAction::ThinkingStart => {
             *in_thinking_block = true;
-            send_event!(tx, AppEvent::StreamThinking(String::new(),));
         }
         SseAction::ThinkingEnd => {
             *in_thinking_block = false;
@@ -1571,11 +2916,16 @@ fn dispatch_sse_action(action: SseAction, ctx: SseActionDispatch<'_>) -> Result<
 /// through). The struct lets the finalize helper take ownership of the
 /// accumulators and the per-turn channels in a single move.
 struct SseFinalize<'a> {
+    run_context: Arc<tools::ToolRunContext>,
+    speculation: Arc<crate::speculation::SpeculationCoordinator>,
+    speculative_read: Option<crate::speculation::SpeculationHandle>,
     provider: &'a str,
+    model_identity: &'a str,
     full_content: String,
-    reasoning_content: String,
+    provider_reasoning_continuation: String,
     tool_accumulator: ToolCallAccumulator,
     anthropic_accumulator: AnthropicToolAccumulator,
+    terminal_outcome: ProviderTerminalOutcome,
     stream_usage: TokenUsage,
     memory_db: Option<Arc<MemoryDb>>,
     app_config: Option<Arc<AppConfig>>,
@@ -1588,21 +2938,29 @@ struct SseFinalize<'a> {
     tx: &'a mpsc::Sender<AppEvent>,
 }
 
-/// Drain the streaming accumulators into a `TurnResult`, dispatching
-/// any captured tool calls. Sends `ResponseDone` when no follow-up
-/// turn is needed — the agentic loop handles the follow-up case.
+/// Drain the streaming accumulators into a `TurnResult` and dispatch any
+/// captured tool calls. The frontend orchestrator emits its terminal event
+/// only after it has committed the returned portable/native session state.
 async fn finalize_sse_stream(f: SseFinalize<'_>) -> Result<TurnResult, String> {
     // Determine tool calls from the appropriate accumulator
     let tool_calls = if f.provider == "anthropic" && f.anthropic_accumulator.has_tool_use() {
-        f.anthropic_accumulator.finalize_tool_calls()
+        f.anthropic_accumulator.finalize_tool_calls_checked()?
     } else if f.tool_accumulator.has_tool_calls() {
-        f.tool_accumulator.finalize()
+        f.tool_accumulator.finalize_checked()?
+    } else if f.provider == "anthropic" {
+        f.anthropic_accumulator.finalize_tool_calls_checked()?
+    } else if !f.tool_accumulator.tool_calls.is_empty() {
+        f.tool_accumulator.finalize_checked()?
     } else {
         vec![]
     };
+    ensure_provider_turn_succeeded(f.terminal_outcome, tool_calls.len())?;
 
     // Execute tool calls if any
-    let (tool_results, has_tools) = execute_tool_calls_for_tui(
+    let tool_batch = execute_tool_calls_for_tui(
+        f.run_context,
+        f.speculation,
+        f.speculative_read,
         &tool_calls,
         f.memory_db,
         f.app_config,
@@ -1612,29 +2970,33 @@ async fn finalize_sse_stream(f: SseFinalize<'_>) -> Result<TurnResult, String> {
         f.policy_enforcer,
         f.task_mgr,
         f.session_id.as_deref(),
+        f.model_identity,
         f.tx,
     )
     .await;
 
-    // Only send ResponseDone if there are NO tool calls needing followup.
-    // When there are tool calls, the caller (app.rs agentic loop) handles
-    // the followup requests and sends ResponseDone when truly finished.
-    if !has_tools {
-        send_event!(f.tx, AppEvent::ResponseDone);
-    }
+    let provider_reasoning_continuation = if tool_batch.has_tools && f.provider != "anthropic" {
+        crate::runtime::ProviderReasoningContinuation::try_from_provider(
+            f.provider_reasoning_continuation,
+        )
+        .map_err(|error| error.to_string())?
+    } else {
+        None
+    };
 
     Ok(TurnResult {
         content: f.full_content,
-        reasoning_content: (!f.reasoning_content.is_empty()).then_some(f.reasoning_content),
+        reasoning_summary: None,
+        provider_reasoning_continuation,
         tool_calls,
-        tool_results,
+        tool_results: tool_batch.results,
         usage: f.stream_usage,
-        needs_followup: has_tools,
-        // The SSE accumulators expose stop_reason internally but this
-        // layer does not currently surface it. Anthropic / OpenAI
-        // streams report `None`; only the Google JSON path populates
-        // this field today (crosslink #788).
+        needs_followup: tool_batch.has_tools,
+        terminal_outcome: f.terminal_outcome,
+        // The typed terminal outcome above carries the normalized state.
         finish_reason: None,
+        provider_native_state: None,
+        execution_bindings: Some(tool_batch.bindings),
     })
 }
 
@@ -1643,10 +3005,9 @@ async fn finalize_sse_stream(f: SseFinalize<'_>) -> Result<TurnResult, String> {
 pub enum SseAction {
     /// Emit text to the streaming output
     Text(String),
-    /// Emit thinking text
-    Thinking(String),
-    /// Emit OpenAI-compatible reasoning text.
-    Reasoning(String),
+    /// Raw provider reasoning was observed and deliberately withheld from
+    /// normal frontend and transcript channels.
+    PrivateReasoning(String),
     /// Start a thinking block
     ThinkingStart,
     /// End a thinking block
@@ -1689,14 +3050,14 @@ pub fn process_sse_event(
                 .and_then(|d| d.get("thinking"))
                 .and_then(|t| t.as_str())
             {
-                return SseAction::Thinking(text.to_string());
+                return SseAction::PrivateReasoning(text.to_string());
             }
             if let Some(text) = json
                 .get("delta")
                 .and_then(|d| d.get("text"))
                 .and_then(|t| t.as_str())
             {
-                return SseAction::Thinking(text.to_string());
+                return SseAction::PrivateReasoning(text.to_string());
             }
         }
     }
@@ -1713,7 +3074,7 @@ pub fn process_sse_event(
         .and_then(|c| c.get("delta"))
     {
         if let Some(reasoning) = openai_reasoning_delta_text(delta) {
-            return SseAction::Reasoning(reasoning);
+            return SseAction::PrivateReasoning(reasoning);
         }
         if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
             return SseAction::Text(content.to_string());
@@ -1724,20 +3085,91 @@ pub fn process_sse_event(
     SseAction::None
 }
 
-#[derive(Debug)]
 enum ResponsesSseAction {
     Text(String),
-    Reasoning(String),
-    ToolCall(ToolCall),
-    Usage(TokenUsage),
+    ReasoningSummary(String),
+    PrivateReasoning,
+    Created(String),
+    OutputItem(Value),
+    Completed {
+        response_id: String,
+        output_items: Option<Vec<Value>>,
+        usage: Option<TokenUsage>,
+    },
     Error(String),
-    Done,
     None,
+}
+
+#[derive(Default)]
+struct ResponsesStreamCapture {
+    response_id: Option<String>,
+    output_items: Vec<Value>,
+    output_bytes: usize,
+    completed: bool,
+}
+
+impl ResponsesStreamCapture {
+    fn observe_response_id(&mut self, response_id: String) -> Result<(), String> {
+        if response_id.is_empty() {
+            return Err("Responses stream emitted an empty response id".to_string());
+        }
+        if self
+            .response_id
+            .as_ref()
+            .is_some_and(|current| current != &response_id)
+        {
+            return Err(format!(
+                "Responses stream changed response id from {:?} to {response_id:?}",
+                self.response_id.as_deref().unwrap_or_default()
+            ));
+        }
+        self.response_id = Some(response_id);
+        Ok(())
+    }
+
+    fn observe_output_item(&mut self, item: Value) -> Result<(), String> {
+        if self.output_items.len() >= crate::runtime::MAX_PROVIDER_NATIVE_ITEMS.saturating_sub(1) {
+            return Err(format!(
+                "Responses turn exceeds {} native output items",
+                crate::runtime::MAX_PROVIDER_NATIVE_ITEMS.saturating_sub(1)
+            ));
+        }
+        let bytes = serde_json::to_vec(&item)
+            .map_err(|error| format!("could not size Responses output item: {error}"))?
+            .len();
+        if bytes > crate::runtime::MAX_PROVIDER_NATIVE_ITEM_BYTES {
+            return Err(format!(
+                "Responses output item is {bytes} bytes; maximum is {}",
+                crate::runtime::MAX_PROVIDER_NATIVE_ITEM_BYTES
+            ));
+        }
+        self.output_bytes = self
+            .output_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| "Responses output byte count overflow".to_string())?;
+        if self.output_bytes > crate::runtime::MAX_PROVIDER_NATIVE_STATE_BYTES {
+            return Err(format!(
+                "Responses output items exceed {} bytes",
+                crate::runtime::MAX_PROVIDER_NATIVE_STATE_BYTES
+            ));
+        }
+        self.output_items.push(item);
+        Ok(())
+    }
+
+    fn replace_completed_output(&mut self, output_items: Vec<Value>) -> Result<(), String> {
+        self.output_items.clear();
+        self.output_bytes = 0;
+        for item in output_items {
+            self.observe_output_item(item)?;
+        }
+        Ok(())
+    }
 }
 
 fn parse_responses_usage(response: &Value) -> Option<TokenUsage> {
     let usage = response.get("usage")?;
-    let input_tokens = usage
+    let raw_input_tokens = usage
         .get("input_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
@@ -1750,14 +3182,27 @@ fn parse_responses_usage(response: &Value) -> Option<TokenUsage> {
         .and_then(|details| details.get("cached_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    if input_tokens == 0 && output_tokens == 0 && cache_read_tokens == 0 {
+    let cache_write_tokens = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cache_write_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if raw_input_tokens == 0
+        && output_tokens == 0
+        && cache_read_tokens == 0
+        && cache_write_tokens == 0
+    {
         return None;
     }
     Some(TokenUsage {
-        input_tokens,
+        // Responses reports cache reads/writes as a breakdown of its inclusive
+        // input total. Keep TokenUsage's buckets disjoint for cost accounting.
+        input_tokens: raw_input_tokens
+            .saturating_sub(cache_read_tokens)
+            .saturating_sub(cache_write_tokens),
         output_tokens,
         cache_read_tokens,
-        cache_write_tokens: 0,
+        cache_write_tokens,
     })
 }
 
@@ -1782,18 +3227,17 @@ fn parse_responses_function_call(item: &Value) -> Result<Option<ToolCall>, Strin
     let call_id = item
         .get("call_id")
         .and_then(Value::as_str)
-        .or_else(|| item.get("id").and_then(Value::as_str))
         .filter(|id| !id.is_empty())
-        .ok_or_else(|| format!("Responses function_call missing call_id: {item}"))?;
+        .ok_or_else(|| "Responses function_call missing call_id".to_string())?;
     let name = item
         .get("name")
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
-        .ok_or_else(|| format!("Responses function_call missing name: {item}"))?;
+        .ok_or_else(|| "Responses function_call missing name".to_string())?;
     let arguments = item
         .get("arguments")
         .and_then(Value::as_str)
-        .unwrap_or("{}");
+        .ok_or_else(|| "Responses function_call missing string arguments".to_string())?;
     Ok(Some(ToolCall {
         id: call_id.to_string(),
         call_type: "function".to_string(),
@@ -1804,8 +3248,105 @@ fn parse_responses_function_call(item: &Value) -> Result<Option<ToolCall>, Strin
     }))
 }
 
+fn responses_visible_output_text(output_items: &[Value]) -> Result<String, String> {
+    let mut text = String::new();
+    for (item_index, item) in output_items.iter().enumerate() {
+        if item.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let content = item
+            .get("content")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                format!("Responses message output item {item_index} is missing content array")
+            })?;
+        for (content_index, part) in content.iter().enumerate() {
+            if part.get("type").and_then(Value::as_str) != Some("output_text") {
+                continue;
+            }
+            let part_text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
+                format!(
+                    "Responses output_text part {content_index} in item {item_index} is missing text"
+                )
+            })?;
+            text.push_str(part_text);
+        }
+    }
+    Ok(text)
+}
+
+fn responses_contains_refusal(output_items: &[Value]) -> Result<bool, String> {
+    for (item_index, item) in output_items.iter().enumerate() {
+        if item.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let content = item
+            .get("content")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                format!("Responses message output item {item_index} is missing content array")
+            })?;
+        if content.iter().any(|part| {
+            part.get("type").and_then(Value::as_str) == Some("refusal")
+                && part
+                    .get("refusal")
+                    .and_then(Value::as_str)
+                    .is_some_and(|refusal| !refusal.is_empty())
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Validate the terminal state of a complete, non-streaming Responses object.
+///
+/// # Errors
+///
+/// Returns an error when `status` is not `completed`, output is malformed, or
+/// the response represents refusal rather than a successful terminal turn.
+pub fn validate_openai_responses_terminal_json(
+    response: &Value,
+) -> Result<ProviderTerminalOutcome, String> {
+    if response.get("status").and_then(Value::as_str) != Some("completed") {
+        return Err(format!(
+            "Responses request did not complete successfully (status={:?})",
+            response.get("status").and_then(Value::as_str)
+        ));
+    }
+    let output_items = response
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Responses completed response is missing output array".to_string())?;
+    let refusal_observed = responses_contains_refusal(output_items)?;
+    let mut tool_call_count = 0_usize;
+    for item in output_items {
+        if parse_responses_function_call(item)?.is_some() {
+            tool_call_count = tool_call_count.saturating_add(1);
+        }
+    }
+    let outcome = if refusal_observed {
+        ProviderTerminalOutcome::Refused
+    } else if tool_call_count > 0 {
+        ProviderTerminalOutcome::ToolCalls
+    } else {
+        ProviderTerminalOutcome::Completed
+    };
+    ensure_provider_turn_succeeded(outcome, tool_call_count)?;
+    Ok(outcome)
+}
+
 fn process_responses_sse_event(json: &Value) -> Result<ResponsesSseAction, String> {
     match json.get("type").and_then(Value::as_str).unwrap_or_default() {
+        "response.created" => {
+            let response_id = json
+                .get("response")
+                .and_then(|response| response.get("id"))
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| "Responses response.created is missing response.id".to_string())?;
+            Ok(ResponsesSseAction::Created(response_id.to_string()))
+        }
         "response.output_text.delta" => Ok(json
             .get("delta")
             .and_then(Value::as_str)
@@ -1813,27 +3354,51 @@ fn process_responses_sse_event(json: &Value) -> Result<ResponsesSseAction, Strin
             .map_or(ResponsesSseAction::None, |delta| {
                 ResponsesSseAction::Text(delta.to_string())
             })),
-        "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => Ok(json
+        "response.reasoning_text.delta" => Ok(ResponsesSseAction::PrivateReasoning),
+        "response.reasoning_summary_text.delta" => Ok(json
             .get("delta")
             .and_then(Value::as_str)
             .filter(|delta| !delta.is_empty())
             .map_or(ResponsesSseAction::None, |delta| {
-                ResponsesSseAction::Reasoning(delta.to_string())
+                ResponsesSseAction::ReasoningSummary(delta.to_string())
             })),
         "response.output_item.done" => {
-            let Some(item) = json.get("item") else {
-                return Ok(ResponsesSseAction::None);
-            };
-            parse_responses_function_call(item)
-                .map(|call| call.map_or(ResponsesSseAction::None, ResponsesSseAction::ToolCall))
+            let item = json
+                .get("item")
+                .filter(|item| item.is_object())
+                .cloned()
+                .ok_or_else(|| {
+                    "Responses response.output_item.done is missing an item object".to_string()
+                })?;
+            Ok(ResponsesSseAction::OutputItem(item))
         }
         "response.completed" => {
-            if let Some(response) = json.get("response") {
-                if let Some(usage) = parse_responses_usage(response) {
-                    return Ok(ResponsesSseAction::Usage(usage));
-                }
+            let response = json
+                .get("response")
+                .filter(|response| response.is_object())
+                .ok_or_else(|| "Responses response.completed is missing response".to_string())?;
+            if response.get("status").and_then(Value::as_str) != Some("completed") {
+                return Err(
+                    "Responses response.completed did not carry status=completed".to_string(),
+                );
             }
-            Ok(ResponsesSseAction::Done)
+            let response_id = response
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| "Responses response.completed is missing response.id".to_string())?;
+            let output_items = match response.get("output") {
+                None | Some(Value::Null) => None,
+                Some(Value::Array(output)) => Some(output.clone()),
+                Some(_) => {
+                    return Err("Responses completed output must be an array or null".to_string());
+                }
+            };
+            Ok(ResponsesSseAction::Completed {
+                response_id: response_id.to_string(),
+                output_items,
+                usage: parse_responses_usage(response),
+            })
         }
         "response.failed" => Ok(ResponsesSseAction::Error(responses_error_message(
             json,
@@ -1850,37 +3415,268 @@ fn process_responses_sse_event(json: &Value) -> Result<ResponsesSseAction, Strin
 fn dispatch_responses_action(
     action: ResponsesSseAction,
     full_content: &mut String,
-    reasoning_content: &mut String,
-    tool_calls: &mut Vec<ToolCall>,
+    reasoning_summary: &mut String,
+    capture: &mut ResponsesStreamCapture,
     usage: &mut TokenUsage,
-    tx: &mpsc::Sender<AppEvent>,
+    on_text: &mut impl FnMut(&str) -> Result<(), String>,
+    on_reasoning_summary: &mut impl FnMut(&str) -> Result<(), String>,
 ) -> Result<bool, String> {
     match action {
         ResponsesSseAction::Text(text) => {
-            send_event!(tx, AppEvent::StreamText(text.clone()));
+            on_text(&text)?;
             full_content.push_str(&text);
         }
-        ResponsesSseAction::Reasoning(text) => {
-            let display_text = merge_reasoning_delta(reasoning_content, &text);
+        ResponsesSseAction::ReasoningSummary(text) => {
+            let display_text = merge_reasoning_delta(reasoning_summary, &text);
             if !display_text.is_empty() {
-                send_event!(tx, AppEvent::StreamThinking(display_text));
+                on_reasoning_summary(&display_text)?;
             }
         }
-        ResponsesSseAction::ToolCall(call) => tool_calls.push(call),
-        ResponsesSseAction::Usage(observed) => {
-            usage.accumulate(&observed);
+        ResponsesSseAction::PrivateReasoning | ResponsesSseAction::None => {}
+        ResponsesSseAction::Created(response_id) => capture.observe_response_id(response_id)?,
+        ResponsesSseAction::OutputItem(item) => capture.observe_output_item(item)?,
+        ResponsesSseAction::Completed {
+            response_id,
+            output_items,
+            usage: observed_usage,
+        } => {
+            capture.observe_response_id(response_id)?;
+            if let Some(output_items) = output_items {
+                // The account-backed Codex API can omit fields from the
+                // completed envelope that were present in output_item.done.
+                // Codex itself treats the done events as authoritative. Keep
+                // the completed output only as a compatibility fallback for
+                // providers that do not emit per-item events.
+                if capture.output_items.is_empty() {
+                    capture.replace_completed_output(output_items)?;
+                }
+            }
+            if let Some(observed) = observed_usage {
+                usage.accumulate(&observed);
+            }
+            capture.completed = true;
             return Ok(true);
         }
         ResponsesSseAction::Error(message) => return Err(message),
-        ResponsesSseAction::Done => return Ok(true),
-        ResponsesSseAction::None => {}
     }
     Ok(false)
 }
 
+fn finalize_responses_capture(
+    capture: ResponsesStreamCapture,
+    provider: &str,
+    model_identity: &str,
+    provider_native_state: Option<&crate::runtime::ProviderNativeState>,
+    assistant_message_ordinal: u64,
+) -> Result<
+    (
+        crate::runtime::ProviderNativeState,
+        Vec<ToolCall>,
+        ProviderTerminalOutcome,
+    ),
+    String,
+> {
+    if !capture.completed {
+        return Err("Responses stream ended before response.completed".to_string());
+    }
+    let response_id = capture
+        .response_id
+        .ok_or_else(|| "Responses completed without a response id".to_string())?;
+    let refusal_observed = responses_contains_refusal(&capture.output_items)?;
+    let provider_output =
+        crate::providers::OpenAiResponsesTurnOutput::new(response_id, capture.output_items)?;
+    let next_provider_state = crate::providers::advance_openai_responses_state(
+        provider,
+        model_identity,
+        provider_native_state,
+        assistant_message_ordinal,
+        &provider_output,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut tool_calls = Vec::new();
+    let mut call_ids = std::collections::BTreeSet::new();
+    for item in provider_output.output_items() {
+        if let Some(call) = parse_responses_function_call(item)? {
+            if !call_ids.insert(call.id.clone()) {
+                return Err(format!(
+                    "Responses completion repeated function call id {:?}",
+                    call.id
+                ));
+            }
+            tool_calls.push(call);
+        }
+    }
+    let terminal_outcome = if refusal_observed {
+        ProviderTerminalOutcome::Refused
+    } else if tool_calls.is_empty() {
+        ProviderTerminalOutcome::Completed
+    } else {
+        ProviderTerminalOutcome::ToolCalls
+    };
+    Ok((next_provider_state, tool_calls, terminal_outcome))
+}
+
+/// Inputs for the shared bounded `OpenAI` Responses stream decoder.
+///
+/// Frontends own rendering and tool execution. The decoder owns provider
+/// terminal validation, exact output capture, tool-call parsing, and native
+/// continuation advancement so those semantics cannot drift between the TUI,
+/// print mode, ACP, and child runs.
+pub struct OpenAiResponsesStreamParams<'a> {
+    pub response: reqwest::Response,
+    pub headers: &'a crate::secrets::SensitiveHeaders,
+    pub provider: &'a str,
+    pub model_identity: &'a str,
+    pub provider_native_state: Option<&'a crate::runtime::ProviderNativeState>,
+    pub assistant_message_ordinal: u64,
+}
+
+/// A completed, terminal-validated `OpenAI` Responses turn before frontend-owned
+/// tool effects are dispatched.
+///
+/// Deliberately does not implement `Debug`: reasoning text and the native state
+/// can contain protected provider material.
+pub struct OpenAiResponsesDecodedTurn {
+    pub content: String,
+    pub reasoning_summary: Option<crate::runtime::ReasoningSummary>,
+    pub tool_calls: Vec<ToolCall>,
+    pub usage: TokenUsage,
+    pub terminal_outcome: ProviderTerminalOutcome,
+    pub provider_native_state: crate::runtime::ProviderNativeState,
+}
+
+/// Decode one `OpenAI` Responses SSE stream through the canonical bounded state
+/// machine and advance its stateless continuation.
+///
+/// The callbacks receive provisional display deltas only. A successful return
+/// means a matching `response.completed` event was observed and all exact
+/// provider output was validated and committed into the returned native state.
+/// Callers must append the corresponding portable assistant projection before
+/// dispatching any returned tool call.
+///
+/// # Errors
+///
+/// Returns an error for transport/timeout/parse failures, incomplete or failed
+/// terminal events, inconsistent response identity/output, malformed tool calls,
+/// or invalid continuation state.
+pub async fn decode_openai_responses_stream(
+    p: OpenAiResponsesStreamParams<'_>,
+    mut on_text: impl FnMut(&str) -> Result<(), String>,
+    mut on_reasoning_summary: impl FnMut(&str) -> Result<(), String>,
+    mut on_timeout: impl FnMut(u64, usize) -> Result<(), String>,
+) -> Result<OpenAiResponsesDecodedTurn, String> {
+    let OpenAiResponsesStreamParams {
+        response,
+        headers,
+        provider,
+        model_identity,
+        provider_native_state,
+        assistant_message_ordinal,
+    } = p;
+    let mut stream = provider_transport::bounded_byte_stream(
+        response,
+        provider_transport::MAX_STREAM_RESPONSE_BYTES,
+    )
+    .eventsource();
+    let mut full_content = String::new();
+    let mut reasoning_summary = String::new();
+    let mut capture = ResponsesStreamCapture::default();
+    let mut stream_usage = TokenUsage::default();
+    let mut last_data_time = std::time::Instant::now();
+    let stream_timeout = std::time::Duration::from_secs(proxy::SSE_STREAM_TIMEOUT_SECS);
+
+    loop {
+        let sse = match tokio::time::timeout(stream_timeout, stream.next()).await {
+            Ok(Some(Ok(sse))) => sse,
+            Ok(Some(Err(e))) => {
+                return Err(headers
+                    .sanitize_diagnostic(&format!("Responses stream error: {e}"))
+                    .to_string());
+            }
+            Ok(None) => break,
+            Err(_) => {
+                let elapsed = last_data_time.elapsed().as_secs();
+                on_timeout(elapsed, full_content.len())?;
+                return Err("Responses stream timed out before response.completed".to_string());
+            }
+        };
+
+        last_data_time = std::time::Instant::now();
+        if sse.data == "[DONE]" {
+            break;
+        }
+        let json = serde_json::from_str::<Value>(&sse.data)
+            .map_err(|err| format!("Failed to parse Responses SSE event: {err}"))?;
+        let action = process_responses_sse_event(&json)
+            .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
+        let done = dispatch_responses_action(
+            action,
+            &mut full_content,
+            &mut reasoning_summary,
+            &mut capture,
+            &mut stream_usage,
+            &mut on_text,
+            &mut on_reasoning_summary,
+        )
+        .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
+        if done {
+            break;
+        }
+    }
+
+    if !capture.completed {
+        return Err("Responses stream ended before response.completed".to_string());
+    }
+    let terminal_text = responses_visible_output_text(&capture.output_items)
+        .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
+    if full_content.is_empty() && !terminal_text.is_empty() {
+        on_text(&terminal_text)?;
+        full_content = terminal_text;
+    } else if terminal_text != full_content {
+        return Err(
+            "Responses terminal output text disagrees with streamed output_text deltas".to_string(),
+        );
+    }
+
+    let (next_provider_state, tool_calls, terminal_outcome) = finalize_responses_capture(
+        capture,
+        provider,
+        model_identity,
+        provider_native_state,
+        assistant_message_ordinal,
+    )
+    .map_err(|error| headers.sanitize_diagnostic(&error).to_string())?;
+
+    let reasoning_summary = if reasoning_summary.is_empty() {
+        None
+    } else {
+        Some(
+            crate::runtime::ReasoningSummary::try_from_provider(reasoning_summary)
+                .map_err(|error| error.to_string())?,
+        )
+    };
+    Ok(OpenAiResponsesDecodedTurn {
+        content: full_content,
+        reasoning_summary,
+        tool_calls,
+        usage: stream_usage,
+        terminal_outcome,
+        provider_native_state: next_provider_state,
+    })
+}
+
+#[allow(clippy::too_many_lines)] // Streaming validation and the final state commit remain in wire order.
 async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnResult, String> {
     let SseStreamParams {
+        run_context,
+        speculation,
+        speculative_read,
         response,
+        headers,
+        provider,
+        model_identity,
+        provider_native_state,
+        assistant_message_ordinal,
         memory_db,
         app_config,
         permission_mgr,
@@ -1892,49 +3688,64 @@ async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnRes
         tx,
         ..
     } = p;
-    let mut stream = response.bytes_stream().eventsource();
-    let mut full_content = String::new();
-    let mut reasoning_content = String::new();
-    let mut tool_calls = Vec::new();
-    let mut stream_usage = TokenUsage::default();
-    let mut last_data_time = std::time::Instant::now();
-    let stream_timeout = std::time::Duration::from_secs(proxy::SSE_STREAM_TIMEOUT_SECS);
-
-    loop {
-        let sse = match tokio::time::timeout(stream_timeout, stream.next()).await {
-            Ok(Some(Ok(sse))) => sse,
-            Ok(Some(Err(e))) => {
-                send_event!(tx, AppEvent::ApiError(format!("Stream error: {e}")));
-                break;
+    let emit_live_assistant_text = should_emit_live_assistant_text(app_config.as_deref());
+    let decoded = decode_openai_responses_stream(
+        OpenAiResponsesStreamParams {
+            response,
+            headers,
+            provider,
+            model_identity,
+            provider_native_state,
+            assistant_message_ordinal,
+        },
+        |text| {
+            if emit_live_assistant_text {
+                send_event!(tx, AppEvent::StreamText(text.to_string()));
             }
-            Ok(None) => break,
-            Err(_) => {
-                handle_sse_timeout(last_data_time.elapsed().as_secs(), full_content.len(), tx)?;
-                break;
-            }
-        };
+            Ok(())
+        },
+        |summary| {
+            send_event!(tx, AppEvent::StreamReasoningSummary(summary.to_string()));
+            Ok(())
+        },
+        |elapsed_secs, content_bytes| {
+            tracing::error!(
+                target: "openclaudia::stream",
+                event = "sse_stream_timeout",
+                kind = "result",
+                is_error = true,
+                elapsed_secs,
+                timeout_secs = proxy::SSE_STREAM_TIMEOUT_SECS,
+                content_so_far_bytes = content_bytes,
+                "SSE stream timed out without further data"
+            );
+            send_event!(
+                tx,
+                AppEvent::StreamTimeout {
+                    elapsed_secs,
+                    timeout_secs: proxy::SSE_STREAM_TIMEOUT_SECS,
+                }
+            );
+            Ok(())
+        },
+    )
+    .await?;
 
-        last_data_time = std::time::Instant::now();
-        if sse.data == "[DONE]" {
-            break;
-        }
+    let OpenAiResponsesDecodedTurn {
+        content,
+        reasoning_summary,
+        tool_calls,
+        usage,
+        terminal_outcome,
+        provider_native_state: next_provider_state,
+    } = decoded;
 
-        let json = serde_json::from_str::<Value>(&sse.data)
-            .map_err(|err| format!("Failed to parse Responses SSE event: {err}"))?;
-        let done = dispatch_responses_action(
-            process_responses_sse_event(&json)?,
-            &mut full_content,
-            &mut reasoning_content,
-            &mut tool_calls,
-            &mut stream_usage,
-            tx,
-        )?;
-        if done {
-            break;
-        }
-    }
+    ensure_provider_turn_succeeded(terminal_outcome, tool_calls.len())?;
 
-    let (tool_results, needs_followup) = execute_tool_calls_for_tui(
+    let tool_batch = execute_tool_calls_for_tui(
+        run_context,
+        speculation,
+        speculative_read,
         &tool_calls,
         memory_db,
         app_config,
@@ -1944,20 +3755,22 @@ async fn stream_responses_sse_response(p: SseStreamParams<'_>) -> Result<TurnRes
         policy_enforcer,
         task_mgr,
         session_id.as_deref(),
+        model_identity,
         tx,
     )
     .await;
-    if !needs_followup {
-        send_event!(tx, AppEvent::ResponseDone);
-    }
     Ok(TurnResult {
-        content: full_content,
-        reasoning_content: (!reasoning_content.is_empty()).then_some(reasoning_content),
+        content,
+        reasoning_summary,
+        provider_reasoning_continuation: None,
         tool_calls,
-        tool_results,
-        usage: stream_usage,
-        needs_followup,
+        tool_results: tool_batch.results,
+        usage,
+        needs_followup: tool_batch.has_tools,
+        terminal_outcome,
         finish_reason: None,
+        provider_native_state: Some(next_provider_state),
+        execution_bindings: Some(tool_batch.bindings),
     })
 }
 
@@ -1980,7 +3793,7 @@ fn openai_reasoning_delta_text(delta: &Value) -> Option<String> {
 /// Append a reasoning delta to `buffer` and return only the newly-displayable text.
 ///
 /// Some OpenAI-compatible providers send cumulative reasoning text instead of
-/// incremental chunks. This keeps persisted reasoning complete while avoiding
+/// incremental chunks. This keeps transient continuation or typed summaries complete while avoiding
 /// duplicate display output.
 #[must_use]
 pub fn merge_reasoning_delta(buffer: &mut String, text: &str) -> String {
@@ -1997,31 +3810,15 @@ pub fn merge_reasoning_delta(buffer: &mut String, text: &str) -> String {
     }
 }
 
-/// Tools that are safe to execute without permission (read-only / informational).
-const SAFE_TOOLS: &[&str] = &[
-    "read_file",
-    "grounding_context",
-    "list_files",
-    "grep",
-    "glob",
-    "web_search",
-    "ask_user_question",
-    "todo_read",
-    "task",
-    "agent_output",
-    "task_stop",
-    "enter_plan_mode",
-    "exit_plan_mode",
-    "lsp",
-    "memory_search",
-    "core_memory_get",
-    "crosslink",
-];
-
-/// Check if a tool needs permission before execution.
+/// Check whether a tool's declared ceiling reaches the authorization policy.
+///
+/// This is a catalog helper for UI/tests. Concrete dispatch resolves the
+/// invocation through the mandatory host-safety and permission policies.
+/// Unknown tools return `true`; omission is never interpreted as safe.
 #[must_use]
 pub fn tool_needs_permission(tool_name: &str) -> bool {
-    !SAFE_TOOLS.contains(&tool_name)
+    crate::tools::effect::lookup(tool_name)
+        .is_none_or(|(_, spec)| spec.effect.requires_authorization())
 }
 
 /// Execute tool calls and send progress events to the TUI.
@@ -2033,7 +3830,9 @@ pub fn tool_needs_permission(tool_name: &str) -> bool {
 /// Outcome of a TUI permission check for a single tool call.
 enum PermissionOutcome {
     /// The tool is allowed to proceed.
-    Allowed { checked: bool },
+    Allowed {
+        authorization: Option<ExecutionPermit>,
+    },
     /// The tool was denied; the caller should push `result_json` and `continue`.
     DeniedWithResult(serde_json::Value),
     /// The permission channel is broken; the caller should `break`.
@@ -2060,13 +3859,19 @@ fn permission_denied_with_result(
     }))
 }
 
-fn observe_policy_decision_json(session_id: Option<&str>, allowed: bool, reason: &str) {
+fn observe_policy_decision_json(
+    run: &crate::tools::ToolRunContext,
+    session_id: Option<&str>,
+    allowed: bool,
+    reason: &str,
+) {
     if let Some(session_id) = session_id {
-        crate::grounded_loop::observe_policy_decision_for_session(session_id, allowed, reason);
+        crate::grounded_loop::observe_policy_decision_for_session(run, session_id, allowed, reason);
     }
 }
 
 fn policy_denied_tool_result(
+    run: &crate::tools::ToolRunContext,
     tool_name: &str,
     tool_call_id: &str,
     error: &PolicyError,
@@ -2074,7 +3879,7 @@ fn policy_denied_tool_result(
     tx: &mpsc::Sender<AppEvent>,
 ) -> Value {
     let reason = error.to_string();
-    observe_policy_decision_json(session_id, false, &reason);
+    observe_policy_decision_json(run, session_id, false, &reason);
     let _ = tx.send(AppEvent::ToolDone {
         name: tool_name.to_string(),
         success: false,
@@ -2088,69 +3893,8 @@ fn policy_denied_tool_result(
     })
 }
 
-fn parse_permission_arguments_for_tui(
-    tool_name: &str,
-    tool_call_id: &str,
-    arguments: &str,
-    tx: &mpsc::Sender<AppEvent>,
-) -> Result<Value, PermissionOutcome> {
-    match serde_json::from_str::<Value>(arguments) {
-        Ok(Value::Object(map)) => Ok(Value::Object(map)),
-        Ok(value) => {
-            let msg = format!(
-                "Invalid tool arguments JSON for '{tool_name}': expected a JSON object, got {}",
-                json_value_type_name(&value)
-            );
-            Err(permission_denied_with_result(
-                tool_name,
-                tool_call_id,
-                &msg,
-                &format!("[ERROR] {msg}"),
-                tx,
-            ))
-        }
-        Err(err) => {
-            let msg = format!("Invalid tool arguments JSON for '{tool_name}': {err}");
-            Err(permission_denied_with_result(
-                tool_name,
-                tool_call_id,
-                &msg,
-                &format!("[ERROR] {msg}"),
-                tx,
-            ))
-        }
-    }
-}
-
-fn permission_manager_outcome_for_tui(
-    tool_name: &str,
-    tool_call_id: &str,
-    arguments: &str,
-    mgr: &PermissionManager,
-    transient_allowed_tool_rules: &[PermissionRule],
-    tx: &mpsc::Sender<AppEvent>,
-) -> Option<PermissionOutcome> {
-    let args = match parse_permission_arguments_for_tui(tool_name, tool_call_id, arguments, tx) {
-        Ok(args) => args,
-        Err(outcome) => return Some(outcome),
-    };
-
-    match mgr.check_with_transient_allow_rules(tool_name, &args, transient_allowed_tool_rules) {
-        crate::permissions::CheckResult::Allowed => {
-            Some(PermissionOutcome::Allowed { checked: true })
-        }
-        crate::permissions::CheckResult::Denied(reason) => Some(permission_denied_with_result(
-            tool_name,
-            tool_call_id,
-            &format!("Permission denied: {reason}"),
-            &format!("[DENIED] Permission denied: {reason}"),
-            tx,
-        )),
-        crate::permissions::CheckResult::NeedsPrompt { .. } => None,
-    }
-}
-
 async fn permission_request_hook_outcome(
+    run_context: &Arc<tools::ToolRunContext>,
     tool_name: &str,
     tool_call_id: &str,
     arguments: &str,
@@ -2161,12 +3905,13 @@ async fn permission_request_hook_outcome(
     let engine = hook_engine?;
     let tool_input = serde_json::from_str::<Value>(arguments)
         .unwrap_or_else(|_| serde_json::json!({ "raw_arguments": arguments }));
-    let mut input = crate::hooks::HookInput::new(crate::hooks::HookEvent::PermissionRequest)
-        .with_tool(tool_name, tool_input)
-        .with_extra(
-            "tool_call_id",
-            serde_json::Value::String(tool_call_id.to_string()),
-        );
+    let mut input =
+        crate::hooks::HookInput::for_run(run_context, crate::hooks::HookEvent::PermissionRequest)
+            .with_tool(tool_name, tool_input)
+            .with_extra(
+                "tool_call_id",
+                serde_json::Value::String(tool_call_id.to_string()),
+            );
     if let Some(session_id) = session_id {
         input = input.with_session_id(session_id);
     }
@@ -2194,76 +3939,60 @@ async fn permission_request_hook_outcome(
 
 /// Check whether a tool call is permitted in the current session.
 ///
-/// Consults batch/session deny caches first, then the `PermissionManager`
-/// (so hard-safety denials and config auto-allows win), then batch/session
-/// allow caches, then `PermissionRequest` hooks, and finally sends a
-/// `PermissionRequest` event and `.await`s the user's decision via a tokio
-/// `oneshot` if no rule matches.
+/// Consults the canonical permission manager first. Exact reusable approval
+/// records are consumed there; no frontend-local tool-name cache participates.
+/// If no receipt or policy matches, runs `PermissionRequest` hooks and awaits
+/// the user's decision via a Tokio oneshot.
 ///
 /// `async` so the reply wait yields the runtime — under
 /// `flavor = "current_thread"` a synchronous `mpsc::recv` here would
 /// pin the only thread and deadlock the main TUI loop (which is the
 /// one that has to deliver the user's response).
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn check_tool_permission(
+    run_context: &Arc<tools::ToolRunContext>,
     tool_name: &str,
     tool_call_id: &str,
     arguments: &str,
-    always_allowed: &mut std::collections::HashSet<String>,
-    always_denied: &mut std::collections::HashSet<String>,
-    permission_mgr: Option<&PermissionManager>,
+    permission_mgr: &PermissionManager,
     transient_allowed_tool_rules: &[PermissionRule],
     hook_engine: Option<&crate::hooks::HookEngine>,
     session_id: Option<&str>,
     tx: &mpsc::Sender<AppEvent>,
 ) -> PermissionOutcome {
-    // Batch-scoped cache (this invocation of execute_tool_calls_for_tui).
-    if always_denied.contains(tool_name) {
-        return permission_denied_with_result(
-            tool_name,
-            tool_call_id,
-            "Denied (always deny for this session)",
-            "[DENIED] User denied permission for this tool.",
-            tx,
-        );
-    }
-    if always_allowed.contains(tool_name) && permission_mgr.is_none() {
-        return PermissionOutcome::Allowed { checked: false };
-    }
-    // Session-scoped cache (crosslink #724 — survives across batches).
-    let mut session_always_allowed = false;
-    if let Some(mgr) = permission_mgr {
-        if mgr.tui_is_always_denied(tool_name) {
+    let tool_call = ToolCall {
+        id: tool_call_id.to_string(),
+        call_type: "function".to_string(),
+        function: crate::tools::FunctionCall {
+            name: tool_name.to_string(),
+            arguments: arguments.to_string(),
+        },
+    };
+
+    match permission_mgr.authorize_tool_call_with_transient_rules(
+        &tool_call,
+        session_id,
+        transient_allowed_tool_rules,
+    ) {
+        AuthorizationResult::Allowed(permit) => {
+            return PermissionOutcome::Allowed {
+                authorization: Some(permit),
+            };
+        }
+        AuthorizationResult::Denied(reason) => {
             return permission_denied_with_result(
                 tool_name,
                 tool_call_id,
-                "Denied (always deny for this session)",
-                "[DENIED] User denied permission for this tool.",
+                &format!("Permission denied: {reason}"),
+                &format!("[DENIED] Permission denied: {reason}"),
                 tx,
             );
         }
-        if mgr.tui_is_always_allowed(tool_name) {
-            session_always_allowed = true;
-        }
-        if let Some(outcome) = permission_manager_outcome_for_tui(
-            tool_name,
-            tool_call_id,
-            arguments,
-            mgr,
-            transient_allowed_tool_rules,
-            tx,
-        ) {
-            return outcome;
-        }
-    }
-
-    if always_allowed.contains(tool_name) || session_always_allowed {
-        return PermissionOutcome::Allowed {
-            checked: permission_mgr.is_some(),
-        };
+        AuthorizationResult::NeedsPrompt { .. } => {}
     }
 
     if let Some(outcome) = permission_request_hook_outcome(
+        run_context,
         tool_name,
         tool_call_id,
         arguments,
@@ -2292,25 +4021,77 @@ async fn check_tool_permission(
     {
         return PermissionOutcome::ChannelBroken;
     }
-    match reply_rx.await {
-        Ok(PermissionResponse::Allow) => PermissionOutcome::Allowed {
-            checked: permission_mgr.is_some(),
-        },
-        Ok(PermissionResponse::AlwaysAllow) => {
-            always_allowed.insert(tool_name.to_string());
-            // Persist for the rest of the session (crosslink #724).
-            if let Some(mgr) = permission_mgr {
-                mgr.tui_remember_always_allowed(tool_name.to_string());
-            }
-            PermissionOutcome::Allowed {
-                checked: permission_mgr.is_some(),
-            }
-        }
+    permission_prompt_response(&reply_rx.await, permission_mgr, session_id, &tool_call, tx)
+}
+
+fn permission_prompt_response(
+    response: &Result<PermissionResponse, tokio::sync::oneshot::error::RecvError>,
+    permission_mgr: &PermissionManager,
+    session_id: Option<&str>,
+    tool_call: &ToolCall,
+    tx: &mpsc::Sender<AppEvent>,
+) -> PermissionOutcome {
+    let tool_name = &tool_call.function.name;
+    let tool_call_id = &tool_call.id;
+    match response {
+        Ok(PermissionResponse::Allow) => permission_mgr
+            .approve_tool_call_once(tool_call, session_id, ApprovalProvenance::InteractiveUser)
+            .map_or_else(
+                |reason| {
+                    permission_denied_with_result(
+                        tool_name,
+                        tool_call_id,
+                        &format!("Permission approval failed: {reason}"),
+                        &format!("[DENIED] Permission approval failed: {reason}"),
+                        tx,
+                    )
+                },
+                |permit| PermissionOutcome::Allowed {
+                    authorization: Some(permit),
+                },
+            ),
+        Ok(PermissionResponse::AlwaysAllow) => session_id.map_or_else(
+            || {
+                permission_denied_with_result(
+                    tool_name,
+                    tool_call_id,
+                    "A scoped reusable approval requires a permission manager and session",
+                    "[DENIED] Scoped reusable approval unavailable.",
+                    tx,
+                )
+            },
+            |session_id| {
+                permission_mgr
+                    .approve_tool_call_for_session(
+                        tool_call,
+                        session_id,
+                        ApprovalProvenance::InteractiveUser,
+                    )
+                    .map_or_else(
+                        |reason| {
+                            permission_denied_with_result(
+                                tool_name,
+                                tool_call_id,
+                                &format!("Permission approval failed: {reason}"),
+                                &format!("[DENIED] Permission approval failed: {reason}"),
+                                tx,
+                            )
+                        },
+                        |permit| PermissionOutcome::Allowed {
+                            authorization: Some(permit),
+                        },
+                    )
+            },
+        ),
         Ok(PermissionResponse::AlwaysDeny) => {
-            always_denied.insert(tool_name.to_string());
-            // Persist for the rest of the session (crosslink #724).
-            if let Some(mgr) = permission_mgr {
-                mgr.tui_remember_always_denied(tool_name.to_string());
+            if let Some(session_id) = session_id {
+                if let Err(error) = permission_mgr.deny_tool_call_for_session(
+                    tool_call,
+                    session_id,
+                    ApprovalProvenance::InteractiveUser,
+                ) {
+                    tracing::warn!(%error, "Could not retain exact session denial");
+                }
             }
             permission_denied_with_result(
                 tool_name,
@@ -2331,12 +4112,14 @@ async fn check_tool_permission(
 }
 
 struct ToolPermissionDispatch {
-    mgr: Option<Arc<PermissionManager>>,
-    already_checked: bool,
+    mgr: Arc<PermissionManager>,
+    authorization: Option<ExecutionPermit>,
 }
 
 struct SingleToolExecution<'a> {
+    run_context: Arc<tools::ToolRunContext>,
     tool_call: &'a ToolCall,
+    precomputed_read: Option<crate::speculation::SpeculationHandle>,
     memory_db: Option<Arc<MemoryDb>>,
     app_config: Option<Arc<AppConfig>>,
     permission: ToolPermissionDispatch,
@@ -2347,12 +4130,19 @@ struct SingleToolExecution<'a> {
     tx: &'a mpsc::Sender<AppEvent>,
 }
 
-/// Execute one tool call on a blocking thread, fire `PostToolUse` hooks, and
-/// return the JSON result to append to conversation history.
+const fn tool_result_completed_successfully(result: &tools::ToolResult) -> bool {
+    !result.is_error() && !result.is_partial()
+}
+
+/// Execute one tool call through its canonical sync or async dispatcher, fire
+/// the matching post-tool hook, and retain the typed provider result.
 /// Returns `None` when the event channel is broken (caller should `break`).
-async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<Value> {
+#[allow(clippy::too_many_lines)] // One tool call owns UX events, admission, execution, and cancellation.
+async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<tools::ToolResult> {
     let SingleToolExecution {
+        run_context,
         tool_call,
+        precomputed_read,
         memory_db,
         app_config,
         permission,
@@ -2363,47 +4153,87 @@ async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<Value> {
         tx,
     } = p;
     let tool_name = &tool_call.function.name;
-    let tool_call_clone = tool_call.clone();
-    let mem_db = memory_db;
-    let app_config_for_blocking = app_config;
     let perm_mgr = permission.mgr;
-    let permission_already_checked_for_blocking = permission.already_checked;
-    let session_for_blocking = session_id.map(str::to_string);
-    let policy_for_blocking = policy_enforcer;
-    let task_mgr_for_blocking = task_mgr;
-    let result = tokio::task::spawn_blocking(move || {
-        // Lock the TaskManager only inside the blocking thread so we
-        // don't hold the mutex across `.await`. Failure-mode parity with
-        // the legacy "no session" branch: poisoned mutex → recover the
-        // inner data rather than panicking, so a single panicking task
-        // tool doesn't take down the entire TUI session.
-        let mut task_guard = task_mgr_for_blocking
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::services::tool_executor::ToolExecutor::execute(
+    let result = if tool_name.starts_with("mcp__") {
+        crate::services::tool_executor::ToolExecutor::execute_mcp(
             crate::services::tool_executor::ToolExecutorRequest {
-                tool_call: &tool_call_clone,
-                memory_db: mem_db.as_deref(),
-                app_config: app_config_for_blocking.as_deref(),
-                task_mgr: Some(&mut *task_guard),
-                permission_mgr: perm_mgr.as_deref(),
-                permission_already_checked: permission_already_checked_for_blocking,
-                session_id: session_for_blocking.as_deref(),
-                policy_enforcer: policy_for_blocking.as_deref(),
+                run_context: &run_context,
+                tool_call,
+                memory_db: memory_db.as_deref(),
+                app_config: app_config.as_deref(),
+                task_mgr: None,
+                permission_mgr: perm_mgr.as_ref(),
+                authorization: permission.authorization,
+                session_id,
+                policy_enforcer: policy_enforcer.as_deref(),
             },
         )
-    })
-    .await
-    .unwrap_or_else(|e| tools::ToolResult {
-        tool_call_id: tool_call.id.clone(),
-        content: format!("Tool execution panicked: {e}"),
-        is_error: true,
-    });
+        .await
+    } else {
+        let tool_call_clone = tool_call.clone();
+        let panic_tool_call = tool_call.clone();
+        let session_for_blocking = session_id.map(str::to_string);
+        let run_context_for_blocking = Arc::clone(&run_context);
+        let uses_task_graph = tools::uses_canonical_task_graph(tool_name);
+        tokio::task::spawn_blocking(move || {
+            if let Some(handle) = precomputed_read {
+                return crate::services::tool_executor::ToolExecutor::execute_precomputed_read(
+                    crate::services::tool_executor::PrecomputedReadRequest {
+                        run_context: &run_context_for_blocking,
+                        tool_call: &tool_call_clone,
+                        handle,
+                        memory_db: memory_db.as_deref(),
+                        app_config: app_config.as_deref(),
+                        permission_mgr: perm_mgr.as_ref(),
+                        authorization: permission.authorization,
+                        session_id: session_for_blocking.as_deref(),
+                        policy_enforcer: policy_enforcer.as_deref(),
+                    },
+                );
+            }
+            let execute = |task_mgr: Option<&mut crate::session::TaskManager>| {
+                crate::services::tool_executor::ToolExecutor::execute(
+                    crate::services::tool_executor::ToolExecutorRequest {
+                        run_context: &run_context_for_blocking,
+                        tool_call: &tool_call_clone,
+                        memory_db: memory_db.as_deref(),
+                        app_config: app_config.as_deref(),
+                        task_mgr,
+                        permission_mgr: perm_mgr.as_ref(),
+                        authorization: permission.authorization,
+                        session_id: session_for_blocking.as_deref(),
+                        policy_enforcer: policy_enforcer.as_deref(),
+                    },
+                )
+            };
+            if uses_task_graph {
+                // The lock is acquired on the blocking worker only for handlers
+                // that consume task state. Unrelated file/process/network tools
+                // remain independent of planning persistence.
+                let mut task_guard = task_mgr
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                execute(Some(&mut task_guard))
+            } else {
+                execute(None)
+            }
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tools::ToolResult::failure(
+                &panic_tool_call,
+                tools::ToolFailureCode::Internal,
+                format!("Tool execution panicked: {e}"),
+                tools::ToolRetryability::Never,
+            )
+        })
+    };
+    let completed_successfully = tool_result_completed_successfully(&result);
     if tx
         .send(AppEvent::ToolDone {
             name: tool_name.clone(),
-            success: !result.is_error,
-            content: result.content.clone(),
+            success: completed_successfully,
+            content: result.content().to_string(),
         })
         .is_err()
     {
@@ -2411,23 +4241,17 @@ async fn execute_single_tool(p: SingleToolExecution<'_>) -> Option<Value> {
     }
     if let Some((engine, tool_input)) = hook_context {
         crate::services::tool_executor::ToolExecutor::fire_post_tool(
+            &run_context,
             engine,
-            !result.is_error,
+            completed_successfully,
             tool_name,
             tool_input,
-            &result.content,
+            result.content(),
             session_id,
         )
         .await;
     }
-    let result_content = if result.is_error {
-        format!("[ERROR] {}", result.content)
-    } else {
-        result.content
-    };
-    Some(
-        serde_json::json!({ "role": "tool", "tool_call_id": result.tool_call_id, "content": result_content, "is_error": result.is_error }),
-    )
+    Some(result)
 }
 
 /// Build a human-readable one-line description of what a tool call will do.
@@ -2468,9 +4292,9 @@ fn describe_tool_call(tool_name: &str, args: &Value) -> String {
             .get("url")
             .and_then(|v| v.as_str())
             .map_or_else(|| "Fetching URL".to_string(), |u| format!("Fetching {u}")),
-        "crosslink" => args.get("args").and_then(|v| v.as_str()).map_or_else(
+        "crosslink" => args.get("operation").and_then(|v| v.as_str()).map_or_else(
             || "Running crosslink".to_string(),
-            |a| format!("crosslink {a}"),
+            |operation| format!("crosslink {operation}"),
         ),
         _ => format!("Running {tool_name}"),
     }
@@ -2585,74 +4409,99 @@ pub fn normalize_message_tool_arguments_for_history(messages: &mut [Value]) -> u
     changed
 }
 
-/// Return the effective path that the pipeline should pre-check with
-/// guardrails before read/search tool execution.
-///
-/// Write-like tools intentionally return `None` here because their handlers
-/// already call `guardrails::check_file_access` at the mutation boundary.
-fn guardrail_path_for_tool_call(tool_name: &str, args: &Value) -> Option<String> {
-    let args = args.as_object()?;
-
-    match tool_name {
-        "read_file" => args.get("path").and_then(Value::as_str).map(str::to_string),
-        "list_files" | "glob" | "grep" => Some(
-            args.get("path")
-                .and_then(Value::as_str)
-                .unwrap_or(".")
-                .to_string(),
-        ),
-        _ => None,
+fn emit_failed_quality_gate_events(
+    run_context: &Arc<tools::ToolRunContext>,
+    tx: &mpsc::Sender<AppEvent>,
+    session_id: Option<&str>,
+    model_identity: &str,
+) -> Option<Value> {
+    let report = crate::guardrails::run_quality_gates_at(
+        run_context,
+        model_identity,
+        crate::config::RunAfter::EveryTurn,
+    )?;
+    if report.disposition() == crate::guardrails::QualityGateDisposition::Skipped {
+        return None;
     }
-}
-
-fn guardrail_block_for_tool_call(tool_name: &str, args: &Value) -> Option<String> {
-    let path = guardrail_path_for_tool_call(tool_name, args)?;
-    crate::guardrails::check_file_access(&path).err()
-}
-
-fn emit_failed_quality_gate_events(tx: &mpsc::Sender<AppEvent>, session_id: Option<&str>) {
-    for gate in crate::guardrails::run_quality_gates() {
-        record_quality_gate_verification(session_id, &gate);
-        if gate.passed {
+    let mut findings = Vec::new();
+    for gate in report.results() {
+        record_quality_gate_verification(run_context, session_id, gate);
+        if gate.passed() {
             continue;
         }
-        if tx
-            .send(AppEvent::StreamText(format!(
-                "\n⚠ Quality gate '{}': {}\n",
-                gate.name,
-                gate.stdout.lines().next().unwrap_or("failed")
-            )))
-            .is_err()
-        {
+        findings.push(format!("{} ({:?})", gate.name(), gate.status()));
+        if tx.send(failed_quality_gate_event(gate)).is_err() {
             tracing::warn!("TUI channel closed during tool execution");
             break;
         }
     }
+    if findings.is_empty()
+        || !matches!(
+            report.disposition(),
+            crate::guardrails::QualityGateDisposition::Findings
+                | crate::guardrails::QualityGateDisposition::Blocked
+        )
+    {
+        return None;
+    }
+    Some(serde_json::json!({
+        "role": "system",
+        "content": format!(
+            "Configured quality-gate findings must be addressed before finalization: {}",
+            findings.join(", ")
+        ),
+        "metadata": {
+            "openclaudia_context_source": "reality"
+        }
+    }))
+}
+
+fn failed_quality_gate_event(gate: &crate::guardrails::QualityCheckResult) -> AppEvent {
+    let detail = gate
+        .stdout()
+        .lines()
+        .next()
+        .filter(|line| !line.trim().is_empty())
+        .or_else(|| {
+            gate.stderr()
+                .lines()
+                .next()
+                .filter(|line| !line.trim().is_empty())
+        })
+        .unwrap_or("failed");
+    AppEvent::ToolDone {
+        name: format!("quality_gate:{}", gate.name()),
+        success: false,
+        content: format!("Quality gate '{}' failed: {detail}", gate.name()),
+    }
 }
 
 fn record_quality_gate_verification(
+    run: &crate::tools::ToolRunContext,
     session_id: Option<&str>,
     gate: &crate::guardrails::QualityCheckResult,
 ) {
     let Some(session_id) = session_id else {
         return;
     };
-    let mut ledger = match crate::ledger::RealityLedger::open_project_session(session_id) {
-        Ok(ledger) => ledger,
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                gate = %gate.name,
-                error = %err,
-                "failed to open session reality ledger for quality-gate verification"
-            );
-            return;
-        }
-    };
-    if let Err(err) = crate::grounded_loop::append_quality_gate_observations(&mut ledger, gate) {
+    let mut ledger =
+        match crate::ledger::RealityLedger::open_project_session_for_run(run, session_id) {
+            Ok(ledger) => ledger,
+            Err(err) => {
+                tracing::warn!(
+                    session_id,
+                    gate = %gate.name(),
+                    error = %err,
+                    "failed to open session reality ledger for quality-gate verification"
+                );
+                return;
+            }
+        };
+    if let Err(err) = crate::grounded_loop::append_quality_gate_observations(run, &mut ledger, gate)
+    {
         tracing::warn!(
             session_id,
-            gate = %gate.name,
+            gate = %gate.name(),
             error = %err,
             "failed to append quality-gate observations to reality ledger"
         );
@@ -2663,10 +4512,13 @@ fn record_quality_gate_verification(
 /// handshake: sends `PermissionRequest` to the TUI and blocks until
 /// the user responds with y/n/a/d.
 ///
-/// Returns the tool result messages (for appending to conversation history)
-/// and a boolean indicating whether there were any tool calls.
+/// Returns the tool result messages plus the exact run-scoped services that
+/// must drive the immediate follow-up turn.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn execute_tool_calls_for_tui(
+    mut run_context: Arc<tools::ToolRunContext>,
+    mut speculation: Arc<crate::speculation::SpeculationCoordinator>,
+    mut speculative_read: Option<crate::speculation::SpeculationHandle>,
     tool_calls: &[ToolCall],
     memory_db: Option<Arc<MemoryDb>>,
     app_config: Option<Arc<AppConfig>>,
@@ -2674,27 +4526,83 @@ async fn execute_tool_calls_for_tui(
     transient_allowed_tool_rules: &[PermissionRule],
     hook_engine: Option<Arc<crate::hooks::HookEngine>>,
     policy_enforcer: Option<Arc<PolicyEnforcer>>,
-    task_mgr: Arc<Mutex<crate::session::TaskManager>>,
+    mut task_mgr: Arc<Mutex<crate::session::TaskManager>>,
     session_id: Option<&str>,
+    model_identity: &str,
     tx: &mpsc::Sender<AppEvent>,
-) -> (Vec<Value>, bool) {
+) -> ToolCallBatch {
     // Session-level "always allow/deny" cache (lives for this agentic loop)
-    let mut always_allowed: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut always_denied: std::collections::HashSet<String> = std::collections::HashSet::new();
     if tool_calls.is_empty() {
-        return (vec![], false);
+        if let Some(handle) = speculative_read.take() {
+            handle.discard("provider turn made no tool call");
+        }
+        return ToolCallBatch {
+            results: Vec::new(),
+            has_tools: false,
+            bindings: TurnExecutionBindings {
+                run_context,
+                permission_mgr,
+                task_mgr,
+                speculation,
+            },
+        };
     }
+
+    let Some(mut permission_mgr) = permission_mgr else {
+        if let Some(handle) = speculative_read.take() {
+            handle.discard("execution frontend has no permission manager");
+        }
+        let mut results = Vec::with_capacity(tool_calls.len());
+        for tool_call in tool_calls {
+            let result = tools::ToolResult::failure(
+                tool_call,
+                tools::ToolFailureCode::PermissionDenied,
+                "Permission denied: the execution frontend has no permission manager".to_string(),
+                tools::ToolRetryability::Never,
+            );
+            if tx
+                .send(AppEvent::ToolDone {
+                    name: tool_call.function.name.clone(),
+                    success: false,
+                    content: result.content().to_string(),
+                })
+                .is_err()
+            {
+                break;
+            }
+            observe_tool_result(&run_context, session_id, &result);
+            results.push(result.openai_message());
+        }
+        return ToolCallBatch {
+            results,
+            has_tools: true,
+            bindings: TurnExecutionBindings {
+                run_context,
+                permission_mgr: None,
+                task_mgr,
+                speculation,
+            },
+        };
+    };
 
     let mut results = Vec::new();
 
     for tool_call in tool_calls {
+        if speculative_read
+            .as_ref()
+            .is_some_and(|handle| !handle.matches(&run_context, tool_call))
+        {
+            if let Some(handle) = speculative_read.take() {
+                handle.discard("next actual tool call did not exactly match prediction");
+            }
+        }
         let tool_name = &tool_call.function.name;
         let tool_args = match parse_tool_arguments_for_tui(tool_name, &tool_call.function.arguments)
         {
             Ok(args) => args,
             Err(msg) => match malformed_tool_arguments_result(tool_call, &msg, tx) {
                 Ok(result_json) => {
-                    observe_tool_result_json(session_id, tool_name, &result_json);
+                    observe_tool_result_json(&run_context, session_id, tool_name, &result_json);
                     results.push(result_json);
                     continue;
                 }
@@ -2702,25 +4610,23 @@ async fn execute_tool_calls_for_tui(
             },
         };
 
-        // Check read/search blast radius guardrails against the effective
-        // filesystem path, not the raw JSON argument envelope.
-        if let Some(msg) = guardrail_block_for_tool_call(tool_name, &tool_args) {
+        if let Err(reason) = run_context.admit_runtime_mode_tool(tool_name, &tool_args) {
+            let result = tools::ToolResult::failure(
+                tool_call,
+                tools::ToolFailureCode::PolicyDenied,
+                reason,
+                tools::ToolRetryability::Never,
+            );
             send_event_or_break!(
                 tx,
                 AppEvent::ToolDone {
                     name: tool_name.clone(),
                     success: false,
-                    content: format!("Blocked by guardrails: {msg}"),
+                    content: result.content().to_string(),
                 }
             );
-            let result_json = serde_json::json!({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": format!("[BLOCKED] {msg}"),
-                "is_error": true
-            });
-            observe_tool_result_json(session_id, tool_name, &result_json);
-            results.push(result_json);
+            observe_tool_result(&run_context, session_id, &result);
+            results.push(result.openai_message());
             continue;
         }
 
@@ -2729,19 +4635,35 @@ async fn execute_tool_calls_for_tui(
             session_id,
             tool_name,
         ) {
-            let result_json =
-                policy_denied_tool_result(tool_name, &tool_call.id, &err, session_id, tx);
-            observe_tool_result_json(session_id, tool_name, &result_json);
+            if let Some(handle) = speculative_read.take() {
+                handle.discard("predicted call was denied by enterprise policy");
+            }
+            let result_json = policy_denied_tool_result(
+                &run_context,
+                tool_name,
+                &tool_call.id,
+                &err,
+                session_id,
+                tx,
+            );
+            observe_tool_result_json(&run_context, session_id, tool_name, &result_json);
             results.push(result_json);
             continue;
         }
 
         if let Some(engine) = hook_engine.as_deref() {
             if let Err(blocked) = crate::services::tool_executor::ToolExecutor::run_pre_tool_use(
-                engine, session_id, tool_name, &tool_args,
+                &run_context,
+                engine,
+                session_id,
+                tool_name,
+                &tool_args,
             )
             .await
             {
+                if let Some(handle) = speculative_read.take() {
+                    handle.discard("predicted call was denied by a pre-tool hook");
+                }
                 send_event_or_break!(
                     tx,
                     AppEvent::ToolDone {
@@ -2756,40 +4678,43 @@ async fn execute_tool_calls_for_tui(
                     "content": format!("[BLOCKED] {}", blocked.content),
                     "is_error": true
                 });
-                observe_tool_result_json(session_id, tool_name, &result_json);
+                observe_tool_result_json(&run_context, session_id, tool_name, &result_json);
                 results.push(result_json);
                 continue;
             }
         }
 
-        // Permission check for write/destructive tools
-        let mut permission_already_checked = false;
-        if tool_needs_permission(tool_name) {
-            match check_tool_permission(
-                tool_name,
-                &tool_call.id,
-                &tool_call.function.arguments,
-                &mut always_allowed,
-                &mut always_denied,
-                permission_mgr.as_deref(),
-                transient_allowed_tool_rules,
-                hook_engine.as_deref(),
-                session_id,
-                tx,
-            )
-            .await
-            {
-                PermissionOutcome::Allowed { checked } => {
-                    permission_already_checked = checked;
+        // Every call, including read-only calls, reaches the concrete manager
+        // so explicit denials and host safety remain enforceable.
+        let authorization = match check_tool_permission(
+            &run_context,
+            tool_name,
+            &tool_call.id,
+            &tool_call.function.arguments,
+            permission_mgr.as_ref(),
+            transient_allowed_tool_rules,
+            hook_engine.as_deref(),
+            session_id,
+            tx,
+        )
+        .await
+        {
+            PermissionOutcome::Allowed { authorization } => authorization,
+            PermissionOutcome::DeniedWithResult(result_json) => {
+                if let Some(handle) = speculative_read.take() {
+                    handle.discard("predicted call was denied by permission policy");
                 }
-                PermissionOutcome::DeniedWithResult(result_json) => {
-                    observe_tool_result_json(session_id, tool_name, &result_json);
-                    results.push(result_json);
-                    continue;
-                }
-                PermissionOutcome::ChannelBroken => break,
+                observe_tool_result_json(&run_context, session_id, tool_name, &result_json);
+                results.push(result_json);
+                continue;
             }
-        }
+            PermissionOutcome::ChannelBroken => {
+                if let Some(handle) = speculative_read.take() {
+                    handle.discard("permission channel closed before predicted call admission");
+                }
+                break;
+            }
+        };
 
         let args_desc = describe_tool_call(tool_name, &tool_args);
         let hook_context = hook_engine
@@ -2803,13 +4728,35 @@ async fn execute_tool_calls_for_tui(
             }
         );
 
+        let precomputed_read = if speculative_read
+            .as_ref()
+            .is_some_and(|handle| handle.matches(&run_context, tool_call))
+        {
+            if run_context
+                .tool_catalog()
+                .admit_tool_call(&run_context, tool_name)
+                .is_ok()
+            {
+                speculative_read.take()
+            } else {
+                if let Some(handle) = speculative_read.take() {
+                    handle.discard("predicted call was denied by the published tool catalog");
+                }
+                None
+            }
+        } else {
+            None
+        };
+
         let tool_result = execute_single_tool(SingleToolExecution {
+            run_context: Arc::clone(&run_context),
             tool_call,
+            precomputed_read,
             memory_db: memory_db.clone(),
             app_config: app_config.clone(),
             permission: ToolPermissionDispatch {
-                mgr: permission_mgr.clone(),
-                already_checked: permission_already_checked,
+                mgr: Arc::clone(&permission_mgr),
+                authorization,
             },
             policy_enforcer: policy_enforcer.clone(),
             task_mgr: task_mgr.clone(),
@@ -2820,81 +4767,195 @@ async fn execute_tool_calls_for_tui(
         .await;
         match tool_result {
             None => break, // channel broken
-            Some(mut result_json) => {
-                // ask_user_question bridge — see `intercept_user_question`.
-                // Returns `Err(())` only when the AppEvent channel is dead,
-                // matching the existing break-on-broken-channel semantics.
-                if intercept_user_question(&mut result_json, tx).await.is_err() {
+            Some(mut result) => {
+                let Ok(approved_plan_context) = resolve_tui_follow_up(&mut result, tx).await else {
                     break;
+                };
+                if let Some(transition) = result.workspace_transition() {
+                    match tools::ToolRunContext::apply_workspace_transition(
+                        &run_context,
+                        transition,
+                    ) {
+                        Ok(next_run) => {
+                            if let Some(config) = app_config.as_deref() {
+                                if let Err(error) =
+                                    crate::guardrails::configure(&next_run, &config.guardrails)
+                                {
+                                    result = result.with_postcondition_failure(
+                                        tools::ToolFailure::new(
+                                            tools::ToolFailureCode::Internal,
+                                            format!(
+                                                "Workspace changed, but guardrail rebinding failed: {error}"
+                                            ),
+                                            tools::ToolRetryability::Never,
+                                        ),
+                                    );
+                                }
+                            }
+                            match crate::session::TaskManager::open_for_run(&next_run) {
+                                Ok(manager) => {
+                                    task_mgr = Arc::new(Mutex::new(manager));
+                                }
+                                Err(error) => {
+                                    result = result.with_postcondition_failure(
+                                        tools::ToolFailure::new(
+                                            tools::ToolFailureCode::Unavailable,
+                                            format!(
+                                                "Workspace changed, but task graph rebinding failed: {error}"
+                                            ),
+                                            tools::ToolRetryability::Safe,
+                                        ),
+                                    );
+                                    match crate::session::TaskManager::for_run(&next_run) {
+                                        Ok(manager) => {
+                                            task_mgr = Arc::new(Mutex::new(manager));
+                                        }
+                                        Err(fallback_error) => {
+                                            result = result.with_postcondition_failure(
+                                                tools::ToolFailure::new(
+                                                    tools::ToolFailureCode::Internal,
+                                                    format!(
+                                                        "Workspace task graph binding failed: {fallback_error}"
+                                                    ),
+                                                    tools::ToolRetryability::Never,
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            permission_mgr = Arc::new(permission_mgr.rebind_for_run(&next_run));
+                            run_context = next_run;
+                            speculation = Arc::new(
+                                crate::speculation::SpeculationCoordinator::for_run(&run_context),
+                            );
+                            if tx
+                                .send(AppEvent::WorkspaceTransition {
+                                    run_context: Arc::clone(&run_context),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            result = result.with_postcondition_failure(tools::ToolFailure::new(
+                                tools::ToolFailureCode::Conflict,
+                                format!("Workspace transition was not published: {error}"),
+                                tools::ToolRetryability::Safe,
+                            ));
+                        }
+                    }
                 }
-                observe_tool_result_json(session_id, tool_name, &result_json);
-                results.push(result_json);
+                speculation.observe_result(tool_call, &result);
+                observe_tool_result(&run_context, session_id, &result);
+                results.push(result.openai_message());
+                if let Some(context) = approved_plan_context {
+                    results.push(context);
+                }
             }
         }
     }
 
-    emit_failed_quality_gate_events(tx, session_id);
+    if let Some(handle) = speculative_read.take() {
+        handle.discard("provider tool calls did not consume the exact prediction");
+    }
 
-    (results, true)
+    if let Some(finding) =
+        emit_failed_quality_gate_events(&run_context, tx, session_id, model_identity)
+    {
+        results.push(finding);
+    }
+
+    ToolCallBatch {
+        results,
+        has_tools: true,
+        bindings: TurnExecutionBindings {
+            run_context,
+            permission_mgr: Some(permission_mgr),
+            task_mgr,
+            speculation,
+        },
+    }
 }
 
-fn observe_tool_result_json(session_id: Option<&str>, tool_name: &str, result_json: &Value) {
+fn observe_tool_result_json(
+    run: &crate::tools::ToolRunContext,
+    session_id: Option<&str>,
+    tool_name: &str,
+    result_json: &Value,
+) {
     let Some(session_id) = session_id else {
         return;
     };
-    let result = tools::ToolResult {
-        tool_call_id: result_json
+    let tool_call = ToolCall {
+        id: result_json
             .get("tool_call_id")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        content: result_json
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        is_error: result_json
-            .get("is_error")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        call_type: "function".to_string(),
+        function: crate::tools::FunctionCall {
+            name: tool_name.to_string(),
+            arguments: "{}".to_string(),
+        },
+    };
+    let result = tools::ToolResult::bind(
+        &tool_call,
+        tool_name,
+        tools::ToolHandlerResult::legacy(
+            result_json
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            result_json
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
+    );
+    observe_tool_result(run, Some(session_id), &result);
+}
+
+fn observe_tool_result(
+    run: &crate::tools::ToolRunContext,
+    session_id: Option<&str>,
+    result: &tools::ToolResult,
+) {
+    let Some(session_id) = session_id else {
+        return;
     };
     crate::services::tool_executor::ToolExecutor::observe_tool_result(
+        run,
         Some(session_id),
-        tool_name,
-        &result,
+        result,
     );
 }
 
-/// Bridge the sync `ask_user_question` tool's `USER_QUESTION_MARKER`
-/// payload onto the full-screen TUI's modal flow.
-///
-/// The sync tool returns a JSON object of shape `{"type":
-/// "user_question", "questions": [...]}` as the tool-result content.
-/// The REPL intercepts that via `process_tool_result_marker` and
-/// blocks on stdin (`handle_user_questions`). Under the full-screen
-/// TUI we route the question set to a modal via `AppEvent::
-/// UserQuestion`, park on a oneshot for the answer JSON, and
-/// rewrite `result_json["content"]` so the model only ever sees
-/// the user's answers — never the raw marker.
-///
-/// Returns `Err(())` only when the `AppEvent` channel is dead
-/// (TUI shut down mid-turn). Tool-result payloads that aren't a
-/// `user_question` marker are returned unchanged and `Ok(())`.
-async fn intercept_user_question(
-    result_json: &mut Value,
+/// Resolve a trusted typed follow-up through the full-screen TUI. Ordinary
+/// tool text is never inspected for control state.
+async fn resolve_tui_follow_up(
+    result: &mut tools::ToolResult,
     tx: &mpsc::Sender<AppEvent>,
-) -> Result<(), ()> {
-    let Some(content) = result_json.get("content").and_then(|v| v.as_str()) else {
-        return Ok(());
-    };
-    if !matches!(
-        crate::tools::parse_tool_control_signal(content),
-        Some(crate::tools::ToolControlSignal::UserQuestion)
-    ) {
-        return Ok(());
-    }
-    let Some(questions) = crate::tools::parse_user_questions(content) else {
-        return Ok(());
+) -> Result<Option<Value>, ()> {
+    let follow_up = result.follow_up().clone();
+    let questions = match follow_up {
+        tools::ToolFollowUp::None => return Ok(None),
+        tools::ToolFollowUp::UserQuestion { questions, .. } => questions,
+        tools::ToolFollowUp::EnterPlanMode { .. } => {
+            return resolve_tui_plan_follow_up(result, PlanModeRequest::Enter, tx).await;
+        }
+        tools::ToolFollowUp::ExitPlanMode {
+            allowed_prompts, ..
+        } => {
+            return resolve_tui_plan_follow_up(
+                result,
+                PlanModeRequest::Exit { allowed_prompts },
+                tx,
+            )
+            .await;
+        }
     };
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -2914,17 +4975,58 @@ async fn intercept_user_question(
     let answers = reply_rx
         .await
         .unwrap_or_else(|_| "{\"_cancelled\": true}".to_string());
-    if let Some(obj) = result_json.as_object_mut() {
-        obj.insert("content".to_string(), Value::String(answers));
+    let response =
+        serde_json::from_str(&answers).unwrap_or_else(|_| Value::String(answers.clone()));
+    *result = result
+        .resolve_follow_up(answers, response)
+        .expect("typed user question has one pending follow-up");
+    Ok(None)
+}
+
+async fn resolve_tui_plan_follow_up(
+    result: &mut tools::ToolResult,
+    request: PlanModeRequest,
+    tx: &mpsc::Sender<AppEvent>,
+) -> Result<Option<Value>, ()> {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if tx
+        .send(AppEvent::PlanModeRequest {
+            request,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return Err(());
     }
-    Ok(())
+    let reply = reply_rx.await.unwrap_or_else(|_| PlanModeReply::Cancelled {
+        message: "Plan-mode request cancelled because the TUI closed".to_string(),
+    });
+    let context_message = match reply {
+        PlanModeReply::Completed {
+            message,
+            response,
+            context_message,
+        } => {
+            *result = result
+                .resolve_follow_up(message, response)
+                .expect("typed plan follow-up has one pending host action");
+            context_message
+        }
+        PlanModeReply::Cancelled { message } => {
+            *result = result
+                .cancel_follow_up(message.clone(), message)
+                .expect("typed plan follow-up has one pending host action");
+            None
+        }
+    };
+    Ok(context_message)
 }
 
 /// Build the assistant message with tool calls for appending to conversation history.
 #[must_use]
 pub fn build_assistant_message_with_tools(
     content: &str,
-    reasoning_content: Option<&str>,
+    reasoning_summary: Option<&crate::runtime::ReasoningSummary>,
     tool_calls: &[ToolCall],
     _provider: &str,
 ) -> Value {
@@ -2948,8 +5050,8 @@ pub fn build_assistant_message_with_tools(
         "content": Value::String(content.to_string()),
         "tool_calls": tool_calls_json
     });
-    if let Some(reasoning) = reasoning_content.filter(|text| !text.is_empty()) {
-        message["reasoning_content"] = Value::String(reasoning.to_string());
+    if let Some(summary) = reasoning_summary {
+        crate::runtime::attach_reasoning_summary(&mut message, summary);
     }
     message
 }
@@ -2957,27 +5059,412 @@ pub fn build_assistant_message_with_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::{
+        ContinuationGeneration, ProviderNativeItem, ProviderNativeItemPurpose, ProviderNativeState,
+        ProviderStateFacet, ProviderWireProtocol,
+    };
+
+    #[test]
+    fn enabled_vdd_holds_assistant_text_at_the_shared_stream_boundary() {
+        let enabled: AppConfig = serde_yaml::from_str(
+            "proxy: {}\nproviders: {}\nvdd:\n  enabled: true\n  mode: blocking\n",
+        )
+        .expect("enabled VDD config");
+        let disabled: AppConfig =
+            serde_yaml::from_str("proxy: {}\nproviders: {}\n").expect("default config");
+
+        assert!(!should_emit_live_assistant_text(Some(&enabled)));
+        assert!(should_emit_live_assistant_text(Some(&disabled)));
+        assert!(should_emit_live_assistant_text(None));
+    }
+
+    fn pipeline_native_state(
+        provider: &str,
+        model: &str,
+        protocol: ProviderWireProtocol,
+        facet: ProviderStateFacet,
+        purpose: ProviderNativeItemPurpose,
+    ) -> ProviderNativeState {
+        ProviderNativeState::new(
+            provider,
+            model,
+            protocol,
+            ContinuationGeneration::new(1).expect("non-zero generation"),
+            vec![
+                ProviderNativeItem::new(facet, purpose, serde_json::json!({"opaque": "native"}))
+                    .expect("valid native item"),
+            ],
+        )
+        .expect("valid native state")
+    }
+
+    #[test]
+    fn provider_request_state_seam_retains_evidence_outside_prompt() {
+        let messages = [serde_json::json!({"role": "user", "content": "hello"})];
+        let state = pipeline_native_state(
+            "openai",
+            "gpt-test",
+            ProviderWireProtocol::OpenAiChatCompletions,
+            ProviderStateFacet::Usage,
+            ProviderNativeItemPurpose::Evidence,
+        );
+        let body = build_request_for_wire_with_tools(
+            WireApi::ChatCompletions,
+            "openai",
+            "gpt-test",
+            &messages,
+            "medium",
+            None,
+            None,
+            &serde_json::json!([]),
+            Some(&state),
+        )
+        .expect("evidence-only state is retained outside provider input");
+        assert_eq!(body["messages"][0]["content"], "hello");
+        assert!(!body.to_string().contains("native"));
+    }
+
+    #[test]
+    fn provider_request_state_seam_rejects_lossy_or_mismatched_resume() {
+        let messages = [serde_json::json!({"role": "user", "content": "hello"})];
+        let continuation = pipeline_native_state(
+            "openai",
+            "gpt-test",
+            ProviderWireProtocol::OpenAiChatCompletions,
+            ProviderStateFacet::ServerContinuation,
+            ProviderNativeItemPurpose::Continuation,
+        );
+        let build = |provider: &str, model: &str, state: &ProviderNativeState| {
+            build_request_for_wire_with_tools(
+                WireApi::ChatCompletions,
+                provider,
+                model,
+                &messages,
+                "medium",
+                None,
+                None,
+                &serde_json::json!([]),
+                Some(state),
+            )
+        };
+        assert!(build("openai", "gpt-test", &continuation)
+            .expect_err("unwired continuation must fail")
+            .contains("not wired yet"));
+        assert!(build("openai", "gpt-other", &continuation)
+            .expect_err("model mismatch must fail")
+            .contains("belongs to model"));
+        assert!(build("anthropic", "gpt-test", &continuation)
+            .expect_err("provider mismatch must fail")
+            .contains("belongs to provider"));
+    }
+
+    fn test_run() -> Arc<tools::ToolRunContext> {
+        Arc::clone(tools::security::test_run_context())
+    }
+
+    fn test_speculation(
+        run: &Arc<tools::ToolRunContext>,
+    ) -> Arc<crate::speculation::SpeculationCoordinator> {
+        Arc::new(crate::speculation::SpeculationCoordinator::for_run(run))
+    }
+
+    #[tokio::test]
+    async fn tui_plan_follow_up_uses_typed_host_reply_and_returns_approved_context() {
+        let tool_call = ToolCall {
+            id: "plan-enter".to_string(),
+            call_type: "function".to_string(),
+            function: tools::FunctionCall {
+                name: "enter_plan_mode".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let result = tools::ToolResult::bind(
+            &tool_call,
+            "enter_plan_mode",
+            tools::ToolHandlerResult::success_text("Plan mode entry requested".to_string())
+                .with_follow_up(tools::ToolFollowUp::EnterPlanMode {
+                    state: tools::ToolFollowUpState::Pending,
+                }),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let resolver = tokio::spawn(async move {
+            let mut result = result;
+            let context = resolve_tui_follow_up(&mut result, &tx)
+                .await
+                .expect("TUI channel");
+            (result, context)
+        });
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => break event,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        panic!("resolver disconnected before sending plan request")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("typed plan request");
+        let AppEvent::PlanModeRequest { request, reply } = event else {
+            panic!("expected typed plan request");
+        };
+        assert_eq!(request, PlanModeRequest::Enter);
+        let context = serde_json::json!({
+            "role": "system",
+            "content": "approved context"
+        });
+        reply
+            .send(PlanModeReply::Completed {
+                message: "entered".to_string(),
+                response: serde_json::json!({"entered": true}),
+                context_message: Some(context.clone()),
+            })
+            .expect("resolver still waiting");
+
+        let (result, returned_context) = resolver.await.expect("resolver task");
+        assert_eq!(returned_context, Some(context));
+        assert!(matches!(
+            result.follow_up(),
+            tools::ToolFollowUp::EnterPlanMode {
+                state: tools::ToolFollowUpState::Resolved { response }
+            } if response["entered"] == true
+        ));
+    }
+
+    #[tokio::test]
+    async fn tui_plan_follow_up_cancellation_is_reported_as_cancelled_tool_state() {
+        let tool_call = ToolCall {
+            id: "plan-exit".to_string(),
+            call_type: "function".to_string(),
+            function: tools::FunctionCall {
+                name: "exit_plan_mode".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let result = tools::ToolResult::bind(
+            &tool_call,
+            "exit_plan_mode",
+            tools::ToolHandlerResult::success_text("Plan mode exit requested".to_string())
+                .with_follow_up(tools::ToolFollowUp::ExitPlanMode {
+                    allowed_prompts: Vec::new(),
+                    state: tools::ToolFollowUpState::Pending,
+                }),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let resolver = tokio::spawn(async move {
+            let mut result = result;
+            let context = resolve_tui_follow_up(&mut result, &tx)
+                .await
+                .expect("TUI channel");
+            (result, context)
+        });
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => break event,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        panic!("resolver disconnected before sending plan request")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("typed plan request");
+        let AppEvent::PlanModeRequest { reply, .. } = event else {
+            panic!("expected typed plan request");
+        };
+        reply
+            .send(PlanModeReply::Cancelled {
+                message: "user cancelled".to_string(),
+            })
+            .expect("resolver still waiting");
+
+        let (result, context) = resolver.await.expect("resolver task");
+        assert_eq!(context, None);
+        assert!(matches!(
+            result.follow_up(),
+            tools::ToolFollowUp::ExitPlanMode {
+                state: tools::ToolFollowUpState::Cancelled { reason },
+                ..
+            } if reason == "user cancelled"
+        ));
+    }
+
+    #[test]
+    fn partial_tool_outcomes_are_not_reported_as_successful_completion() {
+        let call = tools::ToolCall {
+            id: "partial-hook-fixture".to_string(),
+            call_type: "function".to_string(),
+            function: tools::FunctionCall {
+                name: "mcp__fixture__remote".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let failure = tools::ToolFailure::new(
+            tools::ToolFailureCode::External,
+            "remote outcome unknown".to_string(),
+            tools::ToolRetryability::Unknown,
+        );
+        let partial = tools::ToolResult::bind(
+            &call,
+            "mcp__fixture__remote",
+            tools::ToolHandlerResult::partial_text("uncertain", vec![failure]),
+        );
+        let success = tools::ToolResult::bind(
+            &call,
+            "mcp__fixture__remote",
+            tools::ToolHandlerResult::success_text("done"),
+        );
+
+        assert!(!tool_result_completed_successfully(&partial));
+        assert!(tool_result_completed_successfully(&success));
+    }
+
+    fn typed_test_blocks(prefix: &str, suffix: &str) -> crate::prompt::SystemPromptBlocks {
+        let mut items = Vec::new();
+        if !prefix.is_empty() {
+            items.push(crate::context::ContextItem::host_instruction(
+                "test.stable",
+                crate::context::HostInstructionSource::CorePolicy,
+                "compiled:test",
+                prefix,
+                crate::context::ContextFreshness::Static,
+                1,
+            ));
+        }
+        if !suffix.is_empty() {
+            items.push(crate::context::ContextItem::host_instruction(
+                "test.dynamic",
+                crate::context::HostInstructionSource::RuntimePolicy,
+                "host:test",
+                suffix,
+                crate::context::ContextFreshness::Turn,
+                2,
+            ));
+        }
+        crate::prompt::SystemPromptBlocks::from_items(
+            items,
+            crate::context::ContextBudget::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn tui_pipeline_propagates_automatic_learning_policy() {
+        let host = tempfile::tempdir().expect("host home");
+        let workspace = tempfile::tempdir().expect("TUI learning workspace");
+        std::fs::create_dir_all(workspace.path().join("src")).expect("source directory");
+        let run = crate::tools::security::test_run_context_for(workspace.path());
+        let memory = Arc::new(
+            crate::memory::MemoryDb::open_for_workspace(host.path(), workspace.path())
+                .expect("TUI workspace memory"),
+        );
+        let config: crate::config::AppConfig = serde_yaml::from_str(
+            r"
+proxy:
+  target: local
+providers:
+  local:
+    base_url: http://localhost:1234/v1
+memory:
+  automatic_learning_enabled: true
+",
+        )
+        .expect("TUI learning config");
+        let permissions = Arc::new(crate::permissions::PermissionManager::unrestricted_for_run(
+            &run,
+        ));
+        let tasks = Arc::new(Mutex::new(
+            crate::session::TaskManager::for_run(&run).expect("TUI task manager"),
+        ));
+        let call = tools::ToolCall {
+            id: "tui-learning-write".to_string(),
+            call_type: "function".to_string(),
+            function: tools::FunctionCall {
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": "src/tui_learning.rs",
+                    "content": "pub const TUI_POLICY_PROPAGATED: bool = true;\n"
+                })
+                .to_string(),
+            },
+        };
+        let (tx, _rx) = mpsc::channel();
+
+        let result = execute_single_tool(SingleToolExecution {
+            run_context: Arc::clone(&run),
+            tool_call: &call,
+            precomputed_read: None,
+            memory_db: Some(memory),
+            app_config: Some(Arc::new(config)),
+            permission: ToolPermissionDispatch {
+                mgr: permissions,
+                authorization: None,
+            },
+            policy_enforcer: None,
+            task_mgr: tasks,
+            session_id: Some("tui-learning-policy"),
+            hook_context: None,
+            tx: &tx,
+        })
+        .await
+        .expect("TUI pipeline result");
+        assert!(!result.is_error(), "TUI write failed: {}", result.content());
+        assert!(result.observations().iter().any(|observation| {
+            observation.kind == "technical_learning_capture" && !observation.authoritative
+        }));
+        crate::tools::retire_run(&run);
+    }
 
     #[test]
     fn quality_gate_records_command_and_failed_gate_findings() {
+        let run = crate::tools::security::test_run_context_for(std::path::Path::new(env!(
+            "CARGO_MANIFEST_DIR"
+        )));
         let mut ledger = crate::ledger::RealityLedger::new();
-        let gate = crate::guardrails::QualityCheckResult {
-            name: "unit".to_string(),
-            command: "cargo test --lib".to_string(),
-            passed: false,
-            exit_code: 101,
-            stdout: "running tests".to_string(),
-            stderr: "one failed".to_string(),
-            required: true,
+        let config = crate::config::GuardrailsConfig {
+            quality_gates: Some(crate::config::QualityGatesConfig {
+                enabled: true,
+                checks: vec![crate::config::QualityCheck {
+                    name: "unit".to_string(),
+                    command: "sh -c 'printf running-tests; printf one-failed >&2; exit 7'"
+                        .to_string(),
+                    required: true,
+                }],
+                ..crate::config::QualityGatesConfig::default()
+            }),
+            ..crate::config::GuardrailsConfig::default()
         };
+        crate::guardrails::configure(&run, &config).expect("configure gate");
+        let gate = crate::guardrails::run_quality_gates(&run, "test-model")
+            .into_iter()
+            .next()
+            .expect("gate result");
 
-        let ids = crate::grounded_loop::append_quality_gate_observations(&mut ledger, &gate)
+        let event = failed_quality_gate_event(&gate);
+        let AppEvent::ToolDone {
+            name,
+            success,
+            content,
+        } = event
+        else {
+            panic!("failed quality gate must not enter the model-text stream");
+        };
+        assert_eq!(name, "quality_gate:unit");
+        assert!(!success);
+        assert!(content.contains("running-tests"));
+
+        let ids = crate::grounded_loop::append_quality_gate_observations(&run, &mut ledger, &gate)
             .expect("append");
         let command_observation = ledger.get(ids.command).expect("command observation");
         assert_eq!(
-            command_observation.authority,
-            crate::ledger::Authority::Command
+            command_observation.provenance.trust,
+            crate::ledger::EvidenceTrust::RuntimeObserved
         );
+        assert!(command_observation.provenance.is_bound_to(&run));
         let crate::ledger::ObservationKind::CommandRun {
             argv,
             exit_code,
@@ -2990,14 +5477,23 @@ mod tests {
         };
         assert_eq!(
             argv,
-            &vec!["cargo".to_string(), "test".to_string(), "--lib".to_string()]
+            &vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf running-tests; printf one-failed >&2; exit 7".to_string()
+            ]
         );
-        assert_eq!(*exit_code, 101);
-        assert_eq!(stdout, "running tests");
-        assert_eq!(stderr, "one failed");
+        assert_eq!(*exit_code, 7);
+        assert_eq!(stdout, "running-tests");
+        assert_eq!(stderr, "one-failed");
 
         let observation = ledger.get(ids.verification).expect("observation");
-        assert_eq!(observation.authority, crate::ledger::Authority::Verifier);
+        assert_eq!(
+            observation.provenance.trust,
+            crate::ledger::EvidenceTrust::TrustedVerifier
+        );
+        assert!(observation.provenance.is_bound_to(&run));
+        assert!(observation.provenance.verification_method.is_some());
         let crate::ledger::ObservationKind::Verification {
             passed,
             command,
@@ -3007,70 +5503,15 @@ mod tests {
             panic!("expected verification observation");
         };
         assert!(!passed);
-        assert_eq!(command.as_deref(), Some("cargo test --lib"));
+        assert_eq!(
+            command.as_deref(),
+            Some("sh -c 'printf running-tests; printf one-failed >&2; exit 7'")
+        );
         assert!(findings
             .iter()
             .any(|finding| finding.contains("quality gate 'unit' failed")));
         assert!(findings.iter().any(|finding| finding.contains("stdout:")));
         assert!(findings.iter().any(|finding| finding.contains("stderr:")));
-    }
-
-    #[test]
-    fn guardrail_path_for_tool_call_uses_actual_read_path() {
-        let args = serde_json::json!({"path":"src/main.rs"});
-
-        assert_eq!(
-            guardrail_path_for_tool_call("read_file", &args),
-            Some("src/main.rs".to_string())
-        );
-    }
-
-    #[test]
-    fn guardrail_path_for_tool_call_defaults_read_search_paths() {
-        let args = serde_json::json!({});
-
-        for tool_name in ["list_files", "glob", "grep"] {
-            assert_eq!(
-                guardrail_path_for_tool_call(tool_name, &args),
-                Some(".".to_string()),
-                "{tool_name} should precheck its executor's default path"
-            );
-        }
-    }
-
-    #[test]
-    fn guardrail_path_for_tool_call_matches_optional_path_type_semantics() {
-        let args = serde_json::json!({"path":42});
-
-        assert_eq!(
-            guardrail_path_for_tool_call("list_files", &args),
-            Some(".".to_string())
-        );
-        assert_eq!(guardrail_path_for_tool_call("read_file", &args), None);
-    }
-
-    #[test]
-    fn guardrail_path_for_tool_call_skips_non_object_arguments() {
-        let args = serde_json::json!([]);
-
-        assert_eq!(guardrail_path_for_tool_call("list_files", &args), None);
-    }
-
-    #[test]
-    fn guardrail_path_for_tool_call_skips_write_tools_checked_by_handlers() {
-        let write_args = serde_json::json!({"path":"src/main.rs","content":"new"});
-        let edit_args = serde_json::json!({"path":"src/main.rs"});
-        let notebook_args = serde_json::json!({"notebook_path":"nb.ipynb"});
-
-        assert_eq!(
-            guardrail_path_for_tool_call("write_file", &write_args),
-            None
-        );
-        assert_eq!(guardrail_path_for_tool_call("edit_file", &edit_args), None);
-        assert_eq!(
-            guardrail_path_for_tool_call("notebook_edit", &notebook_args),
-            None
-        );
     }
 
     #[test]
@@ -3110,17 +5551,26 @@ mod tests {
         };
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
+        let permission_mgr = Some(Arc::new(PermissionManager::unrestricted()));
+        let run_context = test_run();
+        let speculation = test_speculation(&run_context);
 
-        let (results, has_tools) = execute_tool_calls_for_tui(
+        let ToolCallBatch {
+            results, has_tools, ..
+        } = execute_tool_calls_for_tui(
+            run_context,
+            speculation,
+            None,
             &[tool_call],
             None,
             None,
-            None,
+            permission_mgr,
             &[],
             None,
             None,
             task_mgr,
             Some(session_id),
+            "test-model",
             &tx,
         )
         .await;
@@ -3178,6 +5628,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn s074_tui_tool_batch_returns_rebound_execution_services() {
+        use std::sync::mpsc as std_mpsc;
+
+        let root = tempfile::tempdir().expect("TUI workspace fixture");
+        let git = which::which("git").expect("Git test dependency");
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.name", "OpenClaudia Test"],
+            vec!["config", "user.email", "openclaudia@example.invalid"],
+        ] {
+            let output = std::process::Command::new(&git)
+                .args(args)
+                .current_dir(root.path())
+                .output()
+                .expect("run fixture Git");
+            assert!(
+                output.status.success(),
+                "fixture Git failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::fs::write(root.path().join("tracked.txt"), "baseline\n").expect("tracked fixture");
+        for args in [vec!["add", "tracked.txt"], vec!["commit", "-qm", "fixture"]] {
+            let output = std::process::Command::new(&git)
+                .args(args)
+                .current_dir(root.path())
+                .output()
+                .expect("commit fixture");
+            assert!(
+                output.status.success(),
+                "fixture Git failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let source = crate::tools::security::test_run_context_for(root.path());
+        let permission_mgr = Arc::new(PermissionManager::unrestricted_for_run(&source));
+        let task_mgr = Arc::new(Mutex::new(
+            crate::session::TaskManager::for_run(&source).expect("source task manager"),
+        ));
+        let tool_call = ToolCall {
+            id: "s074-tui-enter".to_string(),
+            call_type: "function".to_string(),
+            function: tools::FunctionCall {
+                name: "enter_worktree".to_string(),
+                arguments: serde_json::json!({"branch": "s074-tui-followup"}).to_string(),
+            },
+        };
+        let (tx, rx) = std_mpsc::channel::<AppEvent>();
+
+        let batch = execute_tool_calls_for_tui(
+            Arc::clone(&source),
+            test_speculation(&source),
+            None,
+            &[tool_call],
+            None,
+            None,
+            Some(permission_mgr),
+            &[],
+            None,
+            None,
+            task_mgr,
+            Some(source.session_id()),
+            "test-model",
+            &tx,
+        )
+        .await;
+
+        assert!(batch.has_tools);
+        assert_eq!(batch.results.len(), 1);
+        assert_eq!(batch.results[0]["is_error"], false);
+        let isolated = batch.bindings.run_context;
+        assert!(isolated.isolated_workspace().is_some());
+        assert_eq!(isolated.project_root(), isolated.working_directory());
+        assert!(matches!(
+            source.require(crate::tools::ToolResource::WorkspaceRead),
+            Err(crate::tools::ToolCapabilityError::InactiveWorkspaceGeneration { .. })
+        ));
+        let event_run = rx
+            .try_iter()
+            .find_map(|event| match event {
+                AppEvent::WorkspaceTransition { run_context } => Some(run_context),
+                _ => None,
+            })
+            .expect("workspace transition event");
+        assert_eq!(event_run.run_id(), isolated.run_id());
+        assert_eq!(event_run.generation(), isolated.generation());
+    }
+
+    #[tokio::test]
     async fn execute_tool_calls_for_tui_one_time_allow_executes_without_nested_prompt() {
         use std::sync::mpsc as std_mpsc;
         use std::time::Duration;
@@ -3206,7 +5745,12 @@ mod tests {
             let mgr = Arc::clone(&mgr);
             async move {
                 let tool_calls = vec![tool_call];
+                let run_context = test_run();
+                let speculation = test_speculation(&run_context);
                 execute_tool_calls_for_tui(
+                    run_context,
+                    speculation,
+                    None,
                     &tool_calls,
                     None,
                     None,
@@ -3216,6 +5760,7 @@ mod tests {
                     None,
                     task_mgr,
                     Some("s"),
+                    "test-model",
                     &tx,
                 )
                 .await
@@ -3242,7 +5787,9 @@ mod tests {
             .send(PermissionResponse::Allow)
             .expect("tool runner should still be awaiting permission reply");
 
-        let (results, has_tools) = handle.await.expect("tool runner should not panic");
+        let ToolCallBatch {
+            results, has_tools, ..
+        } = handle.await.expect("tool runner should not panic");
         assert!(has_tools);
         assert_eq!(results.len(), 1);
         let content = results[0]["content"].as_str().unwrap_or_default();
@@ -3265,8 +5812,6 @@ mod tests {
         let ledger = Arc::new(Mutex::new(crate::ledger::RealityLedger::new()));
         let _ledger_guard =
             crate::ledger::install_active_ledger_for_session(session_id, Arc::clone(&ledger));
-        let mgr = Arc::new(PermissionManager::unrestricted());
-        mgr.tui_remember_always_denied("bash".to_string());
         let tool_call = ToolCall {
             id: "call_denied".to_string(),
             call_type: "function".to_string(),
@@ -3275,10 +5820,28 @@ mod tests {
                 arguments: r#"{"command":"cargo test"}"#.to_string(),
             },
         };
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mgr = Arc::new(PermissionManager::new(
+            dir.path().join("permissions.json"),
+            true,
+            Vec::new(),
+        ));
+        mgr.deny_tool_call_for_session(
+            &tool_call,
+            session_id,
+            crate::permissions::ApprovalProvenance::InteractiveUser,
+        )
+        .expect("exact session denial");
         let (tx, _rx) = std_mpsc::channel::<AppEvent>();
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
+        let run_context = test_run();
 
-        let (results, has_tools) = execute_tool_calls_for_tui(
+        let ToolCallBatch {
+            results, has_tools, ..
+        } = execute_tool_calls_for_tui(
+            Arc::clone(&run_context),
+            test_speculation(&run_context),
+            None,
             &[tool_call],
             None,
             None,
@@ -3288,6 +5851,7 @@ mod tests {
             None,
             task_mgr,
             Some(session_id),
+            "test-model",
             &tx,
         )
         .await;
@@ -3298,7 +5862,7 @@ mod tests {
         assert!(
             results[0]["content"]
                 .as_str()
-                .is_some_and(|content| content.contains("User denied permission")),
+                .is_some_and(|content| content.contains("exact approval-scope denial")),
             "tool result should carry the denial: {}",
             results[0]
         );
@@ -3312,7 +5876,11 @@ mod tests {
                 .cloned()
         }
         .expect("denied tool result observation");
-        assert_eq!(observation.authority, crate::ledger::Authority::Tool);
+        assert_eq!(
+            observation.provenance.trust,
+            crate::ledger::EvidenceTrust::UntrustedContent
+        );
+        assert!(observation.provenance.is_bound_to(&run_context));
         let crate::ledger::ObservationKind::ToolResult { tool, result } = &observation.kind else {
             panic!("expected tool result observation");
         };
@@ -3322,7 +5890,7 @@ mod tests {
         assert!(
             result["content"]
                 .as_str()
-                .is_some_and(|content| content.contains("User denied permission")),
+                .is_some_and(|content| content.contains("exact approval-scope denial")),
             "ledgered tool result should carry the denial: {result}"
         );
     }
@@ -3351,8 +5919,15 @@ mod tests {
         };
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
+        let run_context = test_run();
+        let speculation = test_speculation(&run_context);
 
-        let (results, has_tools) = execute_tool_calls_for_tui(
+        let ToolCallBatch {
+            results, has_tools, ..
+        } = execute_tool_calls_for_tui(
+            run_context,
+            speculation,
+            None,
             &[tool_call],
             None,
             None,
@@ -3362,6 +5937,7 @@ mod tests {
             Some(policy_enforcer),
             task_mgr,
             Some(session_id),
+            "test-model",
             &tx,
         )
         .await;
@@ -3447,8 +6023,15 @@ mod tests {
         };
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
+        let run_context = test_run();
+        let speculation = test_speculation(&run_context);
 
-        let (results, has_tools) = execute_tool_calls_for_tui(
+        let ToolCallBatch {
+            results, has_tools, ..
+        } = execute_tool_calls_for_tui(
+            run_context,
+            speculation,
+            None,
             &[tool_call],
             None,
             None,
@@ -3458,6 +6041,7 @@ mod tests {
             None,
             task_mgr,
             Some("tui-prehook-session"),
+            "test-model",
             &tx,
         )
         .await;
@@ -3511,17 +6095,25 @@ mod tests {
         };
         let (tx, _rx) = std_mpsc::channel::<AppEvent>();
         let task_mgr = Arc::new(Mutex::new(crate::session::TaskManager::new()));
+        let permission_mgr = Some(Arc::new(PermissionManager::unrestricted()));
+        let run_context = test_run();
 
-        let (results, has_tools) = execute_tool_calls_for_tui(
+        let ToolCallBatch {
+            results, has_tools, ..
+        } = execute_tool_calls_for_tui(
+            Arc::clone(&run_context),
+            test_speculation(&run_context),
+            None,
             &[tool_call],
             None,
             None,
-            None,
+            permission_mgr,
             &[],
             None,
             None,
             task_mgr,
             Some(session_id),
+            "test-model",
             &tx,
         )
         .await;
@@ -3539,7 +6131,11 @@ mod tests {
                 .cloned()
         }
         .expect("tool result observation");
-        assert_eq!(observation.authority, crate::ledger::Authority::Tool);
+        assert_eq!(
+            observation.provenance.trust,
+            crate::ledger::EvidenceTrust::UntrustedContent
+        );
+        assert!(observation.provenance.is_bound_to(&run_context));
         let crate::ledger::ObservationKind::ToolResult { tool, result } = &observation.kind else {
             panic!("expected tool result observation");
         };
@@ -3562,7 +6158,8 @@ mod tests {
             "is_error": false
         });
 
-        observe_tool_result_json(Some(session_id), "ask_user_question", &result_json);
+        let run = test_run();
+        observe_tool_result_json(&run, Some(session_id), "ask_user_question", &result_json);
 
         let observation = {
             let ledger = ledger.lock().expect("ledger lock");
@@ -3579,6 +6176,11 @@ mod tests {
         assert_eq!(tool, "ask_user_question");
         assert_eq!(result["tool_call_id"], "call_question");
         assert_eq!(result["content"], "{\"answer\":\"use the SSD\"}");
+        assert_eq!(
+            observation.provenance.trust,
+            crate::ledger::EvidenceTrust::UntrustedContent
+        );
+        assert!(observation.provenance.is_bound_to(&run));
     }
 
     #[test]
@@ -3710,6 +6312,159 @@ mod tests {
     }
 
     #[test]
+    fn native_json_decoder_advances_bound_state_and_rejects_incomplete_ollama() {
+        let gemini_response = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": {
+                            "id": "gemini-native-call",
+                            "name": "bash",
+                            "args": {"command": "pwd"}
+                        },
+                        "thoughtSignature": "opaque-signature"
+                    }]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 11,
+                "candidatesTokenCount": 7
+            }
+        });
+        let gemini =
+            decode_provider_native_json_turn("gemini", "gemini-3.5-pro", &gemini_response, None, 1)
+                .expect("Gemini native response decodes");
+        assert_eq!(gemini.tool_calls[0].id, "gemini-native-call");
+        assert_eq!(gemini.usage.input_tokens, 11);
+        assert_eq!(gemini.usage.output_tokens, 7);
+        assert_eq!(
+            gemini.provider_native_state.protocol(),
+            ProviderWireProtocol::GeminiGenerateContent
+        );
+        gemini
+            .provider_native_state
+            .validate_binding(
+                "gemini",
+                "gemini-3.5-pro",
+                ProviderWireProtocol::GeminiGenerateContent,
+            )
+            .expect("decoded state retains exact request identity");
+
+        let incomplete_ollama = serde_json::json!({
+            "model": "qwen3",
+            "message": {"role": "assistant", "content": "partial"},
+            "done": false
+        });
+        let error =
+            decode_provider_native_json_turn("ollama", "qwen3", &incomplete_ollama, None, 1)
+                .err()
+                .expect("incomplete Ollama output cannot advance continuation");
+        assert!(error.contains("before done=true"), "{error}");
+    }
+
+    #[test]
+    fn canonical_native_json_builder_replays_exact_state_without_private_metadata() {
+        let exact_content = serde_json::json!({
+            "role": "model",
+            "parts": [{
+                "functionCall": {
+                    "id": "gemini-native-call",
+                    "name": "bash",
+                    "args": {"command": "pwd"}
+                },
+                "thoughtSignature": "opaque-signature"
+            }]
+        });
+        let gemini_response = serde_json::json!({
+            "candidates": [{"content": exact_content, "finishReason": "STOP"}]
+        });
+        let decoded =
+            decode_provider_native_json_turn("google", "gemini-3.5-pro", &gemini_response, None, 1)
+                .expect("Gemini native response decodes");
+        let gemini_messages = vec![
+            serde_json::json!({"role": "user", "content": "where am I"}),
+            build_assistant_message_with_tools("", None, &decoded.tool_calls, "google"),
+            serde_json::json!({
+                "role": "tool",
+                "name": "bash",
+                "tool_call_id": "gemini-native-call",
+                "content": "{\"cwd\":\"/workspace\"}"
+            }),
+        ];
+        let gemini_request = build_request_for_wire_with_tools(
+            WireApi::ChatCompletions,
+            "google",
+            "gemini-3.5-pro",
+            &gemini_messages,
+            "medium",
+            None,
+            None,
+            &serde_json::json!([]),
+            Some(&decoded.provider_native_state),
+        )
+        .expect("canonical Gemini request replays state");
+        assert_eq!(gemini_request["contents"][1], exact_content);
+        assert!(gemini_request
+            .get("_openclaudia_gemini_portable_history")
+            .is_none());
+
+        let exact_message = serde_json::json!({
+            "role": "assistant",
+            "content": "",
+            "thinking": "private reasoning",
+            "tool_calls": [{
+                "function": {
+                    "index": 12,
+                    "name": "read",
+                    "arguments": {"path": "Cargo.toml"}
+                }
+            }]
+        });
+        let ollama_response = serde_json::json!({
+            "model": "qwen3",
+            "message": exact_message,
+            "done": true
+        });
+        let decoded =
+            decode_provider_native_json_turn("ollama", "qwen3", &ollama_response, None, 1)
+                .expect("Ollama native response decodes");
+        let ollama_messages = vec![
+            serde_json::json!({"role": "user", "content": "read the manifest"}),
+            build_assistant_message_with_tools("", None, &decoded.tool_calls, "ollama"),
+            serde_json::json!({
+                "role": "tool",
+                "name": "read",
+                "tool_call_id": decoded.tool_calls[0].id,
+                "content": "manifest"
+            }),
+        ];
+        let ollama_request = build_request_for_wire_with_tools(
+            WireApi::ChatCompletions,
+            "ollama",
+            "qwen3",
+            &ollama_messages,
+            "medium",
+            None,
+            None,
+            &serde_json::json!([]),
+            Some(&decoded.provider_native_state),
+        )
+        .expect("canonical Ollama request replays state");
+        let mut safe_message = exact_message;
+        safe_message
+            .as_object_mut()
+            .expect("native message object")
+            .remove("thinking");
+        assert_eq!(ollama_request["messages"][1], safe_message);
+        assert_eq!(ollama_request["stream"], false);
+        assert!(ollama_request
+            .get("_openclaudia_ollama_portable_history")
+            .is_none());
+    }
+
+    #[test]
     fn test_build_openai_request() {
         let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
         let req = build_openai_request("gpt-4", &messages, "medium");
@@ -3769,6 +6524,11 @@ mod tests {
         assert!(req.get("max_output_tokens").is_none());
         assert_eq!(req["stream"], true);
         assert_eq!(req["store"], false);
+        assert_eq!(req["context_management"][0]["type"], "compaction");
+        assert_eq!(
+            req["context_management"][0]["compact_threshold"],
+            crate::compaction::get_context_window("gpt-5.5").saturating_mul(4) / 5
+        );
         assert_eq!(req["reasoning"]["effort"], "high");
         assert_eq!(req["input"][0]["type"], "message");
         assert_eq!(req["input"][0]["role"], "user");
@@ -3781,17 +6541,473 @@ mod tests {
         assert_eq!(req["input"][3]["call_id"], "call_1");
         assert_eq!(req["tools"][0]["type"], "function");
         assert!(req["tools"][0].get("function").is_none());
+        assert!(req.get("_openclaudia_responses_history").is_none());
+        assert!(req["input"].as_array().is_some_and(|items| items
+            .iter()
+            .all(|item| item.get("_openclaudia_message_ordinal").is_none())));
     }
 
     #[test]
-    fn process_responses_sse_event_extracts_text_tool_calls_and_usage() {
+    fn openai_wires_typed_tool_image_without_persisting_base64_in_message() {
+        let bytes = b"typed-openai-image".to_vec();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let attachment = tools::register_transient_attachment(
+            "image/png",
+            bytes,
+            tools::ToolSensitivity::Workspace,
+        )
+        .expect("register image attachment");
+        let mut tool_result = serde_json::json!({
+            "role": "tool",
+            "tool_call_id": "call_image",
+            "content": "typed image metadata"
+        });
+        tool_result[tools::TOOL_ATTACHMENTS_MESSAGE_KEY] =
+            serde_json::to_value([attachment]).expect("serialize attachment metadata");
+        assert!(!serde_json::to_string(&tool_result)
+            .expect("serialize portable message")
+            .contains(&encoded));
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "inspect"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_image",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]
+            }),
+            tool_result,
+        ];
+
+        let responses = build_openai_responses_request("gpt-5.5", &messages, "medium")
+            .expect("build Responses media request");
+        let output = responses["input"][2]["output"]
+            .as_array()
+            .expect("typed Responses output parts");
+        assert_eq!(output[0]["type"], "input_text");
+        assert_eq!(output[1]["type"], "input_image");
+        assert!(output[1]["image_url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with(&encoded)));
+        assert_eq!(
+            serde_json::to_string(&responses)
+                .expect("serialize Responses body")
+                .matches(&encoded)
+                .count(),
+            1
+        );
+
+        let chat = build_openai_request("gpt-4o", &messages, "medium");
+        assert!(chat["messages"][2]
+            .get(tools::TOOL_ATTACHMENTS_MESSAGE_KEY)
+            .is_none());
+        assert!(chat["messages"][3]["content"][1]["image_url"]["url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with(&encoded)));
+        assert_eq!(
+            serde_json::to_string(&chat)
+                .expect("serialize Chat Completions body")
+                .matches(&encoded)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn responses_request_accepts_null_assistant_content_for_tool_only_turn() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "inspect"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_null_content",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{\"command\":\"pwd\"}"}
+                }]
+            }),
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "call_null_content",
+                "content": "/workspace"
+            }),
+        ];
+
+        let request = build_request_for_wire_with_tools(
+            WireApi::OpenAiResponses,
+            "openai",
+            "gpt-test",
+            &messages,
+            "medium",
+            None,
+            None,
+            &serde_json::json!([]),
+            None,
+        )
+        .expect("tool-only assistant history must be representable");
+
+        assert_eq!(request["input"][1]["type"], "function_call");
+        assert_eq!(request["input"][2]["type"], "function_call_output");
+    }
+
+    fn first_responses_test_output() -> crate::providers::OpenAiResponsesTurnOutput {
+        crate::providers::OpenAiResponsesTurnOutput::new(
+            "resp_first",
+            vec![
+                serde_json::json!({
+                    "id": "rs_1",
+                    "type": "reasoning",
+                    "encrypted_content": "encrypted-native-reasoning"
+                }),
+                serde_json::json!({
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "phase": "commentary",
+                    "_openclaudia_message_ordinal": "provider-owned-field",
+                    "content": [{"type": "output_text", "text": "I'll check."}]
+                }),
+                serde_json::json!({
+                    "id": "fc_1",
+                    "type": "function_call",
+                    "status": "completed",
+                    "call_id": "call_1",
+                    "name": "bash",
+                    "arguments": "{\"command\":\"pwd\"}"
+                }),
+            ],
+        )
+        .expect("first native output")
+    }
+
+    fn second_responses_test_output() -> crate::providers::OpenAiResponsesTurnOutput {
+        crate::providers::OpenAiResponsesTurnOutput::new(
+            "resp_second",
+            vec![
+                serde_json::json!({
+                    "id": "cmp_2",
+                    "type": "compaction",
+                    "encrypted_content": "encrypted-native-compaction"
+                }),
+                serde_json::json!({
+                    "id": "msg_2",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "Done."}]
+                }),
+            ],
+        )
+        .expect("second native output")
+    }
+
+    #[test]
+    fn responses_compaction_retires_superseded_native_and_portable_input() {
+        let first_output = first_responses_test_output();
+        let first_state = crate::providers::advance_openai_responses_state(
+            "openai",
+            "gpt-5.5",
+            None,
+            1,
+            &first_output,
+        )
+        .expect("first continuation state");
+        let second_output = second_responses_test_output();
+        let second_state = crate::providers::advance_openai_responses_state(
+            "openai",
+            "gpt-5.5",
+            Some(&first_state),
+            3,
+            &second_output,
+        )
+        .expect("second continuation state");
+        assert_eq!(second_state.generation().get(), 2);
+        let serialized = serde_json::to_string(&second_state).expect("serialize native state");
+        let resumed: ProviderNativeState =
+            serde_json::from_str(&serialized).expect("resume native state");
+
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "inspect"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "I'll check.",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{\"command\":\"pwd\"}"}
+                }]
+            }),
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "/workspace"
+            }),
+            serde_json::json!({"role": "assistant", "content": "Done."}),
+            serde_json::json!({"role": "user", "content": "continue"}),
+        ];
+        let request = build_request_for_wire_with_tools(
+            WireApi::OpenAiResponses,
+            "openai",
+            "gpt-5.5",
+            &messages,
+            "high",
+            None,
+            None,
+            &serde_json::json!([]),
+            Some(&resumed),
+        )
+        .expect("lossless resumed request");
+
+        assert_eq!(request["store"], false);
+        assert!(request.get("previous_response_id").is_none());
+        assert!(request.get("_openclaudia_responses_history").is_none());
+        let input = request["input"].as_array().expect("Responses input");
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0], second_output.output_items()[0]);
+        assert_eq!(input[1]["phase"], "final_answer");
+        assert_eq!(input[2]["role"], "user");
+        assert!(input
+            .iter()
+            .all(|item| item.get("_openclaudia_message_ordinal").is_none()));
+        assert!(!serialized.contains("resp_first"));
+        assert!(serialized.contains("resp_second"));
+        assert!(!serialized.contains("encrypted-native-reasoning"));
+        assert!(serialized.contains("encrypted-native-compaction"));
+    }
+
+    #[test]
+    fn responses_state_rejects_history_that_lost_its_bound_assistant_turn() {
+        let output = crate::providers::OpenAiResponsesTurnOutput::new(
+            "resp_missing",
+            vec![serde_json::json!({
+                "id": "msg_missing",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "answer"}]
+            })],
+        )
+        .expect("native output");
+        let state =
+            crate::providers::advance_openai_responses_state("openai", "gpt-5.5", None, 1, &output)
+                .expect("native state");
+        let error = build_request_for_wire_with_tools(
+            WireApi::OpenAiResponses,
+            "openai",
+            "gpt-5.5",
+            &[serde_json::json!({"role": "user", "content": "rewritten"})],
+            "high",
+            None,
+            None,
+            &serde_json::json!([]),
+            Some(&state),
+        )
+        .expect_err("missing assistant binding must fail closed");
+        assert!(error.contains("missing assistant ordinal 1"), "{error}");
+    }
+
+    #[test]
+    fn responses_state_rejects_unrecognized_evidence_instead_of_ignoring_it() {
+        let state = ProviderNativeState::new(
+            "openai",
+            "gpt-5.5",
+            ProviderWireProtocol::OpenAiResponses,
+            ContinuationGeneration::new(1).expect("non-zero generation"),
+            vec![ProviderNativeItem::new(
+                ProviderStateFacet::ServerContinuation,
+                ProviderNativeItemPurpose::Evidence,
+                serde_json::json!({"format": "unrecognized_responses_evidence_v1"}),
+            )
+            .expect("shape-valid evidence")],
+        )
+        .expect("shape-valid state");
+
+        let error = build_request_for_wire_with_tools(
+            WireApi::OpenAiResponses,
+            "openai",
+            "gpt-5.5",
+            &[serde_json::json!({"role": "user", "content": "continue"})],
+            "high",
+            None,
+            None,
+            &serde_json::json!([]),
+            Some(&state),
+        )
+        .expect_err("unknown native evidence must not be silently discarded");
+
+        assert!(
+            error.contains("unrecognized OpenAI Responses evidence"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn responses_state_rejects_output_that_precedes_its_turn_evidence() {
+        let output = ProviderNativeItem::new(
+            ProviderStateFacet::NativeMessage,
+            ProviderNativeItemPurpose::Continuation,
+            serde_json::json!({
+                "format": "openai_responses_output_item_v1",
+                "response_id": "resp_reordered",
+                "assistant_ordinal": 1,
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "answer"}]
+                }
+            }),
+        )
+        .expect("shape-valid output");
+        let evidence = ProviderNativeItem::new(
+            ProviderStateFacet::ServerContinuation,
+            ProviderNativeItemPurpose::Evidence,
+            serde_json::json!({
+                "format": "openai_responses_turn_v1",
+                "response_id": "resp_reordered",
+                "assistant_ordinal": 1,
+                "output_item_count": 1,
+                "store": false
+            }),
+        )
+        .expect("shape-valid evidence");
+        let state = ProviderNativeState::new(
+            "openai",
+            "gpt-5.5",
+            ProviderWireProtocol::OpenAiResponses,
+            ContinuationGeneration::new(1).expect("non-zero generation"),
+            vec![output, evidence],
+        )
+        .expect("generic state shape");
+
+        let error = build_request_for_wire_with_tools(
+            WireApi::OpenAiResponses,
+            "openai",
+            "gpt-5.5",
+            &[
+                serde_json::json!({"role": "user", "content": "question"}),
+                serde_json::json!({"role": "assistant", "content": "answer"}),
+            ],
+            "high",
+            None,
+            None,
+            &serde_json::json!([]),
+            Some(&state),
+        )
+        .expect_err("native output before evidence must fail closed");
+
+        assert!(error.contains("not contiguous"), "{error}");
+    }
+
+    #[test]
+    fn responses_state_rejects_generation_and_output_facet_forgery() {
+        let evidence = || {
+            ProviderNativeItem::new(
+                ProviderStateFacet::ServerContinuation,
+                ProviderNativeItemPurpose::Evidence,
+                serde_json::json!({
+                    "format": "openai_responses_turn_v1",
+                    "response_id": "resp_structural",
+                    "assistant_ordinal": 1,
+                    "output_item_count": 1,
+                    "store": false
+                }),
+            )
+            .expect("shape-valid evidence")
+        };
+        let forged_output = ProviderNativeItem::new(
+            ProviderStateFacet::NativeMessage,
+            ProviderNativeItemPurpose::Continuation,
+            serde_json::json!({
+                "format": "openai_responses_output_item_v1",
+                "response_id": "resp_structural",
+                "assistant_ordinal": 1,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_structural",
+                    "name": "bash",
+                    "arguments": "{}"
+                }
+            }),
+        )
+        .expect("generic state permits provider-specific facet validation later");
+        let forged_facet_state = ProviderNativeState::new(
+            "openai",
+            "gpt-5.5",
+            ProviderWireProtocol::OpenAiResponses,
+            ContinuationGeneration::new(1).expect("non-zero generation"),
+            vec![evidence(), forged_output],
+        )
+        .expect("generic state shape");
+        let messages = [
+            serde_json::json!({"role": "user", "content": "question"}),
+            serde_json::json!({"role": "assistant", "content": null, "tool_calls": []}),
+        ];
+        let error = build_request_for_wire_with_tools(
+            WireApi::OpenAiResponses,
+            "openai",
+            "gpt-5.5",
+            &messages,
+            "high",
+            None,
+            None,
+            &serde_json::json!([]),
+            Some(&forged_facet_state),
+        )
+        .expect_err("function_call cannot masquerade as a native message facet");
+        assert!(error.contains("facet"), "{error}");
+
+        let valid_output = ProviderNativeItem::new(
+            ProviderStateFacet::ToolCalls,
+            ProviderNativeItemPurpose::Continuation,
+            serde_json::json!({
+                "format": "openai_responses_output_item_v1",
+                "response_id": "resp_structural",
+                "assistant_ordinal": 1,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_structural",
+                    "name": "bash",
+                    "arguments": "{}"
+                }
+            }),
+        )
+        .expect("valid provider-specific output");
+        let forged_generation_state = ProviderNativeState::new(
+            "openai",
+            "gpt-5.5",
+            ProviderWireProtocol::OpenAiResponses,
+            ContinuationGeneration::new(2).expect("non-zero generation"),
+            vec![evidence(), valid_output],
+        )
+        .expect("generic state shape");
+        let error = build_request_for_wire_with_tools(
+            WireApi::OpenAiResponses,
+            "openai",
+            "gpt-5.5",
+            &messages,
+            "high",
+            None,
+            None,
+            &serde_json::json!([]),
+            Some(&forged_generation_state),
+        )
+        .expect_err("generation cannot disagree with retained turn count");
+        assert!(error.contains("generation 2"), "{error}");
+    }
+
+    #[test]
+    fn process_responses_sse_event_retains_native_items_identity_and_usage() {
         let text_event = serde_json::json!({
             "type": "response.output_text.delta",
             "delta": "hello"
         });
         match process_responses_sse_event(&text_event).expect("text event") {
             ResponsesSseAction::Text(text) => assert_eq!(text, "hello"),
-            other => panic!("expected text event, got {other:?}"),
+            _ => panic!("expected text event"),
         }
 
         let tool_event = serde_json::json!({
@@ -3804,32 +7020,130 @@ mod tests {
             }
         });
         match process_responses_sse_event(&tool_event).expect("tool event") {
-            ResponsesSseAction::ToolCall(call) => {
-                assert_eq!(call.id, "call_abc");
-                assert_eq!(call.function.name, "bash");
-                assert_eq!(call.function.arguments, "{\"command\":\"pwd\"}");
-            }
-            other => panic!("expected tool event, got {other:?}"),
+            ResponsesSseAction::OutputItem(item) => assert_eq!(item, tool_event["item"]),
+            _ => panic!("expected exact output item"),
         }
 
         let usage_event = serde_json::json!({
             "type": "response.completed",
             "response": {
+                "id": "resp_abc",
+                "status": "completed",
+                "output": [tool_event["item"].clone()],
                 "usage": {
                     "input_tokens": 12,
                     "output_tokens": 7,
-                    "input_tokens_details": {"cached_tokens": 5}
+                    "input_tokens_details": {
+                        "cached_tokens": 5,
+                        "cache_write_tokens": 2
+                    }
                 }
             }
         });
         match process_responses_sse_event(&usage_event).expect("usage event") {
-            ResponsesSseAction::Usage(usage) => {
-                assert_eq!(usage.input_tokens, 12);
+            ResponsesSseAction::Completed {
+                response_id,
+                output_items,
+                usage: Some(usage),
+            } => {
+                assert_eq!(response_id, "resp_abc");
+                assert_eq!(output_items, Some(vec![tool_event["item"].clone()]));
+                assert_eq!(usage.input_tokens, 5);
                 assert_eq!(usage.output_tokens, 7);
                 assert_eq!(usage.cache_read_tokens, 5);
+                assert_eq!(usage.cache_write_tokens, 2);
             }
-            other => panic!("expected usage event, got {other:?}"),
+            _ => panic!("expected completed event"),
         }
+    }
+
+    #[test]
+    fn responses_completed_accepts_null_output_from_chatgpt_backend() {
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_null_output",
+                "status": "completed",
+                "output": null
+            }
+        });
+        match process_responses_sse_event(&completed).expect("completed event") {
+            ResponsesSseAction::Completed { output_items, .. } => {
+                assert!(output_items.is_none());
+            }
+            _ => panic!("expected completed event"),
+        }
+    }
+
+    #[test]
+    fn responses_done_item_remains_authoritative_over_lean_completed_copy() {
+        let rich_item = serde_json::json!({
+            "id": "rs_authoritative",
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "encrypted-continuation"
+        });
+        let lean_item = serde_json::json!({
+            "id": "rs_authoritative",
+            "type": "reasoning",
+            "summary": []
+        });
+        let mut capture = ResponsesStreamCapture::default();
+        capture
+            .observe_output_item(rich_item.clone())
+            .expect("done item");
+        let mut full_content = String::new();
+        let mut reasoning_content = String::new();
+        let mut usage = TokenUsage::default();
+
+        let done = dispatch_responses_action(
+            ResponsesSseAction::Completed {
+                response_id: "resp_authoritative".to_string(),
+                output_items: Some(vec![lean_item]),
+                usage: None,
+            },
+            &mut full_content,
+            &mut reasoning_content,
+            &mut capture,
+            &mut usage,
+            &mut |_: &str| Ok(()),
+            &mut |_: &str| Ok(()),
+        )
+        .expect("completed event");
+
+        assert!(done);
+        assert_eq!(capture.output_items, vec![rich_item]);
+    }
+
+    #[test]
+    fn responses_terminal_output_recovers_text_when_deltas_are_absent() {
+        let output = vec![serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "output_text", "text": "first"},
+                {"type": "refusal", "refusal": "not display text"},
+                {"type": "output_text", "text": " second"}
+            ]
+        })];
+
+        assert_eq!(
+            responses_visible_output_text(&output).expect("terminal text"),
+            "first second"
+        );
+    }
+
+    #[test]
+    fn responses_terminal_output_rejects_malformed_visible_text() {
+        let output = vec![serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": 7}]
+        })];
+
+        let error = responses_visible_output_text(&output)
+            .expect_err("malformed terminal output text must fail closed");
+        assert!(error.contains("missing text"), "{error}");
     }
 
     #[test]
@@ -3851,10 +7165,7 @@ mod tests {
     #[test]
     fn test_build_anthropic_request_multi_block() {
         let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
-        let blocks = crate::prompt::SystemPromptBlocks {
-            stable_prefix: "identity and tools".to_string(),
-            dynamic_suffix: "hooks and env".to_string(),
-        };
+        let blocks = typed_test_blocks("identity and tools", "hooks and env");
         let req = build_anthropic_request(
             "claude-sonnet-4-6",
             &messages,
@@ -3882,10 +7193,7 @@ mod tests {
     #[test]
     fn test_build_anthropic_request_empty_suffix_single_block() {
         let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
-        let blocks = crate::prompt::SystemPromptBlocks {
-            stable_prefix: "everything is static".to_string(),
-            dynamic_suffix: String::new(),
-        };
+        let blocks = typed_test_blocks("everything is static", "");
         let req = build_anthropic_request(
             "claude-sonnet-4-6",
             &messages,
@@ -3973,12 +7281,12 @@ mod tests {
         assert_eq!(zai["thinking"]["type"], "enabled");
         assert_eq!(zai["reasoning_effort"], "high");
 
-        let zai_legacy = build_request("zai", "glm-4.7", &messages, "max", None, None)
-            .expect("zai legacy request should build");
-        assert_eq!(zai_legacy["thinking"]["type"], "enabled");
+        let unknown_zai = build_request("zai", "glm-4.7", &messages, "max", None, None)
+            .expect("unknown Z.AI request should still build");
         assert!(
-            zai_legacy.get("reasoning_effort").is_none(),
-            "non-GLM-5.2 Z.AI models must not receive reasoning_effort: {zai_legacy}"
+            unknown_zai.get("thinking").is_none()
+                && unknown_zai.get("reasoning_effort").is_none(),
+            "models without exact capability evidence must not receive optional controls: {unknown_zai}"
         );
 
         let minimax = build_request("minimax", "MiniMax-M3", &messages, "high", None, None)
@@ -4032,7 +7340,10 @@ mod tests {
 
         let ollama = build_request("ollama", "llama3", &messages, "medium", None, None)
             .expect("ollama request should build");
-        assert_eq!(ollama["stream"], true);
+        assert_eq!(
+            ollama["stream"], false,
+            "canonical Ollama agent loops require one terminal JSON response"
+        );
         assert!(ollama["options"]["num_predict"].is_number());
         assert!(
             ollama.get("max_tokens").is_none(),
@@ -4094,9 +7405,15 @@ mod tests {
     }
 
     #[test]
-    fn build_assistant_message_with_tools_preserves_reasoning_content() {
-        let msg = build_assistant_message_with_tools("hello", Some("thought"), &[], "kimi");
-        assert_eq!(msg["reasoning_content"], "thought");
+    fn build_assistant_message_with_tools_preserves_reasoning_summary() {
+        let summary =
+            crate::runtime::ReasoningSummary::try_from_provider("summary").expect("valid summary");
+        let msg = build_assistant_message_with_tools("hello", Some(&summary), &[], "kimi");
+        assert_eq!(
+            crate::runtime::message_reasoning_summary(&msg),
+            Some(summary)
+        );
+        assert!(msg.get("reasoning_content").is_none());
     }
 
     #[test]
@@ -4180,14 +7497,13 @@ mod tests {
         assert_eq!(opus48["output_config"]["effort"], "high");
         assert_eq!(opus48["max_tokens"], 40_000);
 
-        let opus47 = build_anthropic_request("claude-opus-4-7", &messages, "max", None, None)
-            .expect("opus 4.7 max-effort request should build");
-        assert_eq!(opus47["thinking"]["type"], "adaptive");
+        let unknown_opus = build_anthropic_request("claude-opus-4-7", &messages, "max", None, None)
+            .expect("unknown Opus request should still build");
         assert!(
-            opus47["thinking"].get("budget_tokens").is_none(),
-            "Opus 4.7 rejects manual thinking budgets: {opus47}"
+            unknown_opus.get("thinking").is_none()
+                && unknown_opus.get("output_config").is_none(),
+            "models without exact capability evidence must receive no optional thinking controls: {unknown_opus}"
         );
-        assert_eq!(opus47["output_config"]["effort"], "max");
 
         let fable = build_anthropic_request("claude-fable-5", &messages, "high", None, None)
             .expect("fable high-effort request should build");
@@ -4312,13 +7628,13 @@ mod tests {
         let missing_role = vec![serde_json::json!({"content": "hi"})];
         let err = build_google_request(&missing_role, "medium")
             .expect_err("missing message role must fail");
-        assert!(err.contains("'role'"), "{err}");
+        assert!(err.contains("role"), "{err}");
         assert!(err.contains("index 0"), "{err}");
 
         let missing_content = vec![serde_json::json!({"role": "user"})];
         let err = build_google_request(&missing_content, "medium")
             .expect_err("missing message content must fail");
-        assert!(err.contains("'content'"), "{err}");
+        assert!(err.contains("content"), "{err}");
         assert!(err.contains("index 0"), "{err}");
 
         let unsupported_role = vec![serde_json::json!({"role": "developer", "content": "hi"})];
@@ -4457,9 +7773,9 @@ mod tests {
         );
     }
 
-    /// B3 — `tool_needs_permission` classifies read-only tools as safe.
+    /// B3 — `tool_needs_permission` follows mandatory catalog metadata.
     #[test]
-    fn b3_tool_needs_permission_safe_list() {
+    fn b3_tool_needs_permission_uses_effect_catalog() {
         assert!(!tool_needs_permission("read_file"), "read_file is safe");
         assert!(
             !tool_needs_permission("grounding_context"),
@@ -4478,47 +7794,172 @@ mod tests {
         );
     }
 
-    /// crosslink #724 — `check_tool_permission` consults the
-    /// `PermissionManager`'s session-scoped TUI cache and short-circuits to
-    /// `Allowed` without sending a `PermissionRequest` event. This is the
-    /// integration test that proves the cache survives across batches: a
-    /// fresh `execute_tool_calls_for_tui` invocation would see this state.
     #[tokio::test]
-    async fn issue_724_check_tool_permission_uses_session_always_allowed() {
+    async fn tui_permission_manager_applies_explicit_deny_to_read_only_call() {
+        use crate::permissions::{PermissionDecision, PermissionRule};
         use std::sync::mpsc as std_mpsc;
 
-        let mgr = PermissionManager::unrestricted();
-        // Simulate: in a prior batch, the user picked "Always allow" for Bash.
-        mgr.tui_remember_always_allowed("bash".to_string());
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut mgr = PermissionManager::new(dir.path().join("permissions.json"), true, Vec::new());
+        mgr.add_session_rule(PermissionRule {
+            tool: "Read".to_string(),
+            pattern: "/etc/**".to_string(),
+            decision: PermissionDecision::Deny,
+        });
+        let (tx, _rx) = std_mpsc::channel::<AppEvent>();
 
-        // Batch-scoped caches start empty (as they would on every new batch).
-        let mut always_allowed: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let mut always_denied: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        let (tx, rx) = std_mpsc::channel::<AppEvent>();
         let outcome = check_tool_permission(
-            "bash",
-            "call_1",
-            "{\"command\":\"ls\"}",
-            &mut always_allowed,
-            &mut always_denied,
-            Some(&mgr),
+            &test_run(),
+            "read_file",
+            "call_read",
+            r#"{"path":"/etc/shadow"}"#,
+            &mgr,
             &[],
             None,
             None,
             &tx,
         )
         .await;
+        assert!(matches!(outcome, PermissionOutcome::DeniedWithResult(_)));
+    }
+
+    #[tokio::test]
+    async fn tui_unrestricted_manager_denies_unclassified_call_before_prompt() {
+        use std::sync::mpsc as std_mpsc;
+
+        let manager = PermissionManager::unrestricted();
+        let (tx, rx) = std_mpsc::channel::<AppEvent>();
+
+        let outcome = check_tool_permission(
+            &test_run(),
+            "unknown_from_model",
+            "call_unknown",
+            "{}",
+            &manager,
+            &[],
+            None,
+            None,
+            &tx,
+        )
+        .await;
+
+        assert!(matches!(outcome, PermissionOutcome::DeniedWithResult(_)));
         assert!(
-            matches!(outcome, PermissionOutcome::Allowed { checked: true }),
-            "#724: a prior 'always allow' must short-circuit to Allowed without a prompt"
+            rx.try_iter()
+                .all(|event| !matches!(event, AppEvent::PermissionRequest { .. })),
+            "an unclassified call must not be converted into a user-approvable prompt"
+        );
+    }
+
+    /// crosslink #724 / S-017 — an exact, bounded session approval survives
+    /// across batches without becoming a tool-name-wide bypass.
+    #[tokio::test]
+    async fn issue_724_check_tool_permission_uses_exact_session_approval() {
+        use std::sync::mpsc as std_mpsc;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mgr = PermissionManager::new(dir.path().join("permissions.json"), true, Vec::new());
+        let approved = ToolCall {
+            id: "prior_call".to_string(),
+            call_type: "function".to_string(),
+            function: tools::FunctionCall {
+                name: "bash".to_string(),
+                arguments: r#"{"command":"ls"}"#.to_string(),
+            },
+        };
+        let _initial_permit = mgr
+            .approve_tool_call_for_session(
+                &approved,
+                "session-1",
+                crate::permissions::ApprovalProvenance::InteractiveUser,
+            )
+            .expect("exact session approval");
+
+        let (tx, rx) = std_mpsc::channel::<AppEvent>();
+        let outcome = check_tool_permission(
+            &test_run(),
+            "bash",
+            "call_1",
+            "{\"command\":\"ls\"}",
+            &mgr,
+            &[],
+            None,
+            Some("session-1"),
+            &tx,
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                PermissionOutcome::Allowed {
+                    authorization: Some(_)
+                }
+            ),
+            "an exact prior approval must return a call-bound permit without a prompt"
         );
         // No PermissionRequest event should have been emitted.
         assert!(
             rx.try_recv().is_err(),
             "#724: no PermissionRequest event must be sent when the session cache allows"
         );
+    }
+
+    #[test]
+    fn durable_memory_prompts_accept_only_the_one_use_choice() {
+        use std::sync::mpsc as std_mpsc;
+
+        let run = test_run();
+        let manager = PermissionManager::unrestricted_for_run(&run);
+        let (tx, _rx) = std_mpsc::channel::<AppEvent>();
+        for (name, arguments) in [
+            (
+                "memory_review",
+                serde_json::json!({
+                    "action": "review",
+                    "logical_id": "00000000-0000-0000-0000-000000000001",
+                    "expected_record_digest": format!("sha256:{}", "0".repeat(64)),
+                }),
+            ),
+            (
+                "memory_export",
+                serde_json::json!({"destination_root": "/tmp/portable-export"}),
+            ),
+            (
+                "memory_import",
+                serde_json::json!({"source_root": "/tmp/portable-import"}),
+            ),
+        ] {
+            let call = ToolCall {
+                id: format!("{name}-call"),
+                call_type: "function".to_string(),
+                function: tools::FunctionCall {
+                    name: name.to_string(),
+                    arguments: arguments.to_string(),
+                },
+            };
+            let allowed = permission_prompt_response(
+                &Ok(PermissionResponse::Allow),
+                &manager,
+                Some("session-durable-memory"),
+                &call,
+                &tx,
+            );
+            assert!(matches!(
+                allowed,
+                PermissionOutcome::Allowed {
+                    authorization: Some(_)
+                }
+            ));
+
+            let reusable = permission_prompt_response(
+                &Ok(PermissionResponse::AlwaysAllow),
+                &manager,
+                Some("session-durable-memory"),
+                &call,
+                &tx,
+            );
+            assert!(matches!(reusable, PermissionOutcome::DeniedWithResult(_)));
+        }
     }
 
     /// #603: `web_fetch` is gated, but a configured preapproved host should
@@ -4535,18 +7976,13 @@ mod tests {
             Vec::new(),
             vec!["docs.python.org".to_string()],
         );
-        let mut always_allowed: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let mut always_denied: std::collections::HashSet<String> = std::collections::HashSet::new();
-
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
         let outcome = check_tool_permission(
+            &test_run(),
             "web_fetch",
             "call_web",
             r#"{"url":"https://docs.python.org/3/"}"#,
-            &mut always_allowed,
-            &mut always_denied,
-            Some(&mgr),
+            &mgr,
             &[],
             None,
             None,
@@ -4554,7 +7990,12 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(outcome, PermissionOutcome::Allowed { checked: true }),
+            matches!(
+                outcome,
+                PermissionOutcome::Allowed {
+                    authorization: Some(_)
+                }
+            ),
             "#603: preapproved web_fetch URL must be allowed without a prompt"
         );
         assert!(
@@ -4576,18 +8017,13 @@ mod tests {
             pattern: "git status *".to_string(),
             decision: PermissionDecision::Allow,
         }];
-        let mut always_allowed: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let mut always_denied: std::collections::HashSet<String> = std::collections::HashSet::new();
-
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
         let outcome = check_tool_permission(
+            &test_run(),
             "bash",
             "call_git",
             r#"{"command":"git status --short"}"#,
-            &mut always_allowed,
-            &mut always_denied,
-            Some(&mgr),
+            &mgr,
             &transient,
             None,
             None,
@@ -4596,7 +8032,12 @@ mod tests {
         .await;
 
         assert!(
-            matches!(outcome, PermissionOutcome::Allowed { checked: true }),
+            matches!(
+                outcome,
+                PermissionOutcome::Allowed {
+                    authorization: Some(_)
+                }
+            ),
             "matching transient allowed-tools rule must allow without prompting"
         );
         assert!(
@@ -4621,18 +8062,17 @@ mod tests {
             }],
         });
         let engine = HookEngine::new(hooks);
-        let mut always_allowed: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let mut always_denied: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let directory = tempfile::TempDir::new().expect("tempdir");
+        let manager =
+            PermissionManager::new(directory.path().join("permissions.json"), true, Vec::new());
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
 
         let outcome = check_tool_permission(
+            &test_run(),
             "bash",
             "call_hook",
-            r#"{"command":"rm -rf /tmp/openclaudia-hook-test"}"#,
-            &mut always_allowed,
-            &mut always_denied,
-            None,
+            r#"{"command":"printf permission-hook-test"}"#,
+            &manager,
             &[],
             Some(&engine),
             Some("session-1"),
@@ -4683,30 +8123,39 @@ mod tests {
         );
     }
 
-    /// crosslink #724 — symmetric to the above: a session-scoped "always deny"
-    /// short-circuits to `DeniedWithResult` without prompting the user again.
+    /// crosslink #724 / S-017 — an exact session denial short-circuits without
+    /// granting denial authority over other Bash invocations.
     #[tokio::test]
-    async fn issue_724_check_tool_permission_uses_session_always_denied() {
+    async fn issue_724_check_tool_permission_uses_exact_session_denial() {
         use std::sync::mpsc as std_mpsc;
 
-        let mgr = PermissionManager::unrestricted();
-        mgr.tui_remember_always_denied("bash".to_string());
-
-        let mut always_allowed: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let mut always_denied: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mgr = PermissionManager::new(dir.path().join("permissions.json"), true, Vec::new());
+        let denied = ToolCall {
+            id: "prior_call".to_string(),
+            call_type: "function".to_string(),
+            function: tools::FunctionCall {
+                name: "bash".to_string(),
+                arguments: r#"{"command":"cargo test"}"#.to_string(),
+            },
+        };
+        mgr.deny_tool_call_for_session(
+            &denied,
+            "session-1",
+            crate::permissions::ApprovalProvenance::InteractiveUser,
+        )
+        .expect("exact session denial");
 
         let (tx, rx) = std_mpsc::channel::<AppEvent>();
         let outcome = check_tool_permission(
+            &test_run(),
             "bash",
             "call_1",
-            "{\"command\":\"rm -rf /\"}",
-            &mut always_allowed,
-            &mut always_denied,
-            Some(&mgr),
+            "{\"command\":\"cargo test\"}",
+            &mgr,
             &[],
             None,
-            None,
+            Some("session-1"),
             &tx,
         )
         .await;
@@ -5032,77 +8481,27 @@ mod tests {
         }
     }
 
-    /// #596: jitter spread must be non-zero so concurrent retriers don't
-    /// land on identical waits. Sample a window of attempts and assert
-    /// at least two of them differ.
+    /// S-048: retry delays and total attempts are explicitly bounded.
     #[test]
-    fn issue_596_backoff_jitter_produces_non_constant_output() {
-        let mut seen = std::collections::HashSet::new();
-        // 200 samples at attempt=3 → base=16 → jitter ±4 → 9..=24 range.
-        // With a healthy nanos source the set should have at least 3
-        // distinct values long before we exhaust the loop.
-        for _ in 0..200 {
-            seen.insert(backoff_with_jitter(3));
-            if seen.len() >= 3 {
-                break;
-            }
-        }
-        assert!(
-            seen.len() >= 2,
-            "backoff_with_jitter must produce >=2 distinct waits across 200 samples, saw {seen:?}"
-        );
-    }
-
-    /// #596: backoff is always at least 1 second even at attempt=0
-    /// (saturating arithmetic must never yield 0 sleep — that would
-    /// spin-burn the CPU on a stuck transient).
-    #[test]
-    fn issue_596_backoff_floor_is_one_second() {
-        for _ in 0..50 {
-            let wait = backoff_with_jitter(0);
-            assert!(wait >= 1, "wait must be >=1, got {wait}");
-        }
-    }
-
-    #[test]
-    fn issue_596_retry_after_zero_keeps_zero_delay() {
-        assert_eq!(
-            retry_after_with_jitter_from(0, u64::MAX),
-            std::time::Duration::ZERO,
-            "Retry-After: 0 must stay zero so deterministic tests and immediate retry semantics hold"
-        );
-    }
-
-    #[test]
-    fn issue_596_retry_after_jitter_is_additive_and_bounded() {
-        let base = std::time::Duration::from_secs(4);
-        let max = std::time::Duration::from_secs(5);
-
-        let no_jitter = retry_after_with_jitter_from(4, 0);
-        let max_jitter = retry_after_with_jitter_from(4, 1_000);
-
-        assert_eq!(no_jitter, base);
-        assert_eq!(max_jitter, max);
-        for seed in [1, 42, 999, 1_001, u64::MAX] {
-            let wait = retry_after_with_jitter_from(4, seed);
-            assert!(
-                (base..=max).contains(&wait),
-                "Retry-After jitter must stay within 0-25%; seed={seed}, wait={wait:?}"
-            );
-        }
-    }
-
-    /// #592: `max_retries` cap is the CC-parity value (10). Pins via the
-    /// constant being public-via-classifier; if the loop's `MAX_RETRIES`
-    /// drifts, future test failures will name the value.
-    #[test]
-    fn issue_592_retry_classifier_and_helper_are_publicly_accessible() {
-        // These are exercise tests for the public surface of #595-#597.
-        // The actual MAX_RETRIES const lives inside run_turn but the
-        // helpers must be callable from elsewhere so they're testable
-        // and reusable across seams.
+    fn provider_retry_policy_is_bounded() {
         assert!(is_retryable_status(429));
-        let _ = backoff_with_jitter(0);
+        assert_eq!(MAX_API_RETRIES, 10);
+        assert_eq!(
+            provider_transport::retry_delay(0, Some("0")),
+            std::time::Duration::ZERO
+        );
+        assert_eq!(
+            provider_transport::retry_delay(20, Some("999999")),
+            provider_transport::MAX_RETRY_DELAY
+        );
+        assert!(provider_transport::should_retry_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            RequestReplaySafety::AdmissionOnly
+        ));
+        assert!(!provider_transport::should_retry_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            RequestReplaySafety::AdmissionOnly
+        ));
     }
 
     // ── crosslink #598 — overload fallback hint ──────────────────────────────

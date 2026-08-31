@@ -6,7 +6,7 @@
 //! cover the basic forward + error path; this file pins the
 //! shared-Arc semantics (caller can keep their own handle), the
 //! concurrent-call ordering, the `McpError` variant pass-through
-//! matrix, and the close-then-request still-works contract.
+//! matrix, and owned shutdown semantics.
 
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::expect_used)]
@@ -229,25 +229,25 @@ async fn transport_passes_through_server_unreachable_verbatim() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn close_returns_ok_without_side_effects() {
+async fn close_returns_ok_without_counting_a_request() {
     let server = Arc::new(CountingEchoServer::new());
     let transport = InProcessTransport::new(server.clone());
     transport.close().await.expect("close");
-    // No side effects: count is still 0.
+    // Lifecycle shutdown is not an MCP request.
     assert_eq!(server.count(), 0);
 }
 
 #[tokio::test]
-async fn close_then_request_still_works_no_lifecycle_state() {
-    // PINS DOCUMENTED CONTRACT: close() is a no-op for the
-    // in-process transport because there's no child process.
-    // After close, requests still resolve through the Arc.
+async fn close_then_request_is_rejected_by_lifecycle_owner() {
     let server = Arc::new(CountingEchoServer::new());
     let transport = InProcessTransport::new(server.clone());
     transport.close().await.expect("close");
-    let resp = transport.request("post-close", None).await.expect("ok");
-    assert_eq!(resp["method"], "post-close");
-    assert_eq!(server.count(), 1);
+    let error = transport
+        .request("post-close", None)
+        .await
+        .expect_err("closed transports must reject new work");
+    assert!(matches!(error, McpError::ConnectionClosed(_)));
+    assert_eq!(server.count(), 0);
 }
 
 #[tokio::test]

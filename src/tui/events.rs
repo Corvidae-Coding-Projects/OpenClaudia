@@ -17,6 +17,32 @@ pub enum PermissionResponse {
     AlwaysDeny,
 }
 
+/// Trusted plan lifecycle action requested by a typed tool follow-up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanModeRequest {
+    /// Enter the canonical pinned-plan runtime state.
+    Enter,
+    /// Present the exact plan artifact for an explicit user decision.
+    Exit {
+        allowed_prompts: Vec<crate::tools::ToolAllowedPrompt>,
+    },
+}
+
+/// Terminal TUI response to a typed plan lifecycle request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanModeReply {
+    /// The host action completed, including an explicit rejection.
+    Completed {
+        message: String,
+        response: serde_json::Value,
+        /// Approved-plan context to splice into the in-flight provider
+        /// history. `None` for entry and rejection outcomes.
+        context_message: Option<serde_json::Value>,
+    },
+    /// The modal or host transition was cancelled before completion.
+    Cancelled { message: String },
+}
+
 /// Which slash-command branch dispatched a backgrounded shell call, so the
 /// UI thread knows how to render the resulting [`AppEvent::ShellDone`].
 ///
@@ -55,11 +81,16 @@ pub struct ProviderSwitch {
     /// Fully resolved chat endpoint used by subsequent API turns.
     pub endpoint: String,
     /// Fully resolved request headers, including auth and custom provider headers.
-    pub headers: Vec<(String, String)>,
+    pub headers: crate::secrets::SensitiveHeaders,
     /// Wire protocol used for subsequent API turns.
     pub wire_api: crate::pipeline::WireApi,
     /// Claude Code OAuth bearer for Anthropic subscription auth.
-    pub claude_code_token: Option<String>,
+    pub claude_code_token: Option<crate::secrets::OAuthToken>,
+    /// Supported subscription transport through Anthropic's unmodified
+    /// Agent SDK executable.
+    pub claude_agent_sdk: Option<crate::claude_agent_sdk::ClaudeAgentSdk>,
+    /// Supported account transport through `OpenAI`'s pinned Codex runtime.
+    pub codex_agent_sdk: Option<crate::codex_agent_sdk::CodexAgentSdk>,
     /// Runtime auth used by VDD's builder-side verifier after switching.
     pub vdd_builder_auth: crate::vdd::VddProviderAuth,
     /// Existing split system prompt blocks, preserved for Anthropic cache efficiency.
@@ -77,6 +108,12 @@ pub enum ApiRetryKind {
 
 /// Application events from multiple sources.
 pub enum AppEvent {
+    /// Event emitted by work owned by one exact TUI call. Terminal input and
+    /// render ticks are launch-scoped and therefore remain unwrapped.
+    Correlated {
+        call_id: crate::runtime::CallId,
+        event: Box<Self>,
+    },
     /// Terminal key event
     Key(KeyEvent),
     /// Bracketed terminal paste payload
@@ -87,8 +124,8 @@ pub enum AppEvent {
     Tick,
     /// Streaming text delta from API
     StreamText(String),
-    /// Streaming thinking text
-    StreamThinking(String),
+    /// Streaming provider-sanctioned reasoning-summary text.
+    StreamReasoningSummary(String),
     /// Tool execution started
     ToolStart { name: String, description: String },
     /// Tool execution completed
@@ -97,10 +134,19 @@ pub enum AppEvent {
         success: bool,
         content: String,
     },
+    /// A trusted worktree tool published a replacement immutable run.
+    WorkspaceTransition {
+        run_context: std::sync::Arc<crate::tools::ToolRunContext>,
+    },
     /// API response completed
     ResponseDone,
     /// API error
-    ApiError(String),
+    ApiError(crate::secrets::SafeDiagnostic),
+    /// A generation-bound plugin agent finished canonical child execution.
+    PluginAgentDone {
+        label: String,
+        result: crate::subagent::SubagentResult,
+    },
     /// The upstream API request will be retried after a transient failure.
     ApiRetry {
         kind: ApiRetryKind,
@@ -120,8 +166,14 @@ pub enum AppEvent {
     },
     /// Tool results require a follow-up API call
     FollowUp,
-    /// Sync updated session messages back to the App after an agentic loop.
-    SyncMessages(Vec<serde_json::Value>),
+    /// Atomically sync the portable transcript and provider-owned continuation
+    /// after an agentic loop. The two lanes describe one completed state and
+    /// must never be committed independently.
+    SyncSession {
+        session_id: String,
+        messages: Vec<serde_json::Value>,
+        provider_native_state: Option<crate::runtime::ProviderNativeState>,
+    },
     /// Pipeline requesting permission to run a tool.
     ///
     /// Includes a tokio `oneshot::Sender` to reply with the user's
@@ -136,8 +188,8 @@ pub enum AppEvent {
         tool_args: String,
         reply: tokio::sync::oneshot::Sender<PermissionResponse>,
     },
-    /// The `ask_user_question` tool returned its `USER_QUESTION_MARKER`
-    /// payload. The TUI should display a modal that walks the user
+    /// A trusted typed `ask_user_question` follow-up reached the TUI. The UI
+    /// should display a modal that walks the user
     /// through each question, collect answers, and send back a JSON
     /// object mapping `question_text → answer(s)` via the oneshot.
     ///
@@ -146,8 +198,15 @@ pub enum AppEvent {
     /// REPL flow in `cli::repl::input::handle_user_questions` so the
     /// agent-facing contract is identical across both front-ends.
     UserQuestion {
-        questions: Vec<serde_json::Value>,
+        questions: Vec<crate::tools::ToolQuestion>,
         reply: tokio::sync::oneshot::Sender<String>,
+    },
+    /// A typed plan-mode handler needs the TUI-owned session and runtime
+    /// authority to complete its host transition. The pipeline awaits the
+    /// reply without blocking the event loop.
+    PlanModeRequest {
+        request: PlanModeRequest,
+        reply: tokio::sync::oneshot::Sender<PlanModeReply>,
     },
     /// A subprocess dispatched via `App::spawn_shell` has finished.
     /// The UI thread renders this according to [`SpawnTarget`].
@@ -177,7 +236,7 @@ pub enum AppEvent {
         model_hint: String,
     },
     /// A `/provider <name>` background resolution completed successfully.
-    ProviderSwitchReady(ProviderSwitch),
+    ProviderSwitchReady(Box<ProviderSwitch>),
     /// A `/provider <name>` background resolution failed.
     ProviderSwitchError(String),
     /// A `/model list` background fetch completed.
@@ -200,6 +259,8 @@ pub enum AppEvent {
 pub struct EventHandler {
     rx: mpsc::Receiver<AppEvent>,
     tx: mpsc::Sender<AppEvent>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    reader: Option<std::thread::JoinHandle<()>>,
 }
 
 impl EventHandler {
@@ -207,8 +268,13 @@ impl EventHandler {
     pub fn new(tick_rate: Duration) -> Self {
         let (tx, rx) = mpsc::channel();
         let event_tx = tx.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_stop = std::sync::Arc::clone(&stop);
 
-        std::thread::spawn(move || loop {
+        let reader = std::thread::spawn(move || loop {
+            if reader_stop.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
             if event::poll(tick_rate).unwrap_or(false) {
                 if let Ok(evt) = event::read() {
                     if let Some(app_evt) = translate_terminal_event(&evt) {
@@ -222,7 +288,12 @@ impl EventHandler {
             }
         });
 
-        Self { rx, tx }
+        Self {
+            rx,
+            tx,
+            stop,
+            reader: Some(reader),
+        }
     }
 
     /// Get a sender for pushing async events (streaming, tool results) into the loop.
@@ -255,6 +326,83 @@ impl EventHandler {
     /// (terminal-reader thread + API senders) have hung up.
     pub fn try_next(&self) -> Result<AppEvent, mpsc::TryRecvError> {
         self.rx.try_recv()
+    }
+}
+
+impl Drop for EventHandler {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(reader) = self.reader.take() {
+            if reader.join().is_err() {
+                tracing::warn!("TUI terminal reader panicked during shutdown");
+            }
+        }
+    }
+}
+
+/// Owned bridge that tags every event emitted by one model call before it
+/// enters the launch-wide event queue.
+///
+/// The provider pipeline intentionally accepts a standard synchronous sender.
+/// This bridge preserves that boundary while ensuring streaming, tools,
+/// approvals, questions, and terminal events all carry the same typed call ID.
+pub(crate) struct CallEventBridge {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CallEventBridge {
+    pub(crate) fn new(
+        call_id: crate::runtime::CallId,
+        output: mpsc::Sender<AppEvent>,
+    ) -> (Self, mpsc::Sender<AppEvent>) {
+        let (input, receiver) = mpsc::channel();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_stop = std::sync::Arc::clone(&stop);
+        let reader = std::thread::spawn(move || loop {
+            match receiver.recv_timeout(Duration::from_millis(25)) {
+                Ok(event) => {
+                    if output
+                        .send(AppEvent::Correlated {
+                            call_id,
+                            event: Box::new(event),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout)
+                    if reader_stop.load(std::sync::atomic::Ordering::Acquire) =>
+                {
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        });
+        (
+            Self {
+                stop,
+                reader: Some(reader),
+            },
+            input,
+        )
+    }
+
+    pub(crate) fn finish(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(reader) = self.reader.take() {
+            if reader.join().is_err() {
+                tracing::warn!("TUI call-event bridge panicked");
+            }
+        }
+    }
+}
+
+impl Drop for CallEventBridge {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 

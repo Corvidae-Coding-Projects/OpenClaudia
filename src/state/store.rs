@@ -7,6 +7,7 @@
 //! acquired, the closure runs, and the guard is dropped before control returns
 //! to the caller. References into the state cannot escape the closure.
 
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::broadcast;
@@ -36,6 +37,22 @@ pub enum StateEvent {
     },
     PermissionsMutated,
     Cleared,
+    /// The complete snapshot was replaced, including when its session ID was
+    /// preserved.
+    SnapshotReplaced,
+    /// Transaction boundary for the preceding granular events.
+    ///
+    /// Consumers that miss events can compare this generation with
+    /// [`StateStore::generation`] and reconcile from a fresh snapshot.
+    Committed {
+        generation: u64,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct CommittedState {
+    generation: u64,
+    value: SessionState,
 }
 
 /// A broadcast receiver that applies the store's standard lag policy.
@@ -97,7 +114,7 @@ impl StateSubscription {
 /// Shared session state plus a best-effort change notification channel.
 #[derive(Clone)]
 pub struct StateStore {
-    inner: Arc<RwLock<SessionState>>,
+    inner: Arc<RwLock<CommittedState>>,
     events: broadcast::Sender<StateEvent>,
 }
 
@@ -106,7 +123,10 @@ impl StateStore {
     pub fn new(state: SessionState) -> Self {
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
-            inner: Arc::new(RwLock::new(state)),
+            inner: Arc::new(RwLock::new(CommittedState {
+                generation: 0,
+                value: state,
+            })),
             events,
         }
     }
@@ -131,44 +151,77 @@ impl StateStore {
         self.inspect(Clone::clone)
     }
 
+    /// Return the generation of the current committed snapshot.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation
+    }
+
     /// Inspect state without allowing the read guard to escape.
     pub fn inspect<R>(&self, inspect: impl FnOnce(&SessionState) -> R) -> R {
         let guard = self
             .inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inspect(&guard)
+        inspect(&guard.value)
     }
 
     /// Mutate state and queue zero or more events atomically.
     ///
-    /// Events are emitted only after the write guard has been released. If the
-    /// mutation panics, unwinding skips the emission entirely, so subscribers
-    /// never act on a partially applied update.
+    /// The closure edits a private proposal. Its state and one new monotonic
+    /// generation are published only after the closure returns. Events are
+    /// emitted after the write guard has been released and end with a
+    /// [`StateEvent::Committed`] boundary. If the closure panics, the proposal
+    /// and its events are discarded, the lock remains usable, and the panic is
+    /// resumed for the caller.
+    ///
+    /// # Panics
+    ///
+    /// Resumes any panic raised by `update`. It also panics if the store has
+    /// exhausted all `u64` generations without publishing the proposal.
     pub fn update<R>(
         &self,
         update: impl FnOnce(&mut SessionState, &mut Vec<StateEvent>) -> R,
     ) -> R {
-        let (result, pending) = {
+        let (result, pending, generation) = {
             let mut guard = self
                 .inner
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut proposal = guard.value.clone();
             let mut pending = Vec::new();
-            let result = update(&mut guard, &mut pending);
+            let outcome = catch_unwind(AssertUnwindSafe(|| update(&mut proposal, &mut pending)));
+            let result = match outcome {
+                Ok(result) => result,
+                Err(payload) => {
+                    drop(guard);
+                    resume_unwind(payload);
+                }
+            };
+            let Some(generation) = guard.generation.checked_add(1) else {
+                drop(guard);
+                panic!("state generation exhausted");
+            };
+            guard.value = proposal;
+            guard.generation = generation;
             drop(guard);
-            (result, pending)
+            (result, pending, generation)
         };
 
         for event in pending {
             let _ = self.events.send(event);
         }
+        let _ = self.events.send(StateEvent::Committed { generation });
         result
     }
 
     /// Replace the complete state snapshot.
     ///
-    /// A session-switch event is emitted only when the identifier changed.
+    /// A session-switch event is emitted only when the identifier changed;
+    /// every successful replacement still emits a commit boundary.
     pub fn replace(&self, replacement: SessionState) {
         self.update(|state, events| {
             let from = state.identity.session_id.clone();
@@ -182,6 +235,7 @@ impl StateStore {
                     from_messages,
                 });
             }
+            events.push(StateEvent::SnapshotReplaced);
         });
     }
 }
@@ -195,6 +249,7 @@ impl Default for StateStore {
 impl std::fmt::Debug for StateStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StateStore")
+            .field("generation", &self.generation())
             .field("state", &self.snapshot())
             .finish_non_exhaustive()
     }
@@ -222,6 +277,10 @@ mod tests {
 
         let event = rx.recv().await.expect("event flushed");
         assert!(matches!(event, StateEvent::MessageAppended { role } if role == "user"));
+        assert!(matches!(
+            rx.recv().await.expect("commit boundary"),
+            StateEvent::Committed { generation: 1 }
+        ));
     }
 
     #[tokio::test]
@@ -243,6 +302,10 @@ mod tests {
         assert!(matches!(
             rx.recv().await.unwrap(),
             StateEvent::PermissionsMutated
+        ));
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            StateEvent::Committed { generation: 1 }
         ));
     }
 
@@ -282,12 +345,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replace_emits_session_switch_only_for_new_id() {
+    async fn replace_always_commits_and_emits_session_switch_only_for_new_id() {
         let store = StateStore::default();
         let mut rx = store.subscribe();
 
         store.replace(store.snapshot());
-        assert!(rx.try_recv().is_err());
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            StateEvent::SnapshotReplaced
+        ));
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            StateEvent::Committed { generation: 1 }
+        ));
 
         store.replace(SessionState::default());
         assert!(matches!(
@@ -296,6 +366,14 @@ mod tests {
                 from_messages: 0,
                 ..
             }
+        ));
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            StateEvent::SnapshotReplaced
+        ));
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            StateEvent::Committed { generation: 2 }
         ));
     }
 
@@ -321,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn poisoned_lock_recovers_for_followup_access() {
+    fn panicking_update_discards_proposal_without_poisoning_store() {
         let store = StateStore::default();
         let poisoned = store.clone();
         let _ = std::thread::spawn(move || {
@@ -332,6 +410,27 @@ mod tests {
         })
         .join();
 
+        assert_eq!(
+            store.inspect(|state| state.budgets.effort_level),
+            EffortLevel::Medium
+        );
+        assert_eq!(store.generation(), 0);
+
+        store.update(|state, _| state.budgets.effort_level = EffortLevel::Low);
+        assert_eq!(
+            store.inspect(|state| state.budgets.effort_level),
+            EffortLevel::Low
+        );
+        assert_eq!(store.generation(), 1);
+    }
+
+    #[test]
+    fn update_commits_without_notification_subscribers() {
+        let store = StateStore::default();
+
+        store.update(|state, _| state.budgets.effort_level = EffortLevel::High);
+
+        assert_eq!(store.generation(), 1);
         assert_eq!(
             store.inspect(|state| state.budgets.effort_level),
             EffortLevel::High

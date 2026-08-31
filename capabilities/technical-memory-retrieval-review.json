@@ -1,0 +1,16 @@
+{
+  "evaluation_digest": "sha256:aed6d3976d7dd25a4d57d222731544abdc06b04000c21430cfa21d48a682a014",
+  "evaluation_generator_id": "s105-evaluation-runner",
+  "held_out_corpus_digest": "sha256:6e819c488fd9d955ad50123fb2c0c2cd920a9b90c41522b504df6d5f938ca767",
+  "limitations": [
+    "Independent corpus and evaluation review has not yet been performed; runtime promotion must fail closed to the lexical baseline."
+  ],
+  "review_id": "openclaudia-technical-memory-retrieval-review-v1",
+  "reviewed_dimensions": [],
+  "reviewer_config_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "reviewer_id": "unassigned-independent-reviewer",
+  "reviewer_model_id": "unassigned",
+  "schema_version": 1,
+  "tuning_corpus_digest": "sha256:6665fcce7e40e8e5b4497f6c265f90c009976b64842cac0633a475f7610b00ce",
+  "verdict": "rejected"
+}

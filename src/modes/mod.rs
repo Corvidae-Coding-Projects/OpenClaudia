@@ -17,8 +17,11 @@
 pub mod fragments;
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fmt;
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
+use std::sync::RwLock;
 
 // =========================================================================
 // Axis enums
@@ -496,6 +499,918 @@ impl BehaviorMode {
 
         sections.join("\n\n")
     }
+}
+
+// =========================================================================
+// Runtime capability profiles
+// =========================================================================
+
+const MAX_SCOPE_TARGETS: usize = 128;
+const MAX_SCOPE_TARGET_BYTES: usize = 4096;
+
+/// One user- or task-approved resource for a restricted behavioral scope.
+///
+/// Workspace targets are stored relative to the session project so a saved
+/// session can be rebound to the same logical resource in an isolated child
+/// worktree. Tool targets grant one exact wire-level tool surface; they are
+/// never inferred from task prose.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum BehaviorScopeTarget {
+    WorkspacePath(PathBuf),
+    Tool(String),
+}
+
+/// Persistable target intent used to compile adjacent and narrow scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BehaviorScopeTargets {
+    /// Distinguishes an explicit user/task grant from the compatibility grant
+    /// for the workspace selected at process launch.
+    explicit: bool,
+    targets: Vec<BehaviorScopeTarget>,
+}
+
+impl Default for BehaviorScopeTargets {
+    fn default() -> Self {
+        Self::workspace_root()
+    }
+}
+
+impl BehaviorScopeTargets {
+    /// Adjacent-mode compatibility target: the workspace the user launched.
+    #[must_use]
+    pub fn workspace_root() -> Self {
+        Self {
+            explicit: false,
+            targets: vec![BehaviorScopeTarget::WorkspacePath(PathBuf::from("."))],
+        }
+    }
+
+    /// Parse explicit CLI/UI target values against one session workspace.
+    ///
+    /// Values beginning with `tool:` approve one exact tool surface. All other
+    /// values (optionally prefixed with `path:`) name a workspace-relative or
+    /// workspace-contained absolute path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty, excessive, malformed, or escaping targets.
+    pub fn from_user_values(
+        project_root: &Path,
+        working_directory: &Path,
+        values: &[String],
+    ) -> Result<Self, String> {
+        if values.is_empty() {
+            return Err("at least one explicit scope target is required".to_string());
+        }
+        if values.len() > MAX_SCOPE_TARGETS {
+            return Err(format!(
+                "at most {MAX_SCOPE_TARGETS} behavioral scope targets may be approved"
+            ));
+        }
+
+        let mut targets = BTreeSet::new();
+        for value in values {
+            let value = value.trim();
+            if value.is_empty() || value.len() > MAX_SCOPE_TARGET_BYTES {
+                return Err(format!(
+                    "scope targets must contain 1-{MAX_SCOPE_TARGET_BYTES} bytes"
+                ));
+            }
+            if let Some(tool) = value.strip_prefix("tool:") {
+                validate_scope_tool(tool)?;
+                targets.insert(BehaviorScopeTarget::Tool(tool.to_string()));
+                continue;
+            }
+
+            let path = value.strip_prefix("path:").unwrap_or(value);
+            let relative = normalize_scope_path(project_root, working_directory, path)?;
+            targets.insert(BehaviorScopeTarget::WorkspacePath(relative));
+        }
+
+        Ok(Self {
+            explicit: true,
+            targets: targets.into_iter().collect(),
+        })
+    }
+
+    #[must_use]
+    pub const fn is_explicit(&self) -> bool {
+        self.explicit
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
+
+    pub(crate) fn targets(&self) -> &[BehaviorScopeTarget] {
+        &self.targets
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.targets.len() > MAX_SCOPE_TARGETS {
+            return Err(format!(
+                "at most {MAX_SCOPE_TARGETS} behavioral scope targets may be approved"
+            ));
+        }
+        for target in &self.targets {
+            match target {
+                BehaviorScopeTarget::WorkspacePath(path) => validate_relative_scope_path(path)?,
+                BehaviorScopeTarget::Tool(tool) => validate_scope_tool(tool)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_scope_tool(tool: &str) -> Result<(), String> {
+    if tool.is_empty()
+        || tool.len() > 256
+        || !tool
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(format!(
+            "invalid scope tool '{tool}'; use 1-256 ASCII letters, digits, '_', '-' or '.'"
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_scope_path(
+    project_root: &Path,
+    working_directory: &Path,
+    value: &str,
+) -> Result<PathBuf, String> {
+    let supplied = Path::new(value);
+    if supplied
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(format!("scope target '{value}' contains parent traversal"));
+    }
+    let absolute = if supplied.is_absolute() {
+        supplied.to_path_buf()
+    } else {
+        working_directory.join(supplied)
+    };
+    let relative = absolute.strip_prefix(project_root).map_err(|_| {
+        format!(
+            "scope target '{}' is outside project '{}'",
+            absolute.display(),
+            project_root.display()
+        )
+    })?;
+    let relative = if relative.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        relative.to_path_buf()
+    };
+    validate_relative_scope_path(&relative)?;
+    Ok(relative)
+}
+
+fn validate_relative_scope_path(path: &Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err("workspace scope targets must be non-empty relative paths".to_string());
+    }
+    if path
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(format!(
+            "workspace scope target '{}' is not lexically normalized",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundBehaviorScopeTargets {
+    paths: Vec<PathBuf>,
+    tools: BTreeSet<String>,
+}
+
+impl BoundBehaviorScopeTargets {
+    fn bind(project_root: &Path, targets: &BehaviorScopeTargets) -> Result<Self, String> {
+        targets.validate()?;
+        let mut paths = BTreeSet::new();
+        let mut tools = BTreeSet::new();
+        for target in targets.targets() {
+            match target {
+                BehaviorScopeTarget::WorkspacePath(relative) => {
+                    let absolute = canonicalize_scope_target(&project_root.join(relative))?;
+                    if !absolute.starts_with(project_root) {
+                        return Err(format!(
+                            "scope target '{}' resolves outside project '{}'",
+                            relative.display(),
+                            project_root.display()
+                        ));
+                    }
+                    paths.insert(absolute);
+                }
+                BehaviorScopeTarget::Tool(tool) => {
+                    tools.insert(tool.clone());
+                }
+            }
+        }
+        Ok(Self {
+            paths: paths.into_iter().collect(),
+            tools,
+        })
+    }
+
+    fn allows_path(&self, scope: Scope, project_root: &Path, path: &Path) -> bool {
+        self.paths.iter().any(|target| {
+            let boundary = if scope == Scope::Adjacent {
+                target
+                    .parent()
+                    .filter(|parent| parent.starts_with(project_root))
+                    .unwrap_or(target)
+            } else {
+                target.as_path()
+            };
+            path == boundary || path.starts_with(boundary)
+        })
+    }
+
+    fn allows_tool(&self, tool: &str) -> bool {
+        self.tools.contains(tool)
+    }
+}
+
+fn canonicalize_scope_target(path: &Path) -> Result<PathBuf, String> {
+    if let Ok(canonical) = path.canonicalize() {
+        return Ok(canonical);
+    }
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    let canonical_ancestor = loop {
+        if let Ok(canonical) = ancestor.canonicalize() {
+            break canonical;
+        }
+        let name = ancestor.file_name().ok_or_else(|| {
+            format!(
+                "cannot resolve any existing ancestor of scope target '{}'",
+                path.display()
+            )
+        })?;
+        suffix.push(name.to_os_string());
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| format!("cannot resolve parent of scope target '{}'", path.display()))?;
+    };
+    let mut canonical = canonical_ancestor;
+    for component in suffix.iter().rev() {
+        canonical.push(component);
+    }
+    Ok(canonical)
+}
+
+/// Host-enforced mode requested for one agent run.
+///
+/// Behavioral prompts remain useful explanations, but this value is the
+/// authority consulted at tool admission. `Plan` is distinct from a generic
+/// read-only mode because it may update the one host-pinned plan file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeMode {
+    /// Normal behavior, including the read-only and director modifiers.
+    Behavioral(BehaviorMode),
+    /// Plan workflow: observe the codebase and update only the pinned plan.
+    Plan,
+    /// ACP context-gathering mode. Unlike `Plan`, it cannot write a plan file.
+    Initializer,
+    /// Explicit planner/orchestrator posture selected by a frontend flag.
+    Coordinator,
+}
+
+impl Default for RuntimeMode {
+    fn default() -> Self {
+        Self::Behavioral(BehaviorMode::default())
+    }
+}
+
+/// Effective capability class produced from a validated [`RuntimeMode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeModeClass {
+    /// Host permissions and guardrails decide which tools may run.
+    Standard,
+    /// Local observation and explicit user questions only.
+    ReadOnly,
+    /// Read-only analysis plus the exact pinned plan-file workflow.
+    Plan,
+    /// Observation plus the three subagent lifecycle tools.
+    Coordinator,
+}
+
+/// Immutable public view of the mode authority installed in a run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeModeSnapshot {
+    /// Monotonic generation changed by every successful transition.
+    pub generation: u64,
+    /// Validated frontend request that produced the profile.
+    pub mode: RuntimeMode,
+    /// Enforced capability class.
+    pub class: RuntimeModeClass,
+    /// Persistable target intent bound into this exact mode generation.
+    pub scope_targets: BehaviorScopeTargets,
+    bound_scope_targets: BoundBehaviorScopeTargets,
+    approved_plan: Option<PlanExecutionBinding>,
+}
+
+/// Process-local execution authority activated by one exact interactive plan
+/// approval. Durable task state records the plan version; this binding is
+/// intentionally tied to one live run and is never reconstructed on resume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlanExecutionBinding {
+    pub artifact_digest: String,
+    pub plan_digest: String,
+    pub plan_realpath: PathBuf,
+    pub run_id: crate::runtime::RunId,
+    pub capability_generation: u64,
+    pub capability_manifest_digest: String,
+    pub budget_generation: u64,
+    pub budget_limits: crate::runtime::BudgetLimits,
+    pub task_graph_generation: u64,
+    pub activated_mode_generation: u64,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    /// `None` means the reviewed proposal explicitly requested the run's full
+    /// existing capability envelope. `Some` narrows effectful calls to the
+    /// named tool/effect ceilings; read-only support calls remain available.
+    pub proposed_effects: Option<Vec<PlanEffectGrant>>,
+}
+
+/// One structured effect ceiling displayed with a plan proposal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlanEffectGrant {
+    pub tool: String,
+    pub effect: crate::tools::effect::ToolEffect,
+}
+
+impl PlanExecutionBinding {
+    pub(crate) fn allows_effect(
+        &self,
+        tool_name: &str,
+        effect: crate::tools::effect::ToolEffect,
+    ) -> bool {
+        if effect == crate::tools::effect::ToolEffect::ReadOnly {
+            return true;
+        }
+        self.proposed_effects.as_ref().is_none_or(|proposed| {
+            proposed
+                .iter()
+                .any(|grant| grant.tool.eq_ignore_ascii_case(tool_name) && effect <= grant.effect)
+        })
+    }
+}
+
+impl RuntimeModeSnapshot {
+    /// Stable label for diagnostics and typed denial messages.
+    #[must_use]
+    pub fn display_name(&self) -> String {
+        match &self.mode {
+            RuntimeMode::Behavioral(mode) => mode.display_name(),
+            RuntimeMode::Plan => "plan".to_string(),
+            RuntimeMode::Initializer => "initializer".to_string(),
+            RuntimeMode::Coordinator => "coordinator".to_string(),
+        }
+    }
+
+    /// Whether this profile may create or control child runs.
+    #[must_use]
+    pub const fn allows_child_runs(&self) -> bool {
+        matches!(
+            self.class,
+            RuntimeModeClass::Standard | RuntimeModeClass::Coordinator
+        )
+    }
+
+    /// Approval policy exposed for status and audit output.
+    #[must_use]
+    pub const fn approval_semantics(&self) -> &'static str {
+        "host-policy-with-non-bypassable-mode-ceiling"
+    }
+
+    /// Budget policy exposed for status and audit output.
+    #[must_use]
+    pub const fn budget_semantics(&self) -> &'static str {
+        if self.allows_child_runs() {
+            "inherit-run-budget"
+        } else {
+            "inherit-run-budget; child-runs-denied"
+        }
+    }
+
+    /// Digest of the exact plan artifact that activated this mode generation.
+    #[must_use]
+    pub fn approved_plan_artifact_digest(&self) -> Option<&str> {
+        self.approved_plan
+            .as_ref()
+            .map(|binding| binding.artifact_digest.as_str())
+    }
+
+    pub(crate) const fn approved_plan(&self) -> Option<&PlanExecutionBinding> {
+        self.approved_plan.as_ref()
+    }
+
+    /// Explain why a model-visible definition is outside this exact profile.
+    #[must_use]
+    pub fn definition_denial(
+        &self,
+        tool_name: &str,
+        effect: crate::tools::effect::ToolEffect,
+    ) -> Option<String> {
+        if self
+            .approved_plan
+            .as_ref()
+            .is_some_and(|binding| !binding.allows_effect(tool_name, effect))
+        {
+            Some(format!(
+                "approved plan generation {} does not grant this tool",
+                self.generation
+            ))
+        } else if profile_allows_definition(self, tool_name, effect) {
+            None
+        } else {
+            Some(format!(
+                "runtime mode '{}' generation {} does not grant this tool",
+                self.display_name(),
+                self.generation
+            ))
+        }
+    }
+}
+
+/// Atomic mode authority owned by one exact run.
+#[derive(Debug)]
+pub struct RuntimeModeAuthority {
+    project_root: PathBuf,
+    state: RwLock<RuntimeModeSnapshot>,
+}
+
+impl RuntimeModeAuthority {
+    /// Validate and install an initial generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested mode contains conflicting
+    /// capability modifiers.
+    pub fn new(mode: RuntimeMode) -> Result<Self, String> {
+        let scope_targets = BehaviorScopeTargets::workspace_root();
+        let project_root = PathBuf::from("/");
+        let bound_scope_targets = BoundBehaviorScopeTargets {
+            paths: vec![project_root.clone()],
+            tools: BTreeSet::new(),
+        };
+        Self::from_bound(mode, scope_targets, bound_scope_targets, project_root)
+    }
+
+    pub(crate) fn new_for_run(
+        mode: RuntimeMode,
+        scope_targets: BehaviorScopeTargets,
+        project_root: &Path,
+    ) -> Result<Self, String> {
+        let bound_scope_targets = BoundBehaviorScopeTargets::bind(project_root, &scope_targets)?;
+        Self::from_bound(
+            mode,
+            scope_targets,
+            bound_scope_targets,
+            project_root.to_path_buf(),
+        )
+    }
+
+    fn from_bound(
+        mode: RuntimeMode,
+        scope_targets: BehaviorScopeTargets,
+        bound_scope_targets: BoundBehaviorScopeTargets,
+        project_root: PathBuf,
+    ) -> Result<Self, String> {
+        let class = validate_runtime_mode(&mode, &scope_targets)?;
+        Ok(Self {
+            project_root,
+            state: RwLock::new(RuntimeModeSnapshot {
+                generation: 1,
+                mode,
+                class,
+                scope_targets,
+                bound_scope_targets,
+                approved_plan: None,
+            }),
+        })
+    }
+
+    /// Read one internally consistent mode generation.
+    #[must_use]
+    pub fn snapshot(&self) -> RuntimeModeSnapshot {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Validate first, then atomically replace the whole effective profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for conflicting modifiers or generation exhaustion.
+    pub fn transition(&self, mode: RuntimeMode) -> Result<RuntimeModeSnapshot, String> {
+        let scope_targets = self.snapshot().scope_targets;
+        self.transition_scoped(mode, scope_targets)
+    }
+
+    /// Validate a transition against the current target generation without
+    /// mutating authority.
+    pub(crate) fn validate_transition(
+        &self,
+        mode: &RuntimeMode,
+    ) -> Result<RuntimeModeClass, String> {
+        let scope_targets = self.snapshot().scope_targets;
+        self.validate_scoped_transition(mode, &scope_targets)
+    }
+
+    /// Validate and bind a prospective complete profile without publishing it.
+    pub(crate) fn validate_scoped_transition(
+        &self,
+        mode: &RuntimeMode,
+        scope_targets: &BehaviorScopeTargets,
+    ) -> Result<RuntimeModeClass, String> {
+        let class = validate_runtime_mode(mode, scope_targets)?;
+        BoundBehaviorScopeTargets::bind(&self.project_root, scope_targets)?;
+        Ok(class)
+    }
+
+    pub(crate) fn transition_scoped(
+        &self,
+        mode: RuntimeMode,
+        scope_targets: BehaviorScopeTargets,
+    ) -> Result<RuntimeModeSnapshot, String> {
+        let class = validate_runtime_mode(&mode, &scope_targets)?;
+        let bound_scope_targets =
+            BoundBehaviorScopeTargets::bind(&self.project_root, &scope_targets)?;
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let generation = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| "runtime mode generation exhausted".to_string())?;
+        *state = RuntimeModeSnapshot {
+            generation,
+            mode,
+            class,
+            scope_targets,
+            bound_scope_targets,
+            approved_plan: None,
+        };
+        Ok(state.clone())
+    }
+
+    /// Commit the fallible durable/session side of a plan approval while the
+    /// current plan generation is write-locked, then publish its mode and
+    /// execution binding with one infallible state replacement.
+    ///
+    /// A callback error leaves the complete mode snapshot unchanged. Generic
+    /// mode transitions deliberately clear an older plan binding.
+    pub(crate) fn transition_plan_approval<T>(
+        &self,
+        expected_generation: u64,
+        mode: RuntimeMode,
+        commit: impl FnOnce(u64) -> Result<(T, PlanExecutionBinding), String>,
+    ) -> Result<(RuntimeModeSnapshot, T), String> {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generation != expected_generation || state.class != RuntimeModeClass::Plan {
+            return Err(format!(
+                "plan approval expected runtime plan generation {expected_generation}, observed {} ({})",
+                state.generation,
+                state.display_name()
+            ));
+        }
+        let class = validate_runtime_mode(&mode, &state.scope_targets)?;
+        if class == RuntimeModeClass::Plan {
+            return Err("approved plan must activate a non-plan execution mode".to_string());
+        }
+        let bound_scope_targets =
+            BoundBehaviorScopeTargets::bind(&self.project_root, &state.scope_targets)?;
+        let generation = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| "runtime mode generation exhausted".to_string())?;
+        let (result, approved_plan) = commit(generation)?;
+        debug_assert_eq!(approved_plan.activated_mode_generation, generation);
+        *state = RuntimeModeSnapshot {
+            generation,
+            mode,
+            class,
+            scope_targets: state.scope_targets.clone(),
+            bound_scope_targets,
+            approved_plan: Some(approved_plan),
+        };
+        Ok((state.clone(), result))
+    }
+
+    /// Enforce the current profile for one fully classified invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed explanation when the active profile denies the call.
+    pub fn admit_resolved_tool(
+        &self,
+        tool_name: &str,
+        resolved: &crate::tools::effect::ResolvedEffect,
+        canonical_path: Option<&Path>,
+        arguments: &serde_json::Value,
+        plan_file: &Path,
+    ) -> Result<(), String> {
+        let snapshot = self.snapshot();
+        if profile_allows_call(
+            &snapshot,
+            tool_name,
+            resolved,
+            canonical_path,
+            arguments,
+            plan_file,
+            &self.project_root,
+        ) {
+            Ok(())
+        } else {
+            Err(format!(
+                "Runtime mode '{}' generation {} denies tool '{}' ({})",
+                snapshot.display_name(),
+                snapshot.generation,
+                tool_name,
+                resolved.effect.as_str()
+            ))
+        }
+    }
+
+    /// Admit one call against a single locked mode/plan-authority snapshot.
+    /// This prevents a mode change from racing between plan validation and
+    /// the ordinary profile decision.
+    #[allow(clippy::significant_drop_tightening)] // One read guard binds plan validation to profile admission.
+    pub(crate) fn admit_resolved_tool_for_run(
+        &self,
+        run: &crate::tools::ToolRunContext,
+        tool_name: &str,
+        resolved: &crate::tools::effect::ResolvedEffect,
+        canonical_path: Option<&Path>,
+        arguments: &serde_json::Value,
+        plan_file: &Path,
+    ) -> Result<(), String> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(binding) = state.approved_plan() {
+            run.validate_plan_execution(binding, tool_name, resolved.effect)?;
+        }
+        if profile_allows_call(
+            &state,
+            tool_name,
+            resolved,
+            canonical_path,
+            arguments,
+            plan_file,
+            &self.project_root,
+        ) {
+            Ok(())
+        } else {
+            Err(format!(
+                "Runtime mode '{}' generation {} denies tool '{}' ({})",
+                state.display_name(),
+                state.generation,
+                tool_name,
+                resolved.effect.as_str()
+            ))
+        }
+    }
+
+    /// Check a definition-level effect without a concrete resource target.
+    ///
+    /// Production dispatch uses [`Self::admit_resolved_tool`]. This compatibility
+    /// surface remains useful to callers deciding whether a non-path tool class
+    /// is admitted at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns a mode denial when the active profile does not grant the tool.
+    pub fn admit_tool(
+        &self,
+        tool_name: &str,
+        effect: crate::tools::effect::ToolEffect,
+        arguments: &serde_json::Value,
+        plan_file: &Path,
+    ) -> Result<(), String> {
+        let resolved = crate::tools::effect::ResolvedEffect {
+            effect,
+            canonical: tool_name.to_string(),
+            target: tool_name.to_string(),
+            target_kind: crate::tools::effect::ToolTargetKind::Tool,
+            operation: None,
+        };
+        self.admit_resolved_tool(tool_name, &resolved, None, arguments, plan_file)
+    }
+
+    /// Explain why a definition must not be shown to the model in this mode.
+    #[must_use]
+    pub fn definition_denial(
+        &self,
+        tool_name: &str,
+        effect: crate::tools::effect::ToolEffect,
+    ) -> Option<String> {
+        self.snapshot().definition_denial(tool_name, effect)
+    }
+
+    /// Deny effectful frontend shortcuts that do not pass through a tool.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed explanation unless the active mode permits ordinary
+    /// direct frontend operations.
+    pub fn admit_direct_operation(&self, operation: &str) -> Result<(), String> {
+        let snapshot = self.snapshot();
+        if snapshot.class == RuntimeModeClass::Standard {
+            Ok(())
+        } else {
+            Err(format!(
+                "Runtime mode '{}' generation {} denies direct operation '{}'",
+                snapshot.display_name(),
+                snapshot.generation,
+                operation
+            ))
+        }
+    }
+
+    #[allow(clippy::significant_drop_tightening)] // One read guard binds plan validation to direct-operation admission.
+    pub(crate) fn admit_direct_operation_for_run(
+        &self,
+        run: &crate::tools::ToolRunContext,
+        operation: &str,
+    ) -> Result<(), String> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(binding) = state.approved_plan() {
+            run.validate_plan_execution(
+                binding,
+                operation,
+                crate::tools::effect::ToolEffect::ExternalMutation,
+            )?;
+        }
+        if state.class == RuntimeModeClass::Standard {
+            Ok(())
+        } else {
+            Err(format!(
+                "Runtime mode '{}' generation {} denies direct operation '{}'",
+                state.display_name(),
+                state.generation,
+                operation
+            ))
+        }
+    }
+}
+
+fn validate_runtime_mode(
+    mode: &RuntimeMode,
+    scope_targets: &BehaviorScopeTargets,
+) -> Result<RuntimeModeClass, String> {
+    scope_targets.validate()?;
+    let RuntimeMode::Behavioral(behavior) = mode else {
+        return Ok(match mode {
+            RuntimeMode::Plan => RuntimeModeClass::Plan,
+            RuntimeMode::Initializer => RuntimeModeClass::ReadOnly,
+            RuntimeMode::Coordinator => RuntimeModeClass::Coordinator,
+            RuntimeMode::Behavioral(_) => unreachable!(),
+        });
+    };
+    let readonly = behavior.modifiers.contains(&Modifier::Readonly);
+    let director = behavior.modifiers.contains(&Modifier::Director);
+    if readonly && director {
+        return Err(
+            "behavioral mode cannot combine readonly and director capabilities".to_string(),
+        );
+    }
+    if behavior.scope == Scope::Narrow && (!scope_targets.is_explicit() || scope_targets.is_empty())
+    {
+        return Err(
+            "narrow behavioral scope requires at least one explicit --scope-target; targets are never inferred from task prose"
+                .to_string(),
+        );
+    }
+    if behavior.scope == Scope::Adjacent && scope_targets.is_empty() {
+        return Err("adjacent behavioral scope requires an approved target set".to_string());
+    }
+    Ok(if readonly {
+        RuntimeModeClass::ReadOnly
+    } else if director {
+        RuntimeModeClass::Coordinator
+    } else {
+        RuntimeModeClass::Standard
+    })
+}
+
+fn profile_allows_definition(
+    snapshot: &RuntimeModeSnapshot,
+    tool_name: &str,
+    effect: crate::tools::effect::ToolEffect,
+) -> bool {
+    match snapshot.class {
+        RuntimeModeClass::Standard => true,
+        RuntimeModeClass::Plan => {
+            tool_name == "write_file"
+                || tool_name == "enter_plan_mode"
+                || tool_name == "exit_plan_mode"
+                || observation_tool_allowed(tool_name, effect)
+        }
+        RuntimeModeClass::ReadOnly => observation_tool_allowed(tool_name, effect),
+        RuntimeModeClass::Coordinator => {
+            matches!(tool_name, "task" | "agent_output" | "task_stop")
+                || observation_tool_allowed(tool_name, effect)
+        }
+    }
+}
+
+fn profile_allows_call(
+    snapshot: &RuntimeModeSnapshot,
+    tool_name: &str,
+    resolved: &crate::tools::effect::ResolvedEffect,
+    canonical_path: Option<&Path>,
+    arguments: &serde_json::Value,
+    plan_file: &Path,
+    project_root: &Path,
+) -> bool {
+    if snapshot.class == RuntimeModeClass::Plan {
+        return crate::session::is_tool_allowed_in_plan_mode(tool_name, plan_file, arguments);
+    }
+    if !profile_allows_definition(snapshot, tool_name, resolved.effect) {
+        return false;
+    }
+    let RuntimeMode::Behavioral(behavior) = &snapshot.mode else {
+        return true;
+    };
+    if behavior.scope == Scope::Unrestricted {
+        return true;
+    }
+    if behavior.scope == Scope::Adjacent && !snapshot.scope_targets.is_explicit() {
+        return true;
+    }
+    match resolved.target_kind {
+        crate::tools::effect::ToolTargetKind::Path
+        | crate::tools::effect::ToolTargetKind::PathScope => canonical_path.is_some_and(|path| {
+            snapshot
+                .bound_scope_targets
+                .allows_path(behavior.scope, project_root, path)
+        }),
+        crate::tools::effect::ToolTargetKind::Tool
+        | crate::tools::effect::ToolTargetKind::Opaque => {
+            resolved.effect == crate::tools::effect::ToolEffect::ReadOnly
+                || snapshot.bound_scope_targets.allows_tool(tool_name)
+        }
+    }
+}
+
+pub(crate) fn observation_tool_allowed(
+    tool_name: &str,
+    effect: crate::tools::effect::ToolEffect,
+) -> bool {
+    if tool_name == "ask_user_question" || tool_name == "tool_search" {
+        return true;
+    }
+    if prohibited_observation_family(tool_name) {
+        return false;
+    }
+    effect == crate::tools::effect::ToolEffect::ReadOnly
+}
+
+fn prohibited_observation_family(tool_name: &str) -> bool {
+    tool_name == "crosslink"
+        || tool_name == "task"
+        || tool_name == "agent_output"
+        || tool_name == "task_stop"
+        || tool_name.starts_with("task_")
+        || tool_name.starts_with("todo_")
+        || tool_name == "bash"
+        || tool_name == "bash_output"
+        || tool_name == "kill_shell"
+        || tool_name == "kill_shells_for_agent"
+        || tool_name == "enter_worktree"
+        || tool_name == "exit_worktree"
+        || tool_name == "list_worktrees"
+        || tool_name == "web_fetch"
+        || tool_name == "web_search"
+        || tool_name == "web_browser"
+        || tool_name == "list_mcp_resources"
+        || tool_name == "read_mcp_resource"
+        || tool_name == "lsp"
+        || tool_name.starts_with("mcp__")
+        || tool_name.starts_with("plugin__")
 }
 
 /// List all available preset names with their descriptions.
@@ -1101,5 +2016,101 @@ mod tests {
             desc.contains("unrestricted"),
             "description missing scope: {desc}"
         );
+    }
+
+    #[test]
+    fn runtime_profiles_enforce_real_mode_boundaries() {
+        use crate::tools::effect::ToolEffect;
+
+        let plan_dir = tempfile::tempdir().expect("plan dir");
+        let plan_file = plan_dir.path().join("plan.md");
+        std::fs::write(&plan_file, "# Plan\n").expect("plan file");
+        let plan_file = std::fs::canonicalize(plan_file).expect("canonical plan");
+        let empty = serde_json::json!({});
+
+        let targets = BehaviorScopeTargets::from_user_values(
+            plan_dir.path(),
+            plan_dir.path(),
+            &[".".to_string()],
+        )
+        .expect("explicit explore target");
+        let authority = RuntimeModeAuthority::new_for_run(
+            RuntimeMode::Behavioral(BehaviorMode::from_preset(Preset::Explore)),
+            targets,
+            plan_dir.path(),
+        )
+        .expect("explore profile");
+        assert_eq!(authority.snapshot().class, RuntimeModeClass::ReadOnly);
+        assert!(authority
+            .admit_tool("read_file", ToolEffect::ReadOnly, &empty, &plan_file)
+            .is_ok());
+        for (tool, effect) in [
+            ("write_file", ToolEffect::WorkspaceMutation),
+            ("web_fetch", ToolEffect::NetworkRead),
+            ("task_get", ToolEffect::ReadOnly),
+            ("todo_read", ToolEffect::ReadOnly),
+            ("crosslink", ToolEffect::ReadOnly),
+        ] {
+            assert!(
+                authority
+                    .admit_tool(tool, effect, &empty, &plan_file)
+                    .is_err(),
+                "explore mode must deny {tool}"
+            );
+        }
+
+        let coordinator =
+            RuntimeModeAuthority::new(RuntimeMode::Coordinator).expect("coordinator profile");
+        assert!(coordinator
+            .admit_tool("task", ToolEffect::Destructive, &empty, &plan_file)
+            .is_ok());
+        assert!(coordinator
+            .admit_tool("bash", ToolEffect::Destructive, &empty, &plan_file)
+            .is_err());
+    }
+
+    #[test]
+    fn plan_profile_only_writes_the_pinned_plan_and_transitions_atomically() {
+        use crate::tools::effect::ToolEffect;
+
+        let plan_dir = tempfile::tempdir().expect("plan dir");
+        let plan_file = plan_dir.path().join("plan.md");
+        std::fs::write(&plan_file, "# Plan\n").expect("plan file");
+        let plan_file = std::fs::canonicalize(plan_file).expect("canonical plan");
+        let authority = RuntimeModeAuthority::new(RuntimeMode::default()).expect("default mode");
+        let next = authority.transition(RuntimeMode::Plan).expect("enter plan");
+        assert_eq!(next.generation, 2);
+        assert_eq!(next.class, RuntimeModeClass::Plan);
+
+        let plan_args = serde_json::json!({"path": plan_file});
+        assert!(authority
+            .admit_tool(
+                "write_file",
+                ToolEffect::WorkspaceMutation,
+                &plan_args,
+                &plan_file,
+            )
+            .is_ok());
+        let other_args = serde_json::json!({"path": plan_dir.path().join("other.md")});
+        assert!(authority
+            .admit_tool(
+                "write_file",
+                ToolEffect::WorkspaceMutation,
+                &other_args,
+                &plan_file,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn conflicting_runtime_modifiers_fail_validation_without_transition() {
+        let mode = BehaviorMode {
+            modifiers: vec![Modifier::Readonly, Modifier::Director],
+            ..BehaviorMode::default()
+        };
+        let authority = RuntimeModeAuthority::new(RuntimeMode::default()).expect("default mode");
+        let before = authority.snapshot();
+        assert!(authority.transition(RuntimeMode::Behavioral(mode)).is_err());
+        assert_eq!(authority.snapshot(), before);
     }
 }

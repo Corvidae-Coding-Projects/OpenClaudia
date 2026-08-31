@@ -11,9 +11,18 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
-#[cfg(test)]
 use super::SessionId;
 use super::{AgentMode, EffortLevel, SessionDocument, SessionState, StateEvent, StateStore};
+
+fn sanitize_conversation_reasoning(state: &mut SessionState) {
+    for message in &mut state.conversation.messages {
+        crate::runtime::sanitize_portable_reasoning(message);
+    }
+    for (user, assistant) in &mut state.conversation.undo_stack {
+        crate::runtime::sanitize_portable_reasoning(user);
+        crate::runtime::sanitize_portable_reasoning(assistant);
+    }
+}
 
 /// Validate an interactive-session id before using it as a file name.
 ///
@@ -93,6 +102,16 @@ impl Session {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let mut state = SessionState::new(cwd);
         state.conversation.behavior_mode = behavior_mode;
+        if let Ok(causal) = super::SessionCausalState::initialize(
+            &state.identity.session_id,
+            provider,
+            model,
+            &state.conversation.messages,
+            None,
+            super::causal::SessionProvenance::HostCreated,
+        ) {
+            state.identity.causal = causal;
+        }
         Self {
             title: "New conversation".to_string(),
             created_at: now,
@@ -109,10 +128,21 @@ impl Session {
             .inspect(|state| state.identity.session_id.to_string())
     }
 
-    #[cfg(test)]
+    /// Replace the session identity and rebuild its causal envelope. This is
+    /// used when a host protocol allocates the canonical id after constructing
+    /// the in-memory session.
     pub fn set_id(&self, id: String) {
         self.state.update(|state, _| {
             state.identity.session_id = SessionId::from_raw_unchecked(id);
+            state.identity.causal =
+                super::SessionCausalState::uninitialized(&state.identity.session_id);
+            let _ = state.identity.causal.reinitialize_identity(
+                &state.identity.session_id,
+                &self.provider,
+                &self.model,
+                &state.conversation.messages,
+                state.conversation.provider_native_state.as_ref(),
+            );
         });
     }
 
@@ -125,11 +155,219 @@ impl Session {
         self.state.inspect(inspect)
     }
 
+    /// Publish the exact active run root and optional isolated-workspace
+    /// descriptor into resumable session identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal when the run belongs to another session or its
+    /// provider/workspace/capability binding is inconsistent.
+    pub fn bind_workspace_run(
+        &self,
+        run: &crate::tools::ToolRunContext,
+    ) -> Result<(), super::CausalStateError> {
+        if run.session_id() != self.id() {
+            return Err(super::CausalStateError::IdentityConflict {
+                detail: "tool run belongs to another logical session".to_string(),
+            });
+        }
+        let provider = self.provider.clone();
+        let model = self.model.clone();
+        self.state.update(|state, _| {
+            let mut proposed = state.clone();
+            let root = run.project_root().to_path_buf();
+            proposed.identity.cwd = run.working_directory().to_path_buf();
+            proposed.identity.project_root.clone_from(&root);
+            proposed.identity.session_project_dir = root;
+            proposed.identity.active_workspace = run.isolated_workspace().cloned();
+            proposed.transcript.transcript_cwd = run.working_directory().to_path_buf();
+            proposed.identity.causal.refresh(
+                &proposed.identity.session_id,
+                &provider,
+                &model,
+                &proposed.conversation.messages,
+                proposed.conversation.provider_native_state.as_ref(),
+                Some(run),
+            )?;
+            *state = proposed;
+            Ok(())
+        })
+    }
+
+    /// Capture an immutable, causally bound source for `/branch`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal when current state or runtime bindings are
+    /// incomplete, stale, or inconsistent.
+    pub fn branch_source(
+        &self,
+        run: &crate::tools::ToolRunContext,
+    ) -> Result<super::BranchSource, super::CausalStateError> {
+        let mut state = self.state_snapshot();
+        state.identity.causal.refresh(
+            &state.identity.session_id,
+            &self.provider,
+            &self.model,
+            &state.conversation.messages,
+            state.conversation.provider_native_state.as_ref(),
+            Some(run),
+        )?;
+        state.identity.causal.validate_document(
+            &state.identity.session_id,
+            &self.provider,
+            &self.model,
+            &state.conversation.messages,
+            state.conversation.provider_native_state.as_ref(),
+        )?;
+        super::BranchSource::from_session(
+            state.identity.session_id,
+            &state.identity.causal,
+            state.conversation.messages,
+            state.conversation.provider_native_state,
+            run,
+        )
+    }
+
+    /// Record the exact project-owned branch proposal in canonical session
+    /// state. The proposal remains unselectable if this atomic step fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed conflict for stale, duplicate, or cross-run proposals.
+    pub fn register_branch(
+        &self,
+        prepared: &super::PreparedBranch,
+        run: &crate::tools::ToolRunContext,
+    ) -> Result<(), super::CausalStateError> {
+        let provider = self.provider.clone();
+        let model = self.model.clone();
+        self.state.update(|state, _| {
+            let mut proposed = state.clone();
+            super::causal::register_branch(
+                &mut proposed.identity.causal,
+                prepared,
+                &provider,
+                &model,
+                &proposed.conversation.messages,
+                proposed.conversation.provider_native_state.as_ref(),
+                run,
+            )?;
+            *state = proposed;
+            Ok(())
+        })
+    }
+
+    /// Atomically select one validated and host-anchored branch proposal.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal without replacing either transcript lane when
+    /// the proposal is forged, stale, foreign, cyclic, or unavailable.
+    pub fn select_branch(
+        &self,
+        proposal: &super::BranchProposal,
+        run: &crate::tools::ToolRunContext,
+    ) -> Result<(), super::CausalStateError> {
+        let provider = self.provider.clone();
+        let model = self.model.clone();
+        self.state.update(|state, events| {
+            let mut proposed = state.clone();
+            super::causal::select_branch(
+                &mut proposed.identity.causal,
+                &proposed.identity.session_id,
+                &provider,
+                &model,
+                &proposed.conversation.messages,
+                proposed.conversation.provider_native_state.as_ref(),
+                proposal,
+                run,
+            )?;
+            let previous_len = proposed.conversation.messages.len();
+            let (messages, provider_state) = super::causal::proposal_state(proposal);
+            proposed.conversation.messages = messages;
+            proposed.conversation.provider_native_state = provider_state;
+            proposed.conversation.undo_stack.clear();
+            if previous_len > 0 && proposed.conversation.messages.is_empty() {
+                events.push(StateEvent::Cleared);
+            }
+            *state = proposed;
+            Ok(())
+        })
+    }
+
+    /// Validate one causally closed transcript and provider/tool state against
+    /// the host-authorized successor run.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed conflict/unavailable result for forged, stale,
+    /// cross-provider, or cross-workspace state.
+    pub fn validate_resume_against_run(
+        &self,
+        run: &crate::tools::ToolRunContext,
+    ) -> Result<(), super::CausalStateError> {
+        let state = self.state_snapshot();
+        state.identity.causal.validate_resume(
+            &state.identity.session_id,
+            &self.provider,
+            &self.model,
+            &state.conversation.messages,
+            state.conversation.provider_native_state.as_ref(),
+            run,
+        )
+    }
+
+    /// Validate a current causal binding or admit an unbound host-created or
+    /// migrated session once against the trusted host-selected run.
+    /// Project-owned state cannot call this boundary or choose the run it
+    /// binds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal before modifying state when identity, provider,
+    /// workspace, or persisted causal history is inconsistent.
+    pub fn prepare_resume_against_run(
+        &self,
+        run: &crate::tools::ToolRunContext,
+    ) -> Result<(), super::CausalStateError> {
+        let provider = self.provider.clone();
+        let model = self.model.clone();
+        self.state.update(|state, _| {
+            let mut proposed = state.clone();
+            proposed.identity.causal.prepare_resume(
+                &proposed.identity.session_id,
+                &provider,
+                &model,
+                &proposed.conversation.messages,
+                proposed.conversation.provider_native_state.as_ref(),
+                run,
+            )?;
+            *state = proposed;
+            Ok(())
+        })
+    }
+
     pub fn update_state<R>(
         &self,
         update: impl FnOnce(&mut SessionState, &mut Vec<StateEvent>) -> R,
     ) -> R {
-        self.state.update(update)
+        self.state.update(|state, events| {
+            let native_history_prefix = state
+                .conversation
+                .provider_native_state
+                .as_ref()
+                .map(|_| state.conversation.messages.clone());
+            let result = update(state, events);
+            sanitize_conversation_reasoning(state);
+            if native_history_prefix
+                .as_ref()
+                .is_some_and(|prefix| !state.conversation.messages.starts_with(prefix.as_slice()))
+            {
+                state.conversation.provider_native_state = None;
+            }
+            result
+        })
     }
 
     #[must_use]
@@ -143,7 +381,28 @@ impl Session {
         self.updated_at = loaded.updated_at;
         self.model.clone_from(&loaded.model);
         self.provider.clone_from(&loaded.provider);
-        self.state.replace(loaded.state_snapshot());
+        let live_permissions = self.state.inspect(|state| state.permissions.clone());
+        let mut loaded_state = loaded.state_snapshot();
+        sanitize_conversation_reasoning(&mut loaded_state);
+        loaded_state.permissions = live_permissions;
+        self.state.replace(loaded_state);
+    }
+
+    /// Validate and install a loaded session as one atomic frontend boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed causal refusal before any active state is replaced.
+    pub fn apply_loaded_for_run(
+        &mut self,
+        loaded: &Self,
+        run: &crate::tools::ToolRunContext,
+    ) -> Result<(), super::CausalStateError> {
+        let prepared = loaded.detached_clone();
+        prepared.prepare_resume_against_run(run)?;
+        prepared.bind_workspace_run(run)?;
+        self.apply_loaded(&prepared);
+        Ok(())
     }
 
     #[must_use]
@@ -164,13 +423,306 @@ impl Session {
             .inspect(|state| state.conversation.messages.clone())
     }
 
+    /// Persist a private user note outside every provider-visible state lane.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed bound or retention error without changing the session.
+    pub fn add_private_note(
+        &self,
+        content: impl Into<String>,
+    ) -> Result<super::PrivateEventId, super::LocalEventError> {
+        self.state.update(|state, _| {
+            state
+                .local
+                .add_private_note(content.into(), chrono::Utc::now())
+        })
+    }
+
+    /// Snapshot private notes for an explicit local user interface.
+    #[must_use]
+    pub fn private_notes_snapshot(&self) -> Vec<super::PrivateNoteEvent> {
+        self.state
+            .inspect(|state| state.local.private_notes().to_vec())
+    }
+
+    /// Delete retained note content while keeping a digest tombstone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the note does not exist.
+    pub fn delete_private_note(
+        &self,
+        note_id: super::PrivateEventId,
+    ) -> Result<super::PrivateNoteDeletionReceipt, super::LocalEventError> {
+        self.state
+            .update(|state, _| state.local.delete_private_note(note_id))
+    }
+
+    /// Produce a user/evidence message after consuming explicit note-bound
+    /// consent. The caller must intentionally append the returned message;
+    /// this method never mutates ordinary conversation state itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed causal, consent, deletion, or retention error without
+    /// producing model-visible bytes.
+    pub fn project_private_note(
+        &self,
+        note_id: super::PrivateEventId,
+        consent: super::UserNoteProjectionConsent,
+        run: &crate::tools::ToolRunContext,
+    ) -> Result<super::PrivateNoteProjection, super::LocalEventStateError> {
+        let provider = self.provider.clone();
+        let model = self.model.clone();
+        self.state.update(|state, _| {
+            let mut proposed = state.clone();
+            proposed.identity.causal.refresh(
+                &proposed.identity.session_id,
+                &provider,
+                &model,
+                &proposed.conversation.messages,
+                proposed.conversation.provider_native_state.as_ref(),
+                Some(run),
+            )?;
+            let parent_event = proposed.identity.causal.current_event();
+            let projection = proposed
+                .local
+                .project_private_note(note_id, consent, parent_event)?;
+            *state = proposed;
+            Ok(projection)
+        })
+    }
+
+    /// Start a side-question attempt over an immutable exact parent snapshot.
+    /// The returned messages are detached owned values; later parent changes
+    /// cannot alter the child input.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed causal, serialization, input-bound, or retention error
+    /// without appending to conversation history.
+    pub fn begin_side_question(
+        &self,
+        run: &crate::tools::ToolRunContext,
+        call_id: crate::runtime::CallId,
+        question: impl Into<String>,
+    ) -> Result<super::SideQuestionLaunch, super::LocalEventStateError> {
+        let provider = self.provider.clone();
+        let model = self.model.clone();
+        let question = question.into();
+        self.state.update(|state, _| {
+            let mut proposed = state.clone();
+            proposed.identity.causal.refresh(
+                &proposed.identity.session_id,
+                &provider,
+                &model,
+                &proposed.conversation.messages,
+                proposed.conversation.provider_native_state.as_ref(),
+                Some(run),
+            )?;
+            let parent_event = proposed.identity.causal.current_event();
+            let messages = proposed.conversation.messages.clone();
+            let parent_snapshot_digest = super::local_events::digest_messages(&messages)?;
+            let attempt_id = proposed.local.start_side_question(
+                call_id,
+                parent_event.clone(),
+                run.run_id(),
+                parent_snapshot_digest,
+                messages.len(),
+                provider.clone(),
+                model.clone(),
+                question.clone(),
+            )?;
+            *state = proposed;
+            Ok(super::SideQuestionLaunch {
+                attempt_id,
+                call_id,
+                parent_event,
+                parent_snapshot_digest,
+                messages,
+                question,
+            })
+        })
+    }
+
+    /// Bind an admitted child run to its pending side-question attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown or already-terminal attempt.
+    pub fn bind_side_question_child(
+        &self,
+        attempt_id: super::SideQuestionAttemptId,
+        child_run: crate::runtime::RunId,
+    ) -> Result<(), super::LocalEventError> {
+        self.state
+            .update(|state, _| state.local.bind_side_question_child(attempt_id, child_run))
+    }
+
+    /// Attach a successful typed result to its exact parent event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a stale/terminal attempt or an oversized result.
+    pub fn succeed_side_question(
+        &self,
+        attempt_id: super::SideQuestionAttemptId,
+        content: String,
+    ) -> Result<super::SideQuestionResultRef, super::LocalEventError> {
+        self.state
+            .update(|state, _| state.local.succeed_side_question(attempt_id, content))
+    }
+
+    /// Record an explicit terminal side-question failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown/terminal attempt or invalid detail.
+    pub fn fail_side_question(
+        &self,
+        attempt_id: super::SideQuestionAttemptId,
+        code: super::SideQuestionFailureCode,
+        detail: String,
+    ) -> Result<(), super::LocalEventError> {
+        self.state
+            .update(|state, _| state.local.fail_side_question(attempt_id, code, detail))
+    }
+
+    /// Record explicit terminal timeout state for a running child.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown, unadmitted, or terminal attempt.
+    pub fn timeout_side_question(
+        &self,
+        attempt_id: super::SideQuestionAttemptId,
+        timeout_millis: u64,
+    ) -> Result<(), super::LocalEventError> {
+        self.state.update(|state, _| {
+            state
+                .local
+                .timeout_side_question(attempt_id, timeout_millis)
+        })
+    }
+
+    /// Record explicit terminal cancellation state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown/terminal attempt or invalid reason.
+    pub fn cancel_side_question(
+        &self,
+        attempt_id: super::SideQuestionAttemptId,
+        reason: String,
+    ) -> Result<(), super::LocalEventError> {
+        self.state
+            .update(|state, _| state.local.cancel_side_question(attempt_id, reason))
+    }
+
+    /// Snapshot local side-question records without exposing them through the
+    /// provider transcript.
+    #[must_use]
+    pub fn side_questions_snapshot(&self) -> Vec<super::SideQuestionAttempt> {
+        self.state
+            .inspect(|state| state.local.side_questions().to_vec())
+    }
+
+    /// Clone the provider-native lane without holding the state lock across
+    /// request construction or network awaits.
+    #[must_use]
+    pub fn provider_native_state_snapshot(&self) -> Option<crate::runtime::ProviderNativeState> {
+        self.state
+            .inspect(|state| state.conversation.provider_native_state.clone())
+    }
+
+    /// Install validated native state for this session's exact provider/model.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the state belongs to another provider or model.
+    pub fn install_provider_native_state(
+        &self,
+        mut provider_state: crate::runtime::ProviderNativeState,
+    ) -> Result<(), crate::runtime::ProviderStateError> {
+        provider_state.sanitize_plaintext_reasoning()?;
+        provider_state.validate_identity(&self.provider, &self.model)?;
+        self.state.update(|state, _| {
+            let Some(current) = &state.conversation.provider_native_state else {
+                state.conversation.provider_native_state = Some(provider_state);
+                return Ok(());
+            };
+            if current.protocol() != provider_state.protocol() {
+                return Err(crate::runtime::ProviderStateError::ProtocolMismatch {
+                    stored: current.protocol(),
+                    requested: provider_state.protocol(),
+                });
+            }
+            match provider_state.generation().cmp(&current.generation()) {
+                std::cmp::Ordering::Less => {
+                    Err(crate::runtime::ProviderStateError::StaleGeneration {
+                        current: current.generation(),
+                        attempted: provider_state.generation(),
+                    })
+                }
+                std::cmp::Ordering::Equal if provider_state == *current => Ok(()),
+                std::cmp::Ordering::Equal => {
+                    Err(crate::runtime::ProviderStateError::GenerationConflict {
+                        generation: current.generation(),
+                    })
+                }
+                std::cmp::Ordering::Greater => {
+                    state.conversation.provider_native_state = Some(provider_state);
+                    Ok(())
+                }
+            }
+        })
+    }
+
+    /// Remove provider-native state while retaining portable conversation
+    /// history.
+    pub fn clear_provider_native_state(&self) {
+        self.state.update(|state, _| {
+            state.conversation.provider_native_state = None;
+        });
+    }
+
+    /// Change the model and invalidate native continuation state if identity
+    /// changed.
+    pub fn set_model(&mut self, model: impl Into<String>) {
+        let model = model.into();
+        if self.model != model {
+            self.model = model;
+            self.clear_provider_native_state();
+            self.touch();
+        }
+    }
+
+    /// Change provider/model as one state transition and invalidate native
+    /// continuation state if either identity changed.
+    pub fn set_provider_and_model(
+        &mut self,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+    ) {
+        let provider = provider.into();
+        let model = model.into();
+        if self.provider != provider || self.model != model {
+            self.provider = provider;
+            self.model = model;
+            self.clear_provider_native_state();
+            self.touch();
+        }
+    }
+
     #[must_use]
     pub fn message_count(&self) -> usize {
         self.state
             .inspect(|state| state.conversation.messages.len())
     }
 
-    pub fn push_message(&self, message: Value) {
+    pub fn push_message(&self, mut message: Value) {
+        crate::runtime::sanitize_portable_reasoning(&mut message);
         let role = message
             .get("role")
             .and_then(Value::as_str)
@@ -182,10 +734,21 @@ impl Session {
         });
     }
 
-    pub fn replace_messages(&self, messages: Vec<Value>) {
+    pub fn replace_messages(&self, mut messages: Vec<Value>) {
+        for message in &mut messages {
+            crate::runtime::sanitize_portable_reasoning(message);
+        }
         self.state.update(|state, events| {
+            let preserves_native_state = state
+                .conversation
+                .provider_native_state
+                .as_ref()
+                .is_none_or(|_| messages.starts_with(&state.conversation.messages));
             let previous_len = state.conversation.messages.len();
             state.conversation.messages = messages;
+            if !preserves_native_state {
+                state.conversation.provider_native_state = None;
+            }
             if previous_len > 0 && state.conversation.messages.is_empty() {
                 events.push(StateEvent::Cleared);
             }
@@ -207,9 +770,111 @@ impl Session {
         });
     }
 
+    /// Atomically commit the portable transcript and the provider-native
+    /// continuation that was captured from the same completed turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without mutating either lane when identity, protocol,
+    /// generation, or digest continuity is invalid.
+    pub fn replace_messages_and_provider_native_state(
+        &self,
+        mut messages: Vec<Value>,
+        mut provider_state: Option<crate::runtime::ProviderNativeState>,
+    ) -> Result<(), crate::runtime::ProviderStateError> {
+        for message in &mut messages {
+            crate::runtime::sanitize_portable_reasoning(message);
+        }
+        if let Some(next) = &mut provider_state {
+            next.sanitize_plaintext_reasoning()?;
+            next.validate()?;
+            next.validate_identity(&self.provider, &self.model)?;
+        }
+        self.state.update(|state, events| {
+            if let (Some(current), Some(next)) = (
+                state.conversation.provider_native_state.as_ref(),
+                provider_state.as_ref(),
+            ) {
+                if current.protocol() != next.protocol() {
+                    return Err(crate::runtime::ProviderStateError::ProtocolMismatch {
+                        stored: current.protocol(),
+                        requested: next.protocol(),
+                    });
+                }
+                match next.generation().cmp(&current.generation()) {
+                    std::cmp::Ordering::Less => {
+                        return Err(crate::runtime::ProviderStateError::StaleGeneration {
+                            current: current.generation(),
+                            attempted: next.generation(),
+                        });
+                    }
+                    std::cmp::Ordering::Equal if next != current => {
+                        return Err(crate::runtime::ProviderStateError::GenerationConflict {
+                            generation: current.generation(),
+                        });
+                    }
+                    std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => {}
+                }
+            }
+            if provider_state.is_some()
+                && !messages.starts_with(state.conversation.messages.as_slice())
+            {
+                return Err(
+                    crate::runtime::ProviderStateError::PortableHistoryConflict {
+                        current_messages: state.conversation.messages.len(),
+                        attempted_messages: messages.len(),
+                    },
+                );
+            }
+
+            let previous_len = state.conversation.messages.len();
+            state.conversation.messages = messages;
+            state.conversation.provider_native_state = provider_state;
+            if previous_len > 0 && state.conversation.messages.is_empty() {
+                events.push(StateEvent::Cleared);
+            }
+            events.extend(
+                state
+                    .conversation
+                    .messages
+                    .iter()
+                    .skip(previous_len)
+                    .map(|message| {
+                        message
+                            .get("role")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string()
+                    })
+                    .map(|role| StateEvent::MessageAppended { role }),
+            );
+            Ok(())
+        })
+    }
+
+    /// Mutate portable history while preserving native continuation state only
+    /// when the previous history remains an exact prefix. Appending new input
+    /// can continue a provider turn; rewriting prior input creates a branch and
+    /// invalidates opaque provider state tied to the old history.
     pub fn update_messages<R>(&self, update: impl FnOnce(&mut Vec<Value>) -> R) -> R {
-        self.state
-            .update(|state, _| update(&mut state.conversation.messages))
+        self.state.update(|state, _| {
+            let native_history_prefix = state
+                .conversation
+                .provider_native_state
+                .as_ref()
+                .map(|_| state.conversation.messages.clone());
+            let result = update(&mut state.conversation.messages);
+            for message in &mut state.conversation.messages {
+                crate::runtime::sanitize_portable_reasoning(message);
+            }
+            if native_history_prefix
+                .as_ref()
+                .is_some_and(|prefix| !state.conversation.messages.starts_with(prefix.as_slice()))
+            {
+                state.conversation.provider_native_state = None;
+            }
+            result
+        })
     }
 
     #[must_use]
@@ -218,9 +883,25 @@ impl Session {
             .inspect(|state| state.conversation.behavior_mode.clone())
     }
 
+    #[must_use]
+    pub fn behavior_scope_targets(&self) -> crate::modes::BehaviorScopeTargets {
+        self.state
+            .inspect(|state| state.conversation.behavior_scope_targets.clone())
+    }
+
     pub fn set_behavior_mode(&self, mode: crate::modes::BehaviorMode) {
+        let targets = self.behavior_scope_targets();
+        self.set_behavior_mode_and_targets(mode, targets);
+    }
+
+    pub fn set_behavior_mode_and_targets(
+        &self,
+        mode: crate::modes::BehaviorMode,
+        targets: crate::modes::BehaviorScopeTargets,
+    ) {
         self.state.update(|state, events| {
             state.conversation.behavior_mode = mode.clone();
+            state.conversation.behavior_scope_targets = targets;
             events.push(StateEvent::ModeChanged { new: mode });
         });
     }
@@ -344,6 +1025,7 @@ impl Session {
                     (conversation.messages.pop(), conversation.messages.pop())
                 {
                     conversation.undo_stack.push((user, assistant));
+                    conversation.provider_native_state = None;
                     return true;
                 }
             }
@@ -371,6 +1053,7 @@ impl Session {
                     .to_string();
                 conversation.messages.push(user);
                 conversation.messages.push(assistant);
+                conversation.provider_native_state = None;
                 events.push(StateEvent::MessageAppended { role: user_role });
                 events.push(StateEvent::MessageAppended {
                     role: assistant_role,
@@ -415,7 +1098,36 @@ impl Session {
         let updated_at = document.updated_at;
         let model = document.model.clone();
         let provider = document.provider.clone();
-        let state = document.into_state()?;
+        let mut state = document.into_state()?;
+        sanitize_conversation_reasoning(&mut state);
+        let migrated_notes = super::local_events::migrate_legacy_private_notes(
+            &mut state.conversation.messages,
+            &mut state.conversation.undo_stack,
+            &mut state.local,
+            created_at,
+        )
+        .map_err(|_| {
+            super::persist::PersistError::InvalidRecord("legacy private-note migration failed")
+        })?;
+        if migrated_notes > 0 {
+            // A provider-native continuation may contain or be causally bound
+            // to the legacy note bytes. It cannot be safely redacted in place.
+            state.conversation.provider_native_state = None;
+            state
+                .identity
+                .causal
+                .refresh(
+                    &state.identity.session_id,
+                    &provider,
+                    &model,
+                    &state.conversation.messages,
+                    None,
+                    None,
+                )
+                .map_err(|error| {
+                    super::persist::PersistError::InvalidCausalState(error.to_string())
+                })?;
+        }
         Ok(Self {
             title,
             created_at,
@@ -432,13 +1144,44 @@ impl Serialize for Session {
     where
         S: Serializer,
     {
+        use serde::ser::Error as _;
+
+        self.state
+            .update(|state, _| {
+                let mut proposed = state.clone();
+                sanitize_conversation_reasoning(&mut proposed);
+                proposed.identity.causal.refresh(
+                    &proposed.identity.session_id,
+                    &self.provider,
+                    &self.model,
+                    &proposed.conversation.messages,
+                    proposed.conversation.provider_native_state.as_ref(),
+                    None,
+                )?;
+                proposed.identity.causal.validate_document(
+                    &proposed.identity.session_id,
+                    &self.provider,
+                    &self.model,
+                    &proposed.conversation.messages,
+                    proposed.conversation.provider_native_state.as_ref(),
+                )?;
+                *state = proposed;
+                Ok::<(), super::CausalStateError>(())
+            })
+            .map_err(S::Error::custom)?;
+        let state = self.state_snapshot();
+        if let Some(native) = &state.conversation.provider_native_state {
+            native
+                .validate_identity(&self.provider, &self.model)
+                .map_err(S::Error::custom)?;
+        }
         SessionDocument::from_state(
             self.title.clone(),
             self.created_at,
             self.updated_at,
             self.model.clone(),
             self.provider.clone(),
-            self.state_snapshot(),
+            state,
         )
         .serialize(serializer)
     }
@@ -462,6 +1205,36 @@ impl<'de> Deserialize<'de> for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::{
+        ContinuationGeneration, ProviderNativeItem, ProviderNativeItemPurpose, ProviderNativeState,
+        ProviderStateFacet, ProviderWireProtocol,
+    };
+    use serde_json::json;
+
+    fn provider_state_at(
+        provider: &str,
+        model: &str,
+        generation: u64,
+        tokens: u64,
+    ) -> ProviderNativeState {
+        ProviderNativeState::new(
+            provider,
+            model,
+            ProviderWireProtocol::OpenAiResponses,
+            ContinuationGeneration::new(generation).expect("non-zero generation"),
+            vec![ProviderNativeItem::new(
+                ProviderStateFacet::Usage,
+                ProviderNativeItemPurpose::Evidence,
+                json!({"input_tokens": tokens, "cached_tokens": 4}),
+            )
+            .expect("valid item")],
+        )
+        .expect("valid provider state")
+    }
+
+    fn provider_state(provider: &str, model: &str) -> ProviderNativeState {
+        provider_state_at(provider, model, 1, 10)
+    }
 
     #[test]
     fn agent_mode_has_one_canonical_runtime_location() {
@@ -473,6 +1246,199 @@ mod tests {
         session.toggle_mode();
         assert_eq!(session.agent_mode(), AgentMode::Plan);
         assert_eq!(session.state_snapshot().modes.agent_mode, AgentMode::Plan);
+    }
+
+    #[test]
+    fn provider_native_state_persists_with_session() {
+        let session = Session::new("gpt-test", "openai");
+        let expected = provider_state("openai", "gpt-test");
+        session
+            .install_provider_native_state(expected.clone())
+            .expect("matching state");
+
+        let encoded = serde_json::to_string(&session).expect("serialize session");
+        let decoded: Session = serde_json::from_str(&encoded).expect("deserialize session");
+        assert_eq!(decoded.provider_native_state_snapshot(), Some(expected));
+    }
+
+    #[test]
+    fn provider_native_state_rejects_mismatch_and_clears_on_switch() {
+        let mut session = Session::new("gpt-test", "openai");
+        assert!(session
+            .install_provider_native_state(provider_state("openai", "other-model"))
+            .is_err());
+        session
+            .install_provider_native_state(provider_state("openai", "gpt-test"))
+            .expect("matching state");
+        session.set_model("gpt-other");
+        assert!(session.provider_native_state_snapshot().is_none());
+
+        session
+            .install_provider_native_state(provider_state("openai", "gpt-other"))
+            .expect("matching replacement state");
+        session.set_provider_and_model("anthropic", "claude-test");
+        assert!(session.provider_native_state_snapshot().is_none());
+    }
+
+    #[test]
+    fn provider_native_state_prevents_persisting_direct_identity_drift() {
+        let mut session = Session::new("gpt-test", "openai");
+        session
+            .install_provider_native_state(provider_state("openai", "gpt-test"))
+            .expect("matching state");
+        session.model = "gpt-other".to_string();
+
+        let error = serde_json::to_string(&session).expect_err("identity drift must fail closed");
+        assert!(error.to_string().contains("belongs to model"));
+    }
+
+    #[test]
+    fn provider_native_state_install_is_monotonic_and_idempotent() {
+        let session = Session::new("gpt-test", "openai");
+        let generation_two = provider_state_at("openai", "gpt-test", 2, 20);
+        session
+            .install_provider_native_state(generation_two.clone())
+            .expect("initial state");
+        session
+            .install_provider_native_state(generation_two.clone())
+            .expect("exact replay is idempotent");
+
+        let stale = provider_state_at("openai", "gpt-test", 1, 10);
+        assert!(matches!(
+            session.install_provider_native_state(stale),
+            Err(crate::runtime::ProviderStateError::StaleGeneration { .. })
+        ));
+        let conflict = provider_state_at("openai", "gpt-test", 2, 99);
+        assert!(matches!(
+            session.install_provider_native_state(conflict),
+            Err(crate::runtime::ProviderStateError::GenerationConflict { .. })
+        ));
+        assert_eq!(
+            session.provider_native_state_snapshot(),
+            Some(generation_two)
+        );
+
+        let generation_three = provider_state_at("openai", "gpt-test", 3, 30);
+        session
+            .install_provider_native_state(generation_three.clone())
+            .expect("newer generation advances atomically");
+        assert_eq!(
+            session.provider_native_state_snapshot(),
+            Some(generation_three)
+        );
+    }
+
+    #[test]
+    fn portable_and_native_turn_state_commit_atomically() {
+        let session = Session::new("gpt-test", "openai");
+        let generation_two = provider_state_at("openai", "gpt-test", 2, 20);
+        let messages_two = vec![
+            json!({"role": "user", "content": "inspect"}),
+            json!({"role": "assistant", "content": "checking"}),
+        ];
+        let mut messages_three = messages_two.clone();
+        messages_three.push(json!({"role": "user", "content": "continue"}));
+        messages_three.push(json!({"role": "assistant", "content": "done"}));
+        session
+            .replace_messages_and_provider_native_state(messages_two, Some(generation_two))
+            .expect("first atomic sync");
+
+        let generation_three = provider_state_at("openai", "gpt-test", 3, 30);
+        session
+            .replace_messages_and_provider_native_state(
+                messages_three.clone(),
+                Some(generation_three.clone()),
+            )
+            .expect("new generation atomically advances both lanes");
+        assert_eq!(session.messages_snapshot(), messages_three);
+        assert_eq!(
+            session.provider_native_state_snapshot(),
+            Some(generation_three)
+        );
+
+        let stale_messages = vec![json!({"role": "user", "content": "stale overwrite"})];
+        let error = session
+            .replace_messages_and_provider_native_state(
+                stale_messages,
+                Some(provider_state_at("openai", "gpt-test", 1, 10)),
+            )
+            .expect_err("stale native state must reject the entire sync");
+        assert!(matches!(
+            error,
+            crate::runtime::ProviderStateError::StaleGeneration { .. }
+        ));
+        assert_eq!(session.messages_snapshot(), messages_three);
+        assert_eq!(
+            session
+                .provider_native_state_snapshot()
+                .expect("state retained")
+                .generation()
+                .get(),
+            3
+        );
+
+        let rewritten = vec![json!({"role": "user", "content": "different history"})];
+        let error = session
+            .replace_messages_and_provider_native_state(
+                rewritten,
+                Some(provider_state_at("openai", "gpt-test", 4, 40)),
+            )
+            .expect_err("advanced native state cannot overwrite a different portable history");
+        assert!(matches!(
+            error,
+            crate::runtime::ProviderStateError::PortableHistoryConflict { .. }
+        ));
+        assert_eq!(session.messages_snapshot(), messages_three);
+    }
+
+    #[test]
+    fn provider_native_state_survives_append_only_history_changes() {
+        let session = Session::new("gpt-test", "openai");
+        session.push_message(json!({"role": "assistant", "content": "ready"}));
+        let expected = provider_state("openai", "gpt-test");
+        session
+            .install_provider_native_state(expected.clone())
+            .expect("matching state");
+
+        session.push_message(json!({"role": "user", "content": "continue"}));
+        session.update_messages(|messages| {
+            messages.push(json!({"role": "system", "content": "new input"}));
+        });
+        session.update_state(|state, _| {
+            state
+                .conversation
+                .messages
+                .push(json!({"role": "user", "content": "one more"}));
+        });
+
+        assert_eq!(session.provider_native_state_snapshot(), Some(expected));
+    }
+
+    #[test]
+    fn provider_native_state_clears_when_history_is_rewritten() {
+        let session = Session::new("gpt-test", "openai");
+        let original = json!({"role": "assistant", "content": "original"});
+        session.push_message(original.clone());
+        session
+            .install_provider_native_state(provider_state_at("openai", "gpt-test", 1, 10))
+            .expect("matching state");
+
+        session.update_messages(|messages| messages[0]["content"] = json!("edited"));
+        assert!(session.provider_native_state_snapshot().is_none());
+
+        session.replace_messages(vec![original.clone()]);
+        session
+            .install_provider_native_state(provider_state_at("openai", "gpt-test", 2, 20))
+            .expect("matching state");
+        session.replace_messages(vec![json!({"role": "system", "content": "compacted"})]);
+        assert!(session.provider_native_state_snapshot().is_none());
+
+        session.replace_messages(vec![original]);
+        session
+            .install_provider_native_state(provider_state_at("openai", "gpt-test", 3, 30))
+            .expect("matching state");
+        session.update_state(|state, _| state.conversation.messages.clear());
+        assert!(session.provider_native_state_snapshot().is_none());
     }
 
     #[test]
@@ -493,6 +1459,240 @@ mod tests {
         ] {
             assert!(value.get(legacy).is_none(), "legacy duplicate {legacy}");
         }
+        assert!(
+            value["session_state"]["state"].get("permissions").is_none(),
+            "conversation documents must not serialize live permission authority"
+        );
+    }
+
+    #[test]
+    fn private_notes_are_local_until_explicit_user_evidence_projection() {
+        let root = tempfile::tempdir().expect("workspace");
+        let session = Session::new("gpt-test", "openai");
+        session.push_message(json!({"role": "user", "content": "visible"}));
+        let before_messages = session.messages_snapshot();
+        let note_id = session
+            .add_private_note("seed-private-value")
+            .expect("private note");
+
+        assert_eq!(session.messages_snapshot(), before_messages);
+        let encoded = serde_json::to_value(&session).expect("trusted session document");
+        let ordinary_messages = &encoded["session_state"]["state"]["conversation"]["messages"];
+        assert!(!ordinary_messages.to_string().contains("seed-private-value"));
+        assert_eq!(
+            session.private_notes_snapshot()[0].content(),
+            Some("seed-private-value")
+        );
+
+        let session_id = session.inspect_state(|state| state.identity.session_id.clone());
+        let run = crate::tools::ToolRunContext::builder(session_id, root.path())
+            .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(std::collections::HashMap::new())
+            .process(false)
+            .network(false)
+            .secrets(false)
+            .provider("openai")
+            .build()
+            .expect("run");
+        let consent = super::super::UserNoteProjectionConsent::explicit_for(note_id);
+        let projection = session
+            .project_private_note(note_id, consent, &run)
+            .expect("explicit projection");
+        assert_eq!(projection.message["role"], "user");
+        assert_eq!(projection.message["content"], "seed-private-value");
+        assert_eq!(
+            projection.receipt.authority,
+            super::super::PrivateProjectionAuthority::UserEvidence
+        );
+        assert_eq!(session.messages_snapshot(), before_messages);
+    }
+
+    #[test]
+    fn legacy_note_messages_migrate_once_and_invalidate_native_state() {
+        let session = Session::new("gpt-test", "openai");
+        session.push_message(json!({
+            "role": "system",
+            "content": "[Note: seed-private-value]",
+            "metadata": {"type": "note"}
+        }));
+        session.push_message(json!({"role": "user", "content": "visible"}));
+        session
+            .install_provider_native_state(provider_state("openai", "gpt-test"))
+            .expect("matching native state");
+
+        let encoded = serde_json::to_string(&session).expect("legacy-compatible session");
+        let migrated: Session = serde_json::from_str(&encoded).expect("migrated session");
+        assert_eq!(
+            migrated.messages_snapshot(),
+            vec![json!({"role": "user", "content": "visible"})]
+        );
+        assert_eq!(migrated.private_notes_snapshot().len(), 1);
+        assert_eq!(
+            migrated.private_notes_snapshot()[0].content(),
+            Some("seed-private-value")
+        );
+        assert!(migrated.provider_native_state_snapshot().is_none());
+
+        let reencoded = serde_json::to_string(&migrated).expect("migrated persistence");
+        let migrated_again: Session = serde_json::from_str(&reencoded).expect("idempotent load");
+        assert_eq!(migrated_again.private_notes_snapshot().len(), 1);
+        assert_eq!(
+            migrated_again.messages_snapshot(),
+            vec![json!({"role": "user", "content": "visible"})]
+        );
+    }
+
+    #[test]
+    fn side_question_result_attaches_without_mutating_parent_conversation() {
+        let root = tempfile::tempdir().expect("workspace");
+        let mut session = Session::new("gpt-test", "openai");
+        session.title = "Parent title".to_string();
+        session.push_message(json!({"role": "user", "content": "parent"}));
+        session.update_state(|state, _| {
+            state.conversation.undo_stack.push((
+                json!({"role": "user", "content": "undone"}),
+                json!({"role": "assistant", "content": "undone answer"}),
+            ));
+        });
+        session
+            .install_provider_native_state(provider_state("openai", "gpt-test"))
+            .expect("matching native state");
+        let session_id = session.inspect_state(|state| state.identity.session_id.clone());
+        let run = crate::tools::ToolRunContext::builder(session_id, root.path())
+            .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(std::collections::HashMap::new())
+            .process(false)
+            .network(false)
+            .secrets(false)
+            .provider("openai")
+            .build()
+            .expect("run");
+        let before_messages = session.messages_snapshot();
+        let before_undo = session.inspect_state(|state| state.conversation.undo_stack.clone());
+        let before_native = session.provider_native_state_snapshot();
+        let launch = session
+            .begin_side_question(&run, crate::runtime::CallId::new(), "side question")
+            .expect("side-question snapshot");
+        assert_eq!(launch.messages, before_messages);
+        session
+            .bind_side_question_child(launch.attempt_id, crate::runtime::RunId::new())
+            .expect("child binding");
+        let reference = session
+            .succeed_side_question(launch.attempt_id, "side answer".to_string())
+            .expect("typed result");
+
+        assert_eq!(reference.parent_event, launch.parent_event);
+        assert_eq!(session.messages_snapshot(), before_messages);
+        assert_eq!(session.provider_native_state_snapshot(), before_native);
+        assert_eq!(
+            session.inspect_state(|state| state.conversation.undo_stack.clone()),
+            before_undo
+        );
+        assert_eq!(session.title, "Parent title");
+        assert!(matches!(
+            session.side_questions_snapshot()[0].outcome(),
+            super::super::SideQuestionOutcome::Succeeded { .. }
+        ));
+    }
+
+    #[test]
+    fn applying_loaded_session_preserves_current_invocation_permissions() {
+        let mut active = Session::new("active-model", "active-provider");
+        active.update_state(|state, _| {
+            state.permissions.bypass_mode = false;
+            state.permissions.trust_accepted = false;
+            state.permissions.persistence_disabled = true;
+        });
+
+        let loaded = Session::new("loaded-model", "loaded-provider");
+        loaded.update_state(|state, _| {
+            state.permissions.bypass_mode = true;
+            state.permissions.trust_accepted = true;
+            state.permissions.persistence_disabled = false;
+        });
+
+        active.apply_loaded(&loaded);
+        active.inspect_state(|state| {
+            assert!(!state.permissions.bypass_mode);
+            assert!(!state.permissions.trust_accepted);
+            assert!(state.permissions.persistence_disabled);
+        });
+    }
+
+    #[test]
+    fn anchored_branch_selection_restores_both_state_lanes_atomically() {
+        let root = tempfile::tempdir().expect("workspace");
+        let session = Session::new("model", "provider");
+        let session_id = session.inspect_state(|state| state.identity.session_id.clone());
+        let run = crate::tools::ToolRunContext::builder(session_id, root.path())
+            .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(std::collections::HashMap::new())
+            .process(false)
+            .network(false)
+            .secrets(false)
+            .provider("provider")
+            .build()
+            .expect("run");
+        session.bind_workspace_run(&run).expect("initial binding");
+        session.push_message(json!({"role": "user", "content": "branch source"}));
+
+        let prepared = session
+            .branch_source(&run)
+            .expect("branch source")
+            .prepare("snapshot")
+            .expect("proposal");
+        session
+            .register_branch(&prepared, &run)
+            .expect("host anchor");
+        session.push_message(json!({"role": "assistant", "content": "later state"}));
+        session
+            .select_branch(prepared.proposal(), &run)
+            .expect("anchored selection");
+
+        assert_eq!(
+            session.messages_snapshot(),
+            vec![json!({"role": "user", "content": "branch source"})]
+        );
+        session
+            .validate_resume_against_run(&run)
+            .expect("selected state remains causally valid");
+    }
+
+    #[test]
+    fn resume_rejects_a_different_workspace_before_state_replacement() {
+        let root = tempfile::tempdir().expect("workspace");
+        let foreign_root = tempfile::tempdir().expect("foreign workspace");
+        let session = Session::new("model", "provider");
+        let session_id = session.inspect_state(|state| state.identity.session_id.clone());
+        let build_run = |root: &Path| {
+            crate::tools::ToolRunContext::builder(session_id.clone(), root)
+                .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(std::collections::HashMap::new())
+                .process(false)
+                .network(false)
+                .secrets(false)
+                .provider("provider")
+                .build()
+                .expect("run")
+        };
+        let run = build_run(root.path());
+        session.bind_workspace_run(&run).expect("initial binding");
+        let before = session.messages_snapshot();
+        let foreign = build_run(foreign_root.path());
+
+        assert!(matches!(
+            session.validate_resume_against_run(&foreign),
+            Err(crate::state::CausalStateError::WorkspaceConflict { .. })
+        ));
+        assert_eq!(session.messages_snapshot(), before);
     }
 
     #[test]

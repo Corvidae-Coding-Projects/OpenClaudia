@@ -1,33 +1,41 @@
 //! Plugin manager for discovery, loading, and lifecycle management.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
+
+const MAX_PLUGIN_SEARCH_CANDIDATES: usize = 4_096;
 
 use super::git::{
     copy_dir_recursive_within, git_clone, git_pull, read_origin_url_sidecar,
     write_origin_url_sidecar,
 };
-use super::install::{InstallScope, InstalledPlugins, PluginInstallEntry};
+use super::install::InstalledPlugins;
+#[cfg(test)]
+use super::install::PluginInstallEntry;
 use super::marketplace::{
     GitHubSource, MarketplaceManifest, MarketplacePlugin, MarketplaceSource, PluginSource,
     PluginSourceDef, UrlSource,
 };
-use super::policy::{self, PluginPolicy, PolicyAction, PolicyRejection};
-use super::validate::{verify_signature, SignatureError};
-use super::{Plugin, PluginCommand, PluginError, PluginHook, PluginMcpServer};
+#[cfg(test)]
+use super::policy::PolicyAction;
+use super::policy::{self, PluginPolicy, PolicyRejection};
+use super::transaction::{
+    digest_package_tree, recover_pending_transactions, verify_installed_generation,
+    ArtifactSourceProvenance, PluginInstallTransaction,
+};
+use super::zip_cache::ZipCache;
+use super::{
+    InstallScope, Plugin, PluginAgentInvocation, PluginCapabilityRegistry,
+    PluginCapabilityRevocation, PluginCommand, PluginCommandInvocation, PluginError, PluginHook,
+    PluginMcpServer, PluginSkillInvocation,
+};
 
-/// Resolve the project root that owns per-project tracking state
-/// (`<project_root>/.openclaudia/plugins/installed_plugins.json`).
-///
-/// Falls back to the current process cwd as a best-effort root; if even
-/// `current_dir()` fails (deleted cwd, etc.) we use `"."`, which the
-/// caller's atomic-save path will canonicalize via `create_dir_all`.
-/// This matches the value the install entries themselves already record
-/// in `project_path` (see [`PluginInstallEntry::project_path`]).
-fn project_root_cwd() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+#[derive(Debug, Clone)]
+struct PluginSearchRoot {
+    path: PathBuf,
+    scope: InstallScope,
 }
 
 /// Outcome of [`PluginManager::fetch_plugin_archive`].
@@ -66,6 +74,7 @@ impl FetchedSource {
 
     /// `true` when the fetch materialized over git, used by the
     /// orchestrator to pick the right log line.
+    #[cfg(test)]
     const fn is_git(&self) -> bool {
         matches!(self, Self::GitClone { .. })
     }
@@ -76,9 +85,18 @@ pub struct PluginManager {
     /// Loaded plugins by name
     plugins: HashMap<String, Plugin>,
     /// Search paths for plugins
-    search_paths: Vec<PathBuf>,
+    search_paths: Vec<PluginSearchRoot>,
     /// Installation tracking
     installed: InstalledPlugins,
+    /// Exact project root for project-scoped discovery and install state.
+    project_root: PathBuf,
+    /// Sole activation authority for every reviewed plugin component.
+    capabilities: PluginCapabilityRegistry,
+    /// Runtime teardown handoffs not yet acknowledged by the composition root.
+    pending_revocations: VecDeque<PluginCapabilityRevocation>,
+    /// Process-local disable decisions retained across discovery/reload. Durable
+    /// enablement remains owned by the host catalogue composition layer.
+    disabled_plugins: HashSet<String>,
 }
 
 impl PluginManager {
@@ -92,14 +110,22 @@ impl PluginManager {
     /// search (crosslink #893).
     #[must_use]
     pub fn new() -> Self {
-        Self::build(dirs::home_dir())
+        let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::build(dirs::home_dir(), &project_root)
+    }
+
+    /// Create a lenient manager bound to an explicit project root.
+    #[must_use]
+    pub fn new_for_project(project_root: impl Into<PathBuf>) -> Self {
+        let project_root = project_root.into();
+        Self::build(dirs::home_dir(), &project_root)
     }
 
     /// Create a new plugin manager, returning an error when no home directory
     /// can be resolved.
     ///
-    /// `~/.openclaudia/plugins` and `~/.claude/plugins` are the two user-scope
-    /// search locations; without a home directory, plugin discovery can only
+    /// `~/.openclaudia/plugins` is the user-scope search location; foreign
+    /// caches are available only through explicit import paths. Without a home directory, plugin discovery can only
     /// see project-scoped installs, which silently masks the failure case
     /// where the user installed a plugin globally but the harness can't find
     /// it. Production code paths (proxy startup, `openclaudia plugin …`,
@@ -110,6 +136,19 @@ impl PluginManager {
     /// Returns [`PluginError::InstallError`] when `dirs::home_dir()` returns
     /// `None`. Tests can bypass via [`Self::with_paths`].
     pub fn try_new() -> Result<Self, PluginError> {
+        let project_root = std::env::current_dir().map_err(|error| {
+            PluginError::InstallError(format!("cannot determine project root: {error}"))
+        })?;
+        Self::try_new_for_project(project_root)
+    }
+
+    /// Create a production manager bound to an explicit project root.
+    ///
+    /// # Errors
+    /// Returns [`PluginError::InstallError`] when no home directory can be
+    /// resolved.
+    pub fn try_new_for_project(project_root: impl Into<PathBuf>) -> Result<Self, PluginError> {
+        let project_root = project_root.into();
         dirs::home_dir().map_or_else(
             || {
                 Err(PluginError::InstallError(
@@ -118,49 +157,122 @@ impl PluginManager {
                         .to_string(),
                 ))
             },
-            |home| Ok(Self::build(Some(home))),
+            |home| Ok(Self::build(Some(home), &project_root)),
         )
     }
 
     /// Internal helper shared by [`Self::new`] and [`Self::try_new`].
-    fn build(home_dir: Option<PathBuf>) -> Self {
+    fn build(home_dir: Option<PathBuf>, project_root: &Path) -> Self {
+        let project_root = project_root
+            .canonicalize()
+            .unwrap_or_else(|_| project_root.to_path_buf());
         let mut search_paths = Vec::new();
 
         // User plugins directory
         if let Some(home) = home_dir {
-            search_paths.push(home.join(".openclaudia").join("plugins"));
-            // Also search Claude Code's plugin cache for compatibility
-            search_paths.push(home.join(".claude").join("plugins"));
+            search_paths.push(PluginSearchRoot {
+                path: home.join(".openclaudia").join("plugins"),
+                scope: InstallScope::User,
+            });
         }
 
         // Project plugins directory
-        search_paths.push(PathBuf::from(".openclaudia/plugins"));
+        search_paths.push(PluginSearchRoot {
+            path: project_root.join(".openclaudia/plugins"),
+            scope: InstallScope::Project,
+        });
 
+        let installed = InstalledPlugins::load(&project_root);
+        if let Err(error) = recover_pending_transactions(&project_root, &installed) {
+            warn!(error = %error, "Plugin transaction recovery could not reconcile all staging state");
+        }
+
+        let disabled_plugins = installed.disabled_plugins.clone();
         Self {
             plugins: HashMap::new(),
             search_paths,
-            installed: InstalledPlugins::load(&project_root_cwd()),
+            installed,
+            project_root,
+            capabilities: PluginCapabilityRegistry::default(),
+            pending_revocations: VecDeque::new(),
+            disabled_plugins,
         }
     }
 
     /// Create a plugin manager with custom search paths
     #[must_use]
     pub fn with_paths(paths: Vec<PathBuf>) -> Self {
+        let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::with_paths_for_project(paths, project_root)
+    }
+
+    /// Create a manager with custom search paths and an explicit project root.
+    #[must_use]
+    pub fn with_paths_for_project(paths: Vec<PathBuf>, project_root: impl Into<PathBuf>) -> Self {
+        let project_root = project_root.into();
+        let project_root = project_root
+            .canonicalize()
+            .unwrap_or_else(|_| project_root.clone());
+        let paths = paths
+            .into_iter()
+            .map(|path| {
+                let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+                let scope = if canonical.starts_with(&project_root) {
+                    InstallScope::Project
+                } else {
+                    InstallScope::Local
+                };
+                PluginSearchRoot {
+                    path: canonical,
+                    scope,
+                }
+            })
+            .collect();
+        let installed = InstalledPlugins::load(&project_root);
+        if let Err(error) = recover_pending_transactions(&project_root, &installed) {
+            warn!(error = %error, "Plugin transaction recovery could not reconcile all staging state");
+        }
+        let disabled_plugins = installed.disabled_plugins.clone();
         Self {
             plugins: HashMap::new(),
             search_paths: paths,
-            installed: InstalledPlugins::default(),
+            installed,
+            project_root,
+            capabilities: PluginCapabilityRegistry::default(),
+            pending_revocations: VecDeque::new(),
+            disabled_plugins,
         }
     }
 
     /// Discover and load all plugins from search paths and `installed_plugins.json`
+    #[allow(clippy::too_many_lines)] // One ordered pass binds tracked authority before convention discovery and registry publication.
     pub fn discover(&mut self) -> Vec<PluginError> {
         let mut errors = Vec::new();
+        let reserved_names = self.discover_tracked_plugins(&mut errors);
 
         // Load from search paths (convention-based discovery)
-        for search_path in &self.search_paths.clone() {
-            if !search_path.exists() {
-                debug!(path = ?search_path, "Plugin search path does not exist");
+        let mut ambiguous_names = HashSet::new();
+        for search_root in &self.search_paths.clone() {
+            let search_path = &search_root.path;
+            let search_metadata = match fs::symlink_metadata(search_path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    debug!(path = ?search_path, "Plugin search path does not exist");
+                    continue;
+                }
+                Err(error) => {
+                    errors.push(PluginError::IoError(format!(
+                        "cannot inspect plugin search root {}: {error}",
+                        search_path.display()
+                    )));
+                    continue;
+                }
+            };
+            if search_metadata.file_type().is_symlink() || !search_metadata.is_dir() {
+                errors.push(PluginError::InvalidManifest(format!(
+                    "plugin search root must be a real directory: {}",
+                    search_path.display()
+                )));
                 continue;
             }
 
@@ -172,11 +284,97 @@ impl PluginManager {
                 }
             };
 
-            for entry in entries.flatten() {
+            let mut entries = match entries
+                .take(MAX_PLUGIN_SEARCH_CANDIDATES.saturating_add(1))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(entries) => entries,
+                Err(error) => {
+                    errors.push(PluginError::IoError(format!(
+                        "cannot enumerate plugin search root {}: {error}",
+                        search_path.display()
+                    )));
+                    continue;
+                }
+            };
+            if entries.len() > MAX_PLUGIN_SEARCH_CANDIDATES {
+                errors.push(PluginError::InvalidManifest(format!(
+                    "plugin search root {} exceeds {MAX_PLUGIN_SEARCH_CANDIDATES} candidates",
+                    search_path.display()
+                )));
+                continue;
+            }
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
                 let path = entry.path();
-                if path.is_dir() {
+                let file_name = entry.file_name();
+                if matches!(file_name.to_str(), Some(".generations" | ".transactions")) {
+                    continue;
+                }
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(error) => {
+                        errors.push(PluginError::IoError(format!(
+                            "cannot inspect plugin candidate {}: {error}",
+                            path.display()
+                        )));
+                        continue;
+                    }
+                };
+                if file_type.is_symlink() {
+                    errors.push(PluginError::InvalidManifest(format!(
+                        "plugin discovery refuses linked candidate {}",
+                        path.display()
+                    )));
+                    continue;
+                }
+                if file_type.is_dir() {
                     match Plugin::load(&path) {
-                        Ok(plugin) => {
+                        Ok(mut plugin) => {
+                            let normalized_name = plugin.identity().normalized_package.clone();
+                            if reserved_names.contains(&normalized_name) {
+                                errors.push(PluginError::InvalidManifest(format!(
+                                    "convention plugin '{}' attempts to shadow a tracked package",
+                                    plugin.name()
+                                )));
+                                continue;
+                            }
+                            if ambiguous_names.contains(&normalized_name) {
+                                continue;
+                            }
+                            let existing = self
+                                .plugins
+                                .values()
+                                .find(|existing| {
+                                    existing.identity().normalized_package == normalized_name
+                                })
+                                .map(|existing| {
+                                    (existing.name().to_string(), existing.identity().host_scope)
+                                });
+                            if let Some((existing_name, existing_scope)) = existing {
+                                if existing_scope == search_root.scope {
+                                    self.plugins.remove(&existing_name);
+                                    ambiguous_names.insert(normalized_name);
+                                    errors.push(PluginError::InvalidManifest(format!(
+                                        "ambiguous plugin name '{}' appears more than once in {} scope",
+                                        plugin.name(), search_root.scope
+                                    )));
+                                } else {
+                                    errors.push(PluginError::InvalidManifest(format!(
+                                        "plugin '{}' in {} scope cannot shadow the active {}-scope package",
+                                        plugin.name(), search_root.scope, existing_scope
+                                    )));
+                                }
+                                continue;
+                            }
+                            plugin.bind_host_identity(
+                                search_root.scope,
+                                self.host_owner(search_root.scope),
+                                format!("convention-directory:{}", plugin.root().display()),
+                            );
+                            if self.disabled_plugins.contains(plugin.name()) {
+                                plugin.enabled = false;
+                            }
                             info!(
                                 name = %plugin.name(),
                                 version = ?plugin.manifest.version,
@@ -201,42 +399,288 @@ impl PluginManager {
             }
         }
 
-        // Load from installed_plugins.json (tracked installations)
-        for (plugin_id, entries) in &self.installed.plugins {
-            for entry in entries {
-                let install_path = PathBuf::from(&entry.install_path);
-                if !install_path.exists() {
-                    debug!(plugin = %plugin_id, path = ?install_path, "Installed plugin path missing");
+        errors.extend(self.rebuild_capability_registry());
+        errors
+    }
+
+    #[allow(clippy::too_many_lines)] // Selection, receipt validation, and identity binding form one tracked-package transaction.
+    fn discover_tracked_plugins(&mut self, errors: &mut Vec<PluginError>) -> HashSet<String> {
+        // Tracked entries are activation authority. Reserve their names even
+        // when validation fails so convention directories cannot shadow a
+        // rejected or tampered generation.
+        let reserved_names = self
+            .installed
+            .plugins
+            .keys()
+            .map(|plugin_id| {
+                plugin_id
+                    .split('@')
+                    .next()
+                    .unwrap_or(plugin_id)
+                    .to_ascii_lowercase()
+            })
+            .collect::<HashSet<_>>();
+        let mut tracked = self
+            .installed
+            .plugins
+            .iter()
+            .flat_map(|(plugin_id, entries)| {
+                entries
+                    .iter()
+                    .map(move |entry| (plugin_id.clone(), entry.clone()))
+            })
+            .collect::<Vec<_>>();
+        tracked.sort_by(|left, right| {
+            let left_name = left
+                .0
+                .split('@')
+                .next()
+                .unwrap_or(&left.0)
+                .to_ascii_lowercase();
+            let right_name = right
+                .0
+                .split('@')
+                .next()
+                .unwrap_or(&right.0)
+                .to_ascii_lowercase();
+            (
+                left_name,
+                Self::scope_precedence(left.1.scope),
+                &left.0,
+                &left.1.install_path,
+            )
+                .cmp(&(
+                    right_name,
+                    Self::scope_precedence(right.1.scope),
+                    &right.0,
+                    &right.1.install_path,
+                ))
+        });
+        let mut selected_scopes = HashMap::<String, InstallScope>::new();
+        let mut ambiguous = HashSet::new();
+        for (plugin_id, entry) in tracked {
+            let expected_name = plugin_id.split('@').next().unwrap_or(&plugin_id);
+            let normalized_name = expected_name.to_ascii_lowercase();
+            if ambiguous.contains(&normalized_name) {
+                continue;
+            }
+            if let Some(selected_scope) = selected_scopes.get(&normalized_name).copied() {
+                if Self::scope_precedence(selected_scope) == Self::scope_precedence(entry.scope) {
+                    if let Some(existing) = self
+                        .plugins
+                        .values()
+                        .find(|plugin| plugin.identity().normalized_package == normalized_name)
+                        .map(|plugin| plugin.name().to_string())
+                    {
+                        self.plugins.remove(&existing);
+                    }
+                    ambiguous.insert(normalized_name);
+                    errors.push(PluginError::InvalidManifest(format!(
+                        "tracked plugin identity '{expected_name}' has multiple active entries in {selected_scope} scope"
+                    )));
+                } else {
+                    errors.push(PluginError::InvalidManifest(format!(
+                        "tracked plugin '{expected_name}' in {} scope cannot shadow the selected {selected_scope}-scope package",
+                        entry.scope
+                    )));
+                }
+                continue;
+            }
+            // Claim the normalized name before touching package bytes. A
+            // rejected higher-authority entry remains reserved so lower-scope
+            // metadata cannot replace a trusted package that failed closed.
+            selected_scopes.insert(normalized_name.clone(), entry.scope);
+            let install_path = match self.canonical_tracked_install_path(&entry) {
+                Ok(path) => path,
+                Err(error) => {
+                    warn!(plugin = %plugin_id, error = %error, "Rejected plugin catalogue path");
+                    errors.push(error);
                     continue;
                 }
-                // Skip if already loaded from search paths
-                let name = plugin_id.split('@').next().unwrap_or(plugin_id);
-                if self.plugins.contains_key(name) {
+            };
+            let generation_receipt = match verify_installed_generation(&install_path) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    warn!(plugin = %plugin_id, path = ?install_path, error = %error, "Rejected changed or incomplete plugin generation");
+                    errors.push(error.into());
                     continue;
                 }
-                match Plugin::load(&install_path) {
-                    Ok(mut plugin) => {
-                        plugin.id.clone_from(plugin_id);
-                        if let Some(marketplace) = plugin_id.split('@').nth(1) {
-                            plugin.source = marketplace.to_string();
+            };
+            match Plugin::load(&install_path) {
+                Ok(mut plugin) if plugin.name() == expected_name => {
+                    plugin.id.clone_from(&plugin_id);
+                    if let Some(marketplace) = plugin_id.split('@').nth(1) {
+                        plugin.source = marketplace.to_string();
+                    }
+                    if let Some(receipt) = generation_receipt {
+                        if let Err(error) = plugin.bind_generation_receipt(entry.scope, receipt) {
+                            warn!(plugin = %plugin_id, error = %error, "Rejected plugin receipt identity");
+                            errors.push(error);
+                            continue;
                         }
-                        info!(
-                            id = %plugin_id,
-                            name = %plugin.name(),
-                            scope = %entry.scope,
-                            "Loaded installed plugin"
+                    } else {
+                        plugin.bind_host_identity(
+                            entry.scope,
+                            self.host_owner(entry.scope),
+                            format!("catalogue-directory:{}", install_path.display()),
                         );
-                        self.plugins.insert(plugin.name().to_string(), plugin);
                     }
-                    Err(e) => {
-                        warn!(plugin = %plugin_id, error = %e, "Failed to load installed plugin");
-                        errors.push(e);
+                    if self.disabled_plugins.contains(plugin.name()) {
+                        plugin.enabled = false;
                     }
+                    info!(id = %plugin_id, name = %plugin.name(), scope = %entry.scope, "Loaded installed plugin generation");
+                    self.plugins.insert(expected_name.to_string(), plugin);
+                }
+                Ok(plugin) => {
+                    let error = PluginError::InvalidManifest(format!(
+                        "tracked plugin identity '{}' does not match manifest name '{}'",
+                        expected_name,
+                        plugin.name()
+                    ));
+                    warn!(plugin = %plugin_id, error = %error, "Rejected plugin identity mismatch");
+                    errors.push(error);
+                }
+                Err(error) => {
+                    warn!(plugin = %plugin_id, error = %error, "Failed to load installed plugin");
+                    errors.push(error);
                 }
             }
         }
+        reserved_names
+    }
 
-        errors
+    const fn scope_precedence(scope: InstallScope) -> u8 {
+        match scope {
+            InstallScope::Managed => 0,
+            InstallScope::User => 1,
+            InstallScope::Project => 2,
+            InstallScope::Local => 3,
+        }
+    }
+
+    fn host_owner(&self, scope: InstallScope) -> String {
+        match scope {
+            InstallScope::Managed => "host-managed-catalogue".to_string(),
+            InstallScope::User => "host-user-catalogue".to_string(),
+            InstallScope::Project | InstallScope::Local => format!(
+                "workspace:{}",
+                crate::runtime::ContentDigest::sha256(
+                    self.project_root.as_os_str().as_encoded_bytes()
+                )
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // Every path component is checked as one catalogue-containment decision.
+    fn canonical_tracked_install_path(
+        &self,
+        entry: &super::PluginInstallEntry,
+    ) -> Result<PathBuf, PluginError> {
+        let configured_root = match entry.scope {
+            InstallScope::Managed | InstallScope::User => dirs::home_dir()
+                .ok_or_else(|| {
+                    PluginError::InvalidManifest(
+                        "global plugin catalogue is unavailable without a home directory"
+                            .to_string(),
+                    )
+                })?
+                .join(".openclaudia/plugins"),
+            InstallScope::Project | InstallScope::Local => {
+                let bound_project = entry.project_path.as_deref().ok_or_else(|| {
+                    PluginError::InvalidManifest(
+                        "project plugin catalogue entry has no host project binding".to_string(),
+                    )
+                })?;
+                let bound_project = Path::new(bound_project).canonicalize().map_err(|error| {
+                    PluginError::InvalidManifest(format!(
+                        "cannot canonicalize project plugin binding: {error}"
+                    ))
+                })?;
+                if bound_project != self.project_root {
+                    return Err(PluginError::InvalidManifest(
+                        "project plugin catalogue entry belongs to another workspace".to_string(),
+                    ));
+                }
+                self.project_root.join(".openclaudia/plugins")
+            }
+        };
+        let root_metadata = fs::symlink_metadata(&configured_root).map_err(|error| {
+            PluginError::InvalidManifest(format!(
+                "cannot inspect plugin catalogue root {}: {error}",
+                configured_root.display()
+            ))
+        })?;
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin catalogue root must be a real directory: {}",
+                configured_root.display()
+            )));
+        }
+        let canonical_root = configured_root.canonicalize().map_err(|error| {
+            PluginError::InvalidManifest(format!(
+                "cannot canonicalize plugin catalogue root {}: {error}",
+                configured_root.display()
+            ))
+        })?;
+        let declared = Path::new(&entry.install_path);
+        if !declared.is_absolute() {
+            return Err(PluginError::InvalidManifest(
+                "plugin catalogue install path must be absolute".to_string(),
+            ));
+        }
+        let relative = declared.strip_prefix(&configured_root).map_err(|_| {
+            PluginError::InvalidManifest(format!(
+                "plugin install path {} is not rooted in its host-selected catalogue",
+                declared.display()
+            ))
+        })?;
+        let mut walked = configured_root.clone();
+        for component in relative.components() {
+            let std::path::Component::Normal(component) = component else {
+                return Err(PluginError::InvalidManifest(
+                    "plugin install path contains a non-normal component".to_string(),
+                ));
+            };
+            walked.push(component);
+            let metadata = fs::symlink_metadata(&walked).map_err(|error| {
+                PluginError::InvalidManifest(format!(
+                    "cannot inspect plugin install path component {}: {error}",
+                    walked.display()
+                ))
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(PluginError::InvalidManifest(format!(
+                    "plugin install path contains a symbolic link: {}",
+                    walked.display()
+                )));
+            }
+        }
+        let canonical = declared.canonicalize().map_err(|error| {
+            PluginError::InvalidManifest(format!(
+                "cannot canonicalize plugin install path {}: {error}",
+                declared.display()
+            ))
+        })?;
+        if !canonical.starts_with(&canonical_root) {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin install path {} escapes its {} catalogue",
+                canonical.display(),
+                entry.scope
+            )));
+        }
+        let metadata = fs::symlink_metadata(&canonical).map_err(|error| {
+            PluginError::InvalidManifest(format!(
+                "cannot inspect plugin install path {}: {error}",
+                canonical.display()
+            ))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin install path must be a real directory: {}",
+                canonical.display()
+            )));
+        }
+        Ok(canonical)
     }
 
     /// Get a plugin by name
@@ -259,14 +703,12 @@ impl PluginManager {
     /// Get all hooks from all enabled plugins
     #[must_use]
     pub fn all_hooks(&self) -> Vec<(&Plugin, PluginHook)> {
-        self.plugins
-            .values()
-            .filter(|p| p.enabled)
-            .flat_map(|plugin| {
-                plugin
-                    .resolved_hooks()
-                    .into_iter()
-                    .map(move |hook| (plugin, hook))
+        self.capabilities
+            .hooks()
+            .filter_map(|registration| {
+                self.plugins
+                    .get(&registration.metadata.provenance.package)
+                    .map(|plugin| (plugin, registration.hook.clone()))
             })
             .collect()
     }
@@ -283,14 +725,12 @@ impl PluginManager {
     /// Get all commands from all enabled plugins
     #[must_use]
     pub fn all_commands(&self) -> Vec<(&Plugin, PluginCommand)> {
-        self.plugins
-            .values()
-            .filter(|p| p.enabled)
-            .flat_map(|plugin| {
-                plugin
-                    .resolved_commands()
-                    .into_iter()
-                    .map(move |cmd| (plugin, cmd))
+        self.capabilities
+            .commands()
+            .filter_map(|registration| {
+                self.plugins
+                    .get(&registration.metadata.provenance.package)
+                    .map(|plugin| (plugin, registration.command.clone()))
             })
             .collect()
     }
@@ -298,16 +738,89 @@ impl PluginManager {
     /// Get all MCP servers from all enabled plugins
     #[must_use]
     pub fn all_mcp_servers(&self) -> Vec<(&Plugin, PluginMcpServer)> {
-        self.plugins
-            .values()
-            .filter(|p| p.enabled)
-            .flat_map(|plugin| {
-                plugin
-                    .resolved_mcp_servers()
-                    .into_iter()
-                    .map(move |server| (plugin, server))
+        self.capabilities
+            .mcp_servers()
+            .filter_map(|registration| {
+                let plugin = self
+                    .plugins
+                    .get(&registration.metadata.provenance.package)?;
+                match super::resolved_mcp_server_from_config_with(
+                    &registration.server_name,
+                    &registration.config,
+                    &|_| Ok(None),
+                ) {
+                    Ok(server) => Some((plugin, server)),
+                    Err(error) => {
+                        warn!(
+                            plugin = %registration.metadata.provenance.plugin_id,
+                            server = %registration.server_name,
+                            %error,
+                            "Plugin MCP registration is unavailable without run grants"
+                        );
+                        None
+                    }
+                }
             })
             .collect()
+    }
+
+    /// Get enabled MCP servers resolved against one immutable run snapshot.
+    #[must_use]
+    pub fn all_mcp_servers_for_run(
+        &self,
+        run: &crate::tools::ToolRunContext,
+    ) -> Vec<(&Plugin, PluginMcpServer)> {
+        self.mcp_registrations_for_run(run)
+            .into_iter()
+            .map(|(_, plugin, server)| (plugin, server))
+            .collect()
+    }
+
+    /// Resolve enabled MCP registrations without discarding their immutable
+    /// package generation and lifecycle identity.
+    #[must_use]
+    pub fn mcp_registrations_for_run(
+        &self,
+        run: &crate::tools::ToolRunContext,
+    ) -> Vec<(&super::PluginMcpRegistration, &Plugin, PluginMcpServer)> {
+        self.capabilities
+            .mcp_servers()
+            .filter_map(|registration| {
+                let plugin = self
+                    .plugins
+                    .get(&registration.metadata.provenance.package)?;
+                match registration.resolve_for_run(run) {
+                    Ok(server) => Some((registration, plugin, server)),
+                    Err(error) => {
+                        warn!(
+                            plugin = %registration.metadata.provenance.plugin_id,
+                            server = %registration.server_name,
+                            %error,
+                            "Plugin MCP registration is unavailable for this run"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// Install the enabled plugin LSP declarations into one exact run's
+    /// stateful language-server service.
+    pub fn configure_lsp_service_for_run(&self, run: &crate::tools::ToolRunContext) {
+        let mut servers = self
+            .capabilities
+            .lsp_servers()
+            .map(|registration| crate::services::PluginLspServer {
+                owner: registration.metadata.canonical_name.clone(),
+                language: registration.language.clone(),
+                config: registration.config.clone(),
+            })
+            .collect::<Vec<_>>();
+        servers.sort_by(|left, right| {
+            (&left.language, &left.owner).cmp(&(&right.language, &right.owner))
+        });
+        run.lsp_service().configure_plugins(servers);
     }
 
     /// Get the installation tracker
@@ -327,12 +840,37 @@ impl PluginManager {
     ///
     /// Returns `PluginError::NotFound` if no plugin with the given name is loaded.
     pub fn enable(&mut self, name: &str) -> Result<(), PluginError> {
-        if let Some(plugin) = self.plugins.get_mut(name) {
-            plugin.enabled = true;
-            Ok(())
-        } else {
-            Err(PluginError::NotFound(name.to_string()))
+        let activation_generation = self.capabilities.generation().saturating_add(1);
+        let compiled = self
+            .plugins
+            .get(name)
+            .ok_or_else(|| PluginError::NotFound(name.to_string()))
+            .and_then(|plugin| {
+                PluginCapabilityRegistry::compile_plugin(plugin, activation_generation)
+                    .map_err(PluginError::from)
+            })?;
+        self.installed.disabled_plugins.remove(name);
+        if let Err(error) = self.installed.save(&self.project_root) {
+            self.installed.disabled_plugins.insert(name.to_string());
+            return Err(error);
         }
+        let revocation = match self.capabilities.activate(compiled) {
+            Ok(revocation) => revocation,
+            Err(error) => {
+                self.installed.disabled_plugins.insert(name.to_string());
+                if let Err(rollback_error) = self.installed.save(&self.project_root) {
+                    warn!(plugin = name, %rollback_error, "failed to restore persisted disabled state after activation rejection");
+                }
+                return Err(error.into());
+            }
+        };
+        let Some(plugin) = self.plugins.get_mut(name) else {
+            return Err(PluginError::NotFound(name.to_string()));
+        };
+        plugin.enabled = true;
+        self.disabled_plugins.remove(name);
+        self.record_revocation(revocation);
+        Ok(())
     }
 
     /// Disable a plugin
@@ -341,19 +879,170 @@ impl PluginManager {
     ///
     /// Returns `PluginError::NotFound` if no plugin with the given name is loaded.
     pub fn disable(&mut self, name: &str) -> Result<(), PluginError> {
-        if let Some(plugin) = self.plugins.get_mut(name) {
-            plugin.enabled = false;
-            Ok(())
-        } else {
-            Err(PluginError::NotFound(name.to_string()))
+        if !self.plugins.contains_key(name) {
+            return Err(PluginError::NotFound(name.to_string()));
         }
+        self.installed.disabled_plugins.insert(name.to_string());
+        self.installed.save(&self.project_root)?;
+        let plugin = self
+            .plugins
+            .get_mut(name)
+            .ok_or_else(|| PluginError::NotFound(name.to_string()))?;
+        plugin.enabled = false;
+        self.disabled_plugins.insert(name.to_string());
+        let revocation = self.capabilities.revoke_plugin(name);
+        self.record_revocation(revocation);
+        Ok(())
     }
 
     /// Reload all plugins
     pub fn reload(&mut self) -> Vec<PluginError> {
         self.plugins.clear();
-        self.installed = InstalledPlugins::load(&project_root_cwd());
+        self.installed = InstalledPlugins::load(&self.project_root);
+        self.disabled_plugins
+            .clone_from(&self.installed.disabled_plugins);
         self.discover()
+    }
+
+    /// Canonical capability snapshot used by command, hook, skill, agent, MCP,
+    /// and LSP consumers.
+    #[must_use]
+    pub const fn capability_registry(&self) -> &PluginCapabilityRegistry {
+        &self.capabilities
+    }
+
+    /// Compose active plugin hooks as a lower-authority layer under the host
+    /// engine while retaining the host's lifecycle resources and policy.
+    ///
+    /// # Errors
+    /// Returns an activation error if the published hook registration set no
+    /// longer satisfies the canonical hook runtime contract.
+    pub fn compose_hook_engine(
+        &self,
+        host: &crate::hooks::HookEngine,
+    ) -> Result<crate::hooks::HookEngine, PluginError> {
+        let hooks = self.capabilities.hooks_config()?;
+        Ok(host.with_scoped_hooks(hooks))
+    }
+
+    /// Drain lifecycle handoffs after the composition root has atomically
+    /// removed schemas/context and terminated resources owned by each receipt.
+    #[must_use]
+    pub fn take_pending_revocations(&mut self) -> Vec<PluginCapabilityRevocation> {
+        self.pending_revocations.drain(..).collect()
+    }
+
+    /// Render a generation-bound command invocation without rereading package
+    /// files.
+    ///
+    /// # Errors
+    /// Returns [`PluginError::NotFound`] when the command is not active.
+    pub fn invoke_command(
+        &self,
+        plugin_name: &str,
+        command_name: &str,
+        arguments: &str,
+    ) -> Result<PluginCommandInvocation, PluginError> {
+        self.capabilities
+            .invoke_command(plugin_name, command_name, arguments)
+    }
+
+    /// Render a generation-bound plugin skill invocation.
+    ///
+    /// # Errors
+    /// Returns [`PluginError::NotFound`] when the skill is not active.
+    pub fn invoke_skill(
+        &self,
+        plugin_name: &str,
+        skill_name: &str,
+        arguments: &str,
+    ) -> Result<PluginSkillInvocation, PluginError> {
+        self.capabilities
+            .invoke_skill(plugin_name, skill_name, arguments)
+    }
+
+    /// Resolve a generation-bound plugin agent invocation.
+    ///
+    /// # Errors
+    /// Returns an error when the agent is not active or the task is empty.
+    pub fn invoke_agent(
+        &self,
+        plugin_name: &str,
+        agent_name: &str,
+        task: &str,
+    ) -> Result<PluginAgentInvocation, PluginError> {
+        self.capabilities
+            .invoke_agent(plugin_name, agent_name, task)
+    }
+
+    fn rebuild_capability_registry(&mut self) -> Vec<PluginError> {
+        let activation_generation = self.capabilities.generation().saturating_add(1);
+        let mut compiled = Vec::new();
+        let mut rejected = Vec::new();
+        let mut errors = Vec::new();
+        let mut plugins = self.plugins.values().collect::<Vec<_>>();
+        plugins.sort_by_key(|plugin| plugin.name());
+        for plugin in plugins.into_iter().filter(|plugin| plugin.enabled) {
+            match PluginCapabilityRegistry::compile_plugin(plugin, activation_generation) {
+                Ok(generation) => compiled.push(generation),
+                Err(error) => {
+                    rejected.push(plugin.name().to_string());
+                    errors.push(error.into());
+                }
+            }
+        }
+        for name in rejected {
+            if let Some(plugin) = self.plugins.get_mut(&name) {
+                plugin.enabled = false;
+            }
+        }
+        match self.capabilities.replace_all(compiled) {
+            Ok(revocation) => self.record_revocation(revocation),
+            Err(error) => {
+                errors.push(error.into());
+                for plugin in self.plugins.values_mut() {
+                    plugin.enabled = false;
+                }
+                if let Ok(revocation) = self.capabilities.replace_all(Vec::new()) {
+                    self.record_revocation(revocation);
+                }
+            }
+        }
+        errors
+    }
+
+    fn record_revocation(&mut self, revocation: Option<PluginCapabilityRevocation>) {
+        if let Some(revocation) = revocation {
+            self.pending_revocations.push_back(revocation);
+        }
+    }
+
+    fn reload_after_committed_activation(
+        &mut self,
+        plugin_name: &str,
+        activated_path: &Path,
+        source_kind: &str,
+    ) {
+        let reload_errors = self.reload();
+        for error in reload_errors {
+            warn!(
+                plugin = %plugin_name,
+                source = %source_kind,
+                error = %error,
+                "Plugin activation committed; reload reported a discovery error"
+            );
+        }
+        if self
+            .get(plugin_name)
+            .is_none_or(|plugin| plugin.root() != activated_path)
+        {
+            warn!(
+                plugin = %plugin_name,
+                source = %source_kind,
+                path = %activated_path.display(),
+                "Plugin activation committed but this process did not load the new generation; restart to apply it"
+            );
+        }
     }
 
     /// Get the marketplaces directory (~/.claude/marketplaces/)
@@ -397,47 +1086,6 @@ impl PluginManager {
             }
         }
         marketplaces
-    }
-
-    /// Enforce all [`PolicyAction`]s that bear on signature verification for
-    /// `plugin_name`. Reads raw manifest bytes from `manifest_json` (already
-    /// loaded from the marketplace source) and applies every
-    /// `RequireSignature` action in the policy.
-    ///
-    /// # Errors
-    ///
-    /// - [`PluginError::UnsignedPlugin`] — policy requires a signature but
-    ///   `manifest_sig` is `None`.
-    /// - [`PluginError::UnknownSigner`] — signature present but no trusted
-    ///   key accepted it.
-    /// - [`PluginError::SignatureMismatch`] — signature bytes are
-    ///   cryptographically invalid over the supplied bytes.
-    fn enforce_signature_policy(
-        plugin_name: &str,
-        manifest_bytes: &[u8],
-        manifest_sig: Option<&crate::plugins::validate::PluginSignature>,
-        policy: &PluginPolicy,
-    ) -> Result<(), PluginError> {
-        for action in &policy.actions {
-            let PolicyAction::RequireSignature { trusted_keys } = action;
-            let sig =
-                manifest_sig.ok_or_else(|| PluginError::UnsignedPlugin(plugin_name.to_string()))?;
-            match verify_signature(manifest_bytes, sig, trusted_keys) {
-                Ok(()) => {}
-                Err(SignatureError::UnknownSigner | SignatureError::MalformedKey(_)) => {
-                    return Err(PluginError::UnknownSigner(plugin_name.to_string()));
-                }
-                Err(
-                    SignatureError::SignatureMismatch
-                    | SignatureError::MissingSignature
-                    | SignatureError::InvalidLength(_)
-                    | SignatureError::InvalidEncoding(_),
-                ) => {
-                    return Err(PluginError::SignatureMismatch(plugin_name.to_string()));
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Build a [`MarketplaceSource`] from a per-plugin [`PluginSourceDef`],
@@ -556,68 +1204,7 @@ impl PluginManager {
             Self::check_plugin_source_policy(&mp_plugin.source, policy)?;
         }
 
-        // Only do the manifest-load + signature check when there are
-        // RequireSignature actions to enforce — avoids double-loading otherwise.
-        let has_sig_requirement = policy
-            .actions
-            .iter()
-            .any(|a| matches!(a, PolicyAction::RequireSignature { .. }));
-
-        if has_sig_requirement {
-            // Locate the marketplace and plugin manifest to get the raw bytes
-            // and the inline signature field before any install side effects.
-            let marketplaces = self.list_marketplaces();
-            let (_name, mp_manifest) = marketplaces
-                .iter()
-                .find(|(n, _)| n == marketplace_name)
-                .ok_or_else(|| {
-                    PluginError::NotFound(format!("Marketplace '{marketplace_name}' not found"))
-                })?;
-
-            let mp_plugin = mp_manifest
-                .plugins
-                .iter()
-                .find(|p| p.name == plugin_name)
-                .ok_or_else(|| {
-                    PluginError::NotFound(format!(
-                        "Plugin '{plugin_name}' not found in marketplace '{marketplace_name}'"
-                    ))
-                })?;
-
-            // For path-based sources we can load the manifest from disk and
-            // check the inline `signature` field. For git sources the manifest
-            // is not yet cloned — we check the MarketplacePlugin-level
-            // signature field (if any) against the serialized plugin entry.
-            let marketplace_dir = Self::marketplaces_dir().join(marketplace_name);
-            let (manifest_bytes, manifest_sig) = match &mp_plugin.source {
-                super::marketplace::PluginSource::Path(rel_path) => {
-                    Self::path_source_manifest_for_signature(&marketplace_dir, rel_path)?
-                }
-                super::marketplace::PluginSource::Structured(_) => {
-                    // For git/GitHub sources the content is not yet local.
-                    // Serialize the marketplace plugin entry as a stable byte
-                    // representation for the signature check. This covers the
-                    // case where the marketplace index itself is signed.
-                    let raw = serde_json::to_vec(mp_plugin).map_err(|e| {
-                        PluginError::InvalidManifest(format!(
-                            "Cannot serialize plugin entry for signature check: {e}"
-                        ))
-                    })?;
-                    // No inline manifest signature available pre-clone.
-                    (raw, None)
-                }
-            };
-
-            Self::enforce_signature_policy(
-                plugin_name,
-                &manifest_bytes,
-                manifest_sig.as_ref(),
-                policy,
-            )?;
-        }
-
-        // Policy actions satisfied — delegate to the base installer.
-        self.install_from_marketplace(plugin_name, marketplace_name)
+        self.install_marketplace_transaction(plugin_name, marketplace_name, policy)
     }
 
     /// Convert a [`PolicyRejection`] into a [`PluginError`]. Centralizes
@@ -799,7 +1386,7 @@ impl PluginManager {
         let manifest: MarketplaceManifest = serde_json::from_str(&content)
             .map_err(|e| PluginError::InvalidManifest(e.to_string()))?;
 
-        info!(name = %manifest.name, url = %url, plugins = manifest.plugins.len(), "Added git marketplace");
+        info!(name = %manifest.name, plugins = manifest.plugins.len(), "Added git marketplace");
         Ok(manifest)
     }
 
@@ -900,23 +1487,108 @@ impl PluginManager {
         plugin_name: &str,
         marketplace_name: &str,
     ) -> Result<String, PluginError> {
-        let (mp_plugin, plugins_dir, dest) =
+        self.install_marketplace_transaction(
+            plugin_name,
+            marketplace_name,
+            &PluginPolicy::default(),
+        )
+    }
+
+    /// Stage and activate a new marketplace generation under current policy.
+    /// Existing complete generations are retained and the signed successor
+    /// metadata is checked for rollback, freeze, and mix-and-match.
+    ///
+    /// # Errors
+    /// Returns a source-policy, verification, rollback, or activation error.
+    pub fn update_from_marketplace_with_policy(
+        &mut self,
+        plugin_name: &str,
+        marketplace_name: &str,
+        policy: &PluginPolicy,
+    ) -> Result<String, PluginError> {
+        self.install_from_marketplace_with_policy(plugin_name, marketplace_name, policy)
+    }
+
+    fn install_marketplace_transaction(
+        &mut self,
+        plugin_name: &str,
+        marketplace_name: &str,
+        policy: &PluginPolicy,
+    ) -> Result<String, PluginError> {
+        let (mp_plugin, _legacy_plugins_dir, _legacy_dest) =
             self.validate_marketplace_entry(plugin_name, marketplace_name)?;
-        let fetched =
-            Self::fetch_plugin_archive(&mp_plugin, marketplace_name, &plugins_dir, &dest)?;
-        let commit_sha = fetched.commit_sha();
-        Self::extract_to_install_dir(&fetched, &plugins_dir, &dest)?;
-
         let plugin_id = format!("{plugin_name}@{marketplace_name}");
-        Self::register_install(&plugin_id, &dest, mp_plugin.version, commit_sha);
-        let _ = self.reload();
-
-        if fetched.is_git() {
-            info!(plugin = %plugin_name, marketplace = %marketplace_name, "Installed plugin from marketplace (git)");
-        } else {
-            info!(plugin = %plugin_name, marketplace = %marketplace_name, "Installed plugin from marketplace");
+        let source = Self::marketplace_source_provenance(&mp_plugin, marketplace_name);
+        let mut transaction =
+            PluginInstallTransaction::begin(&self.project_root, &plugin_id, source)?;
+        let stage = transaction.staging_path().to_path_buf();
+        let stage_parent = stage.parent().ok_or_else(|| {
+            PluginError::InstallError("plugin transaction staging path has no parent".to_string())
+        })?;
+        let fetched =
+            Self::fetch_plugin_archive(&mp_plugin, marketplace_name, stage_parent, &stage)?;
+        Self::extract_to_install_dir(&fetched, stage_parent, &stage)?;
+        let revision = match fetched.commit_sha() {
+            Some(commit) => commit,
+            None => digest_package_tree(&stage)?,
+        };
+        transaction.bind_resolved_revision(revision)?;
+        let receipt = transaction.verify(policy)?;
+        if receipt.statement.package != plugin_name {
+            return Err(PluginError::InvalidManifest(format!(
+                "marketplace entry '{plugin_name}' materialized manifest package '{}'",
+                receipt.statement.package
+            )));
         }
+        let activated_path = transaction.activate(&receipt)?;
+        self.reload_after_committed_activation(plugin_name, &activated_path, "marketplace");
+
+        info!(
+            plugin = %plugin_name,
+            marketplace = %marketplace_name,
+            digest = %receipt.statement.artifact_digest,
+            verification = ?receipt.verification,
+            "Activated verified plugin generation from marketplace"
+        );
         Ok(plugin_id)
+    }
+
+    fn marketplace_source_provenance(
+        plugin: &MarketplacePlugin,
+        marketplace_name: &str,
+    ) -> ArtifactSourceProvenance {
+        match &plugin.source {
+            PluginSource::Path(relative) => ArtifactSourceProvenance {
+                kind: "marketplace-path".to_string(),
+                locator: format!("{marketplace_name}/{relative}"),
+                requested_revision: None,
+                resolved_revision: String::new(),
+            },
+            PluginSource::Structured(PluginSourceDef::Url(source)) => ArtifactSourceProvenance {
+                kind: "git".to_string(),
+                locator: source.url.clone(),
+                requested_revision: source.git_ref.clone(),
+                resolved_revision: String::new(),
+            },
+            PluginSource::Structured(PluginSourceDef::GitHub(source)) => ArtifactSourceProvenance {
+                kind: "git".to_string(),
+                locator: format!("https://github.com/{}.git", source.repo),
+                requested_revision: source.git_ref.clone(),
+                resolved_revision: String::new(),
+            },
+            PluginSource::Structured(PluginSourceDef::Npm(source)) => ArtifactSourceProvenance {
+                kind: "npm".to_string(),
+                locator: source.package.clone(),
+                requested_revision: source.version.clone(),
+                resolved_revision: String::new(),
+            },
+            PluginSource::Structured(PluginSourceDef::Pip(source)) => ArtifactSourceProvenance {
+                kind: "pip".to_string(),
+                locator: source.package.clone(),
+                requested_revision: source.version.clone(),
+                resolved_revision: String::new(),
+            },
+        }
     }
 
     /// Resolve the marketplace + plugin entry referenced by
@@ -926,15 +1598,14 @@ impl PluginManager {
     /// of `self`), the plugins directory, and the destination path.
     ///
     /// This is step (1) of [`Self::install_from_marketplace`]. It does
-    /// **no** filesystem mutation — it only reads the marketplace
-    /// index and checks that `dest` does not yet exist.
+    /// **no** filesystem mutation; an existing legacy destination is allowed
+    /// because activation publishes a separate immutable generation.
     ///
     /// # Errors
     /// - [`PluginError::NotFound`] when the marketplace or plugin
     ///   entry does not exist in the loaded marketplace index.
     /// - [`PluginError::InvalidManifest`] when the plugin name contains
-    ///   path-traversal characters (`..`, `/`, `\`) or when the
-    ///   destination directory already exists.
+    ///   path-traversal characters (`..`, `/`, `\`).
     fn validate_marketplace_entry(
         &self,
         plugin_name: &str,
@@ -965,16 +1636,8 @@ impl PluginManager {
                 "Plugin name '{plugin_name}' contains invalid path characters"
             )));
         }
-        let plugins_dir = PathBuf::from(".openclaudia/plugins");
+        let plugins_dir = self.project_root.join(".openclaudia/plugins");
         let dest = plugins_dir.join(plugin_name);
-        if dest.exists() {
-            return Err(PluginError::InvalidManifest(format!(
-                "Plugin '{}' already exists at {}",
-                plugin_name,
-                dest.display()
-            )));
-        }
-
         Ok((mp_plugin, plugins_dir, dest))
     }
 
@@ -1023,6 +1686,7 @@ impl PluginManager {
     /// Load the raw plugin manifest and inline signature for a path-based
     /// marketplace source. The path is resolved through
     /// [`Self::resolve_marketplace_plugin_path`] before any manifest read.
+    #[cfg(test)]
     fn path_source_manifest_for_signature(
         marketplace_dir: &Path,
         rel_path: &str,
@@ -1177,24 +1841,20 @@ impl PluginManager {
     /// This is step (4) of [`Self::install_from_marketplace`].
     /// Caller is responsible for calling [`Self::reload`] afterwards
     /// so the new plugin becomes active in this process.
+    #[cfg(test)]
     fn register_install(
+        &self,
         plugin_id: &str,
         dest: &Path,
         version: Option<String>,
         git_commit_sha: Option<String>,
     ) {
-        let project_root = project_root_cwd();
-        let mut installed = InstalledPlugins::load(&project_root);
+        let mut installed = InstalledPlugins::load(&self.project_root);
         installed.upsert(
             plugin_id,
             PluginInstallEntry {
                 scope: InstallScope::Project,
-                project_path: Some(
-                    std::env::current_dir()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string(),
-                ),
+                project_path: Some(self.project_root.to_string_lossy().to_string()),
                 install_path: dest.to_string_lossy().to_string(),
                 version,
                 installed_at: Some(chrono::Utc::now().to_rfc3339()),
@@ -1202,9 +1862,74 @@ impl PluginManager {
                 git_commit_sha,
             },
         );
-        if let Err(e) = installed.save(&project_root) {
+        if let Err(e) = installed.save(&self.project_root) {
             warn!("Failed to save install tracking: {}", e);
         }
+    }
+
+    /// Install a local directory through bounded staging and generation-atomic
+    /// activation. The source remains read-only and is never activated in place.
+    ///
+    /// # Errors
+    /// Returns a package validation, staging, or activation error.
+    pub fn install_from_directory(&mut self, source: &Path) -> Result<String, PluginError> {
+        self.install_from_directory_with_policy(source, &PluginPolicy::default())
+    }
+
+    /// Policy-aware local directory install/update transaction.
+    ///
+    /// # Errors
+    /// Returns a source, detached verification, rollback, or activation error.
+    pub fn install_from_directory_with_policy(
+        &mut self,
+        source: &Path,
+        policy: &PluginPolicy,
+    ) -> Result<String, PluginError> {
+        let canonical = source.canonicalize().map_err(|error| {
+            PluginError::IoError(format!(
+                "cannot canonicalize local plugin source {}: {error}",
+                source.display()
+            ))
+        })?;
+        let policy_source = MarketplaceSource::Directory {
+            path: canonical.to_string_lossy().to_string(),
+        };
+        if let Err(rejection) = policy::check_marketplace_allowed(&policy_source, policy) {
+            return Err(Self::policy_rejection_to_error(rejection, policy));
+        }
+        let source_metadata = fs::symlink_metadata(&canonical)
+            .map_err(|error| PluginError::IoError(error.to_string()))?;
+        if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
+            return Err(PluginError::InvalidManifest(
+                "local plugin source must be a real directory".to_string(),
+            ));
+        }
+        let candidate = Plugin::load(&canonical)?;
+        let plugin_name = candidate.name().to_string();
+        let mut transaction = PluginInstallTransaction::begin(
+            &self.project_root,
+            &plugin_name,
+            ArtifactSourceProvenance {
+                kind: "local-directory".to_string(),
+                locator: canonical.to_string_lossy().to_string(),
+                requested_revision: None,
+                resolved_revision: String::new(),
+            },
+        )?;
+        copy_dir_recursive_within(&canonical, transaction.staging_path(), &canonical)
+            .map_err(|error| PluginError::IoError(error.to_string()))?;
+        let digest = digest_package_tree(transaction.staging_path())?;
+        transaction.bind_resolved_revision(digest)?;
+        let receipt = transaction.verify(policy)?;
+        if receipt.statement.package != plugin_name {
+            return Err(PluginError::InvalidManifest(
+                "local plugin identity changed while staging".to_string(),
+            ));
+        }
+        let activated_path = transaction.activate(&receipt)?;
+        self.reload_after_committed_activation(&plugin_name, &activated_path, "local-directory");
+        info!(plugin = %plugin_name, digest = %receipt.statement.artifact_digest, "Activated verified local plugin generation");
+        Ok(plugin_name)
     }
 
     /// Install a plugin directly from a git repository
@@ -1222,10 +1947,42 @@ impl PluginManager {
         url: &str,
         git_ref: Option<&str>,
     ) -> Result<String, PluginError> {
+        self.install_git_transaction(url, git_ref, &PluginPolicy::default())
+    }
+
+    /// Install or update a directly sourced Git plugin through the same
+    /// detached verification and generation activation transaction used by
+    /// marketplace packages.
+    ///
+    /// # Errors
+    /// Returns a URL/ref, Git, detached verification, rollback, or activation error.
+    pub fn install_from_git_with_policy(
+        &mut self,
+        url: &str,
+        git_ref: Option<&str>,
+        policy: &PluginPolicy,
+    ) -> Result<String, PluginError> {
+        self.install_git_transaction(url, git_ref, policy)
+    }
+
+    fn install_git_transaction(
+        &mut self,
+        url: &str,
+        git_ref: Option<&str>,
+        policy: &PluginPolicy,
+    ) -> Result<String, PluginError> {
         // Reject disallowed URL schemes (http://, file://, git://, inline
         // credentials) before any filesystem work. git_clone will validate
         // again — deliberately redundant, cheap defense-in-depth.
         super::validate::validate_source_url(url)?;
+        let policy_source = MarketplaceSource::Git {
+            url: url.to_string(),
+            git_ref: git_ref.map(str::to_string),
+            path: None,
+        };
+        if let Err(rejection) = policy::check_marketplace_allowed(&policy_source, policy) {
+            return Err(Self::policy_rejection_to_error(rejection, policy));
+        }
 
         // No-silent-HEAD rule: parity with
         // `install_from_marketplace` / `fetch_plugin_archive`
@@ -1245,168 +2002,106 @@ impl PluginManager {
         // url-last-segment extraction was raw and accepted `..`, leading
         // dots, etc., so a crafted URL could place the clone outside the
         // `.openclaudia/plugins/` jail.
-        let name = super::validate::derive_dir_name_from_url(url)?;
-
-        let plugins_dir = PathBuf::from(".openclaudia/plugins");
-        let dest = plugins_dir.join(&name);
-        if dest.exists() {
-            return Err(PluginError::InvalidManifest(format!(
-                "Plugin '{}' already exists at {}",
-                name,
-                dest.display()
-            )));
+        let provisional_name = super::validate::derive_dir_name_from_url(url)?;
+        let mut transaction = PluginInstallTransaction::begin(
+            &self.project_root,
+            &provisional_name,
+            ArtifactSourceProvenance {
+                kind: "git".to_string(),
+                locator: url.to_string(),
+                requested_revision: git_ref.map(str::to_string),
+                resolved_revision: String::new(),
+            },
+        )?;
+        let commit_sha = git_clone(url, transaction.staging_path(), git_ref)?;
+        transaction.bind_resolved_revision(commit_sha)?;
+        let staged = Plugin::load(transaction.staging_path())?;
+        let plugin_name = staged.name().to_string();
+        transaction.rebind_package_identity(&plugin_name)?;
+        let receipt = transaction.verify(policy)?;
+        if receipt.statement.package != plugin_name {
+            return Err(PluginError::InvalidManifest(
+                "git plugin identity changed while staging".to_string(),
+            ));
         }
-
-        fs::create_dir_all(&plugins_dir).map_err(|e| PluginError::IoError(e.to_string()))?;
-
-        // Clone the repo. Capture the commit SHA so the install record
-        // pins exactly what was materialized (crosslink #249 point 1).
-        let commit_sha = git_clone(url, &dest, git_ref)?;
-
-        // Validate it's a valid plugin
-        match Plugin::load(&dest) {
-            Ok(plugin) => {
-                let actual_name = plugin.name().to_string();
-                // Track installation
-                let project_root = project_root_cwd();
-                let mut installed = InstalledPlugins::load(&project_root);
-                installed.upsert(
-                    &actual_name,
-                    PluginInstallEntry {
-                        scope: InstallScope::Project,
-                        project_path: Some(
-                            std::env::current_dir()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_string(),
-                        ),
-                        install_path: dest.to_string_lossy().to_string(),
-                        version: plugin.manifest.version,
-                        installed_at: Some(chrono::Utc::now().to_rfc3339()),
-                        last_updated: None,
-                        git_commit_sha: Some(commit_sha),
-                    },
-                );
-                if let Err(e) = installed.save(&project_root) {
-                    warn!("Failed to save install tracking: {}", e);
-                }
-                let _ = self.reload();
-                info!(plugin = %actual_name, url = %url, "Installed plugin from git");
-                Ok(actual_name)
-            }
-            Err(e) => {
-                // Clean up invalid clone
-                let _ = fs::remove_dir_all(&dest);
-                Err(e)
-            }
-        }
+        let activated_path = transaction.activate(&receipt)?;
+        self.reload_after_committed_activation(&plugin_name, &activated_path, "git");
+        info!(plugin = %plugin_name, digest = %receipt.statement.artifact_digest, "Activated verified plugin generation from git");
+        Ok(plugin_name)
     }
 
-    /// Install a plugin directly from a git URL, enforcing all
-    /// [`PolicyAction`]s including [`PolicyAction::RequireSignature`]
-    /// (crosslink #249).
-    ///
-    /// `install_from_git` itself does NOT consult the policy — the unsigned
-    /// install path is only used by callers that have already proven the
-    /// upstream is trusted (tests, internal automation). Production CLI /
-    /// TUI entry points MUST call this method so the signature requirement
-    /// configured in `PluginPolicy::actions` is actually enforced on every
-    /// install, not just marketplace installs.
-    ///
-    /// The signature check runs AFTER `git_clone` (so the manifest exists
-    /// on disk) but BEFORE the install record is persisted. On rejection,
-    /// the cloned tree is removed so a failed verification leaves no
-    /// trace in `.openclaudia/plugins/`.
+    /// Install a content-addressed offline cache archive with default policy.
     ///
     /// # Errors
-    ///
-    /// - [`PluginError::UnsignedPlugin`] when policy requires a signature
-    ///   and the manifest has none.
-    /// - [`PluginError::UnknownSigner`] when the signature does not match
-    ///   any trusted key.
-    /// - [`PluginError::SignatureMismatch`] when the signature is
-    ///   cryptographically invalid for the manifest bytes.
-    /// - All errors from [`Self::install_from_git`].
-    pub fn install_from_git_with_policy(
+    /// Returns the same errors as [`Self::install_from_cache_with_policy`].
+    pub fn install_from_cache(
         &mut self,
-        url: &str,
-        git_ref: Option<&str>,
+        cache: &ZipCache,
+        sha256: &str,
+    ) -> Result<String, PluginError> {
+        self.install_from_cache_with_policy(cache, sha256, &PluginPolicy::default())
+    }
+
+    /// Install or update a content-addressed offline cache archive through the
+    /// same verification and atomic activation transaction as online sources.
+    ///
+    /// # Errors
+    /// Returns a cache integrity/extraction, manifest, policy, rollback, or
+    /// activation error. Cache index identity/version fields are checked as
+    /// provenance only and cannot override the staged package manifest.
+    pub fn install_from_cache_with_policy(
+        &mut self,
+        cache: &ZipCache,
+        sha256: &str,
         policy: &PluginPolicy,
     ) -> Result<String, PluginError> {
-        // Short-circuit when the policy has no signature requirement: the
-        // base installer is sufficient and we save one manifest re-read.
-        let has_sig_requirement = policy
-            .actions
-            .iter()
-            .any(|a| matches!(a, PolicyAction::RequireSignature { .. }));
-        if !has_sig_requirement {
-            return self.install_from_git(url, git_ref);
+        let entry = cache.entry(sha256)?;
+        let provisional_name = format!("cache-{}", &sha256[..16]);
+        let mut transaction = PluginInstallTransaction::begin(
+            &self.project_root,
+            &provisional_name,
+            ArtifactSourceProvenance {
+                kind: "offline-cache".to_string(),
+                locator: format!("sha256:{sha256}"),
+                requested_revision: Some(sha256.to_string()),
+                resolved_revision: String::new(),
+            },
+        )?;
+        cache.materialize_verified(sha256, transaction.staging_path())?;
+        let staged = Plugin::load(transaction.staging_path())?;
+        let plugin_name = staged.name().to_string();
+        let indexed_name = entry
+            .plugin_id
+            .split('@')
+            .next()
+            .unwrap_or(&entry.plugin_id);
+        let version_mismatch = entry
+            .version
+            .as_ref()
+            .is_some_and(|version| staged.manifest.version.as_ref() != Some(version));
+        if indexed_name != plugin_name || version_mismatch {
+            return Err(PluginError::InvalidManifest(format!(
+                "cache index names {} {:?}, but archive contains {} {:?}",
+                entry.plugin_id, entry.version, plugin_name, staged.manifest.version
+            )));
         }
-
-        // Run the base installer first — it performs the URL-scheme check,
-        // the no-silent-HEAD rule, the dir-name traversal protection, the
-        // clone, and the manifest validation. Whatever this returns is
-        // the *materialised* plugin name on disk; we then re-load the
-        // manifest from there to drive the signature check.
-        let plugin_name = self.install_from_git(url, git_ref)?;
-
-        // Locate the manifest on disk so we can hand the verifier the
-        // canonical bytes the signature was generated over. The lookup
-        // convention `Plugin::load` uses is mirrored here
-        // (.claude-plugin/plugin.json first, plugin.json at the root as
-        // fallback). The derived dir name from the URL is the only stable
-        // way to find the clone — `install_from_git` returns the *plugin*
-        // name from the manifest, which may differ from the dir name.
-        let dir_name = super::validate::derive_dir_name_from_url(url)?;
-        let plugin_dir = PathBuf::from(".openclaudia/plugins").join(&dir_name);
-        let cc_path = plugin_dir.join(".claude-plugin").join("plugin.json");
-        let root_path = plugin_dir.join("plugin.json");
-        let manifest_path = if cc_path.exists() { cc_path } else { root_path };
-
-        let result = (|| -> Result<(), PluginError> {
-            let manifest_bytes = fs::read(&manifest_path).map_err(|e| {
-                PluginError::IoError(format!("Cannot read manifest for signature check: {e}"))
-            })?;
-            let parsed: crate::plugins::manifest::PluginManifest =
-                serde_json::from_slice(&manifest_bytes).map_err(|e| {
-                    PluginError::InvalidManifest(format!(
-                        "Cannot parse manifest for signature check: {e}"
-                    ))
-                })?;
-            Self::enforce_signature_policy(
-                &plugin_name,
-                &manifest_bytes,
-                parsed.signature.as_ref(),
-                policy,
-            )
-        })();
-
-        if let Err(e) = result {
-            // Verification failed — remove the freshly-cloned tree and the
-            // install record so a rejected plugin leaves no trace. Cleanup
-            // errors are deliberately logged-and-swallowed: the plugin
-            // error is what the caller needs to see, and an undeleted
-            // clone is a non-fatal leak the next `plugin doctor` pass will
-            // catch.
-            if plugin_dir.exists() {
-                if let Err(rm_err) = fs::remove_dir_all(&plugin_dir) {
-                    warn!(
-                        "Failed to remove rejected plugin clone at {}: {}",
-                        plugin_dir.display(),
-                        rm_err
-                    );
-                }
-            }
-            let project_root = project_root_cwd();
-            let mut installed = InstalledPlugins::load(&project_root);
-            installed.remove(&plugin_name);
-            if let Err(save_err) = installed.save(&project_root) {
-                warn!("Failed to update install tracking after rejection: {save_err}");
-            }
-            let _ = self.reload();
-            return Err(e);
+        let digest = digest_package_tree(transaction.staging_path())?;
+        transaction.bind_resolved_revision(digest)?;
+        transaction.rebind_package_identity(&plugin_name)?;
+        let receipt = transaction.verify(policy)?;
+        if receipt.statement.package != plugin_name {
+            return Err(PluginError::InvalidManifest(
+                "cached plugin identity changed while staging".to_string(),
+            ));
         }
-
+        let activated_path = transaction.activate(&receipt)?;
+        self.reload_after_committed_activation(&plugin_name, &activated_path, "offline-cache");
+        info!(
+            plugin = %plugin_name,
+            archive_sha256 = %sha256,
+            digest = %receipt.statement.artifact_digest,
+            "Activated verified plugin generation from offline cache"
+        );
         Ok(plugin_name)
     }
 
@@ -1432,7 +2127,85 @@ impl Default for PluginManager {
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+    use std::io::Write as _;
     use tempfile::TempDir;
+
+    #[test]
+    fn default_discovery_does_not_ambiently_activate_foreign_claude_cache() {
+        let project = TempDir::new().expect("project");
+        let manager = PluginManager::new_for_project(project.path());
+
+        assert!(!manager
+            .search_paths
+            .iter()
+            .any(|root| root.path.ends_with(Path::new(".claude/plugins"))));
+        assert!(manager.search_paths.iter().any(|root| {
+            root.scope == InstallScope::Project
+                && root.path.ends_with(Path::new(".openclaudia/plugins"))
+        }));
+    }
+
+    fn cached_plugin_archive() -> Vec<u8> {
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        writer
+            .start_file(
+                "release/.claude-plugin/plugin.json",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .expect("manifest entry");
+        writer
+            .write_all(br#"{"name":"cached-plugin","version":"1.0.0"}"#)
+            .expect("manifest bytes");
+        writer
+            .start_file(
+                "release/commands/run.md",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .expect("command entry");
+        writer.write_all(b"run it").expect("command bytes");
+        writer.finish().expect("finish archive").into_inner()
+    }
+
+    #[test]
+    fn offline_cache_install_activates_verified_generation_despite_unrelated_reload_error() {
+        let project = TempDir::new().expect("project");
+        let search = project.path().join("search");
+        fs::create_dir_all(search.join("broken/.claude-plugin")).expect("broken plugin dir");
+        fs::write(
+            search.join("broken/.claude-plugin/plugin.json"),
+            "{not json",
+        )
+        .expect("broken plugin manifest");
+        let cache = ZipCache::new(project.path().join("cache"));
+        let bytes = cached_plugin_archive();
+        let sha256 = super::super::zip_cache::sha256_hex(&bytes);
+        cache
+            .put(
+                super::super::zip_cache::CacheEntry {
+                    sha256: sha256.clone(),
+                    plugin_id: "cached-plugin".to_string(),
+                    version: Some("1.0.0".to_string()),
+                    installed_at_unix: 1,
+                },
+                &bytes,
+            )
+            .expect("cache plugin");
+        let mut manager =
+            PluginManager::with_paths_for_project(vec![search], project.path().to_path_buf());
+
+        let installed = manager
+            .install_from_cache_with_policy(&cache, &sha256, &PluginPolicy::default())
+            .expect("cache activation remains successful");
+
+        assert_eq!(installed, "cached-plugin");
+        let plugin = manager.get("cached-plugin").expect("activated plugin");
+        assert!(plugin
+            .root()
+            .starts_with(project.path().join(".openclaudia/plugins/.generations")));
+        let tracked = InstalledPlugins::load(project.path());
+        assert!(tracked.plugins.contains_key("cached-plugin"));
+    }
 
     #[test]
     fn directory_add_rejected_by_blocklist_without_touching_fs() {
@@ -2118,20 +2891,13 @@ mod install_decomp_tests {
     /// is the single owner of.
     #[test]
     fn register_install_persists_entry_with_commit_sha() {
-        // crosslink #984 follow-up: `register_install` reads the process
-        // cwd to derive its project root, so this test must mutate it.
-        // Hold the shared cwd lock for the duration so concurrent tests
-        // do not observe a partially-mutated cwd (the same lock the
-        // worktree/cron suites once used).
-        let _cwd = crate::tools::testutil::process_cwd_lock();
         let tmp = TempDir::new().unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        let manager = PluginManager::new_for_project(tmp.path());
 
         let dest = tmp.path().join(".openclaudia").join("plugins").join("p");
         fs::create_dir_all(&dest).unwrap();
 
-        PluginManager::register_install(
+        manager.register_install(
             "p@m",
             &dest,
             Some("1.2.3".to_string()),
@@ -2139,8 +2905,6 @@ mod install_decomp_tests {
         );
 
         let reloaded = InstalledPlugins::load(tmp.path());
-        // Restore cwd before any assertion can panic.
-        std::env::set_current_dir(prev).unwrap();
 
         let entries = reloaded
             .plugins

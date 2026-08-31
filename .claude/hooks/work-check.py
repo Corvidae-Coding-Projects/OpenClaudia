@@ -194,7 +194,8 @@ def is_allowed_bash(input_data, allowed_list):
 
 def is_claude_memory_path(input_data):
     """Check if a Write/Edit targets Claude Code's own memory/config directory (~/.claude/)."""
-    file_path = input_data.get("tool_input", {}).get("file_path", "")
+    tool_input = input_data.get("tool_input", {})
+    file_path = tool_input.get("file_path") or tool_input.get("path", "")
     if not file_path:
         return False
     home = os.path.expanduser("~")
@@ -272,6 +273,14 @@ def main():
     except (json.JSONDecodeError, ValueError, TypeError):
         print("work-check: failed to parse stdin — blocking tool call (fail-closed)")
         sys.exit(2)
+
+    # Normalize OpenClaudia's canonical registry names to Claude-compatible
+    # lifecycle names before applying this compatibility workflow.
+    tool_name = {
+        'write_file': 'Write',
+        'edit_file': 'Edit',
+        'bash': 'Bash',
+    }.get(tool_name, tool_name)
 
     # Only check on Write, Edit, Bash
     if tool_name not in ('Write', 'Edit', 'Bash'):
@@ -419,7 +428,6 @@ def main():
         "  - Retry the same tool call hoping it will work\n"
         "  - Try alternative tools or approaches to bypass this check\n"
         "  - Proceed without creating an issue first\n"
-        "  - Tell the user the hook is preventing you from working\n\n"
         "You MUST do exactly this, right now, before anything else:\n\n"
         "  crosslink quick \"<describe what you are about to do>\" -p <priority> -l <label>\n\n"
         "This single command creates an issue AND sets it as your active work item. "

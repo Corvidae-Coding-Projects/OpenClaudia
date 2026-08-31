@@ -35,7 +35,7 @@ use openclaudia::{
     session::PLAN_MODE_ALLOWED_TOOLS,
     tools::{get_tool_definitions, registry::registry, ToolHandler},
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 
 // ───────────────────────────────────────────────────────────────────────────
 // Section A — aggregate shape
@@ -272,6 +272,31 @@ fn bash_output_schema_allows_no_shell_id_list_mode() {
         shell_id_description.contains("Omit"),
         "bash_output shell_id description must document no-arg list mode; got {shell_id_description:?}"
     );
+    let cursor = def
+        .pointer("/function/parameters/properties/cursor")
+        .expect("bash_output cursor schema");
+    assert_eq!(cursor["type"], "integer");
+    assert_eq!(cursor["minimum"], 0);
+}
+
+#[test]
+fn bash_schema_advertises_the_enforced_command_timeout_contract() {
+    let definition = registry()
+        .get("bash")
+        .expect("bash registered")
+        .definition();
+    let timeout = definition
+        .pointer("/function/parameters/properties/timeout")
+        .expect("bash timeout schema");
+
+    assert_eq!(timeout["type"], "integer");
+    assert_eq!(timeout["minimum"], 1);
+    assert_eq!(timeout["maximum"], 600_000);
+    let description = timeout["description"]
+        .as_str()
+        .expect("bash timeout description");
+    assert!(description.contains("default 300000"), "{description}");
+    assert!(description.contains("Background commands"), "{description}");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -577,8 +602,20 @@ fn tool_search_max_results_schema_advertises_bounds() {
     );
     assert_eq!(
         max_results_schema.get("maximum").and_then(Value::as_u64),
-        Some(50),
+        Some(8),
         "tool_search max_results schema must advertise the enforced ceiling"
+    );
+    assert_eq!(
+        def.pointer("/function/parameters/additionalProperties")
+            .and_then(Value::as_bool),
+        Some(false),
+        "tool_search must reject unrecognized control fields"
+    );
+    assert_eq!(
+        def.pointer("/function/parameters/properties/catalog_generation/type")
+            .and_then(Value::as_str),
+        Some("string"),
+        "tool_search must advertise the generation binding field"
     );
 }
 
@@ -623,6 +660,86 @@ fn grounding_context_schema_advertises_id_and_stale_contract() {
 }
 
 #[test]
+fn canonical_task_and_todo_schemas_advertise_runtime_bounds() {
+    let create = registry()
+        .get("task_create")
+        .expect("task_create registered")
+        .definition();
+    assert_eq!(
+        create
+            .pointer("/function/parameters/properties/subject/maxLength")
+            .and_then(Value::as_u64),
+        Some(openclaudia::task_graph::MAX_TASK_SUBJECT_BYTES as u64)
+    );
+    assert_eq!(
+        create
+            .pointer("/function/parameters/properties/description/maxLength")
+            .and_then(Value::as_u64),
+        Some(openclaudia::task_graph::MAX_TASK_DESCRIPTION_BYTES as u64)
+    );
+    assert_eq!(
+        create
+            .pointer("/function/parameters/properties/active_form/maxLength")
+            .and_then(Value::as_u64),
+        Some(openclaudia::task_graph::MAX_TASK_ACTIVE_FORM_BYTES as u64)
+    );
+
+    let update = registry()
+        .get("task_update")
+        .expect("task_update registered")
+        .definition();
+    for field in [
+        "add_blocks",
+        "add_blocked_by",
+        "remove_blocks",
+        "remove_blocked_by",
+    ] {
+        let pointer = format!("/function/parameters/properties/{field}");
+        let schema = update.pointer(&pointer).expect("edge schema");
+        assert_eq!(
+            schema.get("maxItems").and_then(Value::as_u64),
+            Some(openclaudia::task_graph::MAX_TASK_EDGES as u64),
+            "{field}"
+        );
+        assert_eq!(
+            schema.pointer("/items/maxLength").and_then(Value::as_u64),
+            Some(openclaudia::task_graph::MAX_TASK_ID_BYTES as u64),
+            "{field}"
+        );
+    }
+
+    let list = registry()
+        .get("task_list")
+        .expect("task_list registered")
+        .definition();
+    assert_eq!(
+        list.pointer("/function/parameters/properties/cursor/maxLength")
+            .and_then(Value::as_u64),
+        Some(openclaudia::task_graph::MAX_PAGE_CURSOR_BYTES as u64)
+    );
+
+    let todo = registry()
+        .get("todo_write")
+        .expect("todo_write registered")
+        .definition();
+    assert_eq!(
+        todo.pointer("/function/parameters/properties/todos/maxItems")
+            .and_then(Value::as_u64),
+        Some(openclaudia::task_graph::MAX_TASKS as u64)
+    );
+    assert_eq!(
+        todo.pointer("/function/parameters/properties/todos/items/properties/content/maxLength")
+            .and_then(Value::as_u64),
+        Some(openclaudia::task_graph::MAX_TASK_SUBJECT_BYTES as u64)
+    );
+    assert_eq!(
+        todo.pointer("/function/parameters/properties/todos/items/properties/activeForm/maxLength")
+            .and_then(Value::as_u64),
+        Some(openclaudia::task_graph::MAX_TASK_ACTIVE_FORM_BYTES as u64)
+    );
+}
+
+#[test]
 fn notebook_edit_schema_advertises_all_runtime_cell_types() {
     let def = registry()
         .get("notebook_edit")
@@ -640,6 +757,35 @@ fn notebook_edit_schema_advertises_all_runtime_cell_types() {
             "notebook_edit cell_type schema must advertise runtime-supported {expected:?}; got {variants:?}"
         );
     }
+}
+
+#[test]
+fn notebook_edit_schema_requires_snapshot_and_makes_source_mode_conditional() {
+    let def = registry()
+        .get("notebook_edit")
+        .expect("notebook_edit registered")
+        .definition();
+    let required = def
+        .pointer("/function/parameters/required")
+        .and_then(Value::as_array)
+        .expect("notebook_edit required fields");
+    assert!(required.contains(&json!("notebook_path")));
+    assert!(required.contains(&json!("expected_snapshot")));
+    assert!(
+        !required.contains(&json!("new_source")),
+        "new_source is not required for delete"
+    );
+    assert_eq!(
+        def.pointer("/function/parameters/properties/expected_snapshot/pattern"),
+        Some(&json!("^sha256:[0-9a-f]{64}$"))
+    );
+    assert!(
+        def.pointer("/function/parameters/properties/new_source/description")
+            .and_then(Value::as_str)
+            .is_some_and(|description| description.contains("replace and insert")
+                && description.contains("omit for delete")),
+        "provider-compatible schema must document the runtime conditional"
+    );
 }
 
 #[test]
@@ -674,7 +820,7 @@ fn file_tool_path_descriptions_match_relative_path_support() {
 }
 
 #[test]
-fn cron_create_description_does_not_claim_openclaudia_runs_schedules() {
+fn cron_create_description_advertises_the_durable_runtime_boundary() {
     let def = registry()
         .get("cron_create")
         .expect("cron_create registered")
@@ -684,16 +830,12 @@ fn cron_create_description_does_not_claim_openclaudia_runs_schedules() {
         .and_then(Value::as_str)
         .expect("cron_create description");
     assert!(
-        desc.contains("external schedulers"),
-        "cron_create must describe the actual execution boundary; got {desc:?}"
+        desc.contains("durable authorized agent schedule"),
+        "cron_create must describe durable authorization; got {desc:?}"
     );
     assert!(
-        !desc.contains("executed by loop mode"),
-        "cron_create must not advertise automatic loop-mode execution; got {desc:?}"
-    );
-    assert!(
-        !desc.contains("OpenClaudia runs"),
-        "cron_create must not imply OpenClaudia executes schedules automatically; got {desc:?}"
+        desc.contains("canonical agent runtime"),
+        "cron_create must identify its production execution boundary; got {desc:?}"
     );
 }
 
@@ -708,12 +850,8 @@ fn cron_delete_schema_matches_identifier_contract() {
         .and_then(Value::as_str)
         .expect("cron_delete description");
     assert!(
-        desc.contains("stored cron schedule metadata"),
-        "cron_delete must describe deletion as metadata removal; got {desc:?}"
-    );
-    assert!(
-        !desc.contains("scheduled task"),
-        "cron_delete must not imply OpenClaudia owns task execution; got {desc:?}"
+        desc.contains("authorized schedule") && desc.contains("legacy unapproved metadata"),
+        "cron_delete must distinguish authorized schedules from inert legacy metadata; got {desc:?}"
     );
 
     let params = def
@@ -756,7 +894,7 @@ fn cron_delete_schema_matches_identifier_contract() {
 }
 
 #[test]
-fn cron_list_schema_describes_stored_metadata_not_runner() {
+fn cron_list_schema_describes_authorized_runtime_state_and_legacy_metadata() {
     let def = registry()
         .get("cron_list")
         .expect("cron_list registered")
@@ -766,11 +904,12 @@ fn cron_list_schema_describes_stored_metadata_not_runner() {
         .and_then(Value::as_str)
         .expect("cron_list description");
     assert!(
-        desc.contains("stored cron schedule metadata"),
-        "cron_list must describe stored metadata; got {desc:?}"
+        desc.contains("durable authorized schedules") && desc.contains("recent exact run history"),
+        "cron_list must describe durable runtime state and history; got {desc:?}"
     );
     assert!(
-        !desc.contains("scheduled tasks"),
-        "cron_list must not imply OpenClaudia owns task execution; got {desc:?}"
+        desc.contains("legacy unapproved metadata")
+            && desc.contains("never executed automatically"),
+        "cron_list must keep legacy records explicitly inert; got {desc:?}"
     );
 }

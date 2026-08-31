@@ -88,6 +88,10 @@ impl std::fmt::Display for SessionId {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Identity {
     pub session_id: SessionId,
+    /// Immutable logical identity, causal ancestry, and exact runtime bindings
+    /// used to validate resume and project-owned branch proposals.
+    #[serde(default)]
+    pub causal: super::causal::SessionCausalState,
     /// Parent session id when this session was forked from another
     /// (e.g. the coordinator spawning a teammate). `None` for the
     /// primary user-started session.
@@ -101,7 +105,7 @@ pub struct Identity {
     /// during a session (a `bash cd` tool call updates this).
     pub cwd: PathBuf,
     /// Project root (git toplevel or `original_cwd` when not in a
-    /// repo). Used by MEMORY.md discovery and rules/plugins scope.
+    /// repo). Used by project-scoped memory and plugin discovery.
     pub project_root: PathBuf,
     /// Where transcripts / session-memory / subagent metadata all
     /// anchor. Today derives from `cwd`; kept separate so a future
@@ -112,6 +116,9 @@ pub struct Identity {
     /// included in the system prompt. Matches CC's `--add-dir`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_directories_for_claude_md: Vec<PathBuf>,
+    /// Host-validated isolated-workspace capability retained for exact resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_workspace: Option<crate::runtime::IsolatedWorkspaceDescriptor>,
 }
 
 impl Identity {
@@ -119,14 +126,17 @@ impl Identity {
     /// starts equal to `cwd`, no parent session, no extra dirs.
     #[must_use]
     pub fn rooted_at(cwd: PathBuf) -> Self {
+        let session_id = SessionId::new();
         Self {
-            session_id: SessionId::new(),
+            causal: super::causal::SessionCausalState::uninitialized(&session_id),
+            session_id,
             parent_session_id: None,
             original_cwd: cwd.clone(),
             cwd: cwd.clone(),
             project_root: cwd.clone(),
             session_project_dir: cwd,
             additional_directories_for_claude_md: Vec::new(),
+            active_workspace: None,
         }
     }
 }
@@ -143,6 +153,11 @@ pub struct Conversation {
     /// adapter pick what it needs.
     #[serde(default)]
     pub messages: Vec<serde_json::Value>,
+    /// Lossless provider-owned continuation/evidence lane. Portable messages
+    /// remain authoritative for display and cross-provider migration; this
+    /// state is used only with its exact provider, model, and wire protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_native_state: Option<crate::runtime::ProviderNativeState>,
     /// Stack of `(user, assistant)` pairs popped by `/undo`. Popping
     /// again via `/redo` pushes them back onto `messages`.
     #[serde(default)]
@@ -160,6 +175,10 @@ pub struct Conversation {
     /// Active behavioral mode (agency/quality/scope axes + modifiers).
     #[serde(default)]
     pub behavior_mode: crate::modes::BehaviorMode,
+    /// User/task-approved targets compiled into adjacent and narrow runtime
+    /// scope. Stored relative to the project and rebound on resume.
+    #[serde(default)]
+    pub behavior_scope_targets: crate::modes::BehaviorScopeTargets,
 }
 
 // ─── UI state ───────────────────────────────────────────────────────
@@ -304,24 +323,22 @@ pub struct ModesState {
 
 // ─── Permissions ────────────────────────────────────────────────────
 
-/// Permission state for this session. The `permission_mgr` itself
-/// lives on `AppHandles`; these flags describe the per-session
-/// decisions layered on top of it.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Live permission posture for the current authenticated invocation.
+///
+/// [`crate::state::SessionState`] skips this entire category during serde so a
+/// conversation file can record neither bypass nor mirrored trust authority.
+#[derive(Debug, Clone, Default)]
 pub struct PermissionsState {
     /// `--dangerously-skip-permissions` was set for this session.
     /// Does NOT persist across sessions.
-    #[serde(default)]
     pub bypass_mode: bool,
-    /// The user has accepted the per-project trust prompt. Persists
-    /// across sessions via the existing `permission_mgr` storage;
-    /// mirrored here so callers can read a coherent snapshot.
-    #[serde(default)]
+    /// The current invocation has accepted its project trust prompt.
+    /// This is a process-local mirror only; any durable trust registry lives
+    /// outside conversation/session serialization.
     pub trust_accepted: bool,
     /// When true, no permission decisions made this session get
     /// persisted to the on-disk permissions store. Used by tests
     /// and ephemeral sandboxed sessions.
-    #[serde(default)]
     pub persistence_disabled: bool,
 }
 

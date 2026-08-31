@@ -6,8 +6,18 @@ use std::time::Instant;
 
 use ratatui::{buffer::CellWidth, prelude::*, widgets::Paragraph};
 
-use super::{GOLD, PURPLE, USER_BLUE};
+use super::safety::{
+    append_raw_bounded, sanitize_terminal_label, sanitize_terminal_text, EVENT_TEXT_LIMITS,
+    RENDER_TRUNCATION_MARKER, STREAM_TEXT_LIMITS, THINKING_TEXT_LIMITS,
+};
+use super::{PURPLE, USER_BLUE};
 pub use crate::state::EffortLevel;
+
+const MAX_RETAINED_MESSAGES: usize = 2000;
+const MAX_RETAINED_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_LAYOUT_LOGICAL_LINES: usize = 4096;
+const MAX_LAYOUT_SCROLL_ROWS: usize = 4096;
+const LAYOUT_OVERSCAN_ROWS: usize = 64;
 
 // ─── MessageKind ────────────────────────────────────────────────────────────
 
@@ -25,6 +35,8 @@ pub enum MessageKind {
     Assistant,
     /// A collapsed thinking summary (e.g. "Thought for 1.2s").
     Thinking,
+    /// Provider-sanctioned reasoning summary shown separately from the answer.
+    ReasoningSummary,
     /// An informational system message (no error).
     SystemInfo,
     /// An error-level system message.
@@ -263,12 +275,22 @@ pub struct MessageList {
     /// True while thinking/reasoning deltas are arriving for the current
     /// response, before any regular text has streamed in.
     pub is_thinking_now: bool,
+    /// Whether the current private-text buffer contains a sanctioned summary.
+    pub is_reasoning_summary_now: bool,
     /// When the current thinking block started. Used to render elapsed
     /// seconds next to the `∴ Thinking…` indicator.
     thinking_start: Option<Instant>,
     /// Accumulator for the full thinking stream. Rendered while live so the
     /// user can see progress during long reasoning/tool-planning phases.
     pub thinking_buffer: String,
+    retained_message_bytes: usize,
+    truncation: TruncationState,
+}
+
+#[derive(Clone, Copy)]
+struct TruncationState {
+    streaming: bool,
+    thinking: bool,
 }
 
 struct VisualGrapheme {
@@ -287,19 +309,79 @@ impl MessageList {
             streaming_text: String::new(),
             is_streaming: false,
             is_thinking_now: false,
+            is_reasoning_summary_now: false,
             thinking_start: None,
             thinking_buffer: String::new(),
+            retained_message_bytes: 0,
+            truncation: TruncationState {
+                streaming: false,
+                thinking: false,
+            },
         }
     }
 
     /// Record a thinking-delta chunk. The text is accumulated and rendered
     /// under the live `∴ Thinking…` indicator until the block finalizes.
     pub fn push_thinking(&mut self, text: &str) {
+        self.is_reasoning_summary_now = false;
         if self.thinking_start.is_none() {
             self.thinking_start = Some(Instant::now());
         }
         self.is_thinking_now = true;
-        self.thinking_buffer.push_str(text);
+        if self.truncation.thinking {
+            return;
+        }
+        let admitted = sanitize_terminal_text(text, EVENT_TEXT_LIMITS);
+        let content_limit = THINKING_TEXT_LIMITS
+            .max_output_bytes
+            .saturating_sub(RENDER_TRUNCATION_MARKER.len());
+        if append_raw_bounded(&mut self.thinking_buffer, admitted.as_str(), content_limit)
+            || admitted.was_truncated()
+        {
+            self.thinking_buffer.push_str(RENDER_TRUNCATION_MARKER);
+            self.truncation.thinking = true;
+        }
+    }
+
+    /// Record a provider-sanctioned reasoning-summary delta. This uses the
+    /// existing bounded transient buffer but labels the completed projection
+    /// as a summary rather than raw model thinking.
+    pub fn push_reasoning_summary(&mut self, text: &str) {
+        self.is_reasoning_summary_now = true;
+        self.is_thinking_now = true;
+        if self.truncation.thinking {
+            return;
+        }
+        let admitted = sanitize_terminal_text(text, EVENT_TEXT_LIMITS);
+        let content_limit = THINKING_TEXT_LIMITS
+            .max_output_bytes
+            .saturating_sub(RENDER_TRUNCATION_MARKER.len());
+        if append_raw_bounded(&mut self.thinking_buffer, admitted.as_str(), content_limit)
+            || admitted.was_truncated()
+        {
+            self.thinking_buffer.push_str(RENDER_TRUNCATION_MARKER);
+            self.truncation.thinking = true;
+        }
+    }
+
+    /// Finalize the current provider-sanctioned summary into one bounded
+    /// display message.
+    pub fn finish_reasoning_summary(&mut self) {
+        if !self.is_thinking_now {
+            return;
+        }
+        let summary = std::mem::take(&mut self.thinking_buffer);
+        self.is_thinking_now = false;
+        self.is_reasoning_summary_now = false;
+        self.thinking_start = None;
+        self.truncation.thinking = false;
+        if !summary.trim().is_empty() {
+            self.add(DisplayMessage {
+                kind: MessageKind::ReasoningSummary,
+                content: summary,
+            });
+        }
+        self.scroll_to_bottom();
     }
 
     /// Finalize the current thinking block: replace the live indicator
@@ -312,13 +394,15 @@ impl MessageList {
         let duration = self
             .thinking_start
             .map_or(0.0, |start| start.elapsed().as_secs_f64());
-        self.messages.push(DisplayMessage {
+        self.add(DisplayMessage {
             kind: MessageKind::Thinking,
             content: format!("Thought for {duration:.1}s"),
         });
         self.is_thinking_now = false;
+        self.is_reasoning_summary_now = false;
         self.thinking_start = None;
         self.thinking_buffer.clear();
+        self.truncation.thinking = false;
         self.scroll_to_bottom();
     }
 
@@ -330,6 +414,7 @@ impl MessageList {
     pub fn pop_last(&mut self, count: usize) {
         self.messages
             .truncate(self.messages.len().saturating_sub(count));
+        self.retained_message_bytes = self.messages.iter().map(message_size).sum();
     }
 
     /// Number of messages in the display list.
@@ -344,24 +429,70 @@ impl MessageList {
         self.messages.is_empty()
     }
 
-    pub fn add(&mut self, msg: DisplayMessage) {
+    pub fn add(&mut self, mut msg: DisplayMessage) {
+        msg.content = sanitize_terminal_text(&msg.content, EVENT_TEXT_LIMITS).into_string();
+        match &mut msg.kind {
+            MessageKind::ToolStart { name }
+            | MessageKind::ToolOk { name }
+            | MessageKind::ToolErr { name } => {
+                *name = sanitize_terminal_label(name).into_string();
+            }
+            MessageKind::User
+            | MessageKind::Assistant
+            | MessageKind::Thinking
+            | MessageKind::ReasoningSummary
+            | MessageKind::SystemInfo
+            | MessageKind::SystemError => {}
+        }
+        self.retained_message_bytes = self
+            .retained_message_bytes
+            .saturating_add(message_size(&msg));
         self.messages.push(msg);
+        let mut remove = 0usize;
+        while self.messages.len().saturating_sub(remove) > MAX_RETAINED_MESSAGES
+            || self.retained_message_bytes > MAX_RETAINED_MESSAGE_BYTES
+        {
+            let Some(message) = self.messages.get(remove) else {
+                break;
+            };
+            self.retained_message_bytes = self
+                .retained_message_bytes
+                .saturating_sub(message_size(message));
+            remove += 1;
+        }
+        if remove > 0 {
+            self.messages.drain(..remove);
+        }
         self.scroll_to_bottom();
     }
 
     pub fn append_streaming(&mut self, text: &str) {
-        self.streaming_text.push_str(text);
         self.is_streaming = true;
+        if self.truncation.streaming {
+            return;
+        }
+        let admitted = sanitize_terminal_text(text, EVENT_TEXT_LIMITS);
+        let content_limit = STREAM_TEXT_LIMITS
+            .max_output_bytes
+            .saturating_sub(RENDER_TRUNCATION_MARKER.len());
+        if append_raw_bounded(&mut self.streaming_text, admitted.as_str(), content_limit)
+            || admitted.was_truncated()
+        {
+            self.streaming_text.push_str(RENDER_TRUNCATION_MARKER);
+            self.truncation.streaming = true;
+        }
     }
 
     pub fn finish_streaming(&mut self) {
         if !self.streaming_text.is_empty() {
-            self.messages.push(DisplayMessage {
+            let content = std::mem::take(&mut self.streaming_text);
+            self.add(DisplayMessage {
                 kind: MessageKind::Assistant,
-                content: std::mem::take(&mut self.streaming_text),
+                content,
             });
         }
         self.is_streaming = false;
+        self.truncation.streaming = false;
     }
 
     pub const fn scroll_up(&mut self, n: u16) {
@@ -404,48 +535,15 @@ impl MessageList {
         total.saturating_sub(usize::from(self.scroll_offset))
     }
 
-    /// Append styled lines for the welcome banner system message.
-    fn append_welcome_lines<'a>(out: &mut Vec<Line<'a>>, content: &'a str) {
-        for line in content.lines() {
-            let styled = if line.starts_with("OpenClaudia v") {
-                Line::from(vec![
-                    Span::styled(
-                        "OpenClaudia",
-                        Style::default().fg(PURPLE).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(&line["OpenClaudia".len()..], Style::default().fg(GOLD)),
-                ])
-            } else if line.starts_with("Provider:") {
-                Line::from(Span::styled(line, Style::default().fg(PURPLE)))
-            } else if line.starts_with("Model:") {
-                Line::from(Span::styled(line, Style::default().fg(GOLD)))
-            } else if line.starts_with("Welcome") {
-                Line::from(Span::styled(
-                    line,
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ))
-            } else {
-                Line::from(Span::styled(line, Style::default().fg(Color::DarkGray)))
-            };
-            out.push(styled);
-        }
-    }
-
     /// Append rendered lines for a system-role message to `out`.
     fn append_system_lines<'a>(out: &mut Vec<Line<'a>>, msg: &'a DisplayMessage) {
-        if msg.content.contains("OpenClaudia v") {
-            Self::append_welcome_lines(out, &msg.content);
-        } else {
-            for line in msg.content.lines() {
-                out.push(Line::from(Span::styled(
-                    format!("  {line}"),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC),
-                )));
-            }
+        for line in msg.content.lines() {
+            out.push(Line::from(Span::styled(
+                format!("  {line}"),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )));
         }
         out.push(Line::from(""));
     }
@@ -513,6 +611,21 @@ impl MessageList {
                 )));
                 out.push(Line::from(""));
             }
+            MessageKind::ReasoningSummary => {
+                out.push(Line::from(Span::styled(
+                    "  Reasoning summary",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                )));
+                for line in msg.content.lines() {
+                    out.push(Line::from(Span::styled(
+                        format!("    {line}"),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                out.push(Line::from(""));
+            }
             MessageKind::ToolStart { .. }
             | MessageKind::ToolOk { .. }
             | MessageKind::ToolErr { .. } => {
@@ -521,24 +634,49 @@ impl MessageList {
         }
     }
 
-    /// Build ratatui Lines for rendering.
+    /// Build a bounded tail of logical lines for rendering.
     fn build_lines(&self) -> Vec<Line<'_>> {
         let mut lines: Vec<Line> = Vec::new();
+        let mut selected = VecDeque::new();
+        let mut selected_lines = 0usize;
 
-        for msg in &self.messages {
+        for msg in self.messages.iter().rev() {
+            let message_lines = msg.content.lines().count().saturating_add(2);
+            if !selected.is_empty()
+                && selected_lines.saturating_add(message_lines) > MAX_LAYOUT_LOGICAL_LINES
+            {
+                break;
+            }
+            selected.push_front(msg);
+            selected_lines = selected_lines.saturating_add(message_lines);
+        }
+        let omitted = selected.len() < self.messages.len();
+        if omitted {
+            lines.push(Line::from(Span::styled(
+                "  … older messages omitted from this viewport …",
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(""));
+        }
+        for msg in selected {
             Self::append_message_lines(&mut lines, msg);
         }
 
         // Live thinking indicator (while thinking deltas are arriving)
         if self.is_thinking_now {
-            let elapsed = self
-                .thinking_start
-                .map_or(0.0, |s| s.elapsed().as_secs_f64());
             let thinking_style = Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC);
+            let label = if self.is_reasoning_summary_now {
+                "Provider reasoning summary…".to_string()
+            } else {
+                let elapsed = self
+                    .thinking_start
+                    .map_or(0.0, |s| s.elapsed().as_secs_f64());
+                format!("∴ Thinking… ({elapsed:.1}s)")
+            };
             lines.push(Line::from(Span::styled(
-                format!("  \u{2234} Thinking\u{2026} ({elapsed:.1}s)"),
+                format!("  {label}"),
                 thinking_style,
             )));
             for line in self.thinking_buffer.lines() {
@@ -566,6 +704,9 @@ impl MessageList {
             )));
         }
 
+        if lines.len() > MAX_LAYOUT_LOGICAL_LINES {
+            lines.drain(..lines.len() - MAX_LAYOUT_LOGICAL_LINES);
+        }
         lines
     }
 
@@ -691,15 +832,21 @@ impl MessageList {
         wrapped
     }
 
-    fn wrap_lines(lines: &[Line<'_>], width: u16) -> Vec<Line<'static>> {
+    fn wrap_lines_tail(lines: &[Line<'_>], width: u16, required_rows: usize) -> Vec<Line<'static>> {
         if width == 0 {
             return Vec::new();
         }
-
-        lines
-            .iter()
-            .flat_map(|line| Self::wrap_line(line, width))
-            .collect()
+        let mut wrapped = VecDeque::new();
+        for line in lines.iter().rev() {
+            let visual_lines = Self::wrap_line(line, width);
+            for visual in visual_lines.into_iter().rev() {
+                wrapped.push_front(visual);
+                if wrapped.len() >= required_rows {
+                    return wrapped.into();
+                }
+            }
+        }
+        wrapped.into()
     }
 
     /// Render the message list into a frame area.
@@ -710,9 +857,13 @@ impl MessageList {
         }
 
         let logical_lines = self.build_lines();
-        let mut lines = Self::wrap_lines(&logical_lines, area.width);
-        let mut total = lines.len();
         let visible = usize::from(area.height);
+        let scroll_rows = usize::from(self.scroll_offset).min(MAX_LAYOUT_SCROLL_ROWS);
+        let required_rows = visible
+            .saturating_add(scroll_rows)
+            .saturating_add(LAYOUT_OVERSCAN_ROWS);
+        let mut lines = Self::wrap_lines_tail(&logical_lines, area.width, required_rows);
+        let mut total = lines.len();
 
         // Pad the top with empty lines so content anchors to the bottom
         if total < visible {
@@ -733,6 +884,13 @@ impl MessageList {
 
         frame.render_widget(paragraph, area);
     }
+}
+
+fn message_size(message: &DisplayMessage) -> usize {
+    message
+        .content
+        .len()
+        .saturating_add(message.kind.tool_name().map_or(0, str::len))
 }
 
 impl Default for MessageList {

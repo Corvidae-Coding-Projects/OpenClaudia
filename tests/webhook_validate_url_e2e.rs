@@ -1,9 +1,9 @@
 //! End-to-end tests for `tools::remote_trigger::WebhookRegistry::validate_url`
 //! — the URL safety guard. Pins documented semantics: empty
 //! rejection, scheme upgrade for scheme-less input, explicit
-//! `http://` rejected in strict mode (default), `http://`
-//! accepted via `new_allow_plaintext`, non-http(s) schemes
-//! rejected, missing host rejected.
+//! `http://` rejected in strict mode (default), exact loopback
+//! `http://` accepted via `new_allow_plaintext`, public plaintext and
+//! non-http(s) schemes rejected, and missing hosts rejected.
 //!
 //! Sprint 217 of the verification effort.
 
@@ -13,11 +13,11 @@
 
 use openclaudia::tools::remote_trigger::{WebhookError, WebhookRegistry};
 
-fn strict() -> WebhookRegistry {
+const fn strict() -> WebhookRegistry {
     WebhookRegistry::new()
 }
 
-fn plaintext_ok() -> WebhookRegistry {
+const fn plaintext_ok() -> WebhookRegistry {
     WebhookRegistry::new_allow_plaintext()
 }
 
@@ -48,18 +48,14 @@ fn scheme_less_url_upgraded_to_https() {
     // PINS DOC: example.com/hook → https://example.com/hook
     let r = strict();
     let outcome = r.validate_url("example.com/hook").expect("ok");
-    assert!(
-        outcome.starts_with("https://"),
-        "scheme-less MUST upgrade to https; got {outcome:?}"
-    );
+    assert!(outcome.matches("https://example.com/hook"));
 }
 
 #[test]
 fn scheme_less_url_preserves_path_after_upgrade() {
     let r = strict();
     let outcome = r.validate_url("api.example.com/v1/x").expect("ok");
-    assert!(outcome.contains("api.example.com"));
-    assert!(outcome.contains("/v1/x"));
+    assert!(outcome.matches("https://api.example.com/v1/x"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -85,10 +81,12 @@ fn https_url_with_port_accepted() {
 }
 
 #[test]
-fn https_url_with_userinfo_accepted() {
+fn https_url_with_userinfo_rejected() {
     let r = strict();
-    // Userinfo present — still a valid host-bearing URL.
-    assert!(r.validate_url("https://u:p@example.com/").is_ok());
+    assert!(matches!(
+        r.validate_url("https://u:p@example.com/"),
+        Err(WebhookError::CredentialsInUrl {})
+    ));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -111,25 +109,26 @@ fn explicit_http_url_with_path_rejected_in_strict_mode() {
 }
 
 #[test]
-fn http_insecure_error_carries_raw_url_for_diagnostics() {
+fn http_insecure_error_does_not_carry_raw_url_for_diagnostics() {
     let r = strict();
-    let err = r.validate_url("http://marker-217.com/").unwrap_err();
-    match err {
-        WebhookError::InsecureScheme { url } => {
-            assert_eq!(url, "http://marker-217.com/");
-        }
-        other => panic!("expected InsecureScheme; got {other:?}"),
-    }
+    let sentinel = "http://marker-217.com/hook?token=webhook-secret-sentinel";
+    let err = r.validate_url(sentinel).unwrap_err();
+    assert!(matches!(err, WebhookError::InsecureScheme { .. }));
+    assert!(!format!("{err:?}").contains("webhook-secret-sentinel"));
+    assert!(!err.to_string().contains("webhook-secret-sentinel"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section E — http accepted in plaintext-allowed mode
+// Section E — only exact loopback http accepted in plaintext-allowed mode
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn explicit_http_url_accepted_in_plaintext_mode() {
+fn explicit_public_http_url_rejected_even_in_plaintext_mode() {
     let r = plaintext_ok();
-    assert!(r.validate_url("http://example.com/").is_ok());
+    assert!(matches!(
+        r.validate_url("http://example.com/"),
+        Err(WebhookError::InsecureScheme {})
+    ));
 }
 
 #[test]
@@ -172,16 +171,11 @@ fn javascript_scheme_rejected() {
 }
 
 #[test]
-fn invalid_scheme_error_carries_lowercase_scheme() {
+fn invalid_scheme_error_does_not_carry_untrusted_scheme() {
     let r = strict();
     let err = r.validate_url("FTP://example.com/").unwrap_err();
-    match err {
-        WebhookError::InvalidScheme { scheme } => {
-            // PINS DOC: scheme is lowercased in the error.
-            assert_eq!(scheme, "ftp");
-        }
-        other => panic!("expected InvalidScheme; got {other:?}"),
-    }
+    assert!(matches!(err, WebhookError::InvalidScheme { .. }));
+    assert!(!format!("{err:?}").contains("ftp"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────

@@ -42,9 +42,9 @@ fn marker_starts_with_bracket_namespace_prefix() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn build_message_uses_system_role() {
+fn build_message_uses_assistant_evidence_role() {
     let msg = build_compact_boundary_message(100, 5, Vec::new(), None);
-    assert_eq!(msg.role, "system");
+    assert_eq!(msg.role, "assistant");
 }
 
 #[test]
@@ -104,14 +104,14 @@ fn build_message_json_metadata_is_well_formed() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn is_compact_boundary_recognises_marker_in_system_text_content() {
+fn is_compact_boundary_recognises_marker_in_assistant_text_content() {
     let msg = build_compact_boundary_message(100, 1, Vec::new(), None);
     assert!(is_compact_boundary_message(&msg));
 }
 
 #[test]
 fn is_compact_boundary_rejects_user_role_with_same_text() {
-    // PINS ROLE: only system role qualifies.
+    // PINS ROLE: only assistant historical-evidence messages qualify.
     let mut msg = build_compact_boundary_message(100, 1, Vec::new(), None);
     msg.role = "user".to_string();
     assert!(
@@ -121,16 +121,16 @@ fn is_compact_boundary_rejects_user_role_with_same_text() {
 }
 
 #[test]
-fn is_compact_boundary_rejects_assistant_role_with_same_text() {
+fn is_compact_boundary_accepts_legacy_system_role_for_compatibility() {
     let mut msg = build_compact_boundary_message(100, 1, Vec::new(), None);
-    msg.role = "assistant".to_string();
-    assert!(!is_compact_boundary_message(&msg));
+    msg.role = "system".to_string();
+    assert!(is_compact_boundary_message(&msg));
 }
 
 #[test]
-fn is_compact_boundary_rejects_system_text_not_starting_with_marker() {
+fn is_compact_boundary_rejects_assistant_text_not_starting_with_marker() {
     let msg = ChatMessage {
-        role: "system".to_string(),
+        role: "assistant".to_string(),
         content: MessageContent::Text("not a boundary message".to_string()),
         name: None,
         tool_calls: None,
@@ -144,7 +144,7 @@ fn is_compact_boundary_rejects_system_text_not_starting_with_marker() {
 fn is_compact_boundary_rejects_marker_embedded_mid_text() {
     // PINS PREFIX: marker MUST be at start, not embedded.
     let msg = ChatMessage {
-        role: "system".to_string(),
+        role: "assistant".to_string(),
         content: MessageContent::Text(format!("prefix {COMPACT_BOUNDARY_MARKER} body")),
         name: None,
         tool_calls: None,
@@ -162,7 +162,7 @@ fn is_compact_boundary_recognises_parts_content_with_marker_text() {
     // PINS PARTS BRANCH: Parts variant with a text part
     // starting with the marker also qualifies.
     let msg = ChatMessage {
-        role: "system".to_string(),
+        role: "assistant".to_string(),
         content: MessageContent::Parts(vec![ContentPart {
             content_type: "text".to_string(),
             text: Some(format!("{COMPACT_BOUNDARY_MARKER} {{}}")),
@@ -180,7 +180,7 @@ fn is_compact_boundary_recognises_parts_content_with_marker_text() {
 fn is_compact_boundary_recognises_parts_with_marker_in_any_text_part() {
     // PINS: .any() — marker text in ANY part qualifies.
     let msg = ChatMessage {
-        role: "system".to_string(),
+        role: "assistant".to_string(),
         content: MessageContent::Parts(vec![
             ContentPart {
                 content_type: "text".to_string(),
@@ -271,7 +271,7 @@ fn extract_returns_metadata_from_parts_content_branch() {
     // PINS PARTS BRANCH: extract walks Parts too.
     let metadata_json = r#"{"trigger":"manual","pre_tokens":999,"messages_summarized":3,"archive_ids":[],"archive_session_id":null}"#;
     let msg = ChatMessage {
-        role: "system".to_string(),
+        role: "assistant".to_string(),
         content: MessageContent::Parts(vec![ContentPart {
             content_type: "text".to_string(),
             text: Some(format!("{COMPACT_BOUNDARY_MARKER} {metadata_json}\nbody")),

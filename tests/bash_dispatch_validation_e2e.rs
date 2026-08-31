@@ -12,33 +12,14 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::registry::{registry, ToolContext};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-fn dispatch_bash(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("bash", args, &mut ctx)
-        .expect("bash must be registered")
-}
+mod support;
 
-fn dispatch_bash_output(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("bash_output", args, &mut ctx)
-        .expect("bash_output must be registered")
+fn dispatch_bash(args: &HashMap<String, Value>) -> (String, bool) {
+    support::dispatch_tool("bash", args)
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -69,7 +50,9 @@ fn command_arg_as_number_returns_validation_error() {
     let (msg, is_err) = dispatch_bash(&args);
     assert!(is_err);
     assert!(
-        msg.contains("Invalid 'command' argument: expected string"),
+        msg.contains("Host safety")
+            && msg.contains("malformed arguments")
+            && msg.contains("'command'"),
         "non-string command MUST be rejected clearly; got {msg:?}"
     );
 }
@@ -80,7 +63,9 @@ fn command_arg_as_array_returns_validation_error() {
     let (msg, is_err) = dispatch_bash(&args);
     assert!(is_err);
     assert!(
-        msg.contains("Invalid 'command' argument: expected string"),
+        msg.contains("Host safety")
+            && msg.contains("malformed arguments")
+            && msg.contains("'command'"),
         "array command MUST be rejected clearly; got {msg:?}"
     );
 }
@@ -90,7 +75,9 @@ fn command_arg_as_object_returns_validation_error() {
     let args = args_with(&[("command", json!({"cmd": "echo"}))]);
     let (msg, is_err) = dispatch_bash(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'command' argument: expected string"));
+    assert!(msg.contains("Host safety"));
+    assert!(msg.contains("malformed arguments"));
+    assert!(msg.contains("'command'"));
 }
 
 #[test]
@@ -98,7 +85,8 @@ fn command_arg_as_null_returns_validation_error() {
     let args = args_with(&[("command", Value::Null)]);
     let (msg, is_err) = dispatch_bash(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'command' argument: expected string"));
+    assert!(msg.contains("Host safety"));
+    assert!(msg.contains("Missing 'command' argument"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -145,14 +133,16 @@ fn command_at_exactly_4096_bytes_passes_length_check() {
 
 #[test]
 fn bash_records_command_observation_when_session_ledger_is_active() {
-    let _session_guard = openclaudia::tools::SessionIdGuard::set("bashledger");
+    let run = support::test_run_context(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+    let session_id = run.session_id().to_string();
     let ledger = Arc::new(Mutex::new(openclaudia::ledger::RealityLedger::new()));
     let _ledger_guard =
-        openclaudia::ledger::install_active_ledger_for_session("bashledger", Arc::clone(&ledger));
+        openclaudia::ledger::install_active_ledger_for_session(&session_id, Arc::clone(&ledger));
 
     let command = "printf ledger-bash";
     let args = args_with(&[("command", json!(command))]);
-    let (msg, is_err) = dispatch_bash(&args);
+    let result = support::dispatch_tool_result_for_run(&run, "bash", &args);
+    let (msg, is_err) = support::legacy(&result);
     assert!(!is_err, "bash should succeed: {msg}");
     assert_eq!(msg, "ledger-bash");
 
@@ -181,24 +171,35 @@ fn bash_records_command_observation_when_session_ledger_is_active() {
     assert_eq!(stdout, "ledger-bash");
     assert_eq!(stderr, "");
     assert_eq!(
-        observation.authority,
-        openclaudia::ledger::Authority::Command
+        observation.provenance.trust,
+        openclaudia::ledger::EvidenceTrust::RuntimeObserved
     );
+    assert_eq!(
+        observation.provenance.source,
+        openclaudia::ledger::EvidenceSource::CommandExecution
+    );
+    assert!(observation.provenance.is_bound_to(&run));
+    assert!(matches!(
+        observation.provenance.artifact,
+        Some(openclaudia::ledger::ArtifactBinding::Command { .. })
+    ));
 }
 
 #[test]
 fn background_bash_records_command_observation_after_finish() {
-    let _session_guard = openclaudia::tools::SessionIdGuard::set("bashbgledger");
+    let run = support::test_run_context(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+    let session_id = run.session_id().to_string();
     let ledger = Arc::new(Mutex::new(openclaudia::ledger::RealityLedger::new()));
     let _ledger_guard =
-        openclaudia::ledger::install_active_ledger_for_session("bashbgledger", Arc::clone(&ledger));
+        openclaudia::ledger::install_active_ledger_for_session(&session_id, Arc::clone(&ledger));
 
     let command = "printf ledger-background";
     let args = args_with(&[
         ("command", json!(command)),
         ("run_in_background", json!(true)),
     ]);
-    let (msg, is_err) = dispatch_bash(&args);
+    let result = support::dispatch_tool_result_for_run(&run, "bash", &args);
+    let (msg, is_err) = support::legacy(&result);
     assert!(!is_err, "background bash should start: {msg}");
     let shell_id = msg
         .lines()
@@ -215,7 +216,8 @@ fn background_bash_records_command_observation_after_finish() {
     }
 
     let output_args = args_with(&[("shell_id", json!(shell_id))]);
-    let (output_msg, output_is_err) = dispatch_bash_output(&output_args);
+    let output_result = support::dispatch_tool_result_for_run(&run, "bash_output", &output_args);
+    let (output_msg, output_is_err) = support::legacy(&output_result);
     assert!(
         !output_is_err,
         "bash_output should retrieve finished shell: {output_msg}"

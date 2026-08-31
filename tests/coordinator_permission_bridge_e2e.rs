@@ -158,19 +158,36 @@ fn always_allow_for_one_target_does_not_leak_to_another_target() {
 }
 
 #[test]
+fn always_allow_for_write_path_does_not_leak_to_different_content() {
+    let mut bridge = LeaderPermissionBridge::new();
+    let alpha = TeammateId::new();
+    let approved = r#"{"content":"approved","path":"src/main.rs"}"#;
+    let changed = r#"{"path":"src/main.rs","content":"changed"}"#;
+    bridge.always_allow(alpha.clone(), "write_file", approved);
+
+    // JSON key order is normalized, but a changed argument remains distinct.
+    assert!(bridge.is_always_allowed(
+        &alpha,
+        "write_file",
+        r#"{"path":"src/main.rs","content":"approved"}"#
+    ));
+    assert!(!bridge.is_always_allowed(&alpha, "write_file", changed));
+}
+
+#[test]
 fn always_allow_is_idempotent_repeated_calls_no_effect() {
     let mut bridge = LeaderPermissionBridge::new();
     let alpha = TeammateId::new();
     bridge.always_allow(alpha.clone(), "bash", "git status");
     bridge.always_allow(alpha.clone(), "bash", "git status");
     bridge.always_allow(alpha.clone(), "bash", "git status");
-    // Idempotent — HashSet dedups; bridge stays consistent.
+    // Idempotent — the exact bounded receipt is replaced, not widened.
     assert!(bridge.is_always_allowed(&alpha, "bash", "git status"));
 }
 
 #[test]
 fn always_allow_unknown_teammate_lookup_returns_false() {
-    let bridge = LeaderPermissionBridge::new();
+    let mut bridge = LeaderPermissionBridge::new();
     let alpha = TeammateId::new();
     assert!(!bridge.is_always_allowed(&alpha, "bash", "git status"));
 }

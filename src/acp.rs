@@ -15,24 +15,28 @@
 //! caller crosses `OpenClaudia`'s filesystem jail and OS sandbox instead of
 //! trusting the client's filesystem or terminal implementation.
 
-use std::collections::{HashMap, VecDeque};
-use std::io::{self, BufRead, Write};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::config::AppConfig;
-use crate::hooks::{load_claude_code_hooks, merge_hooks_config, HookEngine};
-use crate::permissions::{CheckResult, PermissionContext, PermissionManager};
+use crate::hooks::{load_effective_hooks, HookEngine};
+use crate::permissions::PermissionManager;
 use crate::providers::get_adapter;
-use crate::rules::RulesEngine;
 use crate::session::{SessionManager, SessionMode};
 use crate::tools::args::ToolArgs as _;
+use crate::tools::{
+    ToolFailure, ToolFailureCode, ToolHandlerResult, ToolOutcome, ToolResult, ToolRetryability,
+};
 
 // Preserve the public ACP wire-type path while the canonical definitions live
 // with the rest of the session snapshot.
@@ -42,20 +46,13 @@ pub use crate::state::{IdeDiagnostic, IdeSelection, IdeState};
 // JSON-RPC types
 // ============================================================================
 
-/// Incoming JSON-RPC message (could be request, notification, or response).
-#[derive(Debug, Clone, Deserialize)]
+/// Validated incoming JSON-RPC request or notification.
+#[derive(Debug, Clone)]
 pub(crate) struct JsonRpcMessage {
-    #[allow(dead_code)]
-    jsonrpc: String,
-    /// Present on requests (needs response) and responses.
-    #[serde(default)]
+    /// Present on requests that need a response.
     id: Option<Value>,
-    /// Present on requests and notifications.
-    #[serde(default)]
-    method: Option<String>,
-    /// Present on requests and notifications.
-    #[serde(default)]
-    params: Option<Value>,
+    method: String,
+    params: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,30 +89,713 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const _INTERNAL_ERROR: i64 = -32603;
+const ACP_CANCELLED: i64 = -32_800;
+
+// Transport and retained-state bounds. These are deliberately byte limits,
+// not token estimates: every layer can enforce them before allocating the
+// next buffer or publishing a wire frame.
+const MAX_ACP_INPUT_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_ACP_INPUT_QUEUE_FRAMES: usize = 32;
+const MAX_ACP_OUTPUT_QUEUE_FRAMES: usize = 16;
+const MAX_ACP_OUTPUT_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ACP_UPDATE_BYTES: usize = 512 * 1024;
+const MAX_ACP_ERROR_BYTES: usize = 16 * 1024;
+const MAX_ACP_PROMPT_BYTES: usize = 256 * 1024;
+const MAX_ACP_HISTORY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ACP_TOOL_ARGUMENT_BYTES: usize = 256 * 1024;
+const MAX_ACP_TOOL_BYTES_PER_TURN: usize = 2 * 1024 * 1024;
+const MAX_ACP_TOOL_OUTPUT_BYTES: usize = 512 * 1024;
+const MAX_ACP_ASSISTANT_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ACP_TOOL_CALLS_PER_TURN: usize = 128;
+const MAX_ACP_ID_BYTES: usize = 256;
+const MAX_ACP_METHOD_BYTES: usize = 128;
+const MAX_ACP_SESSION_ID_BYTES: usize = 256;
+const MAX_ACP_FILE_PATH_BYTES: usize = 16 * 1024;
+const MAX_ACP_IDE_SELECTION_BYTES: usize = 64 * 1024;
+const MAX_ACP_IDE_DIAGNOSTIC_FILES: usize = 128;
+const MAX_ACP_IDE_DIAGNOSTICS_PER_FILE: usize = 256;
+const MAX_ACP_IDE_DIAGNOSTIC_MESSAGE_BYTES: usize = 4 * 1024;
+const ACP_FRAME_ASSEMBLY_TIMEOUT: Duration = Duration::from_secs(30);
+const ACP_OUTPUT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Error)]
+enum AcpTransportError {
+    #[error("ACP JSON frame exceeded its {limit}-byte limit")]
+    FrameTooLarge { limit: usize },
+    #[error("ACP JSON serialization failed: {0}")]
+    Serialize(#[from] serde_json::Error),
+    #[error("ACP JSON frame was not UTF-8")]
+    InvalidUtf8,
+    #[error("ACP output queue is full")]
+    OutputBackpressure,
+    #[error("ACP output client disconnected")]
+    OutputDisconnected,
+}
+
+struct BoundedJsonWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedJsonWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(limit.min(8 * 1024)),
+            limit,
+        }
+    }
+
+    fn finish(self) -> Result<String, AcpTransportError> {
+        String::from_utf8(self.bytes).map_err(|_| AcpTransportError::InvalidUtf8)
+    }
+}
+
+impl Write for BoundedJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.bytes.len().saturating_add(bytes.len()) > self.limit {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                AcpTransportError::FrameTooLarge { limit: self.limit },
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_bounded_json<T: Serialize>(
+    value: &T,
+    limit: usize,
+) -> Result<String, AcpTransportError> {
+    let mut writer = BoundedJsonWriter::new(limit);
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => writer.finish(),
+        Err(error) if error.io_error_kind() == Some(io::ErrorKind::FileTooLarge) => {
+            Err(AcpTransportError::FrameTooLarge { limit })
+        }
+        Err(error) => Err(AcpTransportError::Serialize(error)),
+    }
+}
+
+fn bounded_json_size<T: Serialize>(value: &T, limit: usize) -> Result<usize, AcpTransportError> {
+    serialize_bounded_json(value, limit).map(|encoded| encoded.len())
+}
+
+fn bounded_diagnostic(message: &str) -> String {
+    crate::tools::safe_truncate(message, MAX_ACP_ERROR_BYTES).to_string()
+}
+
+fn validate_bounded_string(value: &Value, field: &str, limit: usize) -> Result<(), String> {
+    let Some(value) = value.as_str() else {
+        return Err(format!("Invalid '{field}' parameter: expected string"));
+    };
+    if value.len() > limit {
+        return Err(format!("'{field}' exceeds the {limit}-byte ACP limit"));
+    }
+    Ok(())
+}
+
+fn validate_optional_bounded_string(
+    params: &serde_json::Map<String, Value>,
+    field: &str,
+    limit: usize,
+) -> Result<(), String> {
+    params
+        .get(field)
+        .map_or(Ok(()), |value| validate_bounded_string(value, field, limit))
+}
+
+fn required_params_object(params: &Value) -> Result<&serde_json::Map<String, Value>, String> {
+    params
+        .as_object()
+        .ok_or_else(|| "JSON-RPC params must be an object".to_string())
+}
+
+#[allow(clippy::too_many_lines)] // Protocol schemas stay adjacent so supported ACP methods cannot drift apart.
+fn validate_json_rpc_method_schema(message: &JsonRpcMessage) -> Result<(), String> {
+    let method = message.method.as_str();
+    let id_required = matches!(
+        method,
+        "initialize"
+            | "authenticate"
+            | "session/new"
+            | "session/load"
+            | "session/prompt"
+            | "session/set_mode"
+            | "session/set_config_option"
+    );
+    if id_required && message.id.is_none() {
+        return Err(format!("ACP method '{method}' requires a JSON-RPC id"));
+    }
+    if method.starts_with("ide/") && message.id.is_some() {
+        return Err(format!("ACP IDE method '{method}' must be a notification"));
+    }
+
+    match method {
+        "initialize" | "authenticate" | "session/new" => {
+            if !message.params.is_null() && !message.params.is_object() {
+                return Err(format!("ACP method '{method}' requires object params"));
+            }
+        }
+        "session/load" => {
+            let params = required_params_object(&message.params)?;
+            let session_id = params
+                .get("sessionId")
+                .ok_or_else(|| "Missing sessionId".to_string())?;
+            validate_bounded_string(session_id, "sessionId", MAX_ACP_SESSION_ID_BYTES)?;
+            if session_id.as_str().is_some_and(str::is_empty) {
+                return Err("sessionId must not be empty".to_string());
+            }
+        }
+        "session/prompt" => {
+            let params = required_params_object(&message.params)?;
+            let session_id = params
+                .get("sessionId")
+                .ok_or_else(|| "Missing sessionId".to_string())?;
+            validate_bounded_string(session_id, "sessionId", MAX_ACP_SESSION_ID_BYTES)?;
+            if session_id.as_str().is_some_and(str::is_empty) {
+                return Err("sessionId must not be empty".to_string());
+            }
+            let prompt = params
+                .get("prompt")
+                .ok_or_else(|| "Missing prompt".to_string())?;
+            validate_bounded_string(prompt, "prompt", MAX_ACP_PROMPT_BYTES)?;
+        }
+        "session/cancel" => {
+            let params = required_params_object(&message.params)?;
+            let session_id = params
+                .get("sessionId")
+                .ok_or_else(|| "Missing sessionId".to_string())?;
+            validate_bounded_string(session_id, "sessionId", MAX_ACP_SESSION_ID_BYTES)?;
+            validate_optional_bounded_string(params, "callId", MAX_ACP_ID_BYTES)?;
+        }
+        "session/set_mode" => {
+            let params = required_params_object(&message.params)?;
+            validate_optional_bounded_string(params, "sessionId", MAX_ACP_SESSION_ID_BYTES)?;
+            let mode = params
+                .get("mode")
+                .or_else(|| params.get("modeId"))
+                .ok_or_else(|| "Missing mode".to_string())?;
+            validate_bounded_string(mode, "mode", MAX_ACP_METHOD_BYTES)?;
+        }
+        "session/set_config_option" => {
+            let params = required_params_object(&message.params)?;
+            validate_optional_bounded_string(params, "sessionId", MAX_ACP_SESSION_ID_BYTES)?;
+            let config_id = params
+                .get("configId")
+                .or_else(|| params.get("key"))
+                .ok_or_else(|| "Missing configId".to_string())?;
+            validate_bounded_string(config_id, "configId", MAX_ACP_METHOD_BYTES)?;
+            let value = params
+                .get("value")
+                .ok_or_else(|| "Missing string value".to_string())?;
+            validate_bounded_string(value, "value", MAX_ACP_PROMPT_BYTES)?;
+        }
+        "ide/file_opened" | "ide/file_closed" | "ide/selection_changed" => {
+            let params = required_params_object(&message.params)?;
+            let session_id = params
+                .get("sessionId")
+                .ok_or_else(|| "Missing sessionId".to_string())?;
+            validate_bounded_string(session_id, "sessionId", MAX_ACP_SESSION_ID_BYTES)?;
+            let path = params
+                .get("filePath")
+                .ok_or_else(|| "Missing filePath".to_string())?;
+            validate_bounded_string(path, "filePath", MAX_ACP_FILE_PATH_BYTES)?;
+            if method == "ide/selection_changed" {
+                validate_optional_bounded_string(params, "text", MAX_ACP_IDE_SELECTION_BYTES)?;
+                if params
+                    .get("selection")
+                    .is_some_and(|value| !value.is_object())
+                {
+                    return Err("Invalid 'selection' parameter: expected object".to_string());
+                }
+            }
+        }
+        "ide/diagnostics" => {
+            let params = required_params_object(&message.params)?;
+            let session_id = params
+                .get("sessionId")
+                .ok_or_else(|| "Missing sessionId".to_string())?;
+            validate_bounded_string(session_id, "sessionId", MAX_ACP_SESSION_ID_BYTES)?;
+            let path = params
+                .get("filePath")
+                .ok_or_else(|| "Missing filePath".to_string())?;
+            validate_bounded_string(path, "filePath", MAX_ACP_FILE_PATH_BYTES)?;
+            if let Some(diagnostics) = params.get("diagnostics") {
+                let diagnostics = diagnostics
+                    .as_array()
+                    .ok_or_else(|| "Invalid 'diagnostics' parameter: expected array".to_string())?;
+                if diagnostics.len() > MAX_ACP_IDE_DIAGNOSTICS_PER_FILE {
+                    return Err(format!(
+                        "'diagnostics' exceeds the {MAX_ACP_IDE_DIAGNOSTICS_PER_FILE}-item ACP limit"
+                    ));
+                }
+                for diagnostic in diagnostics {
+                    let diagnostic = diagnostic
+                        .as_object()
+                        .ok_or_else(|| "Invalid diagnostic entry: expected object".to_string())?;
+                    for field in ["severity", "message"] {
+                        let value = diagnostic
+                            .get(field)
+                            .ok_or_else(|| format!("Diagnostic missing '{field}'"))?;
+                        validate_bounded_string(
+                            value,
+                            field,
+                            MAX_ACP_IDE_DIAGNOSTIC_MESSAGE_BYTES,
+                        )?;
+                    }
+                    validate_optional_bounded_string(
+                        diagnostic,
+                        "source",
+                        MAX_ACP_IDE_DIAGNOSTIC_MESSAGE_BYTES,
+                    )?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn decode_json_rpc_frame(frame: &[u8]) -> Result<JsonRpcMessage, (Value, i64, String)> {
+    let value = serde_json::from_slice::<Value>(frame).map_err(|error| {
+        (
+            Value::Null,
+            PARSE_ERROR,
+            bounded_diagnostic(&format!("Parse error: {error}")),
+        )
+    })?;
+    let Value::Object(mut object) = value else {
+        return Err((
+            Value::Null,
+            INVALID_REQUEST,
+            "JSON-RPC message must be an object".to_string(),
+        ));
+    };
+    let id = object.remove("id");
+    let error_id = id.clone().unwrap_or(Value::Null);
+    match object.remove("jsonrpc") {
+        Some(Value::String(version)) if version == "2.0" => {}
+        Some(_) => {
+            return Err((
+                error_id,
+                INVALID_REQUEST,
+                "JSON-RPC version must be exactly '2.0'".to_string(),
+            ));
+        }
+        None => {
+            return Err((
+                error_id,
+                INVALID_REQUEST,
+                "Missing jsonrpc field".to_string(),
+            ));
+        }
+    }
+    if let Some(id) = id.as_ref() {
+        let valid = match id {
+            Value::String(value) => !value.is_empty() && value.len() <= MAX_ACP_ID_BYTES,
+            Value::Number(number) => number.as_i64().is_some() || number.as_u64().is_some(),
+            _ => false,
+        };
+        if !valid {
+            return Err((
+                Value::Null,
+                INVALID_REQUEST,
+                format!(
+                    "JSON-RPC id must be a non-empty string of at most {MAX_ACP_ID_BYTES} bytes or an integer"
+                ),
+            ));
+        }
+    }
+    let method = match object.remove("method") {
+        Some(Value::String(method))
+            if !method.is_empty() && method.len() <= MAX_ACP_METHOD_BYTES =>
+        {
+            method
+        }
+        Some(Value::String(_)) => {
+            return Err((
+                error_id,
+                INVALID_REQUEST,
+                format!(
+                    "JSON-RPC method must be non-empty and at most {MAX_ACP_METHOD_BYTES} bytes"
+                ),
+            ));
+        }
+        Some(_) => {
+            return Err((
+                error_id,
+                INVALID_REQUEST,
+                "JSON-RPC method must be a string".to_string(),
+            ));
+        }
+        None => {
+            return Err((
+                error_id,
+                INVALID_REQUEST,
+                "Missing method field".to_string(),
+            ));
+        }
+    };
+    let params = object.remove("params").unwrap_or(Value::Null);
+    if !params.is_null() && !params.is_object() {
+        return Err((
+            error_id,
+            INVALID_PARAMS,
+            "JSON-RPC params must be an object".to_string(),
+        ));
+    }
+    let message = JsonRpcMessage { id, method, params };
+    validate_json_rpc_method_schema(&message)
+        .map_err(|message_text| (error_id, INVALID_PARAMS, message_text))?;
+    Ok(message)
+}
+
+#[derive(Debug)]
+enum AcpInbound {
+    Message(JsonRpcMessage),
+    ProtocolError {
+        id: Value,
+        code: i64,
+        message: String,
+    },
+}
+
+#[derive(Debug)]
+struct AcpFrameDecoder {
+    current: Vec<u8>,
+    discarding_oversized: bool,
+    started_at: Option<Instant>,
+}
+
+impl Default for AcpFrameDecoder {
+    fn default() -> Self {
+        Self {
+            current: Vec::with_capacity(8 * 1024),
+            discarding_oversized: false,
+            started_at: None,
+        }
+    }
+}
+
+impl AcpFrameDecoder {
+    const fn has_partial_frame(&self) -> bool {
+        self.discarding_oversized || !self.current.is_empty()
+    }
+
+    fn remaining_assembly_time(&self, now: Instant) -> Option<Duration> {
+        self.started_at
+            .map(|started| ACP_FRAME_ASSEMBLY_TIMEOUT.saturating_sub(now.duration_since(started)))
+    }
+
+    fn feed(&mut self, bytes: &[u8], now: Instant) -> Vec<Result<Vec<u8>, String>> {
+        let mut frames = Vec::new();
+        for &byte in bytes {
+            if byte == b'\n' {
+                if self.discarding_oversized {
+                    frames.push(Err(format!(
+                        "ACP input frame exceeded the {MAX_ACP_INPUT_FRAME_BYTES}-byte limit"
+                    )));
+                } else {
+                    if self.current.last() == Some(&b'\r') {
+                        self.current.pop();
+                    }
+                    if !self.current.is_empty() {
+                        frames.push(Ok(std::mem::take(&mut self.current)));
+                        self.current = Vec::with_capacity(8 * 1024);
+                    }
+                }
+                self.current.clear();
+                self.discarding_oversized = false;
+                self.started_at = None;
+                continue;
+            }
+            if self.started_at.is_none() {
+                self.started_at = Some(now);
+            }
+            if self.discarding_oversized {
+                continue;
+            }
+            if self.current.len() >= MAX_ACP_INPUT_FRAME_BYTES {
+                self.current.clear();
+                self.current.shrink_to(8 * 1024);
+                self.discarding_oversized = true;
+                continue;
+            }
+            self.current.push(byte);
+        }
+        frames
+    }
+
+    fn finish(self) -> Option<String> {
+        if self.has_partial_frame() {
+            Some("ACP input ended with a partial JSON-RPC frame".to_string())
+        } else {
+            None
+        }
+    }
+}
 
 // ============================================================================
 // ACP Server
 // ============================================================================
 
+type SharedAcpTaskManagers =
+    Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<crate::session::TaskManager>>>>>;
+
+const ACP_SESSION_ENVELOPE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcpSessionEnvelope {
+    schema_version: u32,
+    generation: u64,
+    wire_session_id: String,
+    canonical_session_id: String,
+    runtime_mode: String,
+    config_options: HashMap<String, Value>,
+    lifecycle_session: crate::session::Session,
+    session: crate::state::Session,
+}
+
+#[derive(Debug, Error)]
+enum AcpSessionStoreError {
+    #[error("unknown ACP session {0}")]
+    UnknownSession(String),
+    #[error("invalid ACP session id: {0}")]
+    InvalidSessionId(String),
+    #[error("ACP session {session_id} has unsupported schema version {found}")]
+    UnsupportedSchema { session_id: String, found: u32 },
+    #[error("ACP session {session_id} has inconsistent canonical ownership")]
+    OwnershipMismatch { session_id: String },
+    #[error("ACP session {session_id} has invalid causal state: {detail}")]
+    InvalidCausalState { session_id: String, detail: String },
+    #[error("ACP session {session_id} generation is exhausted")]
+    GenerationExhausted { session_id: String },
+    #[error("cannot serialize ACP session {session_id}: {source}")]
+    Serialize {
+        session_id: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("ACP session storage failed for {session_id}: {source}")]
+    Storage {
+        session_id: String,
+        #[source]
+        source: crate::persistence::PersistenceError,
+    },
+    #[error("cannot decode ACP session {session_id}: {source}")]
+    Decode {
+        session_id: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("ACP session {session_id} storage generation conflicts with the proposed envelope")]
+    GenerationConflict { session_id: String },
+    #[error("ACP session {session_id} was published without proven directory durability")]
+    DurabilityUncertain { session_id: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcpActiveCallMarker {
+    session_id: String,
+    call_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveAcpCall {
+    request_key: String,
+    call_id: String,
+    cancellation: Arc<AtomicBool>,
+    canonical_cancellation: Option<crate::runtime::CancellationHandle>,
+    completed: bool,
+}
+
+#[derive(Debug, Default)]
+struct AcpCallRegistry {
+    calls: HashMap<String, ActiveAcpCall>,
+    request_ids: HashSet<String>,
+}
+
+type SharedAcpCalls = Arc<std::sync::Mutex<AcpCallRegistry>>;
+
+fn prepare_acp_session_storage(
+    persist_dir: &std::path::Path,
+) -> Result<crate::persistence::PersistentStorage, String> {
+    let root = persist_dir.join("acp");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        if let Err(error) = builder.create(&root) {
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(format!("Cannot create ACP session store: {error}"));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    if let Err(error) = std::fs::create_dir_all(&root) {
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(format!("Cannot create ACP session store: {error}"));
+        }
+    }
+    let root = std::fs::canonicalize(&root)
+        .map_err(|error| format!("Cannot resolve ACP session store: {error}"))?;
+    crate::persistence::PersistentStorage::open(root)
+        .map_err(|error| format!("Cannot open ACP session store: {error}"))
+}
+
+impl AcpCallRegistry {
+    fn request_key(request_id: &Value) -> Result<String, String> {
+        serialize_bounded_json(request_id, MAX_ACP_ID_BYTES.saturating_mul(2))
+            .map_err(|error| format!("invalid JSON-RPC request id: {error}"))
+    }
+
+    fn reserve_request(&mut self, request_id: &Value) -> Result<(), String> {
+        let request_key = Self::request_key(request_id)?;
+        if !self.request_ids.insert(request_key) {
+            return Err("Duplicate active JSON-RPC request id".to_string());
+        }
+        Ok(())
+    }
+
+    fn complete_request(&mut self, request_id: &Value) {
+        let Ok(request_key) = Self::request_key(request_id) else {
+            return;
+        };
+        self.request_ids.remove(&request_key);
+        self.calls.retain(|_, call| call.request_key != request_key);
+    }
+
+    fn reserve_prompt(
+        &mut self,
+        session_id: &str,
+        request_id: &Value,
+    ) -> Result<ActiveAcpCall, String> {
+        let request_key = Self::request_key(request_id)?;
+        if let Some(existing) = self.calls.get(session_id) {
+            if existing.request_key == request_key && !existing.completed {
+                return Ok(existing.clone());
+            }
+            if !existing.completed {
+                return Err(format!(
+                    "ACP session {session_id} already has active call {}",
+                    existing.call_id
+                ));
+            }
+        }
+        if self.calls.len() >= MAX_ACP_SESSIONS {
+            return Err(format!(
+                "ACP active-call registry reached its {MAX_ACP_SESSIONS}-session bound"
+            ));
+        }
+        let call = ActiveAcpCall {
+            request_key,
+            call_id: crate::runtime::CallId::new().to_string(),
+            cancellation: Arc::new(AtomicBool::new(false)),
+            canonical_cancellation: None,
+            completed: false,
+        };
+        self.calls.insert(session_id.to_string(), call.clone());
+        Ok(call)
+    }
+
+    fn bind_run(
+        &mut self,
+        session_id: &str,
+        call_id: &str,
+        run: &crate::tools::ToolRunContext,
+    ) -> Result<(), String> {
+        let active = self
+            .calls
+            .get_mut(session_id)
+            .ok_or_else(|| format!("ACP call {call_id} is no longer active"))?;
+        if active.call_id != call_id || active.completed {
+            return Err(format!("ACP call {call_id} is no longer active"));
+        }
+        let cancellation = run.runtime().cancellation();
+        if active.cancellation.load(Ordering::SeqCst) {
+            let _ = cancellation.cancel(crate::runtime::CancellationReason::User);
+        }
+        active.canonical_cancellation = Some(cancellation);
+        Ok(())
+    }
+
+    fn request_cancel(&mut self, session_id: &str, call_id: Option<&str>) -> bool {
+        let Some(active) = self.calls.get_mut(session_id) else {
+            return false;
+        };
+        if call_id.is_some_and(|expected| expected != active.call_id) {
+            return false;
+        }
+        active.cancellation.store(true, Ordering::SeqCst);
+        if let Some(cancellation) = active.canonical_cancellation.as_ref() {
+            let _ = cancellation.cancel(crate::runtime::CancellationReason::User);
+        }
+        true
+    }
+
+    fn complete(&mut self, session_id: &str, call_id: &str) {
+        if self
+            .calls
+            .get(session_id)
+            .is_some_and(|active| active.call_id == call_id)
+        {
+            self.calls.remove(session_id);
+        }
+    }
+
+    fn cancel_all(&mut self) {
+        for active in self.calls.values_mut().filter(|active| !active.completed) {
+            active.cancellation.store(true, Ordering::SeqCst);
+            if let Some(cancellation) = active.canonical_cancellation.as_ref() {
+                let _ =
+                    cancellation.cancel(crate::runtime::CancellationReason::FrontendDisconnected);
+            }
+        }
+        self.request_ids.clear();
+    }
+}
+
 /// ACP server state.
 pub struct AcpServer {
     /// Application config (providers, hooks, etc.)
     config: AppConfig,
+    /// Host-owned VDD engine. Required policy still fails closed when this is
+    /// absent; model output cannot construct or waive it.
+    vdd_engine: Option<crate::vdd::VddEngine>,
     /// Session manager for persistence
     session_manager: SessionManager,
     /// Hook engine — wired through every tool dispatch in
     /// [`Self::execute_tool_via_acp`] so `PreToolUse` / `PostToolUse`
     /// gates apply to the ACP path (crosslink #694).
     hook_engine: HookEngine,
-    /// Rules engine — consulted on every system-prompt build so
-    /// `.openclaudia/rules` content lands in the ACP model context
-    /// (crosslink #694).
-    rules_engine: RulesEngine,
     /// Active ACP session ID → `OpenClaudia` session ID mapping.
     /// Bounded to [`MAX_ACP_SESSIONS`] entries; oldest insertion is
     /// evicted when a new session would push the count over the cap
     /// (crosslink #759).
     session_map: HashMap<String, String>,
+    /// ACP session ID -> exact immutable host capability generation.
+    run_contexts: HashMap<String, Arc<crate::tools::ToolRunContext>>,
+    /// ACP session ID -> dynamic MCP registry bound to the same exact run.
+    mcp_managers: HashMap<String, Arc<tokio::sync::RwLock<crate::mcp::McpManager>>>,
+    /// Host-discovered plugin registry used only to compose reviewed MCP/LSP
+    /// integrations. Plugin tool schemas remain unavailable until the
+    /// canonical plugin catalog publishes classified handlers.
+    plugin_manager: Option<Arc<crate::plugins::PluginManager>>,
+    /// Durable canonical task graph handles, keyed by ACP session id and
+    /// rebound whenever that key maps to a different `OpenClaudia` run.
+    task_managers: SharedAcpTaskManagers,
+    /// Host-owned technical lesson store shared by every isolated ACP session
+    /// for this exact launch workspace.
+    memory_db: Arc<crate::memory::MemoryDb>,
     /// Insertion-order tracker that pairs with [`Self::session_map`].
     /// We deliberately do NOT use a third-party LRU crate: the cap is
     /// small (≤64) and the operations are O(N) but only run on
@@ -134,25 +814,105 @@ pub struct AcpServer {
     /// This mirrors the TUI/chat auth path: provider adapters stay transport
     /// translators, while the ACP loop selects OAuth headers/endpoints above
     /// that layer.
-    claude_code_token: Option<String>,
-    /// Library-layer permission manager. Every tool call dispatched from
-    /// `execute_tool_via_openclaudia` consults this gate — closes
-    /// crosslink #505 for the ACP path.
-    permission_mgr: Arc<crate::permissions::PermissionManager>,
+    claude_code_token: Option<crate::secrets::OAuthToken>,
+    /// Supported subscription transport through Anthropic's pinned executable.
+    /// Credentials remain owned by that executable and never enter ACP state.
+    claude_agent_sdk: Option<crate::claude_agent_sdk::ClaudeAgentSdk>,
+    /// Supported account transport through `OpenAI`'s pinned Codex runtime.
+    /// Credentials and verified routing metadata remain owned by Codex.
+    codex_agent_sdk: Option<crate::codex_agent_sdk::CodexAgentSdk>,
+    /// Exact Responses continuation paired with the active portable transcript.
+    provider_native_state: Option<crate::runtime::ProviderNativeState>,
+    /// ACP wire session that owns the in-memory transcript/native pair. ACP's
+    /// broader durable multi-session consolidation remains W12 work, but state
+    /// from one live wire session must never be replayed into another.
+    active_conversation_acp_session_id: Option<String>,
     /// Session-scoped enterprise policy enforcer for model/token/tool caps.
     policy_enforcer: Arc<crate::services::policy::PolicyEnforcer>,
     /// Cancellation flag for in-flight prompts
     cancel_flag: Arc<AtomicBool>,
     /// Channel for writing to stdout (serialized access)
-    stdout_tx: mpsc::UnboundedSender<String>,
+    stdout_tx: mpsc::Sender<String>,
+    /// Queue saturation, writer failure, and client disconnect cancel the
+    /// exact active call instead of silently dropping output.
+    transport_failed: Arc<AtomicBool>,
+    /// Assistant bytes staged until provider terminal success and durable
+    /// canonical session publication.
+    provisional_output: String,
+    /// Bounded reason retained while a prompt is in flight.
+    last_prompt_error: Option<String>,
     /// Session config options set via `session/set_config_option`
     config_options: HashMap<String, Value>,
+    /// In-memory envelopes for the bounded live ACP session set. Durable
+    /// copies live in the descriptor-pinned `OpenClaudia` application store.
+    session_envelopes: HashMap<String, AcpSessionEnvelope>,
+    /// OpenClaudia-owned, descriptor-safe persistence for ACP envelopes.
+    acp_session_storage: crate::persistence::PersistentStorage,
+    /// Exact call currently allowed to publish ACP session updates.
+    active_call: Option<AcpActiveCallMarker>,
+    /// Startup model restored when a newly created wire session becomes active.
+    initial_model: String,
     /// Terminal ID counter for ACP terminal lifecycle
     #[allow(dead_code)]
     next_terminal_id: AtomicU64,
     /// Canonical per-session snapshot. IDE notifications update its `ide`
     /// category and prompt construction reads a detached clone from it.
     state: crate::state::StateStore,
+    /// Explicit launch workspace captured once by the ACP composition root.
+    launch_root: std::path::PathBuf,
+    /// Startup capability snapshot used to derive every ACP session and prompt
+    /// generation without re-reading mutable process environment or roots.
+    launch_capabilities: Arc<crate::tools::ToolRunContext>,
+}
+
+/// Observe ACP cancellation independently of the async runtime.
+///
+/// A foreground local tool runs on Tokio's blocking pool. Under heavy output
+/// or executor load, relying only on an async timer to notice `cancel_flag`
+/// can leave a sandboxed child alive long enough to perform another effect.
+/// This watcher owns no authority beyond its exact session id and exits as
+/// soon as either cancellation or tool completion is observed.
+struct SandboxCancellationWatcher {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<usize>>,
+}
+
+impl SandboxCancellationWatcher {
+    fn spawn(cancellation: Arc<AtomicBool>, run: Arc<crate::tools::ToolRunContext>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let watcher_stop = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || loop {
+            if cancellation.load(Ordering::SeqCst) {
+                return crate::tools::cancel_run_sandbox_processes(&run);
+            }
+            if watcher_stop.load(Ordering::Acquire) {
+                return 0;
+            }
+            std::thread::park_timeout(std::time::Duration::from_millis(5));
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn stop_and_join(mut self) -> usize {
+        self.stop.store(true, Ordering::Release);
+        self.handle.take().map_or(0, |handle| {
+            handle.thread().unpark();
+            handle.join().unwrap_or(0)
+        })
+    }
+}
+
+impl Drop for SandboxCancellationWatcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            let _ = handle.join();
+        }
+    }
 }
 
 /// Cap on [`IdeState::recent_files`] — older entries are pushed out.
@@ -170,6 +930,10 @@ pub(crate) fn apply_ide_file_opened(state: &mut IdeState, params: &Value) {
         warn!("ide/file_opened notification missing `filePath`");
         return;
     };
+    if path.len() > MAX_ACP_FILE_PATH_BYTES {
+        warn!("ide/file_opened notification exceeded the ACP path limit");
+        return;
+    }
     let path = path.to_string();
     state.active_file = Some(path.clone());
     // Move-to-front in the recents ring.
@@ -185,6 +949,10 @@ pub(crate) fn apply_ide_file_closed(state: &mut IdeState, params: &Value) {
         warn!("ide/file_closed notification missing `filePath`");
         return;
     };
+    if path.len() > MAX_ACP_FILE_PATH_BYTES {
+        warn!("ide/file_closed notification exceeded the ACP path limit");
+        return;
+    }
     if state.active_file.as_deref() == Some(path) {
         state.active_file = None;
     }
@@ -193,9 +961,14 @@ pub(crate) fn apply_ide_file_closed(state: &mut IdeState, params: &Value) {
 
 pub(crate) fn apply_ide_selection_changed(state: &mut IdeState, params: &Value) {
     let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    if text.len() > MAX_ACP_IDE_SELECTION_BYTES {
+        warn!("ide/selection_changed notification exceeded the ACP selection limit");
+        return;
+    }
     let file_path = params
         .get("filePath")
         .and_then(|v| v.as_str())
+        .filter(|path| path.len() <= MAX_ACP_FILE_PATH_BYTES)
         .map(str::to_string);
     let range = params.get("selection");
 
@@ -241,24 +1014,38 @@ pub(crate) fn apply_ide_diagnostics(state: &mut IdeState, params: &Value) {
         warn!("ide/diagnostics notification missing `filePath`");
         return;
     };
+    if file_path.len() > MAX_ACP_FILE_PATH_BYTES {
+        warn!("ide/diagnostics notification exceeded the ACP path limit");
+        return;
+    }
     let Some(items) = params.get("diagnostics").and_then(|v| v.as_array()) else {
         state.diagnostics.remove(file_path);
         return;
     };
+    if items.len() > MAX_ACP_IDE_DIAGNOSTICS_PER_FILE {
+        warn!("ide/diagnostics notification exceeded the per-file item limit");
+        return;
+    }
     let parsed: Vec<IdeDiagnostic> = items
         .iter()
         .filter_map(|item| {
             let line = u32::try_from(item.get("line")?.as_u64()?).ok()?;
-            let severity = item.get("severity")?.as_str()?.to_string();
-            let message = item.get("message")?.as_str()?.to_string();
+            let severity = item.get("severity")?.as_str()?;
+            let message = item.get("message")?.as_str()?;
+            if severity.len() > MAX_ACP_IDE_DIAGNOSTIC_MESSAGE_BYTES
+                || message.len() > MAX_ACP_IDE_DIAGNOSTIC_MESSAGE_BYTES
+            {
+                return None;
+            }
             let source = item
                 .get("source")
                 .and_then(|v| v.as_str())
+                .filter(|source| source.len() <= MAX_ACP_IDE_DIAGNOSTIC_MESSAGE_BYTES)
                 .map(str::to_string);
             Some(IdeDiagnostic {
                 line,
-                severity,
-                message,
+                severity: severity.to_string(),
+                message: message.to_string(),
                 source,
             })
         })
@@ -266,6 +1053,12 @@ pub(crate) fn apply_ide_diagnostics(state: &mut IdeState, params: &Value) {
     if parsed.is_empty() {
         state.diagnostics.remove(file_path);
     } else {
+        if !state.diagnostics.contains_key(file_path)
+            && state.diagnostics.len() >= MAX_ACP_IDE_DIAGNOSTIC_FILES
+        {
+            warn!("ide/diagnostics state reached its file limit");
+            return;
+        }
         state.diagnostics.insert(file_path.to_string(), parsed);
     }
 }
@@ -275,13 +1068,9 @@ const IDE_DIAGNOSTIC_FILES_IN_PROMPT: usize = 20;
 const IDE_DIAGNOSTICS_PER_FILE_IN_PROMPT: usize = 20;
 const IDE_DIAGNOSTIC_MESSAGE_BYTES: usize = 1_024;
 
-/// Render a bounded, escaped prompt attachment from an IDE snapshot.
-///
-/// Editor fields are client-controlled data. Routing the complete attachment
-/// through `wrap_system_reminder` prevents a selected closing tag from
-/// forging a second system envelope, while the caps keep a noisy language
-/// server from consuming an unbounded model context.
-fn ide_context_for_prompt(state: &IdeState) -> Option<String> {
+/// Render a bounded, source-labeled reference item from an IDE snapshot.
+/// Editor fields are client-controlled data and never receive system authority.
+fn ide_context_item(state: &IdeState) -> Option<crate::context::ContextItem> {
     use std::fmt::Write as _;
 
     if state.active_file.is_none()
@@ -318,9 +1107,10 @@ fn ide_context_for_prompt(state: &IdeState) -> Option<String> {
     }
     if !state.diagnostics.is_empty() {
         context.push_str("Diagnostics:\n");
-        for (path, diagnostics) in state
-            .diagnostics
-            .iter()
+        let mut diagnostics_by_path = state.diagnostics.iter().collect::<Vec<_>>();
+        diagnostics_by_path.sort_by_key(|(path, _)| *path);
+        for (path, diagnostics) in diagnostics_by_path
+            .into_iter()
             .take(IDE_DIAGNOSTIC_FILES_IN_PROMPT)
         {
             let _ = writeln!(context, "{path}:");
@@ -344,139 +1134,142 @@ fn ide_context_for_prompt(state: &IdeState) -> Option<String> {
         }
     }
 
-    Some(crate::context::wrap_system_reminder(&context))
+    Some(crate::context::ContextItem::reference(
+        "acp.ide_snapshot",
+        crate::context::ReferenceSource::Ide,
+        "acp:ide-state",
+        context,
+        crate::context::ContextFreshness::Turn,
+        400,
+    ))
 }
 
-fn build_acp_system_prompt(rules: Option<&str>, cwd: Option<&str>, ide_state: &IdeState) -> String {
-    let mut prompt = crate::prompt::build_system_prompt_with_cwd(None, rules, None, cwd);
-    if let Some(ide_context) = ide_context_for_prompt(ide_state) {
-        prompt.push_str("\n\n");
-        prompt.push_str(&ide_context);
-    }
-    prompt
+fn build_acp_prompt_context(
+    run: &crate::tools::ToolRunContext,
+    ide_state: &IdeState,
+) -> crate::prompt::SystemPromptBlocks {
+    let items = ide_context_item(ide_state).into_iter().collect();
+    crate::prompt::build_prompt_context_with_items_for_run(
+        &crate::modes::BehaviorMode::default(),
+        run,
+        items,
+        crate::context::ContextBudget::default(),
+    )
 }
 
 /// Run the `PreToolUse` hook gate for a single tool dispatch.
 ///
-/// Returns `None` when the tool may proceed, or `Some(AcpToolResult)`
-/// with `is_error: true` and the deny reason in `content` when a hook
-/// blocks the call.
+/// Returns `None` when the tool may proceed, or the typed lifecycle block when
+/// a hook denies the call. The caller binds that block to the exact provider
+/// invocation instead of manufacturing an ACP-specific result projection.
 ///
 /// Extracted as a free function (not an `AcpServer` method) so it can
 /// be exercised by `pre_tool_gate_tests` without spinning up a full
 /// server. Closes crosslink #694: the ACP path previously dispatched
 /// `execute_tool_with_memory` directly, bypassing this gate entirely.
 async fn pre_tool_use_gate(
+    run: &Arc<crate::tools::ToolRunContext>,
     hook_engine: &HookEngine,
+    session_id: &str,
     tool_name: &str,
     tool_input: &Value,
-) -> Option<AcpToolResult> {
+) -> Option<crate::services::tool_executor::ToolExecutionBlock> {
     crate::services::tool_executor::ToolExecutor::run_pre_tool_use(
+        run,
         hook_engine,
-        None,
+        Some(session_id),
         tool_name,
         tool_input,
     )
     .await
     .err()
-    .map(|blocked| AcpToolResult {
-        content: blocked.content,
-        is_error: true,
-    })
-}
-
-/// Run the ACP dispatch through the same permission manager used by
-/// local tool execution, but project unmatched rules as a headless deny
-/// instead of an interactive prompt.
-fn acp_permission_gate(
-    permission_mgr: &PermissionManager,
-    tool_name: &str,
-    tool_input: &Value,
-) -> Option<AcpToolResult> {
-    let permission_input = normalize_acp_permission_input(tool_name, tool_input);
-    match permission_mgr.check_with_context(
-        tool_name,
-        &permission_input,
-        PermissionContext::Coordinator,
-    ) {
-        CheckResult::Allowed => None,
-        CheckResult::Denied(reason) => {
-            warn!(
-                tool = %tool_name,
-                reason = %reason,
-                "ACP permission gate denied tool dispatch"
-            );
-            Some(AcpToolResult {
-                content: format!("Permission denied: {reason}"),
-                is_error: true,
-            })
-        }
-        CheckResult::NeedsPrompt { tool, target } => {
-            warn!(
-                tool = %tool,
-                target = %target,
-                "ACP permission gate refused interactive prompt"
-            );
-            Some(AcpToolResult {
-                content: format!(
-                    "Permission denied: ACP mode cannot prompt for {tool} on '{target}'"
-                ),
-                is_error: true,
-            })
-        }
-    }
-}
-
-fn normalize_acp_permission_input(tool_name: &str, tool_input: &Value) -> Value {
-    if !matches!(tool_name, "write_file" | "edit_file") {
-        return tool_input.clone();
-    }
-
-    let mut normalized = tool_input.clone();
-    if let Value::Object(map) = &mut normalized {
-        if !map.contains_key("path") {
-            if let Some(file_path) = map.get("file_path").cloned() {
-                map.insert("path".to_string(), file_path);
-            }
-        }
-    }
-    normalized
 }
 
 fn parse_acp_tool_arguments(
     tool_name: &str,
     arguments_json: &str,
-) -> Result<(HashMap<String, Value>, Value), AcpToolResult> {
+) -> Result<(HashMap<String, Value>, Value), ToolFailure> {
+    if arguments_json.len() > MAX_ACP_TOOL_ARGUMENT_BYTES {
+        return Err(acp_arg_error(format!(
+            "Tool arguments exceed the {MAX_ACP_TOOL_ARGUMENT_BYTES}-byte ACP limit"
+        )));
+    }
     crate::services::tool_executor::ToolExecutor::parse_arguments_map(tool_name, arguments_json)
-        .map_err(|content| AcpToolResult {
-            content,
-            is_error: true,
-        })
+        .map_err(acp_arg_error)
+}
+
+fn canonical_acp_mode_input(tool_name: &str, args: &HashMap<String, Value>) -> Value {
+    let mut canonical = args
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    let alias = match tool_name {
+        "read_file" | "write_file" | "edit_file" => Some(("file_path", "path")),
+        "bash_output" | "kill_shell" => Some(("terminal_id", "shell_id")),
+        _ => None,
+    };
+    if let Some((wire_key, canonical_key)) = alias {
+        if !canonical.contains_key(canonical_key) {
+            if let Some(value) = canonical.get(wire_key).cloned() {
+                canonical.insert(canonical_key.to_string(), value);
+            }
+        }
+    }
+    Value::Object(canonical)
 }
 
 fn parse_acp_bool_arg(
     args: &HashMap<String, Value>,
     key: &'static str,
     default: bool,
-) -> Result<bool, AcpToolResult> {
+) -> Result<bool, ToolFailure> {
     args.arg_bool_or_strict(key, default)
-        .map_err(|err| AcpToolResult {
-            content: err.to_string(),
-            is_error: true,
-        })
+        .map_err(|err| acp_arg_error(err.to_string()))
 }
 
-fn acp_arg_error(content: impl Into<String>) -> AcpToolResult {
-    AcpToolResult {
-        content: content.into(),
-        is_error: true,
+fn acp_arg_error(content: impl Into<String>) -> ToolFailure {
+    ToolFailure::new(
+        ToolFailureCode::InvalidArguments,
+        content.into(),
+        ToolRetryability::Never,
+    )
+}
+
+fn acp_internal_error(content: impl Into<String>) -> ToolFailure {
+    ToolFailure::new(
+        ToolFailureCode::Internal,
+        content.into(),
+        ToolRetryability::Unknown,
+    )
+}
+
+fn acp_tool_call(
+    tool_call_id: &str,
+    tool_name: &str,
+    arguments_json: &str,
+) -> crate::tools::ToolCall {
+    crate::tools::ToolCall {
+        id: tool_call_id.to_string(),
+        call_type: "function".to_string(),
+        function: crate::tools::FunctionCall {
+            name: tool_name.to_string(),
+            arguments: arguments_json.to_string(),
+        },
     }
+}
+
+fn bind_acp_failure(tool_call: &crate::tools::ToolCall, failure: ToolFailure) -> ToolResult {
+    ToolResult::bind(
+        tool_call,
+        &tool_call.function.name,
+        ToolHandlerResult::error(failure),
+    )
 }
 
 fn parse_acp_required_string_arg<'a>(
     args: &'a HashMap<String, Value>,
     key: &'static str,
-) -> Result<&'a str, AcpToolResult> {
+) -> Result<&'a str, ToolFailure> {
     match args.get(key) {
         None => Err(acp_arg_error(format!("Missing {key} argument"))),
         Some(Value::String(value)) => Ok(value),
@@ -491,7 +1284,7 @@ fn parse_acp_required_alias_string_arg<'a>(
     primary: &'static str,
     alias: &'static str,
     missing_name: &'static str,
-) -> Result<&'a str, AcpToolResult> {
+) -> Result<&'a str, ToolFailure> {
     if let Some(value) = args.get(primary) {
         return value.as_str().ok_or_else(|| {
             acp_arg_error(format!("Invalid '{primary}' argument: expected string"))
@@ -509,7 +1302,7 @@ fn parse_acp_optional_string_arg<'a>(
     args: &'a HashMap<String, Value>,
     key: &'static str,
     default: &'a str,
-) -> Result<&'a str, AcpToolResult> {
+) -> Result<&'a str, ToolFailure> {
     match args.get(key) {
         None => Ok(default),
         Some(Value::String(value)) => Ok(value),
@@ -519,40 +1312,32 @@ fn parse_acp_optional_string_arg<'a>(
     }
 }
 
-fn parse_acp_read_offset_arg(value: Option<&Value>) -> Result<usize, AcpToolResult> {
+fn parse_acp_read_offset_arg(value: Option<&Value>) -> Result<usize, ToolFailure> {
     let Some(value) = value else {
         return Ok(0);
     };
     let Some(offset) = value.as_u64() else {
-        return Err(AcpToolResult {
-            content: "Error: offset must be a 1-indexed positive integer".to_string(),
-            is_error: true,
-        });
+        return Err(acp_arg_error(
+            "Error: offset must be a 1-indexed positive integer",
+        ));
     };
     if offset == 0 {
-        return Err(AcpToolResult {
-            content: "Error: offset must be a 1-indexed positive integer".to_string(),
-            is_error: true,
-        });
+        return Err(acp_arg_error(
+            "Error: offset must be a 1-indexed positive integer",
+        ));
     }
     Ok(usize::try_from(offset.saturating_sub(1)).unwrap_or(usize::MAX))
 }
 
-fn parse_acp_read_limit_arg(value: Option<&Value>) -> Result<Option<usize>, AcpToolResult> {
+fn parse_acp_read_limit_arg(value: Option<&Value>) -> Result<Option<usize>, ToolFailure> {
     let Some(value) = value else {
         return Ok(None);
     };
     let Some(limit) = value.as_u64() else {
-        return Err(AcpToolResult {
-            content: "Error: limit must be a positive integer".to_string(),
-            is_error: true,
-        });
+        return Err(acp_arg_error("Error: limit must be a positive integer"));
     };
     if limit == 0 {
-        return Err(AcpToolResult {
-            content: "Error: limit must be a positive integer".to_string(),
-            is_error: true,
-        });
+        return Err(acp_arg_error("Error: limit must be a positive integer"));
     }
     Ok(Some(usize::try_from(limit).unwrap_or(usize::MAX)))
 }
@@ -575,6 +1360,89 @@ const fn value_type_name(value: &Value) -> &'static str {
 const MAX_ACP_SESSIONS: usize = 64;
 const ACP_CONFIG_MODE_ID: &str = "mode";
 const ACP_CONFIG_MODEL_ID: &str = "model";
+
+#[derive(Debug, Clone)]
+struct AcpModeProfile {
+    id: &'static str,
+    name: &'static str,
+    description: &'static str,
+    session_mode: SessionMode,
+    runtime_mode: crate::modes::RuntimeMode,
+}
+
+#[derive(Debug, Error)]
+enum AcpCapabilityError {
+    #[error("Unknown ACP sessionId: {0}")]
+    UnknownSession(String),
+    #[error("Invalid ACP mode '{0}'. Supported values are generated in configOptions.mode")]
+    UnknownMode(String),
+    #[error("ACP capability transition was rejected: {0}")]
+    Transition(String),
+    #[error("ACP run capability construction failed: {0}")]
+    Construction(String),
+    #[error("ACP dynamic integration binding failed: {0}")]
+    Integration(String),
+    #[error("ACP effective tool catalog failed: {0}")]
+    Catalog(String),
+}
+
+fn readonly_runtime_mode() -> crate::modes::RuntimeMode {
+    let mut behavior = crate::modes::BehaviorMode::default();
+    behavior.add_modifier(crate::modes::Modifier::Readonly);
+    crate::modes::RuntimeMode::Behavioral(behavior)
+}
+
+fn acp_mode_profiles() -> [AcpModeProfile; 4] {
+    [
+        AcpModeProfile {
+            id: "initializer",
+            name: "Initializer",
+            description: "Gather context with the canonical read-only Initializer policy",
+            session_mode: SessionMode::Initializer,
+            runtime_mode: crate::modes::RuntimeMode::Initializer,
+        },
+        AcpModeProfile {
+            id: "coding",
+            name: "Coding",
+            description: "Implement and verify changes through the canonical Coding policy",
+            session_mode: SessionMode::Coding,
+            runtime_mode: crate::modes::RuntimeMode::Behavioral(
+                crate::modes::BehaviorMode::default(),
+            ),
+        },
+        AcpModeProfile {
+            id: "plan",
+            name: "Plan",
+            description: "Inspect the workspace and write only the run-bound plan resource",
+            session_mode: SessionMode::Coding,
+            runtime_mode: crate::modes::RuntimeMode::Plan,
+        },
+        AcpModeProfile {
+            id: "readonly",
+            name: "Read Only",
+            description:
+                "Inspect local resources without workspace, process, network, or external mutation",
+            session_mode: SessionMode::Coding,
+            runtime_mode: readonly_runtime_mode(),
+        },
+    ]
+}
+
+fn acp_mode_profile(mode: &str) -> Result<AcpModeProfile, AcpCapabilityError> {
+    acp_mode_profiles()
+        .into_iter()
+        .find(|profile| profile.id == mode)
+        .ok_or_else(|| AcpCapabilityError::UnknownMode(mode.to_string()))
+}
+
+const fn acp_runtime_mode_label(snapshot: &crate::modes::RuntimeModeSnapshot) -> &'static str {
+    match (&snapshot.mode, snapshot.class) {
+        (crate::modes::RuntimeMode::Initializer, _) => "initializer",
+        (crate::modes::RuntimeMode::Plan, _) => "plan",
+        (_, crate::modes::RuntimeModeClass::ReadOnly) => "readonly",
+        _ => "coding",
+    }
+}
 
 /// Insert an ACP→openclaudia session-id mapping into `map`, evicting
 /// the oldest entry first if `order` is already at `cap`. Idempotent
@@ -610,13 +1478,6 @@ fn upsert_session_mapping_into(
     order.push_back(acp_session_id);
 }
 
-const fn acp_mode_label(mode: SessionMode) -> &'static str {
-    match mode {
-        SessionMode::Initializer => "initializer",
-        SessionMode::Coding => "coding",
-    }
-}
-
 fn acp_model_option_ids(target: &str, current_model: &str) -> Vec<String> {
     let target = target.trim().to_ascii_lowercase();
     let catalog_provider = crate::providers::canonical_static_catalog_provider(&target);
@@ -637,7 +1498,9 @@ fn acp_model_option_ids(target: &str, current_model: &str) -> Vec<String> {
         }
     }
     if ids.is_empty() {
-        ids.push(crate::providers::default_model_for_target(&target).to_string());
+        if let Some(default) = crate::providers::default_model_for_target(&target) {
+            ids.push(default.to_string());
+        }
     }
     ids
 }
@@ -656,28 +1519,32 @@ fn acp_config_value_options(ids: impl IntoIterator<Item = String>) -> Vec<Value>
 fn acp_session_config_options(
     target: &str,
     current_model: &str,
-    current_mode: SessionMode,
+    run: &crate::tools::ToolRunContext,
 ) -> Vec<Value> {
+    let runtime_mode = run.runtime_mode();
+    let mode_options = acp_mode_profiles()
+        .into_iter()
+        .filter(|profile| {
+            run.validate_runtime_mode_transition(&profile.runtime_mode)
+                .is_ok()
+        })
+        .map(|profile| {
+            json!({
+                "value": profile.id,
+                "name": profile.name,
+                "description": profile.description,
+            })
+        })
+        .collect::<Vec<_>>();
     vec![
         json!({
             "id": ACP_CONFIG_MODE_ID,
             "name": "Session Mode",
-            "description": "Controls whether the session is gathering context or editing code",
+            "description": "Selects a canonical runtime policy for the next capability generation",
             "category": "mode",
             "type": "select",
-            "currentValue": acp_mode_label(current_mode),
-            "options": [
-                {
-                    "value": "initializer",
-                    "name": "Initializer",
-                    "description": "Gather context and prepare the task"
-                },
-                {
-                    "value": "coding",
-                    "name": "Coding",
-                    "description": "Implement and verify code changes"
-                }
-            ],
+            "currentValue": acp_runtime_mode_label(&runtime_mode),
+            "options": mode_options,
         }),
         json!({
             "id": ACP_CONFIG_MODEL_ID,
@@ -694,27 +1561,435 @@ fn acp_session_config_options(
 impl AcpServer {
     /// See [`upsert_session_mapping_into`]. Thin instance wrapper so
     /// existing call sites read naturally.
-    fn upsert_session_mapping(&mut self, acp_session_id: String, oc_session_id: String) {
+    fn upsert_session_mapping(
+        &mut self,
+        acp_session_id: String,
+        oc_session_id: String,
+        run_context: Arc<crate::tools::ToolRunContext>,
+    ) {
+        let replaced_acp_session_id = acp_session_id.clone();
         upsert_session_mapping_into(
             &mut self.session_map,
             &mut self.session_order,
             MAX_ACP_SESSIONS,
-            acp_session_id,
+            acp_session_id.clone(),
             oc_session_id,
         );
+        let retired_ids = self
+            .run_contexts
+            .keys()
+            .filter(|session_id| !self.session_map.contains_key(*session_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for session_id in retired_ids {
+            if let Some(retired) = self.run_contexts.remove(&session_id) {
+                crate::tools::retire_run(&retired);
+            }
+            self.session_envelopes.remove(&session_id);
+        }
+        let mut task_managers = self
+            .task_managers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A reloaded ACP id can point at a different OpenClaudia run, so its
+        // old actor-bound handle must not survive replacement. Retain only
+        // live LRU keys to keep this cache under the same session cap.
+        task_managers.remove(&replaced_acp_session_id);
+        task_managers.retain(|session_id, _| self.session_map.contains_key(session_id));
+        drop(task_managers);
+        self.replace_run_context(acp_session_id, run_context);
     }
 
-    fn oc_session_id_for_acp(&self, acp_session_id: &str) -> String {
-        self.session_map
+    fn replace_run_context(
+        &mut self,
+        acp_session_id: String,
+        run_context: Arc<crate::tools::ToolRunContext>,
+    ) {
+        if let Some(retired) = self.run_contexts.insert(acp_session_id, run_context) {
+            crate::tools::retire_run(&retired);
+        }
+    }
+
+    fn oc_session_id_for_acp(&self, acp_session_id: &str) -> Option<&str> {
+        self.session_map.get(acp_session_id).map(String::as_str)
+    }
+
+    fn build_run_context_for_mode(
+        &self,
+        openclaudia_session_id: &str,
+        runtime_mode: crate::modes::RuntimeMode,
+    ) -> Result<Arc<crate::tools::ToolRunContext>, String> {
+        self.build_run_context_for_mode_with_parent(openclaudia_session_id, runtime_mode, None)
+    }
+
+    fn build_run_context_for_mode_with_parent(
+        &self,
+        openclaudia_session_id: &str,
+        runtime_mode: crate::modes::RuntimeMode,
+        parent_budget: Option<crate::runtime::RunBudgetAuthority>,
+    ) -> Result<Arc<crate::tools::ToolRunContext>, String> {
+        let session_id = crate::state::SessionId::from_raw(openclaudia_session_id)
+            .map_err(|error| format!("Invalid OpenClaudia session id: {error}"))?;
+        let launch = &self.launch_capabilities;
+        let workspace_access = if launch.grants_resource(crate::tools::ToolResource::WorkspaceWrite)
+        {
+            crate::tools::WorkspaceAccess::ReadWrite
+        } else {
+            crate::tools::WorkspaceAccess::ReadOnly
+        };
+        let inherited_root = |root: &&std::path::PathBuf| {
+            root.as_path() != launch.project_root() && root.as_path() != launch.private_temp_root()
+        };
+        let read_only_roots = launch
+            .read_only_roots()
+            .iter()
+            .filter(inherited_root)
+            .cloned()
+            .collect();
+        let read_write_roots = launch
+            .read_write_roots()
+            .iter()
+            .filter(inherited_root)
+            .cloned()
+            .collect();
+        // Each ACP wire session is a budget/cancellation root, not a child of
+        // the launch placeholder or a sibling wire session. All mutable host
+        // inputs are copied from the immutable startup snapshot.
+        let mut builder = crate::tools::ToolRunContext::builder(session_id, &self.launch_root)
+            .working_directory(&self.launch_root)
+            .read_only_roots(read_only_roots)
+            .read_write_roots(read_write_roots)
+            .project_secret_masks(launch.project_secret_masks().to_vec())
+            .protected_environment_grants(launch.environment_grants().clone())
+            .protected_mcp_environment_grants(launch.mcp_environment_grants().clone())
+            .executable_search_path(launch.executable_search_path())
+            .host_home(launch.host_home().map(std::path::Path::to_path_buf))
+            .skill_access(launch.skill_access().clone())
+            .remote_actions(launch.remote_actions().registry().clone())
+            .web_egress_grants(launch.web_egress_grants().clone())
+            .workspace_access(workspace_access)
+            .process(launch.grants_resource(crate::tools::ToolResource::Process))
+            .network(launch.grants_resource(crate::tools::ToolResource::Network))
+            .secrets(launch.grants_resource(crate::tools::ToolResource::Secrets))
+            .process_owner(openclaudia_session_id)
+            .actor_role(crate::runtime::ActorRole::Frontend)
+            .provider(self.config.proxy.target.clone())
+            .budget_limits(
+                self.config
+                    .session
+                    .run_budget
+                    .limits_for_session(&self.config.session),
+            )
+            .runtime_mode(runtime_mode);
+        if let Some(parent_budget) = parent_budget {
+            builder = builder.parent_budget(parent_budget);
+        }
+        let run = builder.build()?;
+        crate::guardrails::configure(&run, &self.config.guardrails)
+            .map_err(|error| format!("Cannot configure ACP guardrails: {error}"))?;
+        Ok(run)
+    }
+
+    fn run_context_for_acp(
+        &self,
+        acp_session_id: &str,
+    ) -> Option<&Arc<crate::tools::ToolRunContext>> {
+        self.run_contexts.get(acp_session_id)
+    }
+
+    fn session_store_target(
+        acp_session_id: &str,
+    ) -> Result<std::path::PathBuf, AcpSessionStoreError> {
+        uuid::Uuid::parse_str(acp_session_id).map_err(|error| {
+            AcpSessionStoreError::InvalidSessionId(format!("{acp_session_id}: {error}"))
+        })?;
+        Ok(std::path::PathBuf::from(format!("{acp_session_id}.json")))
+    }
+
+    fn validate_session_envelope(
+        envelope: AcpSessionEnvelope,
+        expected_wire_id: &str,
+    ) -> Result<AcpSessionEnvelope, AcpSessionStoreError> {
+        if envelope.schema_version != ACP_SESSION_ENVELOPE_SCHEMA_VERSION {
+            return Err(AcpSessionStoreError::UnsupportedSchema {
+                session_id: expected_wire_id.to_string(),
+                found: envelope.schema_version,
+            });
+        }
+        if envelope.wire_session_id != expected_wire_id
+            || envelope.canonical_session_id != envelope.session.id()
+            || envelope.lifecycle_session.id != envelope.canonical_session_id
+            || envelope.generation == 0
+        {
+            return Err(AcpSessionStoreError::OwnershipMismatch {
+                session_id: expected_wire_id.to_string(),
+            });
+        }
+        let state = envelope.session.state_snapshot();
+        if state.identity.session_id.as_str() != envelope.canonical_session_id
+            || envelope
+                .session
+                .provider_native_state_snapshot()
+                .as_ref()
+                .is_some_and(|native| {
+                    native
+                        .validate_identity(&envelope.session.provider, &envelope.session.model)
+                        .is_err()
+                })
+        {
+            return Err(AcpSessionStoreError::OwnershipMismatch {
+                session_id: expected_wire_id.to_string(),
+            });
+        }
+        Ok(envelope)
+    }
+
+    fn remembered_session_envelope(
+        &self,
+        acp_session_id: &str,
+    ) -> Result<Option<AcpSessionEnvelope>, AcpSessionStoreError> {
+        let Some(envelope) = self.session_envelopes.get(acp_session_id).cloned() else {
+            return Ok(None);
+        };
+        Self::validate_session_envelope(envelope, acp_session_id).map(Some)
+    }
+
+    fn remember_session_envelope(
+        &mut self,
+        envelope: &AcpSessionEnvelope,
+    ) -> Result<(), AcpSessionStoreError> {
+        Self::validate_session_envelope(envelope.clone(), &envelope.wire_session_id)?;
+        self.session_envelopes
+            .insert(envelope.wire_session_id.clone(), envelope.clone());
+        Ok(())
+    }
+
+    fn read_persisted_session_envelope(
+        &self,
+        acp_session_id: &str,
+    ) -> Result<AcpSessionEnvelope, AcpSessionStoreError> {
+        let target = Self::session_store_target(acp_session_id)?;
+        let observed = self
+            .acp_session_storage
+            .read(&target, crate::persistence::FileClass::Session)
+            .map_err(|source| AcpSessionStoreError::Storage {
+                session_id: acp_session_id.to_string(),
+                source,
+            })?;
+        let envelope = observed
+            .expose_bytes(|bytes| {
+                bytes
+                    .map(serde_json::from_slice::<AcpSessionEnvelope>)
+                    .transpose()
+            })
+            .map_err(|source| AcpSessionStoreError::Decode {
+                session_id: acp_session_id.to_string(),
+                source,
+            })?
+            .ok_or_else(|| AcpSessionStoreError::UnknownSession(acp_session_id.to_string()))?;
+        Self::validate_session_envelope(envelope, acp_session_id)
+    }
+
+    fn persist_session_envelope(
+        &self,
+        envelope: &AcpSessionEnvelope,
+    ) -> Result<(), AcpSessionStoreError> {
+        let target = Self::session_store_target(&envelope.wire_session_id)?;
+        let bytes = serde_json::to_vec_pretty(envelope).map_err(|source| {
+            AcpSessionStoreError::Serialize {
+                session_id: envelope.wire_session_id.clone(),
+                source,
+            }
+        })?;
+        let observed = self
+            .acp_session_storage
+            .read(&target, crate::persistence::FileClass::Session)
+            .map_err(|source| AcpSessionStoreError::Storage {
+                session_id: envelope.wire_session_id.clone(),
+                source,
+            })?;
+        let existing = observed
+            .expose_bytes(|bytes| {
+                bytes
+                    .map(serde_json::from_slice::<AcpSessionEnvelope>)
+                    .transpose()
+            })
+            .map_err(|source| AcpSessionStoreError::Decode {
+                session_id: envelope.wire_session_id.clone(),
+                source,
+            })?
+            .map(|stored| Self::validate_session_envelope(stored, &envelope.wire_session_id))
+            .transpose()?;
+        if existing
+            .as_ref()
+            .is_some_and(|stored| stored.generation == envelope.generation)
+        {
+            let already_published = observed
+                .expose_bytes(|stored| stored.is_some_and(|stored| stored == bytes.as_slice()));
+            return if already_published {
+                Ok(())
+            } else {
+                Err(AcpSessionStoreError::GenerationConflict {
+                    session_id: envelope.wire_session_id.clone(),
+                })
+            };
+        }
+        let expected_logical_generation = existing
+            .as_ref()
+            .map_or(Some(1), |stored| stored.generation.checked_add(1));
+        if expected_logical_generation != Some(envelope.generation) {
+            return Err(AcpSessionStoreError::GenerationConflict {
+                session_id: envelope.wire_session_id.clone(),
+            });
+        }
+        let mut receipt = self
+            .acp_session_storage
+            .commit(
+                &target,
+                crate::persistence::FileClass::Session,
+                observed.generation(),
+                &bytes,
+            )
+            .map_err(|source| AcpSessionStoreError::Storage {
+                session_id: envelope.wire_session_id.clone(),
+                source,
+            })?;
+        if receipt.state() == crate::persistence::CommitState::PublishedDurabilityUncertain {
+            receipt = self
+                .acp_session_storage
+                .commit(
+                    &target,
+                    crate::persistence::FileClass::Session,
+                    observed.generation(),
+                    &bytes,
+                )
+                .map_err(|source| AcpSessionStoreError::Storage {
+                    session_id: envelope.wire_session_id.clone(),
+                    source,
+                })?;
+        }
+        if receipt.state() == crate::persistence::CommitState::PublishedDurabilityUncertain {
+            return Err(AcpSessionStoreError::DurabilityUncertain {
+                session_id: envelope.wire_session_id.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn visible_config_options(&self) -> HashMap<String, Value> {
+        self.config_options.clone()
+    }
+
+    fn capture_active_session(
+        &mut self,
+        acp_session_id: &str,
+    ) -> Result<AcpSessionEnvelope, AcpSessionStoreError> {
+        let canonical_session_id = self
+            .session_map
             .get(acp_session_id)
             .cloned()
-            .unwrap_or_else(|| acp_session_id.to_string())
+            .ok_or_else(|| AcpSessionStoreError::UnknownSession(acp_session_id.to_string()))?;
+        let previous = self.remembered_session_envelope(acp_session_id)?;
+        let generation = previous.as_ref().map_or(Ok(1), |envelope| {
+            envelope.generation.checked_add(1).ok_or_else(|| {
+                AcpSessionStoreError::GenerationExhausted {
+                    session_id: acp_session_id.to_string(),
+                }
+            })
+        })?;
+        let lifecycle_session = self
+            .session_manager
+            .get_session()
+            .filter(|session| session.id == canonical_session_id)
+            .cloned()
+            .or_else(|| {
+                previous
+                    .as_ref()
+                    .map(|envelope| envelope.lifecycle_session.clone())
+            })
+            .ok_or_else(|| AcpSessionStoreError::OwnershipMismatch {
+                session_id: acp_session_id.to_string(),
+            })?;
+        let mut canonical = previous.as_ref().map_or_else(
+            || crate::state::Session::new(&self.model, &self.config.proxy.target),
+            |envelope| envelope.session.clone(),
+        );
+        if previous.is_none() {
+            canonical.set_id(canonical_session_id.clone());
+        }
+        canonical.set_provider_and_model(&self.config.proxy.target, &self.model);
+        let mut snapshot = self.state.snapshot();
+        snapshot.identity.session_id = crate::state::SessionId::from_raw(&canonical_session_id)
+            .map_err(|error| {
+                AcpSessionStoreError::InvalidSessionId(format!("{canonical_session_id}: {error}"))
+            })?;
+        snapshot.identity.causal = canonical.inspect_state(|state| state.identity.causal.clone());
+        snapshot.conversation.messages.clone_from(&self.messages);
+        snapshot
+            .conversation
+            .provider_native_state
+            .clone_from(&self.provider_native_state);
+        canonical.update_state(|state, _| *state = snapshot);
+        if let Some(run) = self.run_context_for_acp(acp_session_id) {
+            canonical.bind_workspace_run(run).map_err(|error| {
+                AcpSessionStoreError::InvalidCausalState {
+                    session_id: acp_session_id.to_string(),
+                    detail: error.to_string(),
+                }
+            })?;
+        }
+        canonical.touch();
+        let runtime_mode = self
+            .run_context_for_acp(acp_session_id)
+            .map_or("initializer", |run| {
+                acp_runtime_mode_label(&run.runtime_mode())
+            })
+            .to_string();
+        let envelope = AcpSessionEnvelope {
+            schema_version: ACP_SESSION_ENVELOPE_SCHEMA_VERSION,
+            generation,
+            wire_session_id: acp_session_id.to_string(),
+            canonical_session_id,
+            runtime_mode,
+            config_options: self.visible_config_options(),
+            lifecycle_session,
+            session: canonical,
+        };
+        self.persist_session_envelope(&envelope)?;
+        self.remember_session_envelope(&envelope)?;
+        Ok(envelope)
     }
 
-    fn current_session_mode(&self) -> SessionMode {
+    fn restore_session_envelope(
+        &mut self,
+        envelope: &AcpSessionEnvelope,
+    ) -> Result<(), AcpSessionStoreError> {
+        let envelope =
+            Self::validate_session_envelope(envelope.clone(), &envelope.wire_session_id)?;
+        let snapshot = envelope.session.state_snapshot();
+        self.messages.clone_from(&snapshot.conversation.messages);
+        self.provider_native_state
+            .clone_from(&snapshot.conversation.provider_native_state);
+        self.model.clone_from(&envelope.session.model);
         self.session_manager
-            .get_session()
-            .map_or(SessionMode::Initializer, |session| session.mode)
+            .replace_current_session(envelope.lifecycle_session.clone());
+        self.state.replace(snapshot);
+        self.config_options.clone_from(&envelope.config_options);
+        self.active_conversation_acp_session_id = Some(envelope.wire_session_id.clone());
+        self.remember_session_envelope(&envelope)
+    }
+
+    fn activate_owned_session(&mut self, acp_session_id: &str) -> Result<(), AcpSessionStoreError> {
+        if self.active_conversation_acp_session_id.as_deref() == Some(acp_session_id) {
+            return Ok(());
+        }
+        if let Some(active) = self.active_conversation_acp_session_id.clone() {
+            self.capture_active_session(&active)?;
+        }
+        let envelope = self
+            .remembered_session_envelope(acp_session_id)?
+            .ok_or_else(|| AcpSessionStoreError::UnknownSession(acp_session_id.to_string()))?;
+        self.restore_session_envelope(&envelope)
     }
 
     fn cumulative_policy_tokens(&self) -> u64 {
@@ -738,28 +2013,83 @@ impl AcpServer {
         )
     }
 
-    fn acp_config_options(&self) -> Vec<Value> {
-        acp_session_config_options(
+    fn acp_config_options(&self, acp_session_id: &str) -> Result<Vec<Value>, AcpCapabilityError> {
+        let run = self
+            .run_context_for_acp(acp_session_id)
+            .ok_or_else(|| AcpCapabilityError::UnknownSession(acp_session_id.to_string()))?;
+        Ok(acp_session_config_options(
             &self.config.proxy.target,
             &self.model,
-            self.current_session_mode(),
-        )
+            run,
+        ))
     }
 
-    fn apply_acp_mode_value(&mut self, mode: &str) -> Result<SessionMode, String> {
-        match mode {
-            "initializer" => Ok(self
-                .session_manager
-                .set_current_mode(SessionMode::Initializer)
-                .mode),
-            "coding" => Ok(self
-                .session_manager
-                .set_current_mode(SessionMode::Coding)
-                .mode),
-            _ => Err(format!(
-                "Invalid value for mode: {mode}. Supported values: initializer, coding"
-            )),
+    fn existing_requested_acp_session_id(
+        &self,
+        params: &Value,
+    ) -> Result<Option<String>, AcpCapabilityError> {
+        let session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| self.active_conversation_acp_session_id.clone());
+        if let Some(session_id) = session_id {
+            if !self.session_map.contains_key(&session_id) {
+                return Err(AcpCapabilityError::UnknownSession(session_id));
+            }
+            return Ok(Some(session_id));
         }
+        Ok(None)
+    }
+
+    async fn ensure_requested_acp_session_id(
+        &mut self,
+        params: &Value,
+    ) -> Result<String, AcpCapabilityError> {
+        if let Some(session_id) = self.existing_requested_acp_session_id(params)? {
+            self.activate_owned_session(&session_id)
+                .map_err(|error| AcpCapabilityError::Transition(error.to_string()))?;
+            return Ok(session_id);
+        }
+        let (acp_session_id, canonical_session, run) = self
+            .prepare_new_session()
+            .map_err(AcpCapabilityError::Construction)?;
+        self.admit_session_start(&run, &canonical_session.id)
+            .await
+            .map_err(AcpCapabilityError::Transition)?;
+        self.install_new_session(&acp_session_id, canonical_session, Arc::clone(&run))
+            .map_err(|error| AcpCapabilityError::Construction(error.to_string()))?;
+        self.install_run_integrations(&acp_session_id, &run).await?;
+        Ok(acp_session_id)
+    }
+
+    fn apply_acp_mode_value(
+        &mut self,
+        acp_session_id: &str,
+        mode: &str,
+    ) -> Result<Arc<crate::tools::ToolRunContext>, AcpCapabilityError> {
+        let profile = acp_mode_profile(mode)?;
+        let current = Arc::clone(
+            self.run_context_for_acp(acp_session_id)
+                .ok_or_else(|| AcpCapabilityError::UnknownSession(acp_session_id.to_string()))?,
+        );
+        if acp_runtime_mode_label(&current.runtime_mode()) == profile.id {
+            return Ok(current);
+        }
+
+        // Mode is mutable policy within this wire session's exact capability
+        // and budget root. Rotating the root here would reset accounting and
+        // manufacture a different cancellation/workspace owner.
+        current
+            .validate_runtime_mode_transition(&profile.runtime_mode)
+            .map_err(AcpCapabilityError::Transition)?;
+        current
+            .transition_runtime_mode(profile.runtime_mode)
+            .map_err(AcpCapabilityError::Transition)?;
+        if self.active_conversation_acp_session_id.as_deref() == Some(acp_session_id) {
+            self.session_manager.set_current_mode(profile.session_mode);
+        }
+        Ok(current)
     }
 
     fn apply_acp_model_value(&mut self, model: &str) -> Result<(), String> {
@@ -771,58 +2101,313 @@ impl AcpServer {
             .policy()
             .check_model(model)
             .map_err(|err| format!("Blocked by policy: {err}"))?;
+        if self.model != model {
+            self.provider_native_state = None;
+        }
         self.model = model.to_string();
         Ok(())
     }
 
+    fn discover_runtime_plugins(&mut self) {
+        let mut manager =
+            match crate::plugins::PluginManager::try_new_for_project(&self.launch_root) {
+                Ok(manager) => manager,
+                Err(error) => {
+                    warn!(
+                        %error,
+                        "ACP plugin discovery is limited to project-local search paths"
+                    );
+                    crate::plugins::PluginManager::new_for_project(&self.launch_root)
+                }
+            };
+        for error in manager.discover() {
+            warn!(%error, "ACP plugin discovery rejected an entry");
+        }
+        match manager.compose_hook_engine(&self.hook_engine) {
+            Ok(engine) => self.hook_engine = engine,
+            Err(error) => {
+                warn!(%error, "ACP plugin hooks failed canonical activation and remain unavailable");
+            }
+        }
+        self.plugin_manager = Some(Arc::new(manager));
+    }
+
+    async fn build_mcp_manager(
+        &self,
+        run: &Arc<crate::tools::ToolRunContext>,
+    ) -> Result<Arc<tokio::sync::RwLock<crate::mcp::McpManager>>, AcpCapabilityError> {
+        let manager = Arc::new(tokio::sync::RwLock::new(
+            crate::mcp::McpManager::new_with_permissions(
+                Arc::clone(run),
+                self.config.permissions.clone(),
+            ),
+        ));
+        if let Some(plugin_manager) = self.plugin_manager.as_ref() {
+            plugin_manager.configure_lsp_service_for_run(run);
+            crate::proxy::connect_mcp_servers(&manager, plugin_manager).await;
+        }
+        if !crate::mcp::install_manager(run, &manager) {
+            return Err(AcpCapabilityError::Integration(format!(
+                "an MCP manager is already installed for run {} generation {}",
+                run.run_id(),
+                run.generation()
+            )));
+        }
+        Ok(manager)
+    }
+
+    async fn install_run_integrations(
+        &mut self,
+        acp_session_id: &str,
+        run: &Arc<crate::tools::ToolRunContext>,
+    ) -> Result<(), AcpCapabilityError> {
+        let next_manager = self.build_mcp_manager(run).await?;
+        let previous = self
+            .mcp_managers
+            .insert(acp_session_id.to_string(), next_manager);
+        if let Some(previous) = previous {
+            if let Err(error) = previous.read().await.disconnect_all().await {
+                warn!(%error, acp_session_id, "Retired ACP MCP manager did not disconnect cleanly");
+            }
+        }
+        self.mcp_managers
+            .retain(|session_id, _| self.session_map.contains_key(session_id));
+        Ok(())
+    }
+
+    async fn effective_tool_catalog(
+        &self,
+        acp_session_id: &str,
+        run: &Arc<crate::tools::ToolRunContext>,
+        messages: &[Value],
+    ) -> Result<crate::tools::catalog::ToolCatalogSnapshot, AcpCapabilityError> {
+        let manager = self
+            .mcp_managers
+            .get(acp_session_id)
+            .ok_or_else(|| {
+                AcpCapabilityError::Integration(format!(
+                    "no dynamic integration manager is bound to ACP session {acp_session_id}"
+                ))
+            })?
+            .read()
+            .await;
+        if !manager.matches_run(run) {
+            return Err(AcpCapabilityError::Integration(format!(
+                "dynamic integration manager does not match run {} generation {}",
+                run.run_id(),
+                run.generation()
+            )));
+        }
+        let dynamic = manager.tool_catalog_snapshot().await;
+        drop(manager);
+        for unavailable in &dynamic.unavailable {
+            warn!(
+                server = %unavailable.server,
+                tool = %unavailable.tool,
+                reason = %unavailable.reason,
+                "ACP dynamic tool is unavailable in this capability generation"
+            );
+        }
+        crate::tools::get_progressive_tool_definitions_with_additional(
+            run,
+            messages,
+            false,
+            &dynamic.definitions,
+        )
+        .map_err(AcpCapabilityError::Catalog)
+    }
+
+    async fn session_capability_payload(
+        &self,
+        acp_session_id: &str,
+    ) -> Result<Value, AcpCapabilityError> {
+        let run = Arc::clone(
+            self.run_context_for_acp(acp_session_id)
+                .ok_or_else(|| AcpCapabilityError::UnknownSession(acp_session_id.to_string()))?,
+        );
+        let catalog = self
+            .effective_tool_catalog(acp_session_id, &run, &[])
+            .await?;
+        let has_tool = |name: &str| catalog.active_names.iter().any(|active| active == name);
+        let mode = run.runtime_mode();
+        if catalog.capability_generation != run.generation()
+            || catalog.runtime_mode_generation != mode.generation
+        {
+            return Err(AcpCapabilityError::Catalog(format!(
+                "capability or runtime mode changed while preparing session {acp_session_id}; retry negotiation"
+            )));
+        }
+        let unrestricted_workspace_write = mode.class == crate::modes::RuntimeModeClass::Standard
+            && (has_tool("edit_file") || has_tool("write_file"));
+        let restricted_write_targets =
+            if mode.class == crate::modes::RuntimeModeClass::Plan && has_tool("write_file") {
+                vec![run.agent_plan_file().display().to_string()]
+            } else {
+                Vec::new()
+            };
+        Ok(json!({
+            "mode": acp_runtime_mode_label(&mode),
+            "capabilityGeneration": catalog.capability_generation.get(),
+            "runtimeModeGeneration": catalog.runtime_mode_generation,
+            "toolCatalogGeneration": catalog.generation.to_string(),
+            "capabilities": {
+                "prompts": true,
+                "tools": !catalog.active_names.is_empty(),
+                "fs": {
+                    "read": has_tool("read_file") || has_tool("grep") || has_tool("glob"),
+                    "write": unrestricted_workspace_write,
+                    "restrictedWriteTargets": restricted_write_targets,
+                },
+                "terminal": has_tool("bash"),
+            },
+            "availableTools": catalog.active_names,
+            "toolSchemas": catalog.definitions,
+        }))
+    }
+
     /// Create a new ACP server from the loaded config.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the launch workspace or startup grants cannot be
+    /// bound into an immutable run capability.
+    // The distinct credential carriers select different wire protocols and are
+    // deliberately never collapsed into a generic secret.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: AppConfig,
         model: String,
         api_key: Option<crate::providers::ApiKey>,
-        claude_code_token: Option<String>,
-        stdout_tx: mpsc::UnboundedSender<String>,
-    ) -> Self {
+        claude_code_token: Option<crate::secrets::OAuthToken>,
+        claude_agent_sdk: Option<crate::claude_agent_sdk::ClaudeAgentSdk>,
+        codex_agent_sdk: Option<crate::codex_agent_sdk::CodexAgentSdk>,
+        stdout_tx: mpsc::Sender<String>,
+        launch_root: std::path::PathBuf,
+    ) -> Result<Self, String> {
+        let host_home = dirs::home_dir()
+            .ok_or_else(|| "host home is unavailable for private technical memory".to_string())?;
+        Self::new_with_host_home(
+            config,
+            model,
+            api_key,
+            claude_code_token,
+            claude_agent_sdk,
+            codex_agent_sdk,
+            stdout_tx,
+            Arc::new(AtomicBool::new(false)),
+            launch_root,
+            host_home,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_host_home(
+        config: AppConfig,
+        model: String,
+        api_key: Option<crate::providers::ApiKey>,
+        claude_code_token: Option<crate::secrets::OAuthToken>,
+        claude_agent_sdk: Option<crate::claude_agent_sdk::ClaudeAgentSdk>,
+        codex_agent_sdk: Option<crate::codex_agent_sdk::CodexAgentSdk>,
+        stdout_tx: mpsc::Sender<String>,
+        transport_failed: Arc<AtomicBool>,
+        launch_root: std::path::PathBuf,
+        host_home: std::path::PathBuf,
+    ) -> Result<Self, String> {
+        let launch_capabilities =
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), &launch_root)
+                .working_directory(&launch_root)
+                .host_startup_grants()
+                .host_home(Some(host_home))
+                .remote_actions(config.remote_actions.build_registry()?)
+                .web_egress_grants(config.build_web_egress_grants()?)
+                .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+                .process(true)
+                .network(true)
+                .secrets(true)
+                .provider(config.proxy.target.clone())
+                .budget_limits(
+                    config
+                        .session
+                        .run_budget
+                        .limits_for_session(&config.session),
+                )
+                .build()?;
+        let host_home = launch_capabilities
+            .host_home()
+            .ok_or_else(|| "host home is unavailable for private technical memory".to_string())?;
+        let memory_db = Arc::new(
+            crate::memory::MemoryDb::open_for_workspace(host_home, &launch_root)
+                .map_err(|error| format!("opening ACP technical memory failed: {error}"))?,
+        );
+        if let Some(team_id) = config.memory.team_id.clone() {
+            crate::team_memory::activate_team_memory(
+                memory_db.as_ref(),
+                host_home,
+                &launch_root,
+                team_id,
+            )
+            .map_err(|error| {
+                format!("activating ACP authenticated team technical memory failed: {error}")
+            })?;
+        }
         let persist_dir = dirs::data_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join("openclaudia")
             .join("sessions");
+        let acp_session_storage = prepare_acp_session_storage(&persist_dir)?;
+        let initial_model = model.clone();
 
-        let claude_hooks = load_claude_code_hooks();
-        let merged_hooks = merge_hooks_config(config.hooks.clone(), claude_hooks);
+        let merged_hooks = load_effective_hooks(config.hooks.clone());
         let hook_engine = HookEngine::new(merged_hooks);
-        let rules_engine = RulesEngine::new(".openclaudia/rules");
-        let permission_mgr = Arc::new(crate::permissions::PermissionManager::new(
-            std::path::PathBuf::from(".openclaudia/permissions.json"),
-            true,
-            config.permissions.default_allow.clone(),
-        ));
         let policy_enforcer = Arc::new(crate::services::policy::PolicyEnforcer::new(
             config.policy.clone(),
         ));
+        let vdd_engine = if config.vdd.enabled {
+            let client = crate::provider_transport::shared_client()
+                .map_err(|error| format!("creating ACP VDD client failed: {error}"))?;
+            Some(crate::vdd::VddEngine::new(&config.vdd, &config, client))
+        } else {
+            None
+        };
 
-        Self {
+        Ok(Self {
             config,
+            vdd_engine,
             session_manager: SessionManager::new(persist_dir),
             hook_engine,
-            rules_engine,
             session_map: HashMap::new(),
+            run_contexts: HashMap::new(),
+            mcp_managers: HashMap::new(),
+            plugin_manager: None,
+            task_managers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            memory_db,
             session_order: VecDeque::new(),
             messages: Vec::new(),
             model,
             api_key,
             claude_code_token,
-            permission_mgr,
+            claude_agent_sdk,
+            codex_agent_sdk,
+            provider_native_state: None,
+            active_conversation_acp_session_id: None,
             policy_enforcer,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             stdout_tx,
+            transport_failed,
+            provisional_output: String::new(),
+            last_prompt_error: None,
             config_options: HashMap::new(),
+            session_envelopes: HashMap::new(),
+            acp_session_storage,
+            active_call: None,
+            initial_model,
             next_terminal_id: AtomicU64::new(1),
             state: crate::state::StateStore::new(crate::state::SessionState::new(
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                launch_root.clone(),
             )),
-        }
+            launch_root,
+            launch_capabilities,
+        })
     }
 
     /// Read-only snapshot of the current IDE state (active file,
@@ -835,10 +2420,16 @@ impl AcpServer {
     }
 
     fn reset_state_for_session(&self, session_id: &str) {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let mut replacement = crate::state::SessionState::new(cwd);
+        let mut replacement = crate::state::SessionState::new(self.launch_root.clone());
         if let Ok(session_id) = crate::state::SessionId::from_raw(session_id) {
             replacement.identity.session_id = session_id;
+            let _ = replacement.identity.causal.reinitialize_identity(
+                &replacement.identity.session_id,
+                &self.config.proxy.target,
+                &self.model,
+                &replacement.conversation.messages,
+                replacement.conversation.provider_native_state.as_ref(),
+            );
         }
         self.state.replace(replacement);
     }
@@ -846,6 +2437,29 @@ impl AcpServer {
     // ========================================================================
     // Transport helpers
     // ========================================================================
+
+    fn mark_transport_failed(&self, error: &AcpTransportError) {
+        if !self.transport_failed.swap(true, Ordering::SeqCst) {
+            warn!(%error, "ACP output transport failed; cancelling active work");
+        }
+        self.cancel_flag.store(true, Ordering::SeqCst);
+        if let Some(marker) = self.active_call.as_ref() {
+            if let Some(run) = self.run_context_for_acp(&marker.session_id) {
+                let _ = run
+                    .runtime()
+                    .cancellation()
+                    .cancel(crate::runtime::CancellationReason::FrontendDisconnected);
+            }
+        }
+    }
+
+    fn enqueue_json<T: Serialize>(&self, value: &T, limit: usize) -> Result<(), AcpTransportError> {
+        let line = serialize_bounded_json(value, limit)?;
+        self.stdout_tx.try_send(line).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => AcpTransportError::OutputBackpressure,
+            mpsc::error::TrySendError::Closed(_) => AcpTransportError::OutputDisconnected,
+        })
+    }
 
     /// Send a JSON-RPC response.
     fn send_response(&self, id: Value, result: Option<Value>, error: Option<JsonRpcError>) {
@@ -855,8 +2469,8 @@ impl AcpServer {
             result,
             error,
         };
-        if let Ok(line) = serde_json::to_string(&resp) {
-            let _ = self.stdout_tx.send(line);
+        if let Err(error) = self.enqueue_json(&resp, MAX_ACP_OUTPUT_FRAME_BYTES) {
+            self.mark_transport_failed(&error);
         }
     }
 
@@ -867,17 +2481,34 @@ impl AcpServer {
             method: method.to_string(),
             params,
         };
-        if let Ok(line) = serde_json::to_string(&notif) {
-            let _ = self.stdout_tx.send(line);
+        let limit = if method == "session/update" {
+            MAX_ACP_UPDATE_BYTES
+        } else {
+            MAX_ACP_OUTPUT_FRAME_BYTES
+        };
+        if let Err(error) = self.enqueue_json(&notif, limit) {
+            self.mark_transport_failed(&error);
         }
     }
 
     /// Send a session/update notification.
     fn send_session_update(&self, session_id: &str, update_type: &str, content: &Value) {
+        let active_call = self
+            .active_call
+            .as_ref()
+            .filter(|call| call.session_id == session_id);
+        let Some(active_call) = active_call else {
+            warn!(
+                session_id,
+                update_type, "Dropped uncorrelated ACP session update"
+            );
+            return;
+        };
         self.send_notification(
             "session/update",
             Some(json!({
                 "sessionId": session_id,
+                "callId": active_call.call_id,
                 "sessionUpdate": update_type,
                 "content": content,
             })),
@@ -890,7 +2521,7 @@ impl AcpServer {
             None,
             Some(JsonRpcError {
                 code,
-                message: message.to_string(),
+                message: bounded_diagnostic(message),
                 data: None,
             }),
         );
@@ -935,30 +2566,59 @@ impl AcpServer {
     // Message routing
     // ========================================================================
 
-    /// Route an incoming JSON-RPC message.
-    async fn handle_message(&mut self, msg: JsonRpcMessage) {
-        // This server sends notifications and responses, never requests, so an
-        // incoming message must be a request or notification from the client.
-        let method = if let Some(ref m) = msg.method {
-            m.clone()
-        } else {
+    fn validate_message_ownership(&self, message: &JsonRpcMessage) -> Result<(), String> {
+        let session_id = message.params.get("sessionId").and_then(Value::as_str);
+        let requires_live_owner = matches!(
+            message.method.as_str(),
+            "session/prompt"
+                | "session/cancel"
+                | "ide/file_opened"
+                | "ide/file_closed"
+                | "ide/selection_changed"
+                | "ide/diagnostics"
+        );
+        if requires_live_owner {
+            let session_id = session_id.ok_or_else(|| "Missing sessionId".to_string())?;
+            if !self.session_map.contains_key(session_id) {
+                return Err("Unknown ACP sessionId".to_string());
+            }
+        }
+        if matches!(
+            message.method.as_str(),
+            "session/set_mode" | "session/set_config_option"
+        ) && session_id.is_some_and(|session_id| !self.session_map.contains_key(session_id))
+        {
+            return Err("Unknown ACP sessionId".to_string());
+        }
+        Ok(())
+    }
+
+    async fn handle_message_with_calls(&mut self, msg: JsonRpcMessage, calls: &SharedAcpCalls) {
+        if let Err(error) = self.validate_message_ownership(&msg) {
             if let Some(id) = msg.id {
-                self.send_error(id, INVALID_REQUEST, "Missing method field");
+                self.send_error(id, INVALID_PARAMS, &error);
+            } else {
+                warn!(method = %msg.method, %error, "Rejected unowned ACP notification");
             }
             return;
-        };
-
-        let params = msg.params.unwrap_or(Value::Null);
+        }
+        let method = msg.method;
+        let params = msg.params;
 
         match method.as_str() {
             "initialize" => self.handle_initialize(msg.id, params),
             "authenticate" => self.handle_authenticate(msg.id, params),
-            "session/new" => self.handle_session_new(msg.id, params),
-            "session/load" => self.handle_session_load(msg.id, &params),
-            "session/prompt" => self.handle_session_prompt(msg.id, params).await,
-            "session/cancel" => self.handle_session_cancel(msg.id, params),
-            "session/set_mode" => self.handle_session_set_mode(msg.id, &params),
-            "session/set_config_option" => self.handle_session_set_config_option(msg.id, &params),
+            "session/new" => self.handle_session_new_canonical(msg.id, params).await,
+            "session/load" => self.handle_session_load(msg.id, &params).await,
+            "session/prompt" => {
+                self.handle_session_prompt_with_calls(msg.id, params, calls)
+                    .await;
+            }
+            "session/cancel" => self.handle_session_cancel(msg.id, &params, calls),
+            "session/set_mode" => self.handle_session_set_mode(msg.id, &params).await,
+            "session/set_config_option" => {
+                self.handle_session_set_config_option(msg.id, &params).await;
+            }
             // ─── IDE bridge notifications (crosslink #517) ───
             // Editor plugins push file-open / selection / diagnostic
             // events here. They're fire-and-forget (no response) —
@@ -981,6 +2641,11 @@ impl AcpServer {
 
     fn handle_initialize(&self, id: Option<Value>, _params: Value) {
         let Some(id) = id else { return };
+        let launch = &self.launch_capabilities;
+        let mode_options = acp_mode_profiles()
+            .into_iter()
+            .map(|profile| profile.id)
+            .collect::<Vec<_>>();
 
         self.send_response(
             id,
@@ -992,13 +2657,15 @@ impl AcpServer {
                 },
                 "capabilities": {
                     "prompts": true,
-                    "tools": true,
+                    "tools": launch.grants_resource(crate::tools::ToolResource::WorkspaceRead),
                     "fs": {
-                        "read": true,
-                        "write": true,
+                        "read": launch.grants_resource(crate::tools::ToolResource::WorkspaceRead),
+                        "write": launch.grants_resource(crate::tools::ToolResource::WorkspaceWrite),
                     },
-                    "terminal": true,
+                    "terminal": launch.grants_resource(crate::tools::ToolResource::Process),
                 },
+                "sessionModes": mode_options,
+                "effectiveSessionCapabilities": true,
             })),
             None,
         );
@@ -1020,25 +2687,130 @@ impl AcpServer {
         );
     }
 
-    fn handle_session_new(&mut self, id: Option<Value>, _params: Value) {
+    async fn handle_session_new_canonical(&mut self, id: Option<Value>, _params: Value) {
         let Some(id) = id else { return };
 
-        let session = self.session_manager.get_or_create_session();
-        let oc_session_id = session.id.clone();
-
-        // Generate an ACP-facing session ID
-        let acp_session_id = uuid::Uuid::new_v4().to_string();
-        self.upsert_session_mapping(acp_session_id.clone(), oc_session_id);
-        self.messages.clear();
-        if let Some(oc_session_id) = self.session_map.get(&acp_session_id) {
-            self.reset_state_for_session(oc_session_id);
+        let (acp_session_id, canonical_session, run_context) = match self.prepare_new_session() {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.send_error(id, _INTERNAL_ERROR, &error);
+                return;
+            }
+        };
+        let oc_session_id = canonical_session.id.clone();
+        if let Err(reason) = self.admit_session_start(&run_context, &oc_session_id).await {
+            crate::tools::retire_run(&run_context);
+            self.send_error(
+                id,
+                _INTERNAL_ERROR,
+                &format!("SessionStart hook blocked ACP session creation: {reason}"),
+            );
+            return;
         }
 
+        if let Err(error) =
+            self.install_new_session(&acp_session_id, canonical_session, Arc::clone(&run_context))
+        {
+            crate::tools::retire_run(&run_context);
+            self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+            return;
+        }
+        if let Err(error) = self
+            .install_run_integrations(&acp_session_id, &run_context)
+            .await
+        {
+            self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+            return;
+        }
+        self.send_new_session_response(id, &acp_session_id).await;
+    }
+
+    async fn admit_session_start(
+        &self,
+        run_context: &Arc<crate::tools::ToolRunContext>,
+        openclaudia_session_id: &str,
+    ) -> Result<(), String> {
+        let input =
+            crate::hooks::HookInput::for_run(run_context, crate::hooks::HookEvent::SessionStart)
+                .with_session_id(openclaudia_session_id)
+                .with_extra("frontend", serde_json::Value::String("acp".to_string()));
+        let receipt = self
+            .hook_engine
+            .run_lifecycle(crate::hooks::HookEvent::SessionStart, &input)
+            .await;
+        receipt.blocking_reason().map_or(Ok(()), Err)
+    }
+
+    fn prepare_new_session(
+        &self,
+    ) -> Result<
+        (
+            String,
+            crate::session::Session,
+            Arc<crate::tools::ToolRunContext>,
+        ),
+        String,
+    > {
+        let canonical_session = crate::session::Session::new_initializer();
+        let oc_session_id = canonical_session.id.clone();
+        let run_context = self
+            .build_run_context_for_mode(&oc_session_id, crate::modes::RuntimeMode::Initializer)?;
+        Ok((
+            uuid::Uuid::new_v4().to_string(),
+            canonical_session,
+            run_context,
+        ))
+    }
+
+    fn install_new_session(
+        &mut self,
+        acp_session_id: &str,
+        canonical_session: crate::session::Session,
+        run_context: Arc<crate::tools::ToolRunContext>,
+    ) -> Result<(), AcpSessionStoreError> {
+        if let Some(active) = self.active_conversation_acp_session_id.clone() {
+            self.capture_active_session(&active)?;
+        }
+        let oc_session_id = canonical_session.id.clone();
+        self.session_manager
+            .replace_current_session(canonical_session);
+        let initial_model = self.initial_model.clone();
+        self.config_options.clear();
+        self.model = initial_model;
+        self.upsert_session_mapping(
+            acp_session_id.to_string(),
+            oc_session_id.clone(),
+            run_context,
+        );
+        self.messages.clear();
+        self.provider_native_state = None;
+        self.active_conversation_acp_session_id = Some(acp_session_id.to_string());
+        self.reset_state_for_session(&oc_session_id);
+        self.capture_active_session(acp_session_id)?;
+        Ok(())
+    }
+
+    async fn send_new_session_response(&self, id: Value, acp_session_id: &str) {
+        let config_options = match self.acp_config_options(acp_session_id) {
+            Ok(options) => options,
+            Err(error) => {
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                return;
+            }
+        };
+        let effective = match self.session_capability_payload(acp_session_id).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                return;
+            }
+        };
         self.send_response(
             id,
             Some(json!({
                 "sessionId": acp_session_id,
-                "configOptions": self.acp_config_options(),
+                "configOptions": config_options,
+                "effectiveCapabilities": effective,
             })),
             None,
         );
@@ -1046,7 +2818,8 @@ impl AcpServer {
         info!(acp_session_id = %acp_session_id, "Created new ACP session");
     }
 
-    fn handle_session_load(&mut self, id: Option<Value>, params: &Value) {
+    #[allow(clippy::too_many_lines)] // One ACP load transaction with explicit rollback boundaries.
+    async fn handle_session_load(&mut self, id: Option<Value>, params: &Value) {
         let Some(id) = id else { return };
 
         let acp_session_id =
@@ -1063,66 +2836,178 @@ impl AcpServer {
             return;
         }
 
-        // Check if we know this ACP session
-        if let Some(oc_id) = self.session_map.get(&acp_session_id).cloned() {
-            // Try to load the persisted OpenClaudia session
-            if let Some(session) = self.session_manager.load_session(&oc_id) {
-                // Restore it as active
-                self.session_manager.start_coding(&session.id);
-                self.reset_state_for_session(&oc_id);
-                self.send_response(
-                    id,
-                    Some(json!({
-                        "sessionId": acp_session_id,
-                        "loaded": true,
-                        "configOptions": self.acp_config_options(),
-                    })),
-                    None,
-                );
-                info!(acp_session_id = %acp_session_id, "Loaded ACP session");
+        if self.active_conversation_acp_session_id.as_deref() == Some(&acp_session_id) {
+            if let Err(error) = self.capture_active_session(&acp_session_id) {
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
                 return;
             }
         }
-
-        // Unknown or unloadable — create a new session and map it
-        let session = self.session_manager.get_or_create_session();
-        let oc_session_id = session.id.clone();
-        self.upsert_session_mapping(acp_session_id.clone(), oc_session_id);
-        self.messages.clear();
-        if let Some(oc_session_id) = self.session_map.get(&acp_session_id) {
-            self.reset_state_for_session(oc_session_id);
+        let envelope = match self.read_persisted_session_envelope(&acp_session_id) {
+            Ok(envelope) => envelope,
+            Err(AcpSessionStoreError::UnknownSession(_)) => {
+                self.send_error(id, INVALID_PARAMS, "Unknown ACP sessionId");
+                return;
+            }
+            Err(error) => {
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                return;
+            }
+        };
+        let profile = match acp_mode_profile(&envelope.runtime_mode) {
+            Ok(profile) => profile,
+            Err(error) => {
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                return;
+            }
+        };
+        let base = match self
+            .build_run_context_for_mode(&envelope.canonical_session_id, profile.runtime_mode)
+        {
+            Ok(run) => run,
+            Err(error) => {
+                self.send_error(id, _INTERNAL_ERROR, &error);
+                return;
+            }
+        };
+        let workspace = envelope.session.state_snapshot().identity.active_workspace;
+        let run_context = if let Some(workspace) = workspace.as_ref() {
+            match crate::tools::ToolRunContext::resume_isolated_workspace(&base, workspace) {
+                Ok(run) => {
+                    crate::tools::retire_run(&base);
+                    run
+                }
+                Err(error) => {
+                    crate::tools::retire_run(&base);
+                    self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                    return;
+                }
+            }
+        } else {
+            base
+        };
+        if let Err(reason) = self
+            .admit_session_start(&run_context, &envelope.canonical_session_id)
+            .await
+        {
+            crate::tools::retire_run(&run_context);
+            self.send_error(
+                id,
+                _INTERNAL_ERROR,
+                &format!("SessionStart hook blocked ACP session load: {reason}"),
+            );
+            return;
         }
+        if let Some(active) = self.active_conversation_acp_session_id.clone() {
+            if active != acp_session_id {
+                if let Err(error) = self.capture_active_session(&active) {
+                    crate::tools::retire_run(&run_context);
+                    self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                    return;
+                }
+            }
+        }
+        self.upsert_session_mapping(
+            acp_session_id.clone(),
+            envelope.canonical_session_id.clone(),
+            Arc::clone(&run_context),
+        );
+        if let Err(error) = self
+            .install_run_integrations(&acp_session_id, &run_context)
+            .await
+        {
+            self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+            return;
+        }
+        if let Err(error) = self.restore_session_envelope(&envelope) {
+            self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+            return;
+        }
+        self.session_manager.set_current_mode(profile.session_mode);
 
+        let config_options = match self.acp_config_options(&acp_session_id) {
+            Ok(options) => options,
+            Err(error) => {
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                return;
+            }
+        };
+        let effective = match self.session_capability_payload(&acp_session_id).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                return;
+            }
+        };
         self.send_response(
             id,
             Some(json!({
                 "sessionId": acp_session_id,
-                "loaded": false,
-                "configOptions": self.acp_config_options(),
+                "loaded": true,
+                "generation": envelope.generation,
+                "configOptions": config_options,
+                "effectiveCapabilities": effective,
             })),
             None,
         );
 
-        info!(acp_session_id = %acp_session_id, "session/load fell back to new session");
+        info!(acp_session_id = %acp_session_id, generation = envelope.generation, "Loaded exact ACP session generation");
     }
 
-    fn handle_session_cancel(&self, id: Option<Value>, _params: Value) {
-        self.cancel_flag.store(true, Ordering::SeqCst);
+    fn handle_session_cancel(&self, id: Option<Value>, params: &Value, calls: &SharedAcpCalls) {
+        let session_id = match Self::required_string_param(params, "sessionId", "Missing sessionId")
+        {
+            Ok(session_id) if self.session_map.contains_key(session_id) => session_id,
+            Ok(_) => {
+                if let Some(id) = id {
+                    self.send_error(id, INVALID_PARAMS, "Unknown ACP sessionId");
+                }
+                return;
+            }
+            Err(message) => {
+                if let Some(id) = id {
+                    self.send_error(id, INVALID_PARAMS, &message);
+                }
+                return;
+            }
+        };
+        let call_id = match params.get("callId") {
+            Some(Value::String(call_id)) => Some(call_id.as_str()),
+            Some(_) => {
+                if let Some(id) = id {
+                    self.send_error(
+                        id,
+                        INVALID_PARAMS,
+                        "Invalid 'callId' parameter: expected string",
+                    );
+                }
+                return;
+            }
+            None => None,
+        };
+        let cancelled = calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .request_cancel(session_id, call_id);
 
         if let Some(id) = id {
             self.send_response(
                 id,
                 Some(json!({
-                    "cancelled": true,
+                    "sessionId": session_id,
+                    "callId": call_id,
+                    "cancelled": cancelled,
                 })),
                 None,
             );
         }
 
-        info!("Prompt cancellation requested");
+        info!(
+            session_id,
+            call_id, cancelled, "Prompt cancellation request correlated"
+        );
     }
 
-    fn handle_session_set_mode(&mut self, id: Option<Value>, params: &Value) {
+    async fn handle_session_set_mode(&mut self, id: Option<Value>, params: &Value) {
         let Some(id) = id else { return };
 
         let mode = match Self::required_alias_string_param(params, "mode", "modeId", "Missing mode")
@@ -1133,40 +3018,80 @@ impl AcpServer {
                 return;
             }
         };
+        if mode != "auto" && acp_mode_profile(mode).is_err() {
+            self.send_error(
+                id,
+                INVALID_PARAMS,
+                &AcpCapabilityError::UnknownMode(mode.to_string()).to_string(),
+            );
+            return;
+        }
+        let acp_session_id = match self.ensure_requested_acp_session_id(params).await {
+            Ok(session_id) => session_id,
+            Err(error) => {
+                self.send_error(id, INVALID_PARAMS, &error.to_string());
+                return;
+            }
+        };
 
         let active_mode = match mode {
-            "initializer" | "coding" => match self.apply_acp_mode_value(mode) {
-                Ok(mode) => mode,
-                Err(reason) => {
-                    self.send_error(id, INVALID_PARAMS, &reason);
-                    return;
+            "initializer" | "coding" | "plan" | "readonly" => {
+                match self.apply_acp_mode_value(&acp_session_id, mode) {
+                    Ok(run) => acp_runtime_mode_label(&run.runtime_mode()),
+                    Err(reason) => {
+                        self.send_error(id, INVALID_PARAMS, &reason.to_string());
+                        return;
+                    }
                 }
-            },
-            "auto" => self.session_manager.get_or_create_session().mode,
+            }
+            "auto" => self
+                .run_context_for_acp(&acp_session_id)
+                .map_or("initializer", |run| {
+                    acp_runtime_mode_label(&run.runtime_mode())
+                }),
             _ => {
                 self.send_error(
                     id,
                     INVALID_PARAMS,
-                    &format!("Invalid mode: {mode}. Supported: initializer, coding, auto"),
+                    &AcpCapabilityError::UnknownMode(mode.to_string()).to_string(),
                 );
                 return;
             }
         };
-        let active_mode = acp_mode_label(active_mode);
+        if let Err(error) = self.capture_active_session(&acp_session_id) {
+            self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+            return;
+        }
+        let config_options = match self.acp_config_options(&acp_session_id) {
+            Ok(options) => options,
+            Err(error) => {
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                return;
+            }
+        };
+        let effective = match self.session_capability_payload(&acp_session_id).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                return;
+            }
+        };
 
         self.send_response(
             id,
             Some(json!({
+                "sessionId": acp_session_id,
                 "mode": mode,
                 "activeMode": active_mode,
-                "configOptions": self.acp_config_options(),
+                "configOptions": config_options,
+                "effectiveCapabilities": effective,
             })),
             None,
         );
         info!(requested_mode = %mode, active_mode, "Session mode set");
     }
 
-    fn handle_session_set_config_option(&mut self, id: Option<Value>, params: &Value) {
+    async fn handle_session_set_config_option(&mut self, id: Option<Value>, params: &Value) {
         let Some(id) = id else { return };
 
         let uses_v1_shape = params.get("configId").is_some();
@@ -1192,7 +3117,6 @@ impl AcpServer {
                 }
             }
         }
-
         let value = match Self::required_string_param(params, "value", "Missing string value") {
             Ok(value) => value.to_string(),
             Err(message) => {
@@ -1200,9 +3124,35 @@ impl AcpServer {
                 return;
             }
         };
+        if !matches!(config_id.as_str(), ACP_CONFIG_MODE_ID | ACP_CONFIG_MODEL_ID) {
+            self.send_error(
+                id,
+                INVALID_PARAMS,
+                &format!("Unknown configId: {config_id}. Supported values: mode, model"),
+            );
+            return;
+        }
+        if config_id == ACP_CONFIG_MODE_ID && acp_mode_profile(&value).is_err() {
+            self.send_error(
+                id,
+                INVALID_PARAMS,
+                &AcpCapabilityError::UnknownMode(value.clone()).to_string(),
+            );
+            return;
+        }
+        let acp_session_id = match self.ensure_requested_acp_session_id(params).await {
+            Ok(session_id) => session_id,
+            Err(error) => {
+                self.send_error(id, INVALID_PARAMS, &error.to_string());
+                return;
+            }
+        };
 
         let apply_result = match config_id.as_str() {
-            ACP_CONFIG_MODE_ID => self.apply_acp_mode_value(&value).map(|_| ()),
+            ACP_CONFIG_MODE_ID => self
+                .apply_acp_mode_value(&acp_session_id, &value)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
             ACP_CONFIG_MODEL_ID => self.apply_acp_model_value(&value),
             _ => Err(format!(
                 "Unknown configId: {config_id}. Supported values: mode, model"
@@ -1216,10 +3166,30 @@ impl AcpServer {
 
         self.config_options
             .insert(config_id.clone(), Value::String(value.clone()));
+        if let Err(error) = self.capture_active_session(&acp_session_id) {
+            self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+            return;
+        }
+        let config_options = match self.acp_config_options(&acp_session_id) {
+            Ok(options) => options,
+            Err(error) => {
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                return;
+            }
+        };
+        let effective = match self.session_capability_payload(&acp_session_id).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                return;
+            }
+        };
         self.send_response(
             id,
             Some(json!({
-                "configOptions": self.acp_config_options(),
+                "sessionId": acp_session_id,
+                "configOptions": config_options,
+                "effectiveCapabilities": effective,
             })),
             None,
         );
@@ -1238,36 +3208,74 @@ impl AcpServer {
     // bridge loop over a schema drift in a 3rd-party plugin.
     // ========================================================================
 
-    fn handle_ide_file_opened(&self, params: &Value) {
+    fn handle_ide_file_opened(&mut self, params: &Value) {
         if !self.ide_notification_path_allowed(params) {
             return;
         }
-        self.state
-            .update(|state, _| apply_ide_file_opened(&mut state.ide, params));
+        self.update_owned_ide_state(params, apply_ide_file_opened);
     }
 
-    fn handle_ide_file_closed(&self, params: &Value) {
+    fn handle_ide_file_closed(&mut self, params: &Value) {
         if !self.ide_notification_path_allowed(params) {
             return;
         }
-        self.state
-            .update(|state, _| apply_ide_file_closed(&mut state.ide, params));
+        self.update_owned_ide_state(params, apply_ide_file_closed);
     }
 
-    fn handle_ide_selection_changed(&self, params: &Value) {
+    fn handle_ide_selection_changed(&mut self, params: &Value) {
         if !self.ide_notification_path_allowed(params) {
             return;
         }
-        self.state
-            .update(|state, _| apply_ide_selection_changed(&mut state.ide, params));
+        self.update_owned_ide_state(params, |ide, params| {
+            apply_ide_selection_changed(ide, params);
+        });
     }
 
-    fn handle_ide_diagnostics(&self, params: &Value) {
+    fn handle_ide_diagnostics(&mut self, params: &Value) {
         if !self.ide_notification_path_allowed(params) {
             return;
         }
-        self.state
-            .update(|state, _| apply_ide_diagnostics(&mut state.ide, params));
+        self.update_owned_ide_state(params, apply_ide_diagnostics);
+    }
+
+    fn update_owned_ide_state(
+        &mut self,
+        params: &Value,
+        update: impl FnOnce(&mut IdeState, &Value),
+    ) {
+        let Some(acp_session_id) = params.get("sessionId").and_then(Value::as_str) else {
+            return;
+        };
+        if self.active_conversation_acp_session_id.as_deref() == Some(acp_session_id) {
+            self.state.update(|state, _| update(&mut state.ide, params));
+            if let Err(error) = self.capture_active_session(acp_session_id) {
+                warn!(%error, acp_session_id, "Failed to persist ACP IDE state generation");
+            }
+            return;
+        }
+        let mut envelope = match self.remembered_session_envelope(acp_session_id) {
+            Ok(Some(envelope)) => envelope,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(%error, acp_session_id, "Rejected malformed ACP IDE session state");
+                return;
+            }
+        };
+        let Some(generation) = envelope.generation.checked_add(1) else {
+            warn!(acp_session_id, "ACP IDE session generation exhausted");
+            return;
+        };
+        envelope
+            .session
+            .update_state(|state, _| update(&mut state.ide, params));
+        envelope.generation = generation;
+        envelope.session.touch();
+        if let Err(error) = self
+            .remember_session_envelope(&envelope)
+            .and_then(|()| self.persist_session_envelope(&envelope))
+        {
+            warn!(%error, acp_session_id, "Failed to persist inactive ACP IDE state");
+        }
     }
 
     fn ide_notification_path_allowed(&self, params: &Value) -> bool {
@@ -1278,9 +3286,14 @@ impl AcpServer {
             warn!("ACP IDE notification omitted sessionId; dropping unscoped buffer data");
             return false;
         };
-        let openclaudia_session_id = self.oc_session_id_for_acp(acp_session_id);
-        let _guard = crate::tools::SessionIdGuard::set(openclaudia_session_id);
-        match crate::tools::security::validate_client_buffer_path(std::path::Path::new(path)) {
+        let Some(run) = self.run_context_for_acp(acp_session_id) else {
+            warn!(
+                acp_session_id,
+                "ACP IDE notification named an unknown session"
+            );
+            return false;
+        };
+        match crate::tools::security::validate_client_buffer_path(run, std::path::Path::new(path)) {
             Ok(_) => true,
             Err(reason) => {
                 warn!(
@@ -1296,75 +3309,393 @@ impl AcpServer {
     // Prompt execution — the core agentic loop
     // ========================================================================
 
-    fn record_failed_prompt_turn(&mut self, reason: &str) {
-        crate::session::append_failed_turn_message(&mut self.messages, reason);
+    fn ensure_history_bound(&self) -> Result<(), String> {
+        bounded_json_size(&self.messages, MAX_ACP_HISTORY_BYTES)
+            .map(|_| ())
+            .map_err(|_| {
+                format!("ACP conversation history exceeds the {MAX_ACP_HISTORY_BYTES}-byte limit")
+            })
     }
 
-    fn fail_prompt_with_update(&mut self, acp_session_id: &str, text: &str) -> String {
-        self.record_failed_prompt_turn(text);
-        self.send_session_update(
-            acp_session_id,
-            "agent_message_chunk",
-            &json!({"type": "text", "text": text}),
-        );
+    fn push_history_message(&mut self, message: Value) -> Result<(), String> {
+        self.messages.push(message);
+        if let Err(error) = self.ensure_history_bound() {
+            self.messages.pop();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn append_reference_messages_bounded(
+        &mut self,
+        projection: &crate::context::ContextProjection,
+    ) -> Result<(), String> {
+        let original_len = self.messages.len();
+        projection.append_reference_to_json_messages(&mut self.messages);
+        if let Err(error) = self.ensure_history_bound() {
+            self.messages.truncate(original_len);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn stage_assistant_output(&mut self, acp_session_id: &str, text: &str) -> Result<(), String> {
+        if self.provisional_output.len().saturating_add(text.len()) > MAX_ACP_ASSISTANT_OUTPUT_BYTES
+        {
+            return Err(format!(
+                "ACP assistant output exceeds the {MAX_ACP_ASSISTANT_OUTPUT_BYTES}-byte limit"
+            ));
+        }
+        self.provisional_output.push_str(text);
+        if !text.is_empty() {
+            self.send_session_update(
+                acp_session_id,
+                "agent_message_chunk",
+                &json!({
+                    "type": "text",
+                    "text": text,
+                    "provisional": true,
+                }),
+            );
+        }
+        Ok(())
+    }
+
+    fn record_prompt_error(&mut self, reason: &str) {
+        self.last_prompt_error = Some(bounded_diagnostic(reason));
+    }
+
+    fn fail_prompt_with_update(&mut self, _acp_session_id: &str, text: &str) -> String {
+        self.record_prompt_error(text);
         "error".to_string()
     }
 
-    async fn handle_session_prompt(&mut self, id: Option<Value>, params: Value) {
-        let Some(id) = id else { return };
-
-        let acp_session_id =
-            match Self::required_string_param(&params, "sessionId", "Missing sessionId") {
-                Ok(sid) => sid.to_string(),
-                Err(message) => {
-                    self.send_error(id, INVALID_PARAMS, &message);
-                    return;
-                }
-            };
-
-        if acp_session_id.is_empty() {
-            self.send_error(id, INVALID_PARAMS, "sessionId must not be empty");
-            return;
+    fn parse_prompt_params(params: &Value) -> Result<(String, String), String> {
+        let session_id = Self::required_string_param(params, "sessionId", "Missing sessionId")?;
+        if session_id.is_empty() {
+            return Err("sessionId must not be empty".to_string());
         }
+        let prompt = Self::required_string_param(params, "prompt", "Missing prompt")?;
+        if prompt.len() > MAX_ACP_PROMPT_BYTES {
+            return Err(format!(
+                "prompt exceeds the {MAX_ACP_PROMPT_BYTES}-byte ACP limit"
+            ));
+        }
+        Ok((session_id.to_string(), prompt.to_string()))
+    }
 
-        let prompt = match Self::required_string_param(&params, "prompt", "Missing prompt") {
-            Ok(prompt) => prompt.to_string(),
+    async fn prepare_prompt_run_context(
+        &mut self,
+        acp_session_id: &str,
+        oc_session_id: &str,
+    ) -> Result<Arc<crate::tools::ToolRunContext>, String> {
+        let current = self
+            .run_contexts
+            .get(acp_session_id)
+            .cloned()
+            .ok_or_else(|| format!("Unknown ACP session {acp_session_id}"))?;
+        let runtime_mode = current.runtime_mode().mode;
+        let parent_budget = current.runtime().budget().clone();
+        let persisted_workspace = current.isolated_workspace().cloned();
+
+        // A prompt owns an exact cancellation generation. Its budget remains
+        // a child of the wire session's cumulative authority, so rotating the
+        // generation cannot reset provider/tool limits between turns.
+        let base_run = self.build_run_context_for_mode_with_parent(
+            oc_session_id,
+            runtime_mode,
+            Some(parent_budget),
+        )?;
+        let run_context = if let Some(workspace) = persisted_workspace.as_ref() {
+            self.run_contexts.remove(acp_session_id);
+            if let Err(error) = crate::tools::worktree::release_workspace_descriptor_owner(&current)
+            {
+                crate::tools::retire_run(&base_run);
+                self.run_contexts
+                    .insert(acp_session_id.to_string(), current);
+                return Err(error);
+            }
+            crate::tools::retire_run(&current);
+            match crate::tools::ToolRunContext::resume_isolated_workspace(&base_run, workspace) {
+                Ok(run) => {
+                    crate::tools::retire_run(&base_run);
+                    run
+                }
+                Err(error) => {
+                    crate::tools::retire_run(&base_run);
+                    return Err(error.to_string());
+                }
+            }
+        } else {
+            base_run
+        };
+        self.replace_run_context(acp_session_id.to_string(), Arc::clone(&run_context));
+        self.install_run_integrations(acp_session_id, &run_context)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(run_context)
+    }
+
+    fn finish_prompt_call(&mut self, calls: &SharedAcpCalls, acp_session_id: &str, call_id: &str) {
+        calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .complete(acp_session_id, call_id);
+        let marker_matches = self
+            .active_call
+            .as_ref()
+            .is_some_and(|marker| marker.session_id == acp_session_id && marker.call_id == call_id);
+        if marker_matches {
+            self.active_call = None;
+        }
+        self.cancel_flag = Arc::new(AtomicBool::new(false));
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn handle_session_prompt_with_calls(
+        &mut self,
+        id: Option<Value>,
+        params: Value,
+        calls: &SharedAcpCalls,
+    ) {
+        let Some(id) = id else { return };
+        let (acp_session_id, prompt) = match Self::parse_prompt_params(&params) {
+            Ok(parsed) => parsed,
             Err(message) => {
                 self.send_error(id, INVALID_PARAMS, &message);
                 return;
             }
         };
 
-        // Reset cancel flag
-        self.cancel_flag.store(false, Ordering::SeqCst);
-        let oc_session_id = self.oc_session_id_for_acp(&acp_session_id);
-        crate::tools::clear_session_process_cancellation(&oc_session_id);
+        let reservation = {
+            let mut registry = calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry.reserve_prompt(&acp_session_id, &id)
+        };
+        let call = match reservation {
+            Ok(call) => call,
+            Err(error) => {
+                self.send_error(id, INVALID_REQUEST, &error);
+                return;
+            }
+        };
+        let Some(oc_session_id) = self
+            .oc_session_id_for_acp(&acp_session_id)
+            .map(str::to_string)
+        else {
+            self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
+            self.send_error(id, INVALID_PARAMS, "Unknown ACP sessionId");
+            return;
+        };
+        if let Err(error) = self.activate_owned_session(&acp_session_id) {
+            self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
+            self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+            return;
+        }
+        if let Err(error) = self.ensure_history_bound() {
+            self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
+            self.send_error(id, INVALID_REQUEST, &error);
+            return;
+        }
+        let committed_messages = self.messages.clone();
+        let committed_provider_native_state = self.provider_native_state.clone();
+        let committed_lifecycle_session = self.session_manager.get_session().cloned();
+        self.provisional_output.clear();
+        self.last_prompt_error = None;
+        let run_context = match self
+            .prepare_prompt_run_context(&acp_session_id, &oc_session_id)
+            .await
+        {
+            Ok(run) => run,
+            Err(error) => {
+                self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
+                self.send_error(id, _INTERNAL_ERROR, &error);
+                return;
+            }
+        };
+        let binding = {
+            let mut registry = calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry.bind_run(&acp_session_id, &call.call_id, &run_context)
+        };
+        if let Err(error) = binding {
+            self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
+            self.send_error(id, INVALID_REQUEST, &error);
+            return;
+        }
+        self.cancel_flag = Arc::clone(&call.cancellation);
+        let marker = AcpActiveCallMarker {
+            session_id: acp_session_id.clone(),
+            call_id: call.call_id.clone(),
+        };
+        self.active_call = Some(marker);
+        self.send_session_update(
+            &acp_session_id,
+            "call_started",
+            &json!({"callId": &call.call_id}),
+        );
 
-        // Add user message
-        self.messages.push(json!({
+        let prompt_input = crate::hooks::HookInput::for_run(
+            &run_context,
+            crate::hooks::HookEvent::UserPromptSubmit,
+        )
+        .with_session_id(&oc_session_id)
+        .with_prompt(&prompt)
+        .with_extra("frontend", serde_json::Value::String("acp".to_string()));
+        let prompt_receipt = self
+            .hook_engine
+            .run_lifecycle(crate::hooks::HookEvent::UserPromptSubmit, &prompt_input)
+            .await;
+        if let Some(reason) = prompt_receipt.blocking_reason() {
+            self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
+            self.send_error(
+                id,
+                INVALID_REQUEST,
+                &format!("UserPromptSubmit hook blocked ACP prompt: {reason}"),
+            );
+            return;
+        }
+
+        // The user turn and all assistant/tool projections remain provisional
+        // until the final durable envelope commit below.
+        if let Err(error) = self.push_history_message(json!({
             "role": "user",
             "content": prompt.clone(),
-        }));
-        let task_obs = crate::grounded_loop::observe_session_user_task(&oc_session_id, &prompt);
+        })) {
+            self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
+            self.send_error(id, INVALID_REQUEST, &error);
+            return;
+        }
+        let hook_items = crate::context::hook_result_reference_items(
+            &prompt_receipt.into_result(),
+            "user_prompt_submit",
+            500,
+        );
+        if !hook_items.is_empty() {
+            let projection = crate::context::ContextProjector::project(
+                hook_items,
+                crate::context::ContextBudget::default(),
+            );
+            if let Err(error) = self.append_reference_messages_bounded(&projection) {
+                self.messages = committed_messages;
+                self.provider_native_state = committed_provider_native_state;
+                self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
+                self.send_error(id, INVALID_REQUEST, &error);
+                return;
+            }
+        }
+        let task_obs = crate::grounded_loop::observe_session_user_task(
+            &run_context,
+            &oc_session_id,
+            &prompt,
+            &self.model,
+        );
 
         // Run the agentic loop
-        let stop_reason = self
-            .run_prompt_loop(&acp_session_id, &oc_session_id, task_obs)
+        let mut stop_reason = self
+            .run_prompt_loop(run_context, &acp_session_id, &oc_session_id, task_obs)
             .await;
+
+        if let Some(run_context) = self.run_context_for_acp(&acp_session_id) {
+            let stop_input =
+                crate::hooks::HookInput::for_run(run_context, crate::hooks::HookEvent::Stop)
+                    .with_session_id(&oc_session_id)
+                    .with_extra(
+                        "stop_reason",
+                        serde_json::Value::String(stop_reason.clone()),
+                    );
+            let stop_receipt = self
+                .hook_engine
+                .run_lifecycle(crate::hooks::HookEvent::Stop, &stop_input)
+                .await;
+            if let Some(reason) = stop_receipt.blocking_reason() {
+                self.record_prompt_error(&format!(
+                    "Stop hook blocked ACP turn finalization: {reason}"
+                ));
+                stop_reason = "hook_blocked".to_string();
+            }
+        }
+
+        if stop_reason != "end_turn" || self.transport_failed.load(Ordering::SeqCst) {
+            self.messages = committed_messages;
+            self.provider_native_state = committed_provider_native_state;
+            self.provisional_output.clear();
+            let message =
+                self.last_prompt_error
+                    .take()
+                    .unwrap_or_else(|| match stop_reason.as_str() {
+                        "cancelled" => "ACP prompt was cancelled before commit".to_string(),
+                        "max_iterations" => {
+                            "ACP prompt exhausted its iteration budget before terminal success"
+                                .to_string()
+                        }
+                        "hook_blocked" => {
+                            "ACP prompt finalization was blocked by policy".to_string()
+                        }
+                        _ => "ACP prompt failed before terminal success".to_string(),
+                    });
+            let code = if stop_reason == "cancelled" {
+                ACP_CANCELLED
+            } else {
+                _INTERNAL_ERROR
+            };
+            self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
+            if !self.transport_failed.load(Ordering::SeqCst) {
+                self.send_error(id, code, &message);
+            }
+            return;
+        }
 
         // Record turn metrics
         if let Some(session) = self.session_manager.get_session_mut() {
             session.request_count += 1;
             session.updated_at = chrono::Utc::now();
         }
+        let effective = match self.session_capability_payload(&acp_session_id).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.messages = committed_messages;
+                self.provider_native_state = committed_provider_native_state;
+                if let Some(session) = committed_lifecycle_session {
+                    self.session_manager.replace_current_session(session);
+                }
+                self.provisional_output.clear();
+                self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                return;
+            }
+        };
+        let persisted_generation = match self.capture_active_session(&acp_session_id) {
+            Ok(envelope) => envelope.generation,
+            Err(error) => {
+                self.messages = committed_messages;
+                self.provider_native_state = committed_provider_native_state;
+                if let Some(session) = committed_lifecycle_session {
+                    self.session_manager.replace_current_session(session);
+                }
+                self.provisional_output.clear();
+                self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
+                self.send_error(id, _INTERNAL_ERROR, &error.to_string());
+                return;
+            }
+        };
+
+        self.provisional_output.clear();
 
         self.send_response(
             id,
             Some(json!({
+                "sessionId": acp_session_id,
+                "callId": &call.call_id,
+                "generation": persisted_generation,
                 "stopReason": stop_reason,
+                "effectiveCapabilities": effective,
             })),
             None,
         );
+        self.finish_prompt_call(calls, &acp_session_id, &call.call_id);
     }
 
     /// Run the prompt → tool calls → re-prompt loop.
@@ -1372,9 +3703,10 @@ impl AcpServer {
     #[allow(clippy::too_many_lines)]
     async fn run_prompt_loop(
         &mut self,
+        mut run: Arc<crate::tools::ToolRunContext>,
         acp_session_id: &str,
         oc_session_id: &str,
-        task_obs: Option<crate::ledger::ObsId>,
+        mut task_obs: Option<crate::ledger::ObsId>,
     ) -> String {
         // Crosslink #433: a typo in `proxy.target` now surfaces here as
         // an explicit error instead of being silently mapped to
@@ -1388,13 +3720,27 @@ impl AcpServer {
                     .fail_prompt_with_update(acp_session_id, &format!("Provider error: {e}"));
             }
         };
-        let client = reqwest::Client::new();
+        let client = match crate::provider_transport::shared_client() {
+            Ok(client) => client,
+            Err(error) => {
+                return self.fail_prompt_with_update(
+                    acp_session_id,
+                    &format!("Provider transport initialization failed: {error}"),
+                );
+            }
+        };
+        let wire_api = if self.codex_agent_sdk.is_some() {
+            crate::pipeline::WireApi::OpenAiResponses
+        } else {
+            crate::pipeline::WireApi::ChatCompletions
+        };
         // crosslink #717: the iteration ceiling is now resolved from
         // `AcpConfig` (default 50, matches the previous hard-coded
         // value). Operators raising the cap to support long-horizon
         // agents no longer need to recompile — set it via the
         // `acp.max_iterations` YAML key or the
-        // `OPENCLAUDIA_ACP_MAX_ITERATIONS` env var.
+        // `OPENCLAUDIA_ACP__MAX_ITERATIONS` env var (the exact legacy
+        // single-underscore alias remains accepted with a warning).
         let max_iterations = match crate::config::AcpConfig::load() {
             Ok(cfg) => cfg.max_iterations,
             Err(e) => {
@@ -1406,56 +3752,36 @@ impl AcpServer {
         };
 
         for iteration in 0..max_iterations {
-            if self.cancel_flag.load(Ordering::SeqCst) {
+            if self.cancel_flag.load(Ordering::SeqCst)
+                || self.transport_failed.load(Ordering::SeqCst)
+            {
+                self.record_prompt_error("ACP prompt was cancelled before commit");
                 return "cancelled".to_string();
+            }
+            if let Err(error) = self.ensure_history_bound() {
+                return self.fail_prompt_with_update(acp_session_id, &error);
             }
 
             // Build the request
-            let tools =
-                match acp_tool_definitions_for_chat_request(crate::tools::get_tool_definitions()) {
-                    Ok(tools) => tools,
-                    Err(e) => {
-                        let text = format!("Internal ACP tool registry error: {e}");
-                        return self.fail_prompt_with_update(acp_session_id, &text);
-                    }
-                };
-            // Crosslink #694: inject `.openclaudia/rules` content into the
-            // system prompt so the ACP path receives the same rules
-            // context the proxy path injects via `ContextInjector`. The
-            // rules engine is queried against extensions parsed out of
-            // every message in the turn buffer; an empty string is fine —
-            // `build_system_prompt` ignores it.
-            let rules_content = self.collect_rules_for_messages();
-            let rules_arg = if rules_content.is_empty() {
-                None
-            } else {
-                Some(rules_content.as_str())
+            let tools = match self
+                .effective_tool_catalog(acp_session_id, &run, &self.messages)
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|snapshot| {
+                    acp_tool_definitions_for_chat_request(snapshot.definitions_value())
+                }) {
+                Ok(tools) => tools,
+                Err(e) => {
+                    let text = format!("Internal ACP tool registry error: {e}");
+                    return self.fail_prompt_with_update(acp_session_id, &text);
+                }
             };
-            // crosslink #717: pass the working directory through so the
-            // ACP-served prompt names the same cwd block the proxy path
-            // injects. Skipping this dropped the `current working dir`
-            // hint from every ACP turn — tools that resolve relative
-            // paths inherited a different mental model than the model
-            // was given. Best-effort: a failed `current_dir` call simply
-            // omits the block (matches the proxy-path behaviour).
-            let cwd_string = crate::tools::security::current_context()
-                .ok()
-                .map(|context| context.working_directory().to_string_lossy().into_owned());
+            // The exact generation-bound run supplies both the model-visible
+            // working directory and the bounded project skill layer.
             let ide_state = self.ide_state();
-            let system_prompt =
-                build_acp_system_prompt(rules_arg, cwd_string.as_deref(), &ide_state);
-
-            // Prepend system prompt to messages
-            let mut all_messages: Vec<crate::proxy::ChatMessage> =
-                vec![crate::proxy::ChatMessage {
-                    role: "system".to_string(),
-                    content: crate::proxy::MessageContent::Text(system_prompt),
-                    name: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    extra: std::collections::HashMap::new(),
-                }];
+            let prompt_context = build_acp_prompt_context(&run, &ide_state);
             let grounded_messages = match crate::grounded_loop::request_messages_with_grounding(
+                &run,
                 oc_session_id,
                 task_obs,
                 &self.messages,
@@ -1475,10 +3801,17 @@ impl AcpServer {
                     );
                 }
             };
-            all_messages.extend(decoded_messages);
+            let all_messages = prompt_context.prepare_chat_messages(&decoded_messages);
+            let assistant_message_ordinal =
+                match crate::pipeline::next_assistant_message_ordinal(&self.messages) {
+                    Ok(ordinal) => ordinal,
+                    Err(error) => {
+                        return self.fail_prompt_with_update(acp_session_id, &error);
+                    }
+                };
 
             // Build a ChatCompletionRequest for the adapter
-            let chat_request = crate::proxy::ChatCompletionRequest {
+            let mut chat_request = crate::proxy::ChatCompletionRequest {
                 model: self.model.clone(),
                 messages: all_messages,
                 temperature: None,
@@ -1488,24 +3821,127 @@ impl AcpServer {
                 tool_choice: None,
                 extra: std::collections::HashMap::new(),
             };
+            let compactor = crate::services::AutoCompactor::auto(
+                crate::compaction::ContextCompactor::for_model(&chat_request.model),
+            );
+            let needs_compaction = compactor.should_compact(&chat_request, None);
+            match crate::compaction::provider_state_compaction_disposition(
+                wire_api.is_responses(),
+                needs_compaction,
+                self.provider_native_state.as_ref(),
+            ) {
+                crate::compaction::ProviderStateCompactionDisposition::ProviderManaged => {}
+                crate::compaction::ProviderStateCompactionDisposition::BlocksPortableCheckpoint => {
+                    return self.fail_prompt_with_update(
+                        acp_session_id,
+                        "Context needs compaction, but the provider-native continuation is bound to the exact message history and this protocol has no native compaction contract",
+                    );
+                }
+                crate::compaction::ProviderStateCompactionDisposition::Absent
+                | crate::compaction::ProviderStateCompactionDisposition::Preserved => {
+                    match compactor
+                        .auto_compact(
+                            &mut chat_request,
+                            None,
+                            Some(&self.hook_engine),
+                            &run,
+                            Some(oc_session_id),
+                            Some(Arc::clone(&self.memory_db)),
+                        )
+                        .await
+                    {
+                        Ok(Some(result))
+                            if matches!(
+                                result.disposition,
+                                crate::compaction::CompactionDisposition::Partial
+                                    | crate::compaction::CompactionDisposition::CannotFit
+                            ) =>
+                        {
+                            return self.fail_prompt_with_update(
+                                acp_session_id,
+                                &format!(
+                                    "Context cannot fit after checkpoint: {} tokens remain for target {}",
+                                    result.new_tokens, result.target_tokens
+                                ),
+                            );
+                        }
+                        Ok(Some(_) | None) => {}
+                        Err(error) => {
+                            return self.fail_prompt_with_update(
+                                acp_session_id,
+                                &format!("Context checkpoint failed: {error}"),
+                            );
+                        }
+                    }
+                }
+            }
             if let Err(e) = self.check_provider_request_policy(&chat_request) {
                 return self
                     .fail_prompt_with_update(acp_session_id, &format!("Blocked by policy: {e}"));
             }
 
-            // Transform for provider
-            let mut transformed = match adapter.transform_request_with_thinking(
-                &chat_request,
-                &self
-                    .config
-                    .active_provider()
-                    .map(|p| p.thinking.clone())
-                    .unwrap_or_default(),
-            ) {
-                Ok(t) => t,
-                Err(e) => {
-                    return self
-                        .fail_prompt_with_update(acp_session_id, &format!("Provider error: {e}"));
+            // Transform stateful protocols through the canonical wire builder
+            // so exact native continuation is applied before the body leaves
+            // the process. Other Chat Completions providers retain their
+            // streaming adapter path.
+            let thinking = self
+                .config
+                .active_provider()
+                .map(|p| p.thinking.clone())
+                .unwrap_or_default();
+            let uses_native_json = matches!(
+                self.config
+                    .proxy
+                    .target
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "google" | "gemini" | "ollama"
+            );
+            let mut transformed = if wire_api.is_responses() || uses_native_json {
+                let message_values = match chat_request
+                    .messages
+                    .iter()
+                    .cloned()
+                    .map(serde_json::to_value)
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    Ok(messages) => messages,
+                    Err(error) => {
+                        return self.fail_prompt_with_update(
+                            acp_session_id,
+                            &format!("Provider message conversion failed: {error}"),
+                        );
+                    }
+                };
+                match crate::pipeline::build_request_for_wire_with_exact_tools_and_state(
+                    wire_api,
+                    &self.config.proxy.target,
+                    &self.model,
+                    &message_values,
+                    thinking.reasoning_effort.as_deref().unwrap_or("medium"),
+                    None,
+                    None,
+                    chat_request.tools.as_deref().unwrap_or_default(),
+                    self.provider_native_state.as_ref(),
+                ) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return self.fail_prompt_with_update(
+                            acp_session_id,
+                            &format!("Provider error: {error}"),
+                        );
+                    }
+                }
+            } else {
+                match adapter.transform_request_with_thinking(&chat_request, &thinking) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return self.fail_prompt_with_update(
+                            acp_session_id,
+                            &format!("Provider error: {error}"),
+                        );
+                    }
                 }
             };
 
@@ -1514,13 +3950,21 @@ impl AcpServer {
                 return self
                     .fail_prompt_with_update(acp_session_id, "No active provider configured");
             };
-            let claude_code_token = self.claude_code_token.as_deref();
+            let claude_code_token = self.claude_code_token.as_ref();
             if claude_code_token.is_some()
                 && self.config.proxy.target.eq_ignore_ascii_case("anthropic")
             {
-                crate::claude_credentials::inject_system_prompt(&mut transformed);
+                if let Err(error) =
+                    crate::claude_credentials::inject_oauth_prefix_only(&mut transformed)
+                {
+                    return self.fail_prompt_with_update(
+                        acp_session_id,
+                        &format!("Provider authentication error: {error}"),
+                    );
+                }
             }
-            let endpoint = match crate::pipeline::resolve_endpoint(
+            let endpoint = match crate::pipeline::resolve_endpoint_for_wire(
+                wire_api,
                 &self.config.proxy.target,
                 &self.model,
                 &provider.base_url,
@@ -1534,93 +3978,341 @@ impl AcpServer {
             };
 
             // Build HTTP request with headers
-            let extra_headers: Vec<(String, String)> = provider
-                .headers
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect();
-            let headers = match crate::pipeline::resolve_headers(
+            let extra_headers = provider.headers.clone();
+            let headers = if self.codex_agent_sdk.is_some() {
+                crate::secrets::SensitiveHeaders::new()
+            } else {
+                match crate::pipeline::resolve_headers(
+                    &self.config.proxy.target,
+                    self.api_key.as_ref(),
+                    claude_code_token,
+                    &extra_headers,
+                ) {
+                    Ok(headers) => headers,
+                    Err(e) => {
+                        return self.fail_prompt_with_update(
+                            acp_session_id,
+                            &format!("Provider error: {e}"),
+                        );
+                    }
+                }
+            };
+
+            let provider_budget = match crate::provider_budget::reserve_provider_call(
+                &run,
                 &self.config.proxy.target,
-                self.api_key.as_ref(),
-                claude_code_token,
-                &extra_headers,
+                &self.model,
+                &mut transformed,
+                u64::from(self.config.session.token_tracking.max_output_tokens),
             ) {
-                Ok(headers) => headers,
-                Err(e) => {
-                    return self
-                        .fail_prompt_with_update(acp_session_id, &format!("Provider error: {e}"));
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    return self.fail_prompt_with_update(
+                        acp_session_id,
+                        &format!("Run budget denied provider call: {error}"),
+                    );
                 }
             };
-
-            let mut req = client.post(&endpoint).json(&transformed);
-            for (key, value) in &headers {
-                req = req.header(key, value);
-            }
-
-            // Send request
-            debug!(endpoint = %endpoint, iteration = iteration, "Sending provider request");
-            let response = match req.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    return self
-                        .fail_prompt_with_update(acp_session_id, &format!("Request failed: {e}"));
-                }
-            };
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let content_type = response
-                    .headers()
-                    .get("content-type")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .to_string();
-                let body = response.text().await.unwrap_or_default();
-                let error_msg = if content_type.contains("text/html") {
-                    format!("Error {status}: (HTML response — check provider configuration)")
-                } else {
-                    format!("Error {status}: {body}")
+            let (stream_result, next_provider_native_state) = if let Some(sdk) =
+                self.codex_agent_sdk.as_ref()
+            {
+                debug!(iteration, "Sending provider request through Codex SDK");
+                let turn = match sdk
+                    .complete_turn(
+                        &transformed,
+                        thinking.reasoning_effort.as_deref().unwrap_or("medium"),
+                    )
+                    .await
+                {
+                    Ok(turn) => turn,
+                    Err(error) => {
+                        if let Err(budget_error) = provider_budget.finish_unknown() {
+                            return self.fail_prompt_with_update(
+                                acp_session_id,
+                                &format!(
+                                    "Codex SDK request failed: {error}; budget reconciliation failed: {budget_error}"
+                                ),
+                            );
+                        }
+                        return self.fail_prompt_with_update(
+                            acp_session_id,
+                            &format!("Codex SDK request failed: {error}"),
+                        );
+                    }
                 };
-                self.send_session_update(
-                    acp_session_id,
-                    "agent_message_chunk",
-                    &json!({"type": "text", "text": error_msg}),
+                if let Err(error) = provider_budget.reconcile(&turn.usage) {
+                    return self.fail_prompt_with_update(
+                        acp_session_id,
+                        &format!("Provider budget reconciliation failed: {error}"),
+                    );
+                }
+                let terminal = if turn.tool_calls.is_empty() {
+                    crate::pipeline::ProviderTerminalOutcome::Completed
+                } else {
+                    crate::pipeline::ProviderTerminalOutcome::ToolCalls
+                };
+                let tool_calls = turn
+                    .tool_calls
+                    .into_iter()
+                    .map(|call| AccumulatedToolCall {
+                        id: call.id,
+                        name: call.function.name,
+                        arguments: call.function.arguments,
+                    })
+                    .collect();
+                (finish_acp_stream(turn.content, tool_calls, terminal), None)
+            } else if let Some(sdk) = self.claude_agent_sdk.as_ref() {
+                debug!(
+                    iteration,
+                    "Sending provider request through Claude Agent SDK"
                 );
-                self.record_failed_prompt_turn(&error_msg);
-                return "error".to_string();
-            }
+                let turn = match sdk
+                    .complete_turn(
+                        &transformed,
+                        thinking.reasoning_effort.as_deref().unwrap_or("medium"),
+                    )
+                    .await
+                {
+                    Ok(turn) => turn,
+                    Err(error) => {
+                        if let Err(budget_error) = provider_budget.finish_unknown() {
+                            return self.fail_prompt_with_update(
+                                    acp_session_id,
+                                    &format!(
+                                        "Claude Agent SDK request failed: {error}; budget reconciliation failed: {budget_error}"
+                                    ),
+                                );
+                        }
+                        return self.fail_prompt_with_update(
+                            acp_session_id,
+                            &format!("Claude Agent SDK request failed: {error}"),
+                        );
+                    }
+                };
+                if let Err(error) = provider_budget.reconcile(&turn.usage) {
+                    return self.fail_prompt_with_update(
+                        acp_session_id,
+                        &format!("Provider budget reconciliation failed: {error}"),
+                    );
+                }
+                let terminal = if turn.tool_calls.is_empty() {
+                    crate::pipeline::ProviderTerminalOutcome::Completed
+                } else {
+                    crate::pipeline::ProviderTerminalOutcome::ToolCalls
+                };
+                let tool_calls = turn
+                    .tool_calls
+                    .into_iter()
+                    .map(|call| AccumulatedToolCall {
+                        id: call.id,
+                        name: call.function.name,
+                        arguments: call.function.arguments,
+                    })
+                    .collect();
+                (finish_acp_stream(turn.content, tool_calls, terminal), None)
+            } else {
+                let req = match headers.apply(client.post(&endpoint).json(&transformed)) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return self.fail_prompt_with_update(
+                            acp_session_id,
+                            &format!("Provider header error: {error}"),
+                        );
+                    }
+                };
 
-            // Stream the response
-            let stream_result = self
-                .stream_provider_response(acp_session_id, response)
-                .await;
+                // Send request
+                debug!(iteration, "Sending provider request");
+                let response = match crate::provider_transport::send(req).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return self.fail_prompt_with_update(
+                            acp_session_id,
+                            &format!("Request failed: {e}"),
+                        );
+                    }
+                };
+
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let content_type = response
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let body = crate::secrets::read_bounded_diagnostic_body(response)
+                        .await
+                        .unwrap_or_else(|_| zeroize::Zeroizing::new(String::new()));
+                    let error_msg = if content_type.contains("text/html") {
+                        format!("Error {status}: (HTML response — check provider configuration)")
+                    } else {
+                        format!("Error {status}: {}", headers.sanitize_diagnostic(&body))
+                    };
+                    self.record_prompt_error(&error_msg);
+                    return "error".to_string();
+                }
+
+                // Decode stateful protocols through their canonical terminal
+                // validators before ACP dispatches any projected tool call.
+                let decoded = if wire_api.is_responses() {
+                    let decoded = match crate::pipeline::decode_openai_responses_stream(
+                        crate::pipeline::OpenAiResponsesStreamParams {
+                            response,
+                            headers: &headers,
+                            provider: &self.config.proxy.target,
+                            model_identity: &self.model,
+                            provider_native_state: self.provider_native_state.as_ref(),
+                            assistant_message_ordinal,
+                        },
+                        |_| Ok(()),
+                        |_| Ok(()),
+                        |_, _| Ok(()),
+                    )
+                    .await
+                    {
+                        Ok(decoded) => decoded,
+                        Err(error) => {
+                            return self.fail_prompt_with_update(
+                                acp_session_id,
+                                &format!("Provider stream error: {error}"),
+                            );
+                        }
+                    };
+                    let (stream_result, state) = acp_responses_stream_result(decoded);
+                    (stream_result, Some(state))
+                } else if uses_native_json {
+                    let native_json = match crate::provider_transport::read_json_capped::<Value>(
+                        response,
+                        crate::provider_transport::MAX_JSON_RESPONSE_BYTES,
+                    )
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(error) => {
+                            return self.fail_prompt_with_update(
+                                acp_session_id,
+                                &format!("Provider JSON error: {error}"),
+                            );
+                        }
+                    };
+                    let decoded = match crate::pipeline::decode_provider_native_json_turn(
+                        &self.config.proxy.target,
+                        &self.model,
+                        &native_json,
+                        self.provider_native_state.as_ref(),
+                        assistant_message_ordinal,
+                    ) {
+                        Ok(decoded) => decoded,
+                        Err(error) => {
+                            return self.fail_prompt_with_update(
+                                acp_session_id,
+                                &format!(
+                                    "Provider response error: {}",
+                                    headers.sanitize_diagnostic(&error)
+                                ),
+                            );
+                        }
+                    };
+                    let (stream_result, state) = acp_native_json_stream_result(decoded);
+                    (stream_result, Some(state))
+                } else {
+                    (
+                        self.stream_provider_response(acp_session_id, response)
+                            .await,
+                        None,
+                    )
+                };
+
+                if let Err(error) = provider_budget.finish_unknown() {
+                    return self.fail_prompt_with_update(
+                        acp_session_id,
+                        &format!("Provider budget reconciliation failed: {error}"),
+                    );
+                }
+                decoded
+            };
 
             match stream_result {
                 StreamResult::EndTurn { content } => {
-                    let rendered_content =
-                        match crate::grounded_loop::validate_and_render_agentic_final_response(
-                            oc_session_id,
-                            &content,
-                        ) {
-                            Ok(rendered) => rendered,
-                            Err(reason) => {
-                                self.send_session_update(
-                                acp_session_id,
-                                "agent_message_chunk",
-                                &json!({
-                                    "type": "text",
-                                    "text": format!("\nFinal answer failed grounding gate: {reason}"),
-                                }),
+                    let rendered_content = match validate_and_render_acp_final_response(
+                        &run,
+                        oc_session_id,
+                        &content,
+                        &self.model,
+                    ) {
+                        Ok(rendered) => rendered,
+                        Err(reason) => {
+                            self.record_prompt_error(&format!(
+                                "Final answer failed grounding gate: {reason}"
+                            ));
+                            return "error".to_string();
+                        }
+                    };
+                    let user_task = self
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+                        .and_then(|message| message.get("content").and_then(Value::as_str))
+                        .unwrap_or("")
+                        .to_string();
+                    let policy = crate::vdd::VddFinalizationPolicy::from_config(&self.config.vdd);
+                    let scope = format!("acp:{acp_session_id}:{user_task}");
+                    let builder = crate::vdd::BuilderProvider::new(
+                        &self.config.proxy.target,
+                        self.api_key.as_ref(),
+                    )
+                    .with_model(&self.model);
+                    let finalization = crate::vdd::finalize_text_candidate(
+                        self.vdd_engine.as_ref(),
+                        &run,
+                        &policy,
+                        rendered_content,
+                        &scope,
+                        &user_task,
+                        builder,
+                    )
+                    .await;
+                    let (publication, vdd_observation) = finalization.into_parts();
+                    let rendered_content = match publication {
+                        crate::vdd::VddPublication::Publish(candidate) => {
+                            candidate.into_candidate()
+                        }
+                        crate::vdd::VddPublication::Withhold(withheld) => {
+                            let reason = format!(
+                                "VDD finalization withheld assistant success ({:?}): {}",
+                                withheld.outcome(),
+                                withheld.detail()
                             );
-                                return "error".to_string();
-                            }
-                        };
-                    // No tool calls — we're done
-                    if !rendered_content.is_empty() {
-                        self.messages.push(json!({
+                            self.record_prompt_error(&reason);
+                            return "error".to_string();
+                        }
+                    };
+                    if let Err(error) =
+                        self.stage_assistant_output(acp_session_id, &rendered_content)
+                    {
+                        return self.fail_prompt_with_update(acp_session_id, &error);
+                    }
+                    if wire_api.is_responses() || !rendered_content.is_empty() {
+                        if let Err(error) = self.push_history_message(json!({
                             "role": "assistant",
                             "content": rendered_content,
-                        }));
+                        })) {
+                            return self.fail_prompt_with_update(acp_session_id, &error);
+                        }
+                    }
+                    if let Some(observation) = vdd_observation {
+                        let projection = crate::context::ContextProjector::project(
+                            vec![observation],
+                            crate::context::ContextBudget::default(),
+                        );
+                        if let Err(error) = self.append_reference_messages_bounded(&projection) {
+                            return self.fail_prompt_with_update(acp_session_id, &error);
+                        }
+                    }
+                    if let Some(state) = next_provider_native_state {
+                        self.provider_native_state = Some(state);
                     }
                     return "end_turn".to_string();
                 }
@@ -1628,6 +4320,9 @@ impl AcpServer {
                     content,
                     tool_calls,
                 } => {
+                    if let Err(error) = self.stage_assistant_output(acp_session_id, &content) {
+                        return self.fail_prompt_with_update(acp_session_id, &error);
+                    }
                     // Add assistant message with tool calls
                     let tool_calls_json: Vec<Value> = tool_calls
                         .iter()
@@ -1643,11 +4338,16 @@ impl AcpServer {
                         })
                         .collect();
 
-                    self.messages.push(json!({
+                    if let Err(error) = self.push_history_message(json!({
                         "role": "assistant",
                         "content": if content.is_empty() { Value::Null } else { Value::String(content) },
                         "tool_calls": tool_calls_json,
-                    }));
+                    })) {
+                        return self.fail_prompt_with_update(acp_session_id, &error);
+                    }
+                    if let Some(state) = next_provider_native_state {
+                        self.provider_native_state = Some(state);
+                    }
 
                     // Execute tools via ACP client methods
                     for tc in &tool_calls {
@@ -1659,55 +4359,222 @@ impl AcpServer {
                             acp_session_id,
                             "tool_call",
                             &json!({
+                                "toolCallId": tc.id,
                                 "title": tc.name,
                                 "status": "running",
                             }),
                         );
 
-                        let result = self
-                            .execute_tool_via_acp(oc_session_id, &tc.name, &tc.arguments)
+                        let mut result = self
+                            .execute_tool_via_acp(
+                                &run,
+                                oc_session_id,
+                                &tc.id,
+                                &tc.name,
+                                &tc.arguments,
+                            )
                             .await;
-                        record_acp_tool_result_observation(
-                            oc_session_id,
-                            &tc.name,
-                            &tc.id,
-                            &result,
-                        );
+                        match result.follow_up().clone() {
+                            crate::tools::ToolFollowUp::EnterPlanMode { .. } => {
+                                match self.apply_acp_mode_value(acp_session_id, "plan") {
+                                    Ok(next_run) => {
+                                        let mode = next_run.runtime_mode();
+                                        result = result
+                                            .resolve_follow_up(
+                                                format!(
+                                                    "Entered Plan mode generation {}. Workspace and external effects are now denied.",
+                                                    mode.generation
+                                                ),
+                                                json!({
+                                                    "mode": "plan",
+                                                    "capabilityGeneration": next_run.generation().get(),
+                                                    "runtimeModeGeneration": mode.generation,
+                                                }),
+                                            )
+                                            .unwrap_or(result);
+                                        run = next_run;
+                                        task_obs = self.messages.iter().rev().find_map(|message| {
+                                            (message.get("role").and_then(Value::as_str)
+                                                == Some("user"))
+                                            .then(|| message.get("content").and_then(Value::as_str))
+                                            .flatten()
+                                            .and_then(|content| {
+                                                crate::grounded_loop::observe_session_user_task(
+                                                    &run,
+                                                    oc_session_id,
+                                                    content,
+                                                    &self.model,
+                                                )
+                                            })
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let reason = error.to_string();
+                                        result = result
+                                            .cancel_follow_up(
+                                                format!(
+                                                    "Plan mode transition was rejected: {reason}"
+                                                ),
+                                                reason,
+                                            )
+                                            .unwrap_or(result);
+                                    }
+                                }
+                            }
+                            crate::tools::ToolFollowUp::ExitPlanMode { .. } => {
+                                let reason = "Plan mode remains active until the ACP client explicitly negotiates session/set_mode for this sessionId".to_string();
+                                result = result
+                                    .cancel_follow_up(reason.clone(), reason)
+                                    .unwrap_or(result);
+                            }
+                            crate::tools::ToolFollowUp::None
+                            | crate::tools::ToolFollowUp::UserQuestion { .. } => {}
+                        }
+                        record_acp_tool_result_observation(&run, oc_session_id, &result);
+                        if let Some(transition) = result.workspace_transition() {
+                            match crate::tools::ToolRunContext::apply_workspace_transition(
+                                &run, transition,
+                            ) {
+                                Ok(next_run) => {
+                                    if let Err(error) = crate::guardrails::configure(
+                                        &next_run,
+                                        &self.config.guardrails,
+                                    ) {
+                                        result = result.with_postcondition_failure(
+                                            ToolFailure::new(
+                                                ToolFailureCode::Internal,
+                                                format!(
+                                                    "Workspace changed, but ACP guardrail rebinding failed: {error}"
+                                                ),
+                                                ToolRetryability::Never,
+                                            ),
+                                        );
+                                    }
+                                    if let Err(error) = self
+                                        .install_run_integrations(acp_session_id, &next_run)
+                                        .await
+                                    {
+                                        result = result.with_postcondition_failure(
+                                            ToolFailure::new(
+                                                ToolFailureCode::Internal,
+                                                format!(
+                                                    "Workspace changed, but ACP integration rebinding failed: {error}"
+                                                ),
+                                                ToolRetryability::Never,
+                                            ),
+                                        );
+                                    }
+                                    self.task_managers
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .remove(oc_session_id);
+                                    self.replace_run_context(
+                                        acp_session_id.to_string(),
+                                        Arc::clone(&next_run),
+                                    );
+                                    self.state.update(|state, _| {
+                                        let root = next_run.project_root().to_path_buf();
+                                        state.identity.cwd =
+                                            next_run.working_directory().to_path_buf();
+                                        state.identity.project_root.clone_from(&root);
+                                        state.identity.session_project_dir = root;
+                                        state.identity.active_workspace =
+                                            next_run.isolated_workspace().cloned();
+                                        state.transcript.transcript_cwd =
+                                            next_run.working_directory().to_path_buf();
+                                    });
+                                    task_obs = self.messages.iter().rev().find_map(|message| {
+                                        (message.get("role").and_then(Value::as_str)
+                                            == Some("user"))
+                                        .then(|| message.get("content").and_then(Value::as_str))
+                                        .flatten()
+                                        .and_then(|content| {
+                                            crate::grounded_loop::observe_session_user_task(
+                                                &next_run,
+                                                oc_session_id,
+                                                content,
+                                                &self.model,
+                                            )
+                                        })
+                                    });
+                                    run = next_run;
+                                }
+                                Err(error) => {
+                                    result = result.with_postcondition_failure(ToolFailure::new(
+                                        ToolFailureCode::Conflict,
+                                        format!("Workspace transition was not published: {error}"),
+                                        ToolRetryability::Safe,
+                                    ));
+                                }
+                            }
+                        }
 
                         self.send_session_update(
                             acp_session_id,
                             "tool_call",
-                            &json!({
-                                "title": tc.name,
-                                "status": "completed",
-                                "output": result.content,
-                            }),
+                            &acp_tool_call_update_payload(&result),
                         );
 
-                        // Add tool result to messages
-                        self.messages.push(json!({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": result.content,
-                        }));
+                        // The provider receives the exact typed result envelope
+                        // in its text-only tool-result slot. The canonical value
+                        // remains available above for UI and evidence consumers.
+                        if let Err(error) =
+                            self.push_history_message(bounded_acp_tool_message(&result))
+                        {
+                            return self.fail_prompt_with_update(acp_session_id, &error);
+                        }
+                    }
+
+                    if let Some(report) = crate::guardrails::run_quality_gates_at(
+                        &run,
+                        &self.model,
+                        crate::config::RunAfter::EveryTurn,
+                    ) {
+                        if report.prevents_progress() {
+                            let detail = report.reason().map_or_else(
+                                || {
+                                    report
+                                        .results()
+                                        .iter()
+                                        .filter(|check| !check.passed())
+                                        .map(|check| {
+                                            format!("{} ({:?})", check.name(), check.status())
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                },
+                                ToString::to_string,
+                            );
+                            if let Err(error) = self.push_history_message(json!({
+                                "role": "system",
+                                "content": format!(
+                                    "Configured quality-gate findings must be addressed before finalization: {detail}"
+                                ),
+                                "metadata": {
+                                    "openclaudia_context_source": "reality"
+                                }
+                            })) {
+                                return self.fail_prompt_with_update(acp_session_id, &error);
+                            }
+                        }
                     }
 
                     // Continue the loop — re-prompt with tool results
                 }
                 StreamResult::Cancelled => {
+                    self.record_prompt_error("ACP provider stream was cancelled before commit");
                     return "cancelled".to_string();
                 }
                 StreamResult::Error(msg) => {
-                    self.send_session_update(
-                        acp_session_id,
-                        "agent_message_chunk",
-                        &json!({"type": "text", "text": msg}),
-                    );
+                    self.record_prompt_error(&msg);
                     return "error".to_string();
                 }
             }
         }
 
+        self.record_prompt_error(
+            "ACP prompt exhausted its iteration budget before terminal success",
+        );
         "max_iterations".to_string()
     }
 
@@ -1720,260 +4587,290 @@ impl AcpServer {
     #[allow(clippy::too_many_lines)]
     async fn stream_provider_response(
         &self,
-        acp_session_id: &str,
+        _acp_session_id: &str,
         response: reqwest::Response,
     ) -> StreamResult {
+        use eventsource_stream::Eventsource as _;
         use futures::StreamExt;
 
-        let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
+        let mut stream = crate::provider_transport::bounded_byte_stream(
+            response,
+            crate::provider_transport::MAX_STREAM_RESPONSE_BYTES,
+        )
+        .eventsource();
         let mut full_content = String::new();
         let mut tool_calls: Vec<AccumulatedToolCall> = Vec::new();
-
-        // Track partial tool call state
         let mut current_tool_index: Option<usize> = None;
+        let mut terminal = crate::pipeline::ChatStreamTerminal::new(&self.config.proxy.target);
+        let stream_timeout = std::time::Duration::from_secs(crate::proxy::SSE_STREAM_TIMEOUT_SECS);
 
-        while let Some(chunk_result) = stream.next().await {
+        loop {
             if self.cancel_flag.load(Ordering::SeqCst) {
                 return StreamResult::Cancelled;
             }
 
-            let chunk = match chunk_result {
-                Ok(c) => c,
-                Err(e) => {
-                    return StreamResult::Error(format!("Stream error: {e}"));
+            let event = match tokio::time::timeout(stream_timeout, stream.next()).await {
+                Ok(Some(Ok(event))) => event,
+                Ok(Some(Err(error))) => {
+                    return failed_acp_stream(format!("Stream error: {error}"), &full_content);
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    return failed_acp_stream(
+                        format!(
+                            "Provider stream timed out after {} seconds",
+                            crate::proxy::SSE_STREAM_TIMEOUT_SECS
+                        ),
+                        &full_content,
+                    );
                 }
             };
 
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-            // Process complete SSE lines
-            while let Some(line_end) = buffer.find('\n') {
-                let line = buffer[..line_end].trim().to_string();
-                buffer = buffer[line_end + 1..].to_string();
-
-                if line.is_empty() || line == "data: [DONE]" {
-                    if line == "data: [DONE]" {
-                        // Stream complete
-                        return finish_acp_stream(full_content, tool_calls);
-                    }
-                    continue;
+            if let Err(error) = terminal.observe_event_name(&event.event) {
+                return failed_acp_stream(error, &full_content);
+            }
+            if event.data == "[DONE]" {
+                terminal.observe_done();
+                break;
+            }
+            let json: Value = match serde_json::from_str(&event.data) {
+                Ok(value) => value,
+                Err(error) => {
+                    return failed_acp_stream(
+                        format!("Malformed provider SSE event: {error}"),
+                        &full_content,
+                    );
                 }
+            };
+            if let Err(error) = terminal.observe(&json) {
+                return failed_acp_stream(error, &full_content);
+            }
 
-                if !line.starts_with("data: ") {
-                    // Handle Anthropic event: lines
-                    if line.starts_with("event: ") {
-                        let event_type = line.trim_start_matches("event: ");
-                        if event_type == "message_stop" {
-                            return finish_acp_stream(full_content, tool_calls);
-                        }
-                    }
-                    continue;
-                }
+            // Handle OpenAI-format streaming
+            if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
+                for choice in choices {
+                    let Some(delta) = choice.get("delta") else {
+                        continue;
+                    };
 
-                let data = &line["data: ".len()..];
-                let json: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-
-                // Handle OpenAI-format streaming
-                if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
-                    for choice in choices {
-                        let Some(delta) = choice.get("delta") else {
-                            continue;
-                        };
-
-                        // Text content
-                        if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
-                            full_content.push_str(text);
-                            self.send_session_update(
-                                acp_session_id,
-                                "agent_message_chunk",
-                                &json!({"type": "text", "text": text}),
-                            );
-                        }
-
-                        // Tool calls
-                        if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
-                            for tc_delta in tcs {
-                                #[allow(clippy::cast_possible_truncation)]
-                                // Tool call index is always small; truncation is safe
-                                let index = tc_delta
-                                    .get("index")
-                                    .and_then(serde_json::Value::as_u64)
-                                    .unwrap_or(0)
-                                    as usize;
-
-                                while tool_calls.len() <= index {
-                                    tool_calls.push(AccumulatedToolCall::default());
-                                }
-
-                                if let Some(tc_id) = tc_delta.get("id").and_then(|i| i.as_str()) {
-                                    tool_calls[index].id = tc_id.to_string();
-                                }
-
-                                // New tool call
-                                if let Some(func) = tc_delta.get("function") {
-                                    if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
-                                        tool_calls[index].name = name.to_string();
-                                        current_tool_index = Some(index);
-                                    }
-                                    if let Some(args) =
-                                        func.get("arguments").and_then(|a| a.as_str())
-                                    {
-                                        tool_calls[index].arguments.push_str(args);
-                                    }
-                                }
-                            }
-                        }
-
-                        // Finish reason
-                        if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
-                            if reason == "stop" && tool_calls.is_empty() {
-                                return StreamResult::EndTurn {
-                                    content: full_content,
-                                };
-                            }
-                            if reason == "tool_calls" {
-                                return finish_acp_stream(full_content, tool_calls);
-                            }
+                    if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
+                        if let Err(error) = append_bounded_stream_text(
+                            &mut full_content,
+                            text,
+                            MAX_ACP_ASSISTANT_OUTPUT_BYTES,
+                            "assistant output",
+                        ) {
+                            return failed_acp_stream(error, &full_content);
                         }
                     }
-                }
 
-                // Handle Anthropic-format streaming
-                if let Some(delta_type) = json.get("type").and_then(|t| t.as_str()) {
-                    match delta_type {
-                        "content_block_start" => {
-                            let content_block = json.get("content_block").unwrap_or(&Value::Null);
-                            let block_type = content_block
-                                .get("type")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or("");
+                    if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                        for tc_delta in tcs {
+                            let index = tc_delta
+                                .get("index")
+                                .and_then(serde_json::Value::as_u64)
+                                .map_or(0, |value| usize::try_from(value).unwrap_or(usize::MAX));
+                            if index >= crate::tools::MAX_PARALLEL_TOOL_CALL_SLOTS {
+                                return failed_acp_stream(
+                                    format!(
+                                        "Provider tool call index {index} exceeds the supported limit"
+                                    ),
+                                    &full_content,
+                                );
+                            }
 
-                            match block_type {
-                                "thinking" => {
-                                    self.send_session_update(
-                                        acp_session_id,
-                                        "thinking",
-                                        &json!({"type": "thinking", "status": "started"}),
+                            while tool_calls.len() <= index {
+                                if tool_calls.len() >= MAX_ACP_TOOL_CALLS_PER_TURN {
+                                    return failed_acp_stream(
+                                        format!(
+                                            "Provider returned more than {MAX_ACP_TOOL_CALLS_PER_TURN} ACP tool calls"
+                                        ),
+                                        &full_content,
                                     );
                                 }
-                                "tool_use" => {
-                                    let name = content_block
-                                        .get("name")
-                                        .and_then(|n| n.as_str())
-                                        .unwrap_or("");
-                                    let tc_id = content_block
-                                        .get("id")
-                                        .and_then(|i| i.as_str())
-                                        .unwrap_or("");
-                                    tool_calls.push(AccumulatedToolCall {
-                                        id: tc_id.to_string(),
-                                        name: name.to_string(),
-                                        arguments: String::new(),
-                                    });
-                                    current_tool_index = Some(tool_calls.len() - 1);
+                                tool_calls.push(AccumulatedToolCall::default());
+                            }
+
+                            if let Some(tc_id) = tc_delta.get("id").and_then(|i| i.as_str()) {
+                                if tc_id.len() > MAX_ACP_ID_BYTES {
+                                    return failed_acp_stream(
+                                        "Provider tool call id exceeded the ACP id limit"
+                                            .to_string(),
+                                        &full_content,
+                                    );
                                 }
-                                _ => {}
+                                tool_calls[index].id = tc_id.to_string();
+                            }
+
+                            if let Some(func) = tc_delta.get("function") {
+                                if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
+                                    if name.len() > MAX_ACP_METHOD_BYTES {
+                                        return failed_acp_stream(
+                                            "Provider tool name exceeded the ACP method limit"
+                                                .to_string(),
+                                            &full_content,
+                                        );
+                                    }
+                                    tool_calls[index].name = name.to_string();
+                                    current_tool_index = Some(index);
+                                }
+                                if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
+                                    if let Err(error) = append_bounded_stream_text(
+                                        &mut tool_calls[index].arguments,
+                                        args,
+                                        MAX_ACP_TOOL_ARGUMENT_BYTES,
+                                        "tool arguments",
+                                    ) {
+                                        return failed_acp_stream(error, &full_content);
+                                    }
+                                }
                             }
                         }
-                        "content_block_delta" => {
-                            let delta = json.get("delta").unwrap_or(&Value::Null);
-                            let delta_type =
-                                delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    }
+                }
+            }
 
-                            match delta_type {
-                                "text_delta" => {
-                                    if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
-                                        full_content.push_str(text);
-                                        self.send_session_update(
-                                            acp_session_id,
-                                            "agent_message_chunk",
-                                            &json!({"type": "text", "text": text}),
-                                        );
+            // Handle Anthropic-format streaming
+            if let Some(delta_type) = json.get("type").and_then(|t| t.as_str()) {
+                match delta_type {
+                    "content_block_start" => {
+                        let content_block = json.get("content_block").unwrap_or(&Value::Null);
+                        let block_type = content_block
+                            .get("type")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("");
+
+                        if block_type == "tool_use" {
+                            if tool_calls.len() >= MAX_ACP_TOOL_CALLS_PER_TURN {
+                                return failed_acp_stream(
+                                    format!(
+                                        "Provider returned more than {MAX_ACP_TOOL_CALLS_PER_TURN} ACP tool calls"
+                                    ),
+                                    &full_content,
+                                );
+                            }
+                            let name = content_block
+                                .get("name")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("");
+                            let tc_id = content_block
+                                .get("id")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("");
+                            if name.len() > MAX_ACP_METHOD_BYTES || tc_id.len() > MAX_ACP_ID_BYTES {
+                                return failed_acp_stream(
+                                    "Provider tool identity exceeded ACP limits".to_string(),
+                                    &full_content,
+                                );
+                            }
+                            tool_calls.push(AccumulatedToolCall {
+                                id: tc_id.to_string(),
+                                name: name.to_string(),
+                                arguments: String::new(),
+                            });
+                            current_tool_index = Some(tool_calls.len() - 1);
+                        }
+                    }
+                    "content_block_delta" => {
+                        let delta = json.get("delta").unwrap_or(&Value::Null);
+                        let delta_type = delta
+                            .get("type")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("");
+
+                        match delta_type {
+                            "text_delta" => {
+                                if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                                    if let Err(error) = append_bounded_stream_text(
+                                        &mut full_content,
+                                        text,
+                                        MAX_ACP_ASSISTANT_OUTPUT_BYTES,
+                                        "assistant output",
+                                    ) {
+                                        return failed_acp_stream(error, &full_content);
                                     }
                                 }
-                                "thinking_delta" => {
-                                    if let Some(text) =
-                                        delta.get("thinking").and_then(|t| t.as_str())
+                            }
+                            "input_json_delta" => {
+                                if let Some(partial) =
+                                    delta.get("partial_json").and_then(|value| value.as_str())
+                                {
+                                    if let Some(call) = current_tool_index
+                                        .and_then(|index| tool_calls.get_mut(index))
                                     {
-                                        self.send_session_update(
-                                            acp_session_id,
-                                            "thinking",
-                                            &json!({"type": "thinking", "text": text}),
-                                        );
-                                    }
-                                }
-                                "input_json_delta" => {
-                                    if let Some(partial) =
-                                        delta.get("partial_json").and_then(|p| p.as_str())
-                                    {
-                                        if let Some(idx) = current_tool_index {
-                                            if idx < tool_calls.len() {
-                                                tool_calls[idx].arguments.push_str(partial);
-                                            }
+                                        if let Err(error) = append_bounded_stream_text(
+                                            &mut call.arguments,
+                                            partial,
+                                            MAX_ACP_TOOL_ARGUMENT_BYTES,
+                                            "tool arguments",
+                                        ) {
+                                            return failed_acp_stream(error, &full_content);
                                         }
                                     }
                                 }
-                                _ => {}
                             }
+                            _ => {}
                         }
-                        "message_delta" => {
-                            if let Some(delta) = json.get("delta") {
-                                if let Some(reason) =
-                                    delta.get("stop_reason").and_then(|r| r.as_str())
-                                {
-                                    if reason == "end_turn" && tool_calls.is_empty() {
-                                        return StreamResult::EndTurn {
-                                            content: full_content,
-                                        };
-                                    }
-                                    if reason == "tool_use" {
-                                        return finish_acp_stream(full_content, tool_calls);
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
                     }
+                    _ => {}
                 }
             }
         }
 
-        // Stream ended without explicit stop
-        finish_acp_stream(full_content, tool_calls)
+        match terminal.finish() {
+            Ok(outcome) => finish_acp_stream(full_content, tool_calls, outcome),
+            Err(error) => failed_acp_stream(error, &full_content),
+        }
     }
 
     // ========================================================================
     // Tool execution via ACP client methods
     // ========================================================================
 
-    /// Execute a tool by delegating to ACP client methods.
+    /// Execute an ACP-requested tool through `OpenClaudia`'s local handlers.
     ///
     /// Mirrors `proxy.rs::prepare_request_context`'s gate sequence
     /// (crosslink #694):
     /// 1. Run `PreToolUse` hooks. On denial, surface the block reason as
     ///    the tool result instead of dispatching — no ACP fs/terminal
     ///    call is made and no `execute_tool_with_memory` runs.
-    /// 2. Run a non-interactive permission check. ACP stdio cannot show
-    ///    the TUI prompt, so unmatched write/bash/web-fetch decisions
-    ///    become default-deny results.
-    /// 3. Dispatch to the appropriate ACP / local handler.
+    /// 2. Dispatch through the local executor, which mints and consumes an
+    ///    exact permission permit. ACP stdio cannot show the TUI prompt, so
+    ///    unmatched effectful decisions become default-deny results.
+    /// 3. Execute the appropriate normalized local handler.
     /// 4. Fire `PostToolUse` (or `PostToolUseFailure`) after dispatch so
     ///    post-tool side effects (logging, audit, learn hooks) observe
     ///    ACP-driven calls the same way they observe proxy-driven calls.
     async fn execute_tool_via_acp(
         &self,
+        run: &Arc<crate::tools::ToolRunContext>,
         session_id: &str,
+        tool_call_id: &str,
         tool_name: &str,
         arguments_json: &str,
-    ) -> AcpToolResult {
+    ) -> ToolResult {
+        let tool_call = acp_tool_call(tool_call_id, tool_name, arguments_json);
+        if let Err(reason) = run.tool_catalog().admit_tool_call(run, tool_name) {
+            return ToolResult::failure(
+                &tool_call,
+                ToolFailureCode::Unavailable,
+                reason,
+                ToolRetryability::Safe,
+            );
+        }
         let (args, tool_input) = match parse_acp_tool_arguments(tool_name, arguments_json) {
             Ok(parsed) => parsed,
-            Err(result) => return result,
+            Err(failure) => return bind_acp_failure(&tool_call, failure),
         };
+        let mode_input = canonical_acp_mode_input(tool_name, &args);
+        if let Err(reason) = run.admit_runtime_mode_tool(tool_name, &mode_input) {
+            return ToolResult::failure(
+                &tool_call,
+                ToolFailureCode::PolicyDenied,
+                reason,
+                ToolRetryability::Never,
+            );
+        }
 
         // ── Enterprise policy gate ─────────────────────────────────────
         let tool_policy = crate::services::policy::ToolExecutionPolicy::new(
@@ -1981,69 +4878,120 @@ impl AcpServer {
             Some(session_id),
         );
         if let Err(e) = tool_policy.check_tool(tool_name) {
-            return AcpToolResult {
-                content: format!("Blocked by policy: {e}"),
-                is_error: true,
-            };
+            return ToolResult::failure(
+                &tool_call,
+                ToolFailureCode::PolicyDenied,
+                format!("Blocked by policy: {e}"),
+                ToolRetryability::Never,
+            );
         }
 
         // ── PreToolUse gate ─────────────────────────────────────────────
-        if let Some(blocked) = pre_tool_use_gate(&self.hook_engine, tool_name, &tool_input).await {
-            return blocked;
+        if let Some(blocked) =
+            pre_tool_use_gate(run, &self.hook_engine, session_id, tool_name, &tool_input).await
+        {
+            return blocked.into_tool_result(&tool_call);
         }
 
-        // ── Headless permission gate ───────────────────────────────────
-        if let Some(blocked) = acp_permission_gate(&self.permission_mgr, tool_name, &tool_input) {
-            return blocked;
-        }
-
-        if let Err(e) = tool_policy.check_and_record_tool(tool_name) {
-            return AcpToolResult {
-                content: format!("Blocked by policy: {e}"),
-                is_error: true,
-            };
-        }
-
-        let result = match tool_name {
-            "read_file" => self.acp_read_file(session_id, &args).await,
-            "write_file" => self.acp_write_file(session_id, &args).await,
-            "edit_file" => self.acp_edit_file(session_id, &args).await,
-            // Shells must run through the local executor: delegating these to
-            // an arbitrary ACP client's terminal/create API bypasses
-            // OpenClaudia's OS sandbox entirely.
-            "bash" => self.acp_bash(session_id, &args).await,
-            "bash_output" => self.acp_bash_output(session_id, &args),
-            "kill_shell" => self.acp_kill_shell(session_id, &args),
-            "list_files" => self.acp_list_files(session_id, &args).await,
-            "glob" | "grep" => self.acp_search(session_id, &args, tool_name).await,
-            // Internal tools run locally — not file/terminal operations
-            "web_fetch" | "web_search" | "web_browser" | "memory_search" | "memory_save"
-            | "memory_delete" | "memory_list" | "task_create" | "task_update" | "task_get"
-            | "task_list" | "todo_write" | "todo_read" | "enter_plan_mode" | "exit_plan_mode" => {
-                self.execute_local_tool(session_id, tool_name, arguments_json)
-            }
-            name if name.starts_with("mcp__") => {
-                // MCP tools run locally through the MCP manager
-                self.execute_local_tool(session_id, tool_name, arguments_json)
-            }
-            _ => AcpToolResult {
-                content: format!("Unknown tool: {tool_name}"),
-                is_error: true,
-            },
+        let result = self
+            .dispatch_normalized_acp_tool(
+                run,
+                session_id,
+                tool_call_id,
+                tool_name,
+                arguments_json,
+                &args,
+            )
+            .await;
+        let result = match result {
+            Ok(result) => result.with_wire_invocation(&tool_call),
+            Err(failure) => bind_acp_failure(&tool_call, failure),
         };
 
         // ── PostToolUse fire-and-forget ─────────────────────────────────
+        let hook_succeeded = matches!(result.outcome(), ToolOutcome::Success { .. });
+        let hook_output = result.provider_content();
         crate::services::tool_executor::ToolExecutor::fire_post_tool(
+            run,
             &self.hook_engine,
-            !result.is_error,
+            hook_succeeded,
             tool_name,
             tool_input,
-            &result.content,
+            &hook_output,
             Some(session_id),
         )
         .await;
 
         result
+    }
+
+    async fn dispatch_normalized_acp_tool(
+        &self,
+        run: &Arc<crate::tools::ToolRunContext>,
+        session_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments_json: &str,
+        args: &HashMap<String, Value>,
+    ) -> Result<ToolResult, ToolFailure> {
+        match tool_name {
+            "read_file" => {
+                self.acp_read_file(run, session_id, tool_call_id, args)
+                    .await
+            }
+            "write_file" => {
+                self.acp_write_file(run, session_id, tool_call_id, args)
+                    .await
+            }
+            "edit_file" => {
+                self.acp_edit_file(run, session_id, tool_call_id, args)
+                    .await
+            }
+            // Shells must run through the local executor: delegating these to
+            // an arbitrary ACP client's terminal/create API bypasses
+            // OpenClaudia's OS sandbox entirely.
+            "bash" => self.acp_bash(run, session_id, tool_call_id, args).await,
+            "bash_output" => self.acp_bash_output(run, session_id, tool_call_id, args),
+            "kill_shell" => self.acp_kill_shell(run, session_id, tool_call_id, args),
+            "list_files" => {
+                self.acp_list_files(run, session_id, tool_call_id, args)
+                    .await
+            }
+            "glob" | "grep" => {
+                self.acp_search(run, session_id, tool_call_id, args, tool_name)
+                    .await
+            }
+            // SQLite work belongs on the blocking pool; it still retains the
+            // provider's exact invocation ID for typed provenance.
+            "memory_search"
+            | "memory_save"
+            | "memory_update"
+            | "memory_delete"
+            | "memory_review"
+            | "memory_export"
+            | "memory_import"
+            | "memory_list"
+            | "memory_learning_status"
+            | "memory_conflicts"
+            | "memory_source_status"
+            | "memory_source_refresh" => Ok(self
+                .execute_local_tool_async(run, session_id, tool_call_id, tool_name, arguments_json)
+                .await),
+            // Every other built-in registry tool stays on the canonical local
+            // executor. The progressive catalog can therefore activate any
+            // classified built-in without growing a second ACP name list.
+            name if crate::tools::registry::registry().get(name).is_some() => Ok(
+                self.execute_local_tool(run, session_id, tool_call_id, tool_name, arguments_json)
+            ),
+            name if name.starts_with("mcp__") => Ok(self
+                .execute_mcp_tool(run, session_id, tool_call_id, tool_name, arguments_json)
+                .await),
+            _ => Err(ToolFailure::new(
+                ToolFailureCode::Unavailable,
+                format!("Unknown tool: {tool_name}"),
+                ToolRetryability::Never,
+            )),
+        }
     }
 
     /// Execute a tool locally (for internal tools that don't need ACP delegation).
@@ -2055,133 +5003,165 @@ impl AcpServer {
     /// dispatch (matches the proxy path's invariant).
     fn execute_local_tool(
         &self,
+        run: &Arc<crate::tools::ToolRunContext>,
         session_id: &str,
+        tool_call_id: &str,
         tool_name: &str,
         arguments_json: &str,
-    ) -> AcpToolResult {
-        execute_local_tool_with_permission(
-            &self.permission_mgr,
+    ) -> ToolResult {
+        let permission_mgr = self.permission_manager_for_run(run);
+        execute_local_tool_with_permission(AcpLocalToolRequest {
+            run,
+            permission_mgr: &permission_mgr,
             session_id,
+            tool_call_id,
             tool_name,
             arguments_json,
+            policy_enforcer: Some(self.policy_enforcer.as_ref()),
+            memory_db: Some(self.memory_db.as_ref()),
+            app_config: Some(&self.config),
+            task_managers: Arc::clone(&self.task_managers),
+        })
+    }
+
+    async fn execute_mcp_tool(
+        &self,
+        run: &Arc<crate::tools::ToolRunContext>,
+        session_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments_json: &str,
+    ) -> ToolResult {
+        let tool_call = acp_tool_call(tool_call_id, tool_name, arguments_json);
+        let permission_mgr = self.permission_manager_for_run(run);
+        crate::services::tool_executor::ToolExecutor::execute_mcp(
+            crate::services::tool_executor::ToolExecutorRequest {
+                run_context: run,
+                tool_call: &tool_call,
+                memory_db: Some(self.memory_db.as_ref()),
+                app_config: Some(&self.config),
+                task_mgr: None,
+                permission_mgr: &permission_mgr,
+                authorization: None,
+                session_id: Some(session_id),
+                policy_enforcer: Some(self.policy_enforcer.as_ref()),
+            },
         )
+        .await
     }
 
     /// Execute a synchronous local tool on Tokio's blocking pool so a
     /// foreground command or large file operation cannot stall ACP message
-    /// routing. The permission manager is shared read-only here; the outer ACP
-    /// gate already made and recorded the mutable permission decision.
+    /// routing. The permission manager is shared read-only here; the worker
+    /// performs the exact authorization and permit consumption itself.
     async fn execute_local_tool_async(
         &self,
+        run: &Arc<crate::tools::ToolRunContext>,
         session_id: &str,
+        tool_call_id: &str,
         tool_name: &str,
         arguments_json: &str,
-    ) -> AcpToolResult {
-        let permission_mgr = Arc::clone(&self.permission_mgr);
+    ) -> ToolResult {
+        let failure_call = acp_tool_call(tool_call_id, tool_name, arguments_json);
+        let permission_mgr = self.permission_manager_for_run(run);
+        let policy_enforcer = Arc::clone(&self.policy_enforcer);
+        let memory_db = Arc::clone(&self.memory_db);
+        let app_config = self.config.clone();
+        let task_managers = Arc::clone(&self.task_managers);
         let session_id = session_id.to_string();
+        let tool_call_id = tool_call_id.to_string();
         let tool_name = tool_name.to_string();
         let arguments_json = arguments_json.to_string();
         let cancellation = Arc::clone(&self.cancel_flag);
-        let cancellation_session = session_id.clone();
+        let worker_run = Arc::clone(run);
+        let mut cancellation_watcher = Some(SandboxCancellationWatcher::spawn(
+            Arc::clone(&cancellation),
+            Arc::clone(run),
+        ));
         let mut worker = tokio::task::spawn_blocking(move || {
-            execute_local_tool_with_permission(
-                &permission_mgr,
-                &session_id,
-                &tool_name,
-                &arguments_json,
-            )
+            execute_local_tool_with_permission(AcpLocalToolRequest {
+                run: &worker_run,
+                permission_mgr: &permission_mgr,
+                session_id: &session_id,
+                tool_call_id: &tool_call_id,
+                tool_name: &tool_name,
+                arguments_json: &arguments_json,
+                policy_enforcer: Some(policy_enforcer.as_ref()),
+                memory_db: Some(memory_db.as_ref()),
+                app_config: Some(&app_config),
+                task_managers,
+            })
         });
         loop {
             tokio::select! {
                 outcome = &mut worker => {
+                    cancellation_watcher
+                        .take()
+                        .expect("cancellation watcher exists until tool completion")
+                        .stop_and_join();
                     return match outcome {
                         Ok(result) => result,
-                        Err(error) => AcpToolResult {
-                            content: format!("Local tool worker failed: {error}"),
-                            is_error: true,
-                        },
+                        Err(error) => ToolResult::failure(
+                            &failure_call,
+                            ToolFailureCode::Internal,
+                            format!("Local tool worker failed: {error}"),
+                            ToolRetryability::Unknown,
+                        ),
                     };
                 }
                 () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
                     if cancellation.load(Ordering::SeqCst) {
-                        let cancelled_processes =
-                            crate::tools::cancel_session_sandbox_processes(&cancellation_session);
+                        let cancelled_processes = cancellation_watcher
+                            .take()
+                            .expect("cancellation watcher exists until cancellation")
+                            .stop_and_join();
                         let _ = tokio::time::timeout(
                             std::time::Duration::from_secs(5),
                             &mut worker,
                         )
                         .await;
-                        return AcpToolResult {
-                            content: format!(
+                        return ToolResult::failure(
+                            &failure_call,
+                            ToolFailureCode::Cancelled,
+                            format!(
                                 "Tool execution cancelled; terminated {cancelled_processes} sandbox process tree(s)"
                             ),
-                            is_error: true,
-                        };
+                            ToolRetryability::Never,
+                        );
                     }
                 }
             }
         }
     }
 
-    /// Collect rule content for every file extension referenced by the
-    /// current message history.
-    ///
-    /// Mirrors `proxy.rs::prepare_request_context`'s rules injection so
-    /// the ACP path receives the same `.openclaudia/rules` context the
-    /// proxy path does (crosslink #694). Returns an empty string when
-    /// no extensions match a rule — callers can pass the result
-    /// straight to [`crate::prompt::build_system_prompt`] without a
-    /// branch.
-    fn collect_rules_for_messages(&self) -> String {
-        let mut extensions: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let Ok(extension_pattern) = regex::Regex::new(r"[\w/\\.-]+\.([a-zA-Z0-9]{1,10})\b") else {
-            return String::new();
-        };
-        for msg in &self.messages {
-            let Some(content) = msg.get("content") else {
-                continue;
-            };
-            let text = match content {
-                Value::String(s) => s.clone(),
-                Value::Array(parts) => parts
-                    .iter()
-                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                _ => continue,
-            };
-            for cap in extension_pattern.captures_iter(&text) {
-                if let Some(ext) = cap.get(1) {
-                    extensions.insert(ext.as_str().to_lowercase());
-                }
-            }
-        }
-        let ext_refs: Vec<&str> = extensions.iter().map(String::as_str).collect();
-        self.rules_engine.get_combined_rules(&ext_refs)
+    fn permission_manager_for_run(
+        &self,
+        run: &crate::tools::ToolRunContext,
+    ) -> Arc<crate::permissions::PermissionManager> {
+        Arc::new(crate::permissions::PermissionManager::trusted_for_run(
+            run,
+            self.config.permissions.enabled,
+            self.config.permissions.default_allow.clone(),
+            self.config.web_fetch.preapproved_domains.clone(),
+        ))
     }
 
     // -- Locally confined file operations --
 
     async fn acp_read_file(
         &self,
+        run: &Arc<crate::tools::ToolRunContext>,
         session_id: &str,
+        tool_call_id: &str,
         args: &HashMap<String, Value>,
-    ) -> AcpToolResult {
-        let path = match parse_acp_required_alias_string_arg(args, "file_path", "path", "file_path")
-        {
-            Ok(path) => path,
-            Err(result) => return result,
-        };
+    ) -> Result<ToolResult, ToolFailure> {
+        let path = parse_acp_required_alias_string_arg(args, "file_path", "path", "file_path")?;
 
         // Match the registry read_file contract: offset is a 1-indexed
         // positive line number, limit is a positive max-line count. Validate
         // before asking the ACP client to read the file.
-        if let Err(result) = parse_acp_read_offset_arg(args.get("offset")) {
-            return result;
-        }
-        if let Err(result) = parse_acp_read_limit_arg(args.get("limit")) {
-            return result;
-        }
+        parse_acp_read_offset_arg(args.get("offset"))?;
+        parse_acp_read_limit_arg(args.get("limit"))?;
 
         let mut local_args = serde_json::Map::new();
         local_args.insert("path".to_string(), Value::String(path.to_string()));
@@ -2195,174 +5175,244 @@ impl AcpServer {
             local_args.insert("pages".to_string(), pages.clone());
         }
 
-        self.execute_local_tool_async(
-            session_id,
-            "read_file",
-            &Value::Object(local_args).to_string(),
-        )
-        .await
+        Ok(self
+            .execute_local_tool_async(
+                run,
+                session_id,
+                tool_call_id,
+                "read_file",
+                &Value::Object(local_args).to_string(),
+            )
+            .await)
     }
 
     async fn acp_write_file(
         &self,
+        run: &Arc<crate::tools::ToolRunContext>,
         session_id: &str,
+        tool_call_id: &str,
         args: &HashMap<String, Value>,
-    ) -> AcpToolResult {
-        let path = match parse_acp_required_alias_string_arg(args, "file_path", "path", "file_path")
-        {
-            Ok(path) => path,
-            Err(result) => return result,
-        };
-        let content = match parse_acp_required_string_arg(args, "content") {
-            Ok(content) => content,
-            Err(result) => return result,
-        };
+    ) -> Result<ToolResult, ToolFailure> {
+        let path = parse_acp_required_alias_string_arg(args, "file_path", "path", "file_path")?;
+        let content = parse_acp_required_string_arg(args, "content")?;
 
-        self.execute_local_tool_async(
-            session_id,
-            "write_file",
-            &json!({"path": path, "content": content}).to_string(),
-        )
-        .await
+        let mut local_args = json!({"path": path, "content": content});
+        if let Some(expected) = args.get("expected_snapshot") {
+            local_args["expected_snapshot"] = expected.clone();
+        }
+
+        Ok(self
+            .execute_local_tool_async(
+                run,
+                session_id,
+                tool_call_id,
+                "write_file",
+                &local_args.to_string(),
+            )
+            .await)
     }
 
     async fn acp_edit_file(
         &self,
+        run: &Arc<crate::tools::ToolRunContext>,
         session_id: &str,
+        tool_call_id: &str,
         args: &HashMap<String, Value>,
-    ) -> AcpToolResult {
-        let path = match parse_acp_required_alias_string_arg(args, "file_path", "path", "file_path")
-        {
-            Ok(path) => path,
-            Err(result) => return result,
-        };
+    ) -> Result<ToolResult, ToolFailure> {
+        let path = parse_acp_required_alias_string_arg(args, "file_path", "path", "file_path")?;
+        let old_string = parse_acp_required_string_arg(args, "old_string")?;
+        let new_string = parse_acp_required_string_arg(args, "new_string")?;
+        let replace_all = parse_acp_bool_arg(args, "replace_all", false)?;
 
-        let old_string = match parse_acp_required_string_arg(args, "old_string") {
-            Ok(old_string) => old_string,
-            Err(result) => return result,
-        };
+        let mut local_args = json!({
+            "path": path,
+            "old_string": old_string,
+            "new_string": new_string,
+            "replace_all": replace_all
+        });
+        if let Some(expected) = args.get("expected_snapshot") {
+            local_args["expected_snapshot"] = expected.clone();
+        }
 
-        let new_string = match parse_acp_required_string_arg(args, "new_string") {
-            Ok(new_string) => new_string,
-            Err(result) => return result,
-        };
-
-        let replace_all = match parse_acp_bool_arg(args, "replace_all", false) {
-            Ok(value) => value,
-            Err(result) => return result,
-        };
-
-        self.execute_local_tool_async(
-            session_id,
-            "edit_file",
-            &json!({
-                "path": path,
-                "old_string": old_string,
-                "new_string": new_string,
-                "replace_all": replace_all
-            })
-            .to_string(),
-        )
-        .await
+        Ok(self
+            .execute_local_tool_async(
+                run,
+                session_id,
+                tool_call_id,
+                "edit_file",
+                &local_args.to_string(),
+            )
+            .await)
     }
 
     // -- Sandboxed terminal operations --
 
-    async fn acp_bash(&self, session_id: &str, args: &HashMap<String, Value>) -> AcpToolResult {
-        let command = match parse_acp_required_string_arg(args, "command") {
-            Ok(command) => command,
-            Err(result) => return result,
-        };
-
-        let run_in_background = match parse_acp_bool_arg(args, "run_in_background", false) {
-            Ok(value) => value,
-            Err(result) => return result,
-        };
+    async fn acp_bash(
+        &self,
+        run: &Arc<crate::tools::ToolRunContext>,
+        session_id: &str,
+        tool_call_id: &str,
+        args: &HashMap<String, Value>,
+    ) -> Result<ToolResult, ToolFailure> {
+        let command = parse_acp_required_string_arg(args, "command")?;
+        let run_in_background = parse_acp_bool_arg(args, "run_in_background", false)?;
         let local_args = json!({
             "command": command,
             "run_in_background": run_in_background,
         });
-        self.execute_local_tool_async(session_id, "bash", &local_args.to_string())
-            .await
+        Ok(self
+            .execute_local_tool_async(
+                run,
+                session_id,
+                tool_call_id,
+                "bash",
+                &local_args.to_string(),
+            )
+            .await)
     }
 
-    fn acp_bash_output(&self, session_id: &str, args: &HashMap<String, Value>) -> AcpToolResult {
-        let shell_id = match parse_acp_required_alias_string_arg(
-            args,
-            "shell_id",
-            "terminal_id",
-            "shell_id",
-        ) {
-            Ok(shell_id) => shell_id,
-            Err(result) => return result,
-        };
-        self.execute_local_tool(
+    fn acp_bash_output(
+        &self,
+        run: &Arc<crate::tools::ToolRunContext>,
+        session_id: &str,
+        tool_call_id: &str,
+        args: &HashMap<String, Value>,
+    ) -> Result<ToolResult, ToolFailure> {
+        let shell_id =
+            parse_acp_required_alias_string_arg(args, "shell_id", "terminal_id", "shell_id")?;
+        Ok(self.execute_local_tool(
+            run,
             session_id,
+            tool_call_id,
             "bash_output",
             &json!({"shell_id": shell_id}).to_string(),
-        )
+        ))
     }
 
-    fn acp_kill_shell(&self, session_id: &str, args: &HashMap<String, Value>) -> AcpToolResult {
-        let shell_id = match parse_acp_required_alias_string_arg(
-            args,
-            "shell_id",
-            "terminal_id",
-            "shell_id",
-        ) {
-            Ok(shell_id) => shell_id,
-            Err(result) => return result,
-        };
-        self.execute_local_tool(
+    fn acp_kill_shell(
+        &self,
+        run: &Arc<crate::tools::ToolRunContext>,
+        session_id: &str,
+        tool_call_id: &str,
+        args: &HashMap<String, Value>,
+    ) -> Result<ToolResult, ToolFailure> {
+        let shell_id =
+            parse_acp_required_alias_string_arg(args, "shell_id", "terminal_id", "shell_id")?;
+        Ok(self.execute_local_tool(
+            run,
             session_id,
+            tool_call_id,
             "kill_shell",
             &json!({"shell_id": shell_id}).to_string(),
-        )
+        ))
     }
 
     async fn acp_list_files(
         &self,
+        run: &Arc<crate::tools::ToolRunContext>,
         session_id: &str,
+        tool_call_id: &str,
         args: &HashMap<String, Value>,
-    ) -> AcpToolResult {
-        let path = match parse_acp_optional_string_arg(args, "path", ".") {
-            Ok(path) => path,
-            Err(result) => return result,
-        };
-        self.execute_local_tool_async(session_id, "list_files", &json!({"path": path}).to_string())
-            .await
+    ) -> Result<ToolResult, ToolFailure> {
+        let path = parse_acp_optional_string_arg(args, "path", ".")?;
+        let mut local_args = json!({"path": path});
+        if let Some(cursor) = args.get("cursor") {
+            local_args["cursor"] = cursor.clone();
+        }
+        if let Some(limit) = args.get("limit") {
+            local_args["limit"] = limit.clone();
+        }
+        Ok(self
+            .execute_local_tool_async(
+                run,
+                session_id,
+                tool_call_id,
+                "list_files",
+                &local_args.to_string(),
+            )
+            .await)
     }
 
     async fn acp_search(
         &self,
+        run: &Arc<crate::tools::ToolRunContext>,
         session_id: &str,
+        tool_call_id: &str,
         tool_args: &HashMap<String, Value>,
         tool_name: &str,
-    ) -> AcpToolResult {
-        let arguments_json = match serde_json::to_string(tool_args) {
-            Ok(arguments) => arguments,
-            Err(err) => {
-                return AcpToolResult {
-                    content: format!("Failed to serialize {tool_name} arguments: {err}"),
-                    is_error: true,
-                }
-            }
-        };
-        self.execute_local_tool_async(session_id, tool_name, &arguments_json)
-            .await
+    ) -> Result<ToolResult, ToolFailure> {
+        let arguments_json = serde_json::to_string(tool_args).map_err(|err| {
+            acp_internal_error(format!("Failed to serialize {tool_name} arguments: {err}"))
+        })?;
+        Ok(self
+            .execute_local_tool_async(run, session_id, tool_call_id, tool_name, &arguments_json)
+            .await)
     }
 }
 
-fn execute_local_tool_with_permission(
-    permission_mgr: &PermissionManager,
+impl Drop for AcpServer {
+    fn drop(&mut self) {
+        // Drop integration owners before retiring their exact capability
+        // generations. Connection actors cannot then retain authority beyond
+        // the ACP server lifecycle.
+        self.mcp_managers.clear();
+        self.plugin_manager = None;
+        let launch_run_id = self.launch_capabilities.run_id();
+        for (_, run) in self.run_contexts.drain() {
+            if run.run_id() != launch_run_id {
+                crate::tools::retire_run(&run);
+            }
+        }
+        crate::tools::retire_run(&self.launch_capabilities);
+    }
+}
+
+fn validate_and_render_acp_final_response(
+    run: &crate::tools::ToolRunContext,
     session_id: &str,
-    tool_name: &str,
-    arguments_json: &str,
-) -> AcpToolResult {
+    content: &str,
+    model_identity: &str,
+) -> Result<String, String> {
+    crate::grounded_loop::validate_and_render_agentic_final_response(
+        run,
+        session_id,
+        content,
+        model_identity,
+    )
+}
+
+#[derive(Clone)]
+struct AcpLocalToolRequest<'a> {
+    run: &'a Arc<crate::tools::ToolRunContext>,
+    permission_mgr: &'a PermissionManager,
+    session_id: &'a str,
+    tool_call_id: &'a str,
+    tool_name: &'a str,
+    arguments_json: &'a str,
+    policy_enforcer: Option<&'a crate::services::policy::PolicyEnforcer>,
+    memory_db: Option<&'a crate::memory::MemoryDb>,
+    app_config: Option<&'a AppConfig>,
+    task_managers: SharedAcpTaskManagers,
+}
+
+fn execute_local_tool_with_permission(request: AcpLocalToolRequest<'_>) -> ToolResult {
     use crate::tools::{FunctionCall, ToolCall};
 
+    let AcpLocalToolRequest {
+        run,
+        permission_mgr,
+        session_id,
+        tool_call_id,
+        tool_name,
+        arguments_json,
+        policy_enforcer,
+        memory_db,
+        app_config,
+        task_managers,
+    } = request;
+
     let tc = ToolCall {
-        id: "local".to_string(),
+        id: tool_call_id.to_string(),
         call_type: "function".to_string(),
         function: FunctionCall {
             name: tool_name.to_string(),
@@ -2370,24 +5420,72 @@ fn execute_local_tool_with_permission(
         },
     };
 
-    let result = crate::services::tool_executor::ToolExecutor::execute(
-        crate::services::tool_executor::ToolExecutorRequest {
-            tool_call: &tc,
-            memory_db: None,
-            app_config: None,
-            task_mgr: None,
-            permission_mgr: Some(permission_mgr),
-            // `execute_tool_via_acp` performs the headless permission gate
-            // before dispatch, so this worker must not make a second decision.
-            permission_already_checked: true,
-            session_id: Some(session_id),
-            policy_enforcer: None,
-        },
-    );
-    AcpToolResult {
-        content: result.content,
-        is_error: result.is_error,
-    }
+    let planning_tool = crate::tools::uses_canonical_task_graph(tool_name);
+    let result = if planning_tool {
+        let manager = {
+            let mut managers = task_managers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !managers.contains_key(session_id) {
+                let manager = match crate::session::TaskManager::open_for_run(run) {
+                    Ok(manager) => manager,
+                    Err(error) => {
+                        return ToolResult::failure(
+                            &tc,
+                            ToolFailureCode::Unavailable,
+                            format!("Task graph unavailable: {error}"),
+                            ToolRetryability::Safe,
+                        );
+                    }
+                };
+                managers.insert(
+                    session_id.to_string(),
+                    Arc::new(std::sync::Mutex::new(manager)),
+                );
+            }
+            let Some(manager) = managers.get(session_id).map(Arc::clone) else {
+                return ToolResult::failure(
+                    &tc,
+                    ToolFailureCode::Internal,
+                    "Task graph unavailable after initialization",
+                    ToolRetryability::Unknown,
+                );
+            };
+            drop(managers);
+            manager
+        };
+        let mut manager = manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::services::tool_executor::ToolExecutor::execute(
+            crate::services::tool_executor::ToolExecutorRequest {
+                run_context: run,
+                tool_call: &tc,
+                memory_db,
+                app_config,
+                task_mgr: Some(&mut manager),
+                permission_mgr,
+                authorization: None,
+                session_id: Some(session_id),
+                policy_enforcer,
+            },
+        )
+    } else {
+        crate::services::tool_executor::ToolExecutor::execute(
+            crate::services::tool_executor::ToolExecutorRequest {
+                run_context: run,
+                tool_call: &tc,
+                memory_db,
+                app_config,
+                task_mgr: None,
+                permission_mgr,
+                authorization: None,
+                session_id: Some(session_id),
+                policy_enforcer,
+            },
+        )
+    };
+    result
 }
 
 #[cfg(test)]
@@ -2395,20 +5493,27 @@ const ACP_BACKGROUND_COMMAND_PENDING_STDERR: &str =
     "background command started; completion pending via bash_output";
 
 #[cfg(test)]
-fn record_acp_background_command_start(session_id: &str, cwd: &std::path::Path, command: &str) {
-    let mut ledger = match crate::ledger::RealityLedger::open_project_session(session_id) {
-        Ok(ledger) => ledger,
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                command,
-                error = %err,
-                "failed to open session reality ledger for ACP background command"
-            );
-            return;
-        }
-    };
+fn record_acp_background_command_start(
+    run: &crate::tools::ToolRunContext,
+    session_id: &str,
+    cwd: &std::path::Path,
+    command: &str,
+) {
+    let mut ledger =
+        match crate::ledger::RealityLedger::open_project_session_for_run(run, session_id) {
+            Ok(ledger) => ledger,
+            Err(err) => {
+                tracing::warn!(
+                    session_id,
+                    command,
+                    error = %err,
+                    "failed to open session reality ledger for ACP background command"
+                );
+                return;
+            }
+        };
     if let Err(err) = ledger.observe_command_run(
+        run,
         cwd.to_string_lossy().to_string(),
         vec!["bash".to_string(), "-c".to_string(), command.to_string()],
         -1,
@@ -2425,38 +5530,82 @@ fn record_acp_background_command_start(session_id: &str, cwd: &std::path::Path, 
 }
 
 fn record_acp_tool_result_observation(
+    run: &crate::tools::ToolRunContext,
     session_id: &str,
-    tool_name: &str,
-    tool_call_id: &str,
-    result: &AcpToolResult,
+    result: &ToolResult,
 ) {
-    let tool_result = crate::tools::ToolResult {
-        tool_call_id: tool_call_id.to_string(),
-        content: result.content.clone(),
-        is_error: result.is_error,
-    };
-    let mut ledger = match crate::ledger::RealityLedger::open_project_session(session_id) {
-        Ok(ledger) => ledger,
-        Err(err) => {
-            tracing::warn!(
-                session_id,
-                tool = tool_name,
-                error = %err,
-                "failed to open session reality ledger for ACP tool result"
-            );
-            return;
-        }
-    };
-    if let Err(err) =
-        crate::grounded_loop::append_tool_result_observation(&mut ledger, tool_name, &tool_result)
+    let mut ledger =
+        match crate::ledger::RealityLedger::open_project_session_for_run(run, session_id) {
+            Ok(ledger) => ledger,
+            Err(err) => {
+                tracing::warn!(
+                    session_id,
+                    tool = result.handler(),
+                    error = %err,
+                    "failed to open session reality ledger for ACP tool result"
+                );
+                return;
+            }
+        };
+    if let Err(err) = crate::grounded_loop::append_tool_result_observation(run, &mut ledger, result)
     {
         tracing::warn!(
             session_id,
-            tool = tool_name,
+            tool = result.handler(),
             error = %err,
             "failed to append ACP tool result observation to reality ledger"
         );
     }
+}
+
+fn bounded_acp_tool_message(result: &ToolResult) -> Value {
+    let message = result.openai_message();
+    if bounded_json_size(&message, MAX_ACP_TOOL_OUTPUT_BYTES).is_ok() {
+        return message;
+    }
+    let excerpt_limit = MAX_ACP_TOOL_OUTPUT_BYTES / 2;
+    let truncated = json!({
+        "schema": "openclaudia.tool_result.truncated.v1",
+        "tool_call_id": result.tool_call_id(),
+        "handler": result.handler(),
+        "evidence_digest": result.evidence_digest(),
+        "original_status": if result.is_error() { "error" } else if result.is_partial() { "partial" } else { "success" },
+        "content": crate::tools::safe_truncate(result.content(), excerpt_limit),
+        "kept_bytes": excerpt_limit.min(result.content().len()),
+        "truncated": true,
+    });
+    let content = serialize_bounded_json(&truncated, MAX_ACP_TOOL_OUTPUT_BYTES)
+        .unwrap_or_else(|error| format!("ACP tool output could not be projected: {error}"));
+    json!({
+        "role": "tool",
+        "tool_call_id": result.tool_call_id(),
+        "content": content,
+        "is_error": true,
+    })
+}
+
+fn acp_tool_call_update_payload(result: &ToolResult) -> Value {
+    let status = if matches!(result.outcome(), ToolOutcome::Success { .. }) {
+        "completed"
+    } else {
+        "failed"
+    };
+    let rendered = result.render_text();
+    let output = crate::tools::safe_truncate(&rendered, MAX_ACP_TOOL_OUTPUT_BYTES / 2);
+    let mut payload = json!({
+        "toolCallId": result.tool_call_id(),
+        "title": result.handler(),
+        "status": status,
+        "output": output,
+    });
+    let raw_output = result.model_payload();
+    if bounded_json_size(&raw_output, MAX_ACP_TOOL_OUTPUT_BYTES / 2).is_ok() {
+        payload["rawOutput"] = raw_output;
+    } else {
+        payload["truncated"] = Value::Bool(true);
+        payload["evidenceDigest"] = Value::String(result.evidence_digest());
+    }
+    payload
 }
 
 #[cfg(test)]
@@ -2679,8 +5828,89 @@ impl AccumulatedToolCall {
     }
 }
 
-fn finish_acp_stream(content: String, tool_calls: Vec<AccumulatedToolCall>) -> StreamResult {
+fn append_bounded_stream_text(
+    target: &mut String,
+    fragment: &str,
+    limit: usize,
+    field: &str,
+) -> Result<(), String> {
+    if target.len().saturating_add(fragment.len()) > limit {
+        return Err(format!(
+            "Provider {field} exceeded the {limit}-byte ACP limit"
+        ));
+    }
+    target.push_str(fragment);
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // Terminal validation is one atomic provider-frame admission gate.
+fn finish_acp_stream(
+    content: String,
+    tool_calls: Vec<AccumulatedToolCall>,
+    terminal_outcome: crate::pipeline::ProviderTerminalOutcome,
+) -> StreamResult {
+    if content.len() > MAX_ACP_ASSISTANT_OUTPUT_BYTES {
+        return failed_acp_stream(
+            format!(
+                "Provider assistant output exceeded the {MAX_ACP_ASSISTANT_OUTPUT_BYTES}-byte ACP limit"
+            ),
+            &content,
+        );
+    }
+    if tool_calls.len() > MAX_ACP_TOOL_CALLS_PER_TURN {
+        return failed_acp_stream(
+            format!(
+                "Provider returned {} tool calls; ACP limit is {MAX_ACP_TOOL_CALLS_PER_TURN}",
+                tool_calls.len()
+            ),
+            &content,
+        );
+    }
+    let mut aggregate_tool_bytes = 0usize;
+    for (index, call) in tool_calls.iter().enumerate() {
+        if call.id.len() > MAX_ACP_ID_BYTES {
+            return failed_acp_stream(
+                format!("Provider tool call id at index {index} exceeded the ACP id limit"),
+                &content,
+            );
+        }
+        if call.name.len() > MAX_ACP_METHOD_BYTES {
+            return failed_acp_stream(
+                format!("Provider tool name at index {index} exceeded the ACP method limit"),
+                &content,
+            );
+        }
+        if call.arguments.len() > MAX_ACP_TOOL_ARGUMENT_BYTES {
+            return failed_acp_stream(
+                format!(
+                    "Provider tool arguments at index {index} exceeded the {MAX_ACP_TOOL_ARGUMENT_BYTES}-byte ACP limit"
+                ),
+                &content,
+            );
+        }
+        aggregate_tool_bytes = aggregate_tool_bytes
+            .saturating_add(call.id.len())
+            .saturating_add(call.name.len())
+            .saturating_add(call.arguments.len());
+        if aggregate_tool_bytes > MAX_ACP_TOOL_BYTES_PER_TURN {
+            return failed_acp_stream(
+                format!(
+                    "Provider tool data exceeded the {MAX_ACP_TOOL_BYTES_PER_TURN}-byte ACP turn limit"
+                ),
+                &content,
+            );
+        }
+    }
     if tool_calls.is_empty() {
+        if let Err(error) = crate::pipeline::ensure_provider_turn_succeeded(terminal_outcome, 0) {
+            return failed_acp_stream(error, &content);
+        }
+        if content.is_empty() {
+            return failed_acp_stream(
+                "Provider completed the turn without assistant content".to_string(),
+                &content,
+            );
+        }
         return StreamResult::EndTurn { content };
     }
 
@@ -2695,9 +5925,37 @@ fn finish_acp_stream(content: String, tool_calls: Vec<AccumulatedToolCall>) -> S
             missing = %missing,
             "Provider returned incomplete ACP streamed tool call"
         );
-        return StreamResult::Error(format!(
-            "Provider returned incomplete tool call at index {index}: missing {missing}"
-        ));
+        return failed_acp_stream(
+            format!("Provider returned incomplete tool call at index {index}: missing {missing}"),
+            &content,
+        );
+    }
+
+    let mut ids = std::collections::HashSet::new();
+    for (index, call) in tool_calls.iter().enumerate() {
+        if !ids.insert(call.id.as_str()) {
+            return failed_acp_stream(
+                format!("Provider repeated tool call id {:?}", call.id),
+                &content,
+            );
+        }
+        let arguments = if call.arguments.trim().is_empty() {
+            "{}"
+        } else {
+            &call.arguments
+        };
+        if let Err(error) = serde_json::from_str::<Value>(arguments) {
+            return failed_acp_stream(
+                format!("Provider returned invalid JSON arguments for tool call {index}: {error}"),
+                &content,
+            );
+        }
+    }
+
+    if let Err(error) =
+        crate::pipeline::ensure_provider_turn_succeeded(terminal_outcome, tool_calls.len())
+    {
+        return failed_acp_stream(error, &content);
     }
 
     StreamResult::ToolCalls {
@@ -2706,12 +5964,57 @@ fn finish_acp_stream(content: String, tool_calls: Vec<AccumulatedToolCall>) -> S
     }
 }
 
+fn failed_acp_stream(message: String, partial: &str) -> StreamResult {
+    if partial.trim().is_empty() {
+        return StreamResult::Error(message);
+    }
+    StreamResult::Error(format!(
+        "Partial provider response (not committed to conversation history):\n{}\n\n{message}",
+        crate::tools::safe_truncate(partial, 4_000)
+    ))
+}
+
+fn acp_responses_stream_result(
+    decoded: crate::pipeline::OpenAiResponsesDecodedTurn,
+) -> (StreamResult, crate::runtime::ProviderNativeState) {
+    let terminal_outcome = decoded.terminal_outcome;
+    let tool_calls = decoded
+        .tool_calls
+        .into_iter()
+        .map(|call| AccumulatedToolCall {
+            id: call.id,
+            name: call.function.name,
+            arguments: call.function.arguments,
+        })
+        .collect::<Vec<_>>();
+    let result = finish_acp_stream(decoded.content, tool_calls, terminal_outcome);
+    (result, decoded.provider_native_state)
+}
+
+fn acp_native_json_stream_result(
+    decoded: crate::pipeline::ProviderNativeJsonDecodedTurn,
+) -> (StreamResult, crate::runtime::ProviderNativeState) {
+    let terminal_outcome = decoded.terminal_outcome;
+    let tool_calls = decoded
+        .tool_calls
+        .into_iter()
+        .map(|call| AccumulatedToolCall {
+            id: call.id,
+            name: call.function.name,
+            arguments: call.function.arguments,
+        })
+        .collect::<Vec<_>>();
+    let result = finish_acp_stream(decoded.content, tool_calls, terminal_outcome);
+    (result, decoded.provider_native_state)
+}
+
 fn decode_acp_messages(messages: &[Value]) -> Result<Vec<crate::proxy::ChatMessage>, String> {
     messages
         .iter()
         .cloned()
         .enumerate()
-        .map(|(index, message)| {
+        .map(|(index, mut message)| {
+            crate::runtime::redact_reasoning_for_provider_request(&mut message);
             serde_json::from_value(message)
                 .map_err(|err| format!("message at index {index} is invalid: {err}"))
         })
@@ -2765,108 +6068,393 @@ fn acp_tool_definitions_for_chat_request(definitions: Value) -> Result<Vec<Value
     Ok(tools)
 }
 
-/// Result of executing a tool via ACP.
-#[derive(Debug)]
-struct AcpToolResult {
-    content: String,
-    is_error: bool,
-}
-
 // ============================================================================
 // Server entry point
 // ============================================================================
+
+#[cfg(unix)]
+fn wait_for_stdio(fd: std::os::fd::RawFd, events: i16, timeout: Duration) -> io::Result<bool> {
+    let timeout_ms = i32::try_from(timeout.as_millis().min(i32::MAX as u128)).unwrap_or(i32::MAX);
+    let mut descriptor = libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: `descriptor` points to one initialized pollfd for the exact
+        // duration of the call. No other thread aliases it mutably.
+        let outcome = unsafe { libc::poll(&raw mut descriptor, 1, timeout_ms) };
+        if outcome > 0 {
+            return Ok(true);
+        }
+        if outcome == 0 {
+            return Ok(false);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn write_acp_stdout_frame(line: &str) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    let deadline = Instant::now() + ACP_OUTPUT_WRITE_TIMEOUT;
+    let mut bytes = line.as_bytes();
+    while !bytes.is_empty() {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || !wait_for_stdio(output.as_raw_fd(), libc::POLLOUT, remaining)?
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "ACP stdout client did not accept output before the deadline",
+                ));
+            }
+        }
+        let chunk_len = bytes.len().min(4 * 1024);
+        let written = output.write(&bytes[..chunk_len])?;
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "ACP stdout client disconnected",
+            ));
+        }
+        bytes = &bytes[written..];
+    }
+    output.write_all(b"\n")?;
+    output.flush()
+}
+
+fn enqueue_inbound(sender: &mpsc::Sender<AcpInbound>, inbound: AcpInbound) -> Result<(), ()> {
+    sender.blocking_send(inbound).map_err(|_| ())
+}
+
+fn reserve_inbound_request(message: &JsonRpcMessage, calls: &SharedAcpCalls) -> Result<(), String> {
+    let mut registry = calls
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if message.method == "session/cancel" {
+        if let Some(session_id) = message.params["sessionId"].as_str() {
+            let call_id = message.params.get("callId").and_then(Value::as_str);
+            let _ = registry.request_cancel(session_id, call_id);
+        }
+    }
+    let Some(request_id) = message.id.as_ref() else {
+        drop(registry);
+        return Ok(());
+    };
+    registry.reserve_request(request_id)?;
+    if message.method == "session/prompt" {
+        let session_id = message.params["sessionId"]
+            .as_str()
+            .ok_or_else(|| "Missing sessionId".to_string())?;
+        if let Err(error) = registry.reserve_prompt(session_id, request_id) {
+            registry.complete_request(request_id);
+            drop(registry);
+            return Err(error);
+        }
+    }
+    drop(registry);
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // Framing and EOF cleanup share one blocking stdio owner.
+fn read_acp_stdin(
+    sender: &mpsc::Sender<AcpInbound>,
+    calls: &SharedAcpCalls,
+    transport_failed: &Arc<AtomicBool>,
+) {
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut decoder = AcpFrameDecoder::default();
+    let mut buffer = [0u8; 8 * 1024];
+    loop {
+        if transport_failed.load(Ordering::SeqCst) {
+            break;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            let now = Instant::now();
+            let wait = decoder
+                .remaining_assembly_time(now)
+                .unwrap_or(Duration::from_millis(250))
+                .min(Duration::from_millis(250));
+            if wait.is_zero() {
+                let _ = enqueue_inbound(
+                    sender,
+                    AcpInbound::ProtocolError {
+                        id: Value::Null,
+                        code: PARSE_ERROR,
+                        message: "ACP input frame timed out before newline".to_string(),
+                    },
+                );
+                break;
+            }
+            match wait_for_stdio(input.as_raw_fd(), libc::POLLIN, wait) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    let _ = enqueue_inbound(
+                        sender,
+                        AcpInbound::ProtocolError {
+                            id: Value::Null,
+                            code: PARSE_ERROR,
+                            message: bounded_diagnostic(&format!("ACP stdin failed: {error}")),
+                        },
+                    );
+                    break;
+                }
+            }
+        }
+        let read = match input.read(&mut buffer) {
+            Ok(0) => {
+                if let Some(message) = decoder.finish() {
+                    let _ = enqueue_inbound(
+                        sender,
+                        AcpInbound::ProtocolError {
+                            id: Value::Null,
+                            code: PARSE_ERROR,
+                            message,
+                        },
+                    );
+                }
+                break;
+            }
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                let _ = enqueue_inbound(
+                    sender,
+                    AcpInbound::ProtocolError {
+                        id: Value::Null,
+                        code: PARSE_ERROR,
+                        message: bounded_diagnostic(&format!("ACP stdin failed: {error}")),
+                    },
+                );
+                break;
+            }
+        };
+        for decoded in decoder.feed(&buffer[..read], Instant::now()) {
+            let inbound = match decoded {
+                Err(message) => AcpInbound::ProtocolError {
+                    id: Value::Null,
+                    code: INVALID_REQUEST,
+                    message,
+                },
+                Ok(frame) => match decode_json_rpc_frame(&frame) {
+                    Ok(message) => match reserve_inbound_request(&message, calls) {
+                        Ok(()) => AcpInbound::Message(message),
+                        Err(error) => AcpInbound::ProtocolError {
+                            id: message.id.unwrap_or(Value::Null),
+                            code: INVALID_REQUEST,
+                            message: error,
+                        },
+                    },
+                    Err((id, code, message)) => AcpInbound::ProtocolError { id, code, message },
+                },
+            };
+            if enqueue_inbound(sender, inbound).is_err() {
+                return;
+            }
+        }
+    }
+    drop(input);
+    calls
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .cancel_all();
+    crate::tools::cancel_all_sandbox_processes();
+}
 
 /// Run the ACP server on stdin/stdout.
 ///
 /// # Errors
 /// Returns an error if the server fails to start or encounters an I/O error.
+#[allow(clippy::too_many_lines)] // Stdio reader, dispatcher, and writer share one ordered shutdown boundary.
 pub async fn run_acp_server(
     config: AppConfig,
     model: String,
     api_key: Option<crate::providers::ApiKey>,
-    claude_code_token: Option<String>,
+    claude_code_token: Option<crate::secrets::OAuthToken>,
+    claude_agent_sdk: Option<crate::claude_agent_sdk::ClaudeAgentSdk>,
+    codex_agent_sdk: Option<crate::codex_agent_sdk::CodexAgentSdk>,
 ) -> Result<()> {
-    // Set up stdout writer channel — all writes go through this to avoid interleaving
-    let (stdout_tx, mut stdout_rx) = mpsc::unbounded_channel::<String>();
+    let launch_root = std::env::current_dir()
+        .map_err(|error| anyhow::anyhow!("Cannot resolve ACP workspace: {error}"))?;
+    let host_home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot resolve host home for private technical memory"))?;
+    let transport_failed = Arc::new(AtomicBool::new(false));
+    let active_calls = Arc::new(std::sync::Mutex::new(AcpCallRegistry::default()));
+    // Both directions are bounded. Saturation applies backpressure rather than
+    // retaining an unbounded client-controlled transcript in memory.
+    let (stdout_tx, mut stdout_rx) = mpsc::channel::<String>(MAX_ACP_OUTPUT_QUEUE_FRAMES);
 
-    // Spawn stdout writer on a blocking thread — StdoutLock is not Send
+    let writer_failed = Arc::clone(&transport_failed);
+    let writer_calls = Arc::clone(&active_calls);
     let writer_handle = std::thread::spawn(move || {
-        let stdout = io::stdout();
         while let Some(line) = stdout_rx.blocking_recv() {
-            let mut out = stdout.lock();
-            if writeln!(out, "{line}").is_err() {
-                break;
-            }
-            if out.flush().is_err() {
+            if write_acp_stdout_frame(&line).is_err() {
+                writer_failed.store(true, Ordering::SeqCst);
+                writer_calls
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .cancel_all();
                 break;
             }
         }
     });
 
-    let mut server = AcpServer::new(config, model, api_key, claude_code_token, stdout_tx);
+    let mut server = AcpServer::new_with_host_home(
+        config,
+        model,
+        api_key,
+        claude_code_token,
+        claude_agent_sdk,
+        codex_agent_sdk,
+        stdout_tx,
+        Arc::clone(&transport_failed),
+        launch_root,
+        host_home,
+    )
+    .map_err(anyhow::Error::msg)?;
+    server.discover_runtime_plugins();
 
     // Spawn stdin reader on a blocking thread — stdin.lock() is not Send.
-    // Cancellation is raised here, before the sequential dispatcher receives
-    // the message, so an in-flight prompt/tool cannot starve session/cancel.
-    let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
-    let reader_cancel = Arc::clone(&server.cancel_flag);
-    std::thread::spawn(move || {
-        let stdin = io::stdin();
-        let reader = stdin.lock();
-        for line_result in reader.lines() {
-            match line_result {
-                Ok(line) => {
-                    let trimmed = line.trim().to_string();
-                    if serde_json::from_str::<Value>(&trimmed)
-                        .ok()
-                        .and_then(|value| {
-                            value
-                                .get("method")
-                                .and_then(Value::as_str)
-                                .map(str::to_string)
-                        })
-                        .as_deref()
-                        == Some("session/cancel")
-                    {
-                        reader_cancel.store(true, Ordering::SeqCst);
-                    }
-                    if !trimmed.is_empty() && stdin_tx.send(trimmed).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        reader_cancel.store(true, Ordering::SeqCst);
-        crate::tools::cancel_all_sandbox_processes();
+    // Prompt reservations and cancellation are correlated here before the
+    // sequential dispatcher can be occupied by provider/tool work.
+    let (stdin_tx, mut stdin_rx) = mpsc::channel::<AcpInbound>(MAX_ACP_INPUT_QUEUE_FRAMES);
+    let reader_calls = Arc::clone(&active_calls);
+    let reader_failed = Arc::clone(&transport_failed);
+    let reader_handle = std::thread::spawn(move || {
+        read_acp_stdin(&stdin_tx, &reader_calls, &reader_failed);
     });
 
     info!("ACP server started on stdio");
 
     // Process messages from stdin reader thread
-    while let Some(line) = stdin_rx.recv().await {
-        let msg: JsonRpcMessage = match serde_json::from_str(&line) {
-            Ok(m) => m,
-            Err(e) => {
-                // Send parse error if we can extract an id
-                let id = serde_json::from_str::<Value>(&line)
-                    .ok()
-                    .and_then(|v| v.get("id").cloned())
-                    .unwrap_or(Value::Null);
-
-                server.send_error(id, PARSE_ERROR, &format!("Parse error: {e}"));
-                continue;
+    while let Some(inbound) = stdin_rx.recv().await {
+        if transport_failed.load(Ordering::SeqCst) {
+            break;
+        }
+        match inbound {
+            AcpInbound::ProtocolError { id, code, message } => {
+                server.send_error(id, code, &message);
             }
-        };
-
-        server.handle_message(msg).await;
+            AcpInbound::Message(message) => {
+                let request_id = message.id.clone();
+                server
+                    .handle_message_with_calls(message, &active_calls)
+                    .await;
+                if let Some(request_id) = request_id {
+                    active_calls
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .complete_request(&request_id);
+                }
+            }
+        }
     }
 
-    // Clean up — dropping server drops stdout_tx, which causes the writer thread to exit
+    // Close every admitted ACP session through the same observable lifecycle
+    // before releasing its capability generation.
+    let active_runs = server.run_contexts.values().cloned().collect::<Vec<_>>();
+    for run_context in active_runs {
+        let input =
+            crate::hooks::HookInput::for_run(&run_context, crate::hooks::HookEvent::SessionEnd)
+                .with_session_id(run_context.session_id())
+                .with_extra("frontend", serde_json::Value::String("acp".to_string()));
+        let _receipt = server
+            .hook_engine
+            .run_lifecycle(crate::hooks::HookEvent::SessionEnd, &input)
+            .await;
+        crate::tools::retire_run(&run_context);
+    }
+
+    transport_failed.store(true, Ordering::SeqCst);
+    active_calls
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .cancel_all();
     drop(server);
+    #[cfg(unix)]
+    let _ = reader_handle.join();
+    #[cfg(not(unix))]
+    if reader_handle.is_finished() {
+        let _ = reader_handle.join();
+    }
     let _ = writer_handle.join();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod bounded_transport_tests {
+    use super::*;
+
+    #[test]
+    fn decoder_rejects_oversized_and_partial_frames_without_retaining_them() {
+        let now = Instant::now();
+        let mut decoder = AcpFrameDecoder::default();
+        let mut oversized = vec![b'x'; MAX_ACP_INPUT_FRAME_BYTES + 1];
+        oversized.push(b'\n');
+
+        let frames = decoder.feed(&oversized, now);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0]
+            .as_ref()
+            .expect_err("oversized frame")
+            .contains("exceeded"));
+        assert!(!decoder.has_partial_frame());
+
+        assert!(decoder.feed(br#"{"jsonrpc":"2.0""#, now).is_empty());
+        assert!(decoder
+            .finish()
+            .expect("partial EOF")
+            .contains("partial JSON-RPC frame"));
+    }
+
+    #[test]
+    fn decoder_tracks_one_deadline_for_a_drip_fed_frame() {
+        let started = Instant::now();
+        let mut decoder = AcpFrameDecoder::default();
+        assert!(decoder.feed(b"{", started).is_empty());
+        assert_eq!(
+            decoder.remaining_assembly_time(started + ACP_FRAME_ASSEMBLY_TIMEOUT),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn json_rpc_decode_validates_core_fields_and_allows_extensions() {
+        let decoded = decode_json_rpc_frame(
+            br#"{"jsonrpc":"2.0","id":7,"method":"initialize","params":{},"extension":true}"#,
+        )
+        .expect("valid extended request");
+        assert_eq!(decoded.id, Some(json!(7)));
+        assert_eq!(decoded.method, "initialize");
+
+        let (_, code, _) =
+            decode_json_rpc_frame(br#"{"jsonrpc":"1.0","id":7,"method":"initialize","params":{}}"#)
+                .expect_err("wrong protocol version");
+        assert_eq!(code, INVALID_REQUEST);
+    }
+
+    #[test]
+    fn active_json_rpc_request_ids_cannot_be_reused() {
+        let mut registry = AcpCallRegistry::default();
+        let id = json!("request-7");
+        registry.reserve_request(&id).expect("first reservation");
+        assert!(registry.reserve_request(&id).is_err());
+        registry.complete_request(&id);
+        registry
+            .reserve_request(&id)
+            .expect("id released after completion");
+    }
 }
 
 #[cfg(test)]
@@ -3005,7 +6593,12 @@ mod ide_tests {
             diagnostics: HashMap::new(),
         };
 
-        let context = ide_context_for_prompt(&state).expect("non-empty IDE context");
+        let item = ide_context_item(&state).expect("non-empty IDE context");
+        let projection = crate::context::ContextProjector::project(
+            vec![item],
+            crate::context::ContextBudget::default(),
+        );
+        let context = projection.reference;
 
         assert!(context.contains("Active file: /workspace/src/main.rs"));
         assert!(context.contains("&lt;/system-reminder&gt;"));
@@ -3390,9 +6983,32 @@ mod search_security_tests {
 #[cfg(test)]
 mod acp_ledger_helper_tests {
     use super::{
-        record_acp_background_command_start, record_acp_tool_result_observation, AcpToolResult,
-        ACP_BACKGROUND_COMMAND_PENDING_STDERR,
+        acp_tool_call, record_acp_background_command_start, record_acp_tool_result_observation,
+        validate_and_render_acp_final_response, ACP_BACKGROUND_COMMAND_PENDING_STDERR,
     };
+
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
+
+    #[test]
+    fn acp_plain_final_is_denied_by_frontend_boundary() {
+        let session_id = "acp-plain-final-grounding-denial";
+        let path = crate::ledger::project_session_ledger_path(session_id)
+            .expect("test session id must be ledger safe");
+        let _ = std::fs::remove_file(&path);
+
+        let err = validate_and_render_acp_final_response(
+            test_run(),
+            session_id,
+            "Verified with cargo test.",
+            "test-model",
+        )
+        .expect_err("ACP plain final must not bypass typed claims");
+
+        assert_eq!(err, "final answer must use the typed final claim envelope");
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn acp_tool_result_observer_records_bounded_result_envelope() {
@@ -3401,11 +7017,21 @@ mod acp_ledger_helper_tests {
             .expect("test session id must be ledger safe");
         let _ = std::fs::remove_file(&path);
 
-        let result = AcpToolResult {
-            content: "x".repeat(crate::grounded_loop::TOOL_RESULT_LEDGER_CONTENT_MAX_BYTES + 128),
-            is_error: true,
-        };
-        record_acp_tool_result_observation(session_id, "read_file", "call_acp", &result);
+        let tool_call = acp_tool_call("call_acp", "read_file", r#"{"path":"src/acp.rs"}"#);
+        let result = crate::tools::ToolResult::bind(
+            &tool_call,
+            "read_file",
+            crate::tools::ToolHandlerResult::partial_text(
+                "x".repeat(crate::grounded_loop::TOOL_RESULT_LEDGER_CONTENT_MAX_BYTES + 128),
+                vec![crate::tools::ToolFailure::new(
+                    crate::tools::ToolFailureCode::External,
+                    "read stopped after returning bytes".to_string(),
+                    crate::tools::ToolRetryability::Safe,
+                )],
+            ),
+        );
+        let evidence_digest = result.evidence_digest();
+        record_acp_tool_result_observation(test_run(), session_id, &result);
 
         let ledger = crate::ledger::RealityLedger::open_project_session(session_id)
             .expect("reopen session ledger");
@@ -3419,12 +7045,19 @@ mod acp_ledger_helper_tests {
                 )
             })
             .expect("tool result observation");
-        assert_eq!(observation.authority, crate::ledger::Authority::Tool);
+        assert_eq!(
+            observation.provenance.trust,
+            crate::ledger::EvidenceTrust::UntrustedContent
+        );
+        assert!(observation.provenance.is_bound_to(test_run()));
         let crate::ledger::ObservationKind::ToolResult { result, .. } = &observation.kind else {
             panic!("expected tool result observation");
         };
         assert_eq!(result["tool_call_id"], "call_acp");
-        assert_eq!(result["is_error"], true);
+        assert_eq!(result["status"], "partial");
+        assert_eq!(result["is_error"], false);
+        assert_eq!(result["is_partial"], true);
+        assert_eq!(result["evidence_digest"], evidence_digest);
         assert_eq!(result["truncated"], true);
         assert_eq!(
             result["content"].as_str().expect("content").len(),
@@ -3442,13 +7075,17 @@ mod acp_ledger_helper_tests {
         let _ = std::fs::remove_file(&path);
         let cwd = std::env::current_dir().expect("cwd");
 
-        record_acp_background_command_start(session_id, &cwd, "cargo test");
+        record_acp_background_command_start(test_run(), session_id, &cwd, "cargo test");
 
         let ledger = crate::ledger::RealityLedger::open_project_session(session_id)
             .expect("reopen session ledger");
         let observations = ledger.observations_chronological();
         assert_eq!(observations.len(), 1);
-        assert_eq!(observations[0].authority, crate::ledger::Authority::Command);
+        assert_eq!(
+            observations[0].provenance.trust,
+            crate::ledger::EvidenceTrust::RuntimeObserved
+        );
+        assert!(observations[0].provenance.is_bound_to(test_run()));
         let crate::ledger::ObservationKind::CommandRun {
             cwd: observed_cwd,
             argv,
@@ -3564,7 +7201,11 @@ mod tool_definition_tests {
 
 #[cfg(test)]
 mod stream_tool_call_tests {
-    use super::{finish_acp_stream, AccumulatedToolCall, StreamResult};
+    use super::{
+        acp_native_json_stream_result, acp_responses_stream_result, finish_acp_stream,
+        AccumulatedToolCall, StreamResult,
+    };
+    use serde_json::json;
 
     #[test]
     fn finish_stream_returns_complete_tool_calls() {
@@ -3575,6 +7216,7 @@ mod stream_tool_call_tests {
                 name: "bash".to_string(),
                 arguments: r#"{"command":"pwd"}"#.to_string(),
             }],
+            crate::pipeline::ProviderTerminalOutcome::ToolCalls,
         );
 
         match result {
@@ -3600,6 +7242,7 @@ mod stream_tool_call_tests {
                 name: String::new(),
                 arguments: r#"{"command":"pwd"}"#.to_string(),
             }],
+            crate::pipeline::ProviderTerminalOutcome::ToolCalls,
         );
 
         match result {
@@ -3620,6 +7263,7 @@ mod stream_tool_call_tests {
                 name: "bash".to_string(),
                 arguments: r#"{"command":"pwd"}"#.to_string(),
             }],
+            crate::pipeline::ProviderTerminalOutcome::ToolCalls,
         );
 
         match result {
@@ -3628,6 +7272,109 @@ mod stream_tool_call_tests {
                 assert!(message.contains("id"), "{message}");
             }
             other => panic!("expected missing id to error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finish_stream_rejects_length_limited_text_as_success() {
+        let result = finish_acp_stream(
+            "partial".to_string(),
+            Vec::new(),
+            crate::pipeline::ProviderTerminalOutcome::LengthLimited,
+        );
+
+        match result {
+            StreamResult::Error(message) => {
+                assert!(message.contains("output limit"), "{message}");
+            }
+            other => panic!("expected length-limited turn to error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn responses_turn_keeps_native_state_and_exact_tool_identity_for_acp_followup() {
+        let output = crate::providers::OpenAiResponsesTurnOutput::new(
+            "resp_acp_1",
+            vec![json!({
+                "type": "function_call",
+                "id": "fc_acp_1",
+                "call_id": "call_acp_1",
+                "name": "bash",
+                "arguments": r#"{"command":"pwd"}"#
+            })],
+        )
+        .expect("Responses output");
+        let state = crate::providers::advance_openai_responses_state(
+            "openai", "gpt-test", None, 1, &output,
+        )
+        .expect("Responses state");
+        let decoded = crate::pipeline::OpenAiResponsesDecodedTurn {
+            content: String::new(),
+            reasoning_summary: None,
+            tool_calls: vec![crate::tools::ToolCall {
+                id: "call_acp_1".to_string(),
+                call_type: "function".to_string(),
+                function: crate::tools::FunctionCall {
+                    name: "bash".to_string(),
+                    arguments: r#"{"command":"pwd"}"#.to_string(),
+                },
+            }],
+            usage: crate::session::TokenUsage::default(),
+            terminal_outcome: crate::pipeline::ProviderTerminalOutcome::ToolCalls,
+            provider_native_state: state.clone(),
+        };
+
+        let (result, retained) = acp_responses_stream_result(decoded);
+        assert_eq!(retained, state);
+        match result {
+            StreamResult::ToolCalls { tool_calls, .. } => {
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].id, "call_acp_1");
+                assert_eq!(tool_calls[0].name, "bash");
+                assert_eq!(tool_calls[0].arguments, r#"{"command":"pwd"}"#);
+            }
+            other => panic!("expected Responses tool call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn native_json_turn_keeps_state_and_exact_tool_identity_for_acp_followup() {
+        let response = json!({
+            "model": "qwen3",
+            "message": {
+                "role": "assistant",
+                "content": "checking",
+                "thinking": "private",
+                "tool_calls": [{
+                    "function": {
+                        "index": 6,
+                        "name": "bash",
+                        "arguments": {"command": "pwd"}
+                    }
+                }]
+            },
+            "done": true
+        });
+        let decoded = crate::pipeline::decode_provider_native_json_turn(
+            "ollama", "qwen3", &response, None, 1,
+        )
+        .expect("Ollama turn decodes before ACP dispatch");
+        let expected_state = decoded.provider_native_state.clone();
+
+        let (result, retained) = acp_native_json_stream_result(decoded);
+        assert_eq!(retained, expected_state);
+        match result {
+            StreamResult::ToolCalls {
+                content,
+                tool_calls,
+            } => {
+                assert_eq!(content, "checking");
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].id, "call_ollama_1_0");
+                assert_eq!(tool_calls[0].name, "bash");
+                assert_eq!(tool_calls[0].arguments, r#"{"command":"pwd"}"#);
+            }
+            other => panic!("expected Ollama tool call, got {other:?}"),
         }
     }
 }
@@ -3640,22 +7387,22 @@ mod tool_argument_tests {
     fn malformed_json_returns_tool_error() {
         let err =
             parse_acp_tool_arguments("bash", "not json {{").expect_err("malformed JSON must error");
-        assert!(err.is_error);
+        assert_eq!(err.code, crate::tools::ToolFailureCode::InvalidArguments);
         assert!(
-            err.content.contains("Invalid tool arguments JSON"),
+            err.message.contains("Invalid tool arguments JSON"),
             "diagnostic must name malformed arguments: {:?}",
-            err.content
+            err.message
         );
     }
 
     #[test]
     fn non_object_json_returns_tool_error() {
         let err = parse_acp_tool_arguments("bash", "[]").expect_err("array args must error");
-        assert!(err.is_error);
+        assert_eq!(err.code, crate::tools::ToolFailureCode::InvalidArguments);
         assert!(
-            err.content.contains("expected a JSON object"),
+            err.message.contains("expected a JSON object"),
             "diagnostic must reject non-object args: {:?}",
-            err.content
+            err.message
         );
     }
 
@@ -3679,16 +7426,17 @@ mod tool_argument_tests {
 #[cfg(test)]
 mod session_mode_tests {
     use super::{
-        acp_mode_label, build_acp_system_prompt, AcpServer, ACP_CONFIG_MODEL_ID,
-        ACP_CONFIG_MODE_ID, INVALID_PARAMS,
+        build_acp_prompt_context, prepare_acp_session_storage, AcpActiveCallMarker, AcpServer,
+        ACP_CONFIG_MODEL_ID, ACP_CONFIG_MODE_ID, INVALID_PARAMS, MAX_ACP_OUTPUT_QUEUE_FRAMES,
     };
-    use crate::config::{AppConfig, HooksConfig};
+    use crate::config::{AppConfig, Hook, HookEntry, HookPolicy, HooksConfig};
     use crate::hooks::HookEngine;
-    use crate::permissions::PermissionManager;
-    use crate::rules::RulesEngine;
     use crate::session::{SessionManager, SessionMode};
+    use crate::tools::{ToolFailureCode, ToolOutcome};
     use serde_json::{json, Value};
     use std::collections::{HashMap, VecDeque};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -3703,45 +7451,845 @@ proxy:
 providers:
   local:
     base_url: http://localhost:1234/v1
+permissions:
+  # These session-mode fixtures exercise local routing and cancellation, not
+  # interactive approval. Match the fixture's former explicit unrestricted
+  # manager while keeping the manager bound to the exact test run.
+  enabled: false
+memory:
+  automatic_learning_enabled: true
 "#,
         )
         .expect("test config")
     }
 
-    fn test_server() -> (
-        AcpServer,
-        mpsc::UnboundedReceiver<String>,
-        tempfile::TempDir,
-    ) {
+    fn test_server() -> (AcpServer, mpsc::Receiver<String>, tempfile::TempDir) {
+        test_server_with_read_only_roots(Vec::new())
+    }
+
+    fn test_server_with_read_only_roots(
+        read_only_roots: Vec<std::path::PathBuf>,
+    ) -> (AcpServer, mpsc::Receiver<String>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let (stdout_tx, stdout_rx) = mpsc::unbounded_channel();
+        let launch_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let (stdout_tx, stdout_rx) = mpsc::channel(MAX_ACP_OUTPUT_QUEUE_FRAMES);
+        let launch_capabilities =
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), &launch_root)
+                .read_only_roots(read_only_roots)
+                .read_write_roots(Vec::new())
+                .environment_grants(HashMap::new())
+                .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+                .process(true)
+                .network(true)
+                .secrets(true)
+                .provider("unit-test")
+                .build()
+                .expect("test ACP launch capability");
+        let run = launch_capabilities
+            .derive_frontend_session(
+                crate::state::SessionId::new(),
+                &launch_root,
+                &launch_root,
+                "local",
+            )
+            .expect("test ACP session run");
+        let run_contexts = HashMap::from([("unit-test".to_string(), Arc::clone(&run))]);
+        let memory_db = Arc::new(
+            crate::memory::MemoryDb::open_for_workspace(tmp.path(), &launch_root)
+                .expect("test ACP technical memory"),
+        );
+        let acp_session_storage =
+            prepare_acp_session_storage(tmp.path()).expect("test ACP session storage");
         let server = AcpServer {
             config: test_config(),
+            vdd_engine: None,
             session_manager: SessionManager::new(tmp.path().join("sessions")),
             hook_engine: HookEngine::new(HooksConfig::default()),
-            rules_engine: RulesEngine::new(tmp.path().join("rules")),
             session_map: HashMap::new(),
+            run_contexts,
+            mcp_managers: HashMap::new(),
+            plugin_manager: None,
+            task_managers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            memory_db,
             session_order: VecDeque::new(),
             messages: Vec::new(),
             model: "local-model".to_string(),
             api_key: None,
             claude_code_token: None,
-            permission_mgr: Arc::new(PermissionManager::unrestricted()),
+            claude_agent_sdk: None,
+            codex_agent_sdk: None,
+            provider_native_state: None,
+            active_conversation_acp_session_id: None,
             policy_enforcer: Arc::new(crate::services::policy::PolicyEnforcer::new(
                 crate::services::policy::EnterprisePolicy::default(),
             )),
             cancel_flag: Arc::new(AtomicBool::new(false)),
             stdout_tx,
+            transport_failed: Arc::new(AtomicBool::new(false)),
+            provisional_output: String::new(),
+            last_prompt_error: None,
             config_options: HashMap::new(),
+            session_envelopes: HashMap::new(),
+            acp_session_storage,
+            active_call: None,
+            initial_model: "local-model".to_string(),
             next_terminal_id: AtomicU64::new(1),
             state: crate::state::StateStore::new(crate::state::SessionState::new(
-                tmp.path().to_path_buf(),
+                launch_root.clone(),
             )),
+            launch_root,
+            launch_capabilities,
         };
         (server, stdout_rx, tmp)
     }
 
-    fn next_response(rx: &mut mpsc::UnboundedReceiver<String>) -> Value {
+    fn test_run(server: &AcpServer) -> &Arc<crate::tools::ToolRunContext> {
+        server
+            .run_contexts
+            .get("unit-test")
+            .expect("test server carries an explicit run capability")
+    }
+
+    #[test]
+    fn assistant_chunks_are_streamed_as_provisional_until_prompt_commit() {
+        let (mut server, mut stdout, _tmp) = test_server();
+        server.active_call = Some(AcpActiveCallMarker {
+            session_id: "acp-session".to_string(),
+            call_id: "call-1".to_string(),
+        });
+        server
+            .stage_assistant_output("acp-session", "hello")
+            .expect("bounded provisional output");
+
+        let update: Value = serde_json::from_str(
+            &stdout
+                .try_recv()
+                .expect("provisional session update must be emitted"),
+        )
+        .expect("session update JSON");
+        assert_eq!(update["method"], "session/update");
+        assert_eq!(update["params"]["content"]["text"], "hello");
+        assert_eq!(update["params"]["content"]["provisional"], true);
+        assert_eq!(server.provisional_output, "hello");
+    }
+
+    #[cfg(unix)]
+    fn write_hook_capture_script(
+        directory: &std::path::Path,
+        name: &str,
+        capture: &std::path::Path,
+    ) -> std::path::PathBuf {
+        let script = directory.join(name);
+        let capture = shlex::try_quote(
+            capture
+                .to_str()
+                .expect("hook capture path must be valid UTF-8"),
+        )
+        .expect("quote hook capture path");
+        std::fs::write(&script, format!("#!/bin/sh\ncat > {capture}\n"))
+            .expect("write hook capture script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .expect("make hook capture script executable");
+        script
+    }
+
+    fn acp_memory_draft(title: &str) -> Value {
+        let digest = crate::memory::MemoryDigest::for_fields(
+            b"openclaudia.s054.acp-test.v1",
+            &[b"src/acp.rs"],
+        );
+        json!({
+            "title": title,
+            "kind": "testing",
+            "observation": "ACP dispatch reaches the host-owned workspace store.",
+            "guidance": "Keep typed memory on the canonical local tool path.",
+            "applicability": {"paths": ["src/acp.rs"]},
+            "citations": [{
+                "kind": "test",
+                "locator": "src/acp.rs",
+                "source_version": "unit-test",
+                "digest": digest.to_string(),
+                "line_start": 1,
+                "line_end": 1
+            }],
+            "confidence": "verified_by_test",
+            "sensitivity": "internal",
+            "retention": {"policy": "indefinite"}
+        })
+    }
+
+    async fn execute_acp_memory_tool(
+        server: &AcpServer,
+        run: &Arc<crate::tools::ToolRunContext>,
+        call_id: &str,
+        name: &str,
+        arguments: Value,
+    ) -> crate::tools::ToolResult {
+        server
+            .execute_tool_via_acp(run, "unit-test", call_id, name, &arguments.to_string())
+            .await
+    }
+
+    fn test_toolchain_rustc() -> std::path::PathBuf {
+        if let Ok(rustup) = which::which("rustup") {
+            let output = crate::tools::command::run_with_timeout(
+                &rustup,
+                &["which", "rustc"],
+                None,
+                std::time::Duration::from_secs(5),
+            )
+            .expect("query rustup for the active rustc");
+            if output.status.success() {
+                let path = std::path::PathBuf::from(
+                    String::from_utf8(output.stdout)
+                        .expect("rustup rustc path is UTF-8")
+                        .trim(),
+                );
+                assert!(path.is_absolute(), "rustup returned a relative rustc path");
+                return path;
+            }
+        }
+        which::which("rustc").expect("ACP automatic-learning test requires rustc on PATH")
+    }
+
+    #[tokio::test]
+    async fn acp_startup_activates_the_configured_authenticated_team_replica() {
+        let host = tempfile::tempdir().expect("host home");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let principal: crate::team_memory::PrincipalId = "owner".parse().expect("principal");
+        let authority = crate::team_memory::TeamAuthorityStore::bootstrap(
+            host.path(),
+            workspace.path(),
+            principal,
+            31_536_000,
+        )
+        .expect("team authority");
+        let mut config = test_config();
+        config.memory.team_id = Some(authority.team_id().clone());
+        let (stdout_tx, _stdout_rx) = mpsc::channel(MAX_ACP_OUTPUT_QUEUE_FRAMES);
+        let server = AcpServer::new_with_host_home(
+            config,
+            "local-model".to_string(),
+            None,
+            None,
+            None,
+            None,
+            stdout_tx,
+            Arc::new(AtomicBool::new(false)),
+            workspace.path().to_path_buf(),
+            host.path().to_path_buf(),
+        )
+        .expect("ACP startup");
+        let run = Arc::clone(&server.launch_capabilities);
+
+        let listed = execute_acp_memory_tool(
+            &server,
+            &run,
+            "s104-acp-team-list",
+            "memory_list",
+            json!({"scope": "team", "limit": 5}),
+        )
+        .await;
+        assert!(
+            !listed.is_error(),
+            "ACP configured team list failed: {}",
+            listed.content()
+        );
+    }
+
+    fn assert_agent_proposal(record: &crate::memory::TechnicalLessonRecord) {
+        assert_eq!(
+            record.provenance.source_kind,
+            crate::memory::MemorySourceKind::AgentProposal
+        );
+        assert!(record
+            .provenance
+            .source_id
+            .starts_with("tool-invocation:sha256:"));
+    }
+
+    async fn assert_acp_memory_source_routes(
+        server: &AcpServer,
+        run: &Arc<crate::tools::ToolRunContext>,
+    ) {
+        let source_status = execute_acp_memory_tool(
+            server,
+            run,
+            "call-memory-source-status",
+            "memory_source_status",
+            json!({}),
+        )
+        .await;
+        assert!(
+            !source_status.is_error(),
+            "ACP memory_source_status failed: {}",
+            source_status.content()
+        );
+
+        let source_refresh = execute_acp_memory_tool(
+            server,
+            run,
+            "call-memory-source-refresh",
+            "memory_source_refresh",
+            json!({}),
+        )
+        .await;
+        assert!(
+            !source_refresh.is_error(),
+            "ACP memory_source_refresh failed: {}",
+            source_refresh.content()
+        );
+        assert!(matches!(
+            server
+                .memory_db
+                .technical_memory_source_status()
+                .expect("ACP source state"),
+            crate::memory::TechnicalMemorySourceStoreStatus::Unconfigured
+        ));
+    }
+
+    async fn assert_acp_memory_review_requires_host_decision(
+        server: &AcpServer,
+        run: &Arc<crate::tools::ToolRunContext>,
+        record: &crate::memory::TechnicalLessonRecord,
+    ) {
+        let denied = execute_acp_memory_tool(
+            server,
+            run,
+            "call-memory-review-without-host",
+            "memory_review",
+            json!({
+                "action": "review",
+                "logical_id": record.logical_id.to_string(),
+                "expected_record_digest": record.record_digest.to_string()
+            }),
+        )
+        .await;
+        assert!(denied.is_error());
+        assert!(
+            denied
+                .content()
+                .contains("no interactive prompt is available"),
+            "ACP must route memory_review through the canonical permission gate: {}",
+            denied.content()
+        );
+        let after_denial = server
+            .memory_db
+            .query_technical_lessons(
+                Some("ACP memory dispatch"),
+                5,
+                chrono::Utc::now().timestamp(),
+            )
+            .expect("query after ACP review denial")
+            .records
+            .pop()
+            .expect("lesson remains after ACP review denial");
+        assert_eq!(after_denial.record_digest, record.record_digest);
+        assert_eq!(
+            after_denial.lesson.review,
+            crate::memory::LessonReviewState::Candidate
+        );
+    }
+
+    async fn assert_acp_portable_memory_requires_host_decision(
+        server: &AcpServer,
+        run: &Arc<crate::tools::ToolRunContext>,
+    ) {
+        let root = run.project_root().to_string_lossy().into_owned();
+        for (name, arguments) in [
+            ("memory_export", json!({"destination_root": root.clone()})),
+            ("memory_import", json!({"source_root": root})),
+        ] {
+            let denied = execute_acp_memory_tool(
+                server,
+                run,
+                &format!("call-{name}-without-host"),
+                name,
+                arguments,
+            )
+            .await;
+            assert!(denied.is_error(), "ACP {name} unexpectedly executed");
+            assert!(
+                denied
+                    .content()
+                    .contains("no interactive prompt is available"),
+                "ACP must route {name} through the canonical fresh-host gate: {}",
+                denied.content()
+            );
+        }
+    }
+
+    async fn assert_acp_automatic_learning_status(
+        server: &AcpServer,
+        run: &Arc<crate::tools::ToolRunContext>,
+    ) {
+        let status = execute_acp_memory_tool(
+            server,
+            run,
+            "call-memory-learning-status",
+            "memory_learning_status",
+            json!({}),
+        )
+        .await;
+        assert!(
+            !status.is_error(),
+            "ACP memory_learning_status failed: {}",
+            status.content()
+        );
+        assert!(
+            status.content().contains("Automatic technical learning")
+                && status.content().contains("enabled"),
+            "ACP must expose the configured bounded learning status: {}",
+            status.content()
+        );
+    }
+
+    fn create_acp_memory_conflict(
+        server: &AcpServer,
+    ) -> (
+        crate::memory::LogicalMemoryId,
+        Vec<crate::memory::MemoryDigest>,
+    ) {
+        let draft: crate::memory::TechnicalLessonDraft =
+            serde_json::from_value(acp_memory_draft("ACP conflict root")).expect("conflict draft");
+        let source = |label: &str| {
+            crate::memory::MemorySourceEvidence::new(
+                crate::memory::MemorySourceKind::ToolOutcome,
+                format!("acp-test:{label}"),
+                "unit-test".to_string(),
+                crate::memory::MemoryDigest::for_fields(
+                    b"openclaudia.s1081.acp-test.v1",
+                    &[label.as_bytes()],
+                ),
+            )
+        };
+        let root_record = server
+            .memory_db
+            .save_technical_lesson_candidate(&draft, source("root"), "agent:root".to_string(), 1)
+            .expect("conflict root");
+        let root = server
+            .memory_db
+            .revision_by_digest(&root_record.record_digest)
+            .expect("root lookup")
+            .expect("root revision");
+        let root_lesson =
+            crate::memory::TechnicalLesson::decode(&root.content).expect("root lesson");
+        for label in ["left", "right"] {
+            let replacement: crate::memory::TechnicalLessonDraft =
+                serde_json::from_value(acp_memory_draft(&format!("ACP {label} conflict branch")))
+                    .expect("branch draft");
+            let lesson = root_lesson
+                .corrected(
+                    replacement,
+                    root.record_digest.clone(),
+                    format!("retain ACP {label} evidence"),
+                    2,
+                )
+                .expect("branch lesson");
+            let revision = root
+                .successor(
+                    lesson.encode().expect("branch encoding"),
+                    root.tags.clone(),
+                    crate::memory::MemoryProvenance::new(
+                        source(label),
+                        crate::memory::MemoryAttribution::new(
+                            format!("agent:{label}"),
+                            Some(server.memory_db.store_id().expect("store ID")),
+                            Some(
+                                server
+                                    .memory_db
+                                    .workspace_id()
+                                    .expect("workspace ID")
+                                    .to_string(),
+                            ),
+                        ),
+                        crate::memory::MemoryRecordScope::UserPrivate,
+                    ),
+                )
+                .expect("branch revision");
+            server
+                .memory_db
+                .apply_revision(&revision)
+                .expect("apply branch");
+        }
+        let conflict = server
+            .memory_db
+            .inspect_technical_lesson_conflict(root.logical_id, None, 8)
+            .expect("conflict state");
+        assert_eq!(conflict.expected_head_digests.len(), 2);
+        (root.logical_id, conflict.expected_head_digests)
+    }
+
+    async fn assert_acp_conflict_inspection_and_resolution(
+        server: &AcpServer,
+        run: &Arc<crate::tools::ToolRunContext>,
+    ) {
+        let (logical_id, expected_head_digests) = create_acp_memory_conflict(server);
+
+        let inspected = execute_acp_memory_tool(
+            server,
+            run,
+            "call-memory-conflicts",
+            "memory_conflicts",
+            json!({"logical_id": logical_id.to_string(), "limit": 1}),
+        )
+        .await;
+        assert!(
+            !inspected.is_error() && inspected.content().contains("Inspected 1 of 2"),
+            "ACP memory_conflicts failed: {}",
+            inspected.content()
+        );
+
+        let resolved = execute_acp_memory_tool(
+            server,
+            run,
+            "call-memory-resolve",
+            "memory_update",
+            json!({
+                "logical_id": logical_id.to_string(),
+                "expected_head_digests": expected_head_digests,
+                "correction_reason": "Exercise ACP complete-head resolution routing.",
+                "replacement": acp_memory_draft("ACP conflict resolution is canonical")
+            }),
+        )
+        .await;
+        assert!(
+            !resolved.is_error() && resolved.content().contains("Resolved technical lesson"),
+            "ACP memory resolution failed: {}",
+            resolved.content()
+        );
+        let heads = server
+            .memory_db
+            .revision_heads(logical_id)
+            .expect("resolved heads");
+        assert_eq!(heads.len(), 1);
+        assert_eq!(heads[0].version.get(), 3);
+    }
+
+    async fn assert_acp_memory_crud_routes(
+        server: &AcpServer,
+        run: &Arc<crate::tools::ToolRunContext>,
+    ) {
+        let saved = execute_acp_memory_tool(
+            server,
+            run,
+            "call-memory-save",
+            "memory_save",
+            acp_memory_draft("ACP memory dispatch is canonical"),
+        )
+        .await;
+        assert!(
+            !saved.is_error(),
+            "ACP memory_save failed: {}",
+            saved.content()
+        );
+        let first = server
+            .memory_db
+            .query_technical_lessons(
+                Some("ACP memory dispatch"),
+                5,
+                chrono::Utc::now().timestamp(),
+            )
+            .expect("query ACP-saved lesson")
+            .records
+            .pop()
+            .expect("ACP save persisted one lesson");
+
+        assert_acp_memory_review_requires_host_decision(server, run, &first).await;
+        assert_acp_portable_memory_requires_host_decision(server, run).await;
+
+        let updated = execute_acp_memory_tool(
+            server,
+            run,
+            "call-memory-update",
+            "memory_update",
+            json!({
+                "logical_id": first.logical_id.to_string(),
+                "expected_record_digest": first.record_digest.to_string(),
+                "correction_reason": "Exercise ACP update routing.",
+                "replacement": acp_memory_draft("ACP memory update is canonical")
+            }),
+        )
+        .await;
+        assert!(
+            !updated.is_error(),
+            "ACP memory_update failed: {}",
+            updated.content()
+        );
+        let second = server
+            .memory_db
+            .query_technical_lessons(Some("ACP memory update"), 5, chrono::Utc::now().timestamp())
+            .expect("query ACP-updated lesson")
+            .records
+            .pop()
+            .expect("ACP update persisted one lesson");
+        assert_eq!(second.logical_id, first.logical_id);
+        assert_eq!(second.version.get(), 2);
+        assert_agent_proposal(&first);
+        assert_agent_proposal(&second);
+        assert_ne!(first.provenance.source_id, second.provenance.source_id);
+
+        let deleted = execute_acp_memory_tool(
+            server,
+            run,
+            "call-memory-delete",
+            "memory_delete",
+            json!({
+                "logical_id": second.logical_id.to_string(),
+                "expected_record_digest": second.record_digest.to_string()
+            }),
+        )
+        .await;
+        assert!(
+            !deleted.is_error(),
+            "ACP memory_delete failed: {}",
+            deleted.content()
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_routes_every_typed_memory_operation_to_its_host_store() {
+        let (server, _rx, _tmp) = test_server();
+        let run = Arc::clone(test_run(&server));
+
+        let listed = execute_acp_memory_tool(
+            &server,
+            &run,
+            "call-memory-list",
+            "memory_list",
+            json!({"limit": 5}),
+        )
+        .await;
+        assert!(
+            !listed.is_error(),
+            "ACP memory_list failed: {}",
+            listed.content()
+        );
+
+        assert_acp_automatic_learning_status(&server, &run).await;
+
+        assert_acp_memory_source_routes(&server, &run).await;
+
+        assert_acp_memory_crud_routes(&server, &run).await;
+
+        let searched = execute_acp_memory_tool(
+            &server,
+            &run,
+            "call-memory-search",
+            "memory_search",
+            json!({"query": "sqlite", "limit": 5}),
+        )
+        .await;
+        assert!(
+            !searched.is_error(),
+            "ACP memory_search failed: {}",
+            searched.content()
+        );
+
+        assert_acp_conflict_inspection_and_resolution(&server, &run).await;
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn acp_automatic_learning_citations_bind_provider_call_ids() {
+        let rustc = test_toolchain_rustc();
+        let toolchain_root = rustc
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("rustc lives below a toolchain root")
+            .to_path_buf();
+        let read_only_roots = (!matches!(toolchain_root.to_str(), Some("/" | "/bin" | "/usr")))
+            .then_some(toolchain_root)
+            .into_iter()
+            .collect();
+        let (server, _rx, _host) = test_server_with_read_only_roots(read_only_roots);
+        let run = Arc::clone(test_run(&server));
+        let fixture = tempfile::tempdir_in(run.project_root()).expect("project-local fixture");
+        let relative_dir = fixture
+            .path()
+            .strip_prefix(run.project_root())
+            .expect("fixture below project root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let source_path = format!("{relative_dir}/learning_probe.rs");
+        let output_path = format!("{relative_dir}/learning_probe.rmeta");
+        let broken_source = "pub const VALUE: u8 = ;\n";
+        let fixed_source = "pub const VALUE: u8 = 1;\n";
+
+        let initial = execute_acp_memory_tool(
+            &server,
+            &run,
+            "acp-learning-initial-write",
+            "write_file",
+            json!({"path": source_path, "content": broken_source}),
+        )
+        .await;
+        assert!(!initial.is_error(), "initial ACP write failed: {initial:?}");
+
+        // Resolve the real toolchain binary before crossing the sandbox
+        // boundary. CI installs rustc through a rustup proxy whose operation
+        // depends on host-only RUSTUP_* state that the run-bound environment
+        // intentionally does not inherit.
+        let command = format!(
+            "{} --crate-name acp_learning_probe {} --crate-type lib --emit metadata -o {}",
+            shlex::try_quote(
+                rustc
+                    .to_str()
+                    .expect("rustc path must be representable in a shell command"),
+            )
+            .expect("quote rustc path"),
+            shlex::try_quote(&source_path).expect("quote source path"),
+            shlex::try_quote(&output_path).expect("quote output path")
+        );
+        let failure_id = "acp-learning-check-failure";
+        let failed = execute_acp_memory_tool(
+            &server,
+            &run,
+            failure_id,
+            "bash",
+            json!({"command": command.clone()}),
+        )
+        .await;
+        assert!(
+            failed.is_error() || failed.is_partial(),
+            "broken ACP verification unexpectedly succeeded: {failed:?}"
+        );
+
+        let read = execute_acp_memory_tool(
+            &server,
+            &run,
+            "acp-learning-read",
+            "read_file",
+            json!({"path": source_path}),
+        )
+        .await;
+        assert!(!read.is_error(), "ACP read failed: {read:?}");
+        let snapshot = read
+            .content()
+            .rsplit_once("File snapshot: generation=")
+            .and_then(|(_, suffix)| suffix.split(',').next())
+            .filter(|generation| generation.starts_with("sha256:"))
+            .expect("successful ACP read must expose a snapshot generation");
+
+        let edit_id = "acp-learning-edit";
+        let edit = execute_acp_memory_tool(
+            &server,
+            &run,
+            edit_id,
+            "edit_file",
+            json!({
+                "path": source_path,
+                "old_string": broken_source,
+                "new_string": fixed_source,
+                "expected_snapshot": snapshot
+            }),
+        )
+        .await;
+        assert!(!edit.is_error(), "ACP edit failed: {edit:?}");
+
+        let success_id = "acp-learning-check-success";
+        let passed = execute_acp_memory_tool(
+            &server,
+            &run,
+            success_id,
+            "bash",
+            json!({"command": command}),
+        )
+        .await;
+        assert!(
+            matches!(passed.outcome(), ToolOutcome::Success { .. }),
+            "fixed ACP verification did not succeed: {passed:?}"
+        );
+
+        let records = server
+            .memory_db
+            .query_technical_lessons(None, 5, chrono::Utc::now().timestamp())
+            .expect("query ACP learning candidate")
+            .records;
+        assert_eq!(records.len(), 1);
+        let locators = records[0]
+            .lesson
+            .citations
+            .iter()
+            .map(|citation| citation.locator.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        for call_id in [failure_id, edit_id, success_id] {
+            let expected = format!(
+                "tool-call-digest:{}",
+                crate::memory::MemoryDigest::sha256(call_id.as_bytes())
+            );
+            assert!(
+                locators.contains(expected.as_str()),
+                "missing exact ACP call citation {expected}: {locators:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_generations_derive_from_launch_snapshot_without_host_rediscovery() {
+        let (mut server, _rx, _tmp) = test_server();
+        let launch = crate::tools::ToolRunContext::builder(
+            crate::state::SessionId::new(),
+            &server.launch_root,
+        )
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(HashMap::from([(
+            "S019_ACP_SNAPSHOT".to_string(),
+            "bound-at-launch".to_string(),
+        )]))
+        .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+        .process(true)
+        .network(true)
+        .secrets(false)
+        .provider("acp-snapshot-test")
+        .build()
+        .expect("launch snapshot");
+        server.launch_capabilities = Arc::clone(&launch);
+        let session_id = crate::state::SessionId::new();
+
+        let first = server
+            .build_run_context_for_mode(session_id.as_str(), crate::modes::RuntimeMode::Initializer)
+            .expect("first prompt generation");
+        let second = server
+            .build_run_context_for_mode(session_id.as_str(), crate::modes::RuntimeMode::Initializer)
+            .expect("second prompt generation");
+
+        assert_eq!(first.environment_grants(), launch.environment_grants());
+        assert_eq!(second.environment_grants(), launch.environment_grants());
+        assert_ne!(first.run_id(), second.run_id());
+        assert_ne!(first.generation(), second.generation());
+        assert_ne!(first.private_temp_root(), second.private_temp_root());
+    }
+
+    #[test]
+    fn production_session_run_binds_the_loaded_guardrail_policy() {
+        let (mut server, _rx, _tmp) = test_server();
+        server.config.guardrails = serde_yaml::from_str(
+            r"
+blast_radius:
+  enabled: true
+  mode: strict
+  denied_paths:
+    - '.env'
+",
+        )
+        .expect("strict ACP guardrails");
+
+        let session_id = crate::state::SessionId::new();
+        let run = server
+            .build_run_context_for_mode(session_id.as_str(), crate::modes::RuntimeMode::Initializer)
+            .expect("guardrail-bound ACP run");
+        let rejection = crate::guardrails::check_file_access(&run, ".env")
+            .expect_err("ACP run must enforce its configured deny rule");
+        assert!(
+            rejection.contains("matches deny list pattern"),
+            "{rejection}"
+        );
+        crate::tools::retire_run(&run);
+    }
+
+    fn next_response(rx: &mut mpsc::Receiver<String>) -> Value {
         let line = rx.try_recv().expect("expected ACP response");
         serde_json::from_str(&line).expect("response must be JSON")
     }
@@ -3757,7 +8305,7 @@ providers:
         );
     }
 
-    fn assert_no_client_request(rx: &mut mpsc::UnboundedReceiver<String>, context: &str) {
+    fn assert_no_client_request(rx: &mut mpsc::Receiver<String>, context: &str) {
         assert!(
             rx.try_recv().is_err(),
             "{context} must fail before emitting an ACP client request"
@@ -3769,15 +8317,18 @@ providers:
         let (server, mut rx, _tmp) = test_server();
         let args = HashMap::from([("path".to_string(), json!(["src/lib.rs"]))]);
 
-        let result = server.acp_read_file("acp-bad-path", &args).await;
+        let failure = server
+            .acp_read_file(test_run(&server), "acp-bad-path", "call-bad-path", &args)
+            .await
+            .expect_err("bad path must fail argument normalization");
 
-        assert!(result.is_error, "bad path must error: {result:?}");
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result
-                .content
+            failure
+                .message
                 .contains("Invalid 'path' argument: expected string"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
         assert_no_client_request(&mut rx, "bad read path");
     }
@@ -3790,15 +8341,23 @@ providers:
             ("offset".to_string(), json!("2")),
         ]);
 
-        let result = server.acp_read_file("acp-bad-offset", &args).await;
+        let failure = server
+            .acp_read_file(
+                test_run(&server),
+                "acp-bad-offset",
+                "call-bad-offset",
+                &args,
+            )
+            .await
+            .expect_err("bad offset must fail argument normalization");
 
-        assert!(result.is_error, "bad offset must error: {result:?}");
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result
-                .content
+            failure
+                .message
                 .contains("offset must be a 1-indexed positive integer"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
         assert!(
             rx.try_recv().is_err(),
@@ -3814,13 +8373,16 @@ providers:
             ("limit".to_string(), json!(0)),
         ]);
 
-        let result = server.acp_read_file("acp-bad-limit", &args).await;
+        let failure = server
+            .acp_read_file(test_run(&server), "acp-bad-limit", "call-bad-limit", &args)
+            .await
+            .expect_err("zero limit must fail argument normalization");
 
-        assert!(result.is_error, "zero limit must error: {result:?}");
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result.content.contains("limit must be a positive integer"),
+            failure.message.contains("limit must be a positive integer"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
         assert!(
             rx.try_recv().is_err(),
@@ -3836,15 +8398,23 @@ providers:
             ("content".to_string(), json!({"text": "body"})),
         ]);
 
-        let result = server.acp_write_file("acp-bad-content", &args).await;
+        let failure = server
+            .acp_write_file(
+                test_run(&server),
+                "acp-bad-content",
+                "call-bad-content",
+                &args,
+            )
+            .await
+            .expect_err("bad content must fail argument normalization");
 
-        assert!(result.is_error, "bad content must error: {result:?}");
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result
-                .content
+            failure
+                .message
                 .contains("Invalid 'content' argument: expected string"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
         assert_no_client_request(&mut rx, "bad write content");
     }
@@ -3857,15 +8427,23 @@ providers:
             ("content".to_string(), json!("body")),
         ]);
 
-        let result = server.acp_write_file("acp-bad-write-path", &args).await;
+        let failure = server
+            .acp_write_file(
+                test_run(&server),
+                "acp-bad-write-path",
+                "call-bad-write-path",
+                &args,
+            )
+            .await
+            .expect_err("bad file_path must fail argument normalization");
 
-        assert!(result.is_error, "bad file_path must error: {result:?}");
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result
-                .content
+            failure
+                .message
                 .contains("Invalid 'file_path' argument: expected string"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
         assert_no_client_request(&mut rx, "bad write file_path");
     }
@@ -3885,23 +8463,26 @@ providers:
             .nth(1)
             .expect("fixture has a second line")
             .to_string();
-        let result = server.acp_read_file("acp-window", &args).await;
+        let result = server
+            .acp_read_file(test_run(&server), "acp-window", "call-window", &args)
+            .await
+            .expect("valid read arguments");
 
-        assert!(!result.is_error, "valid window must succeed: {result:?}");
+        assert!(!result.is_error(), "valid window must succeed: {result:?}");
         assert!(
-            result.content.contains(&format!("| {expected}")),
+            result.content().contains(&format!("| {expected}")),
             "offset=2 limit=1 must show the fixture's line 2; got {}",
-            result.content
+            result.content()
         );
         assert!(
             result
-                .content
+                .content()
                 .lines()
                 .filter(|line| line.contains('|'))
                 .count()
                 == 1,
             "offset/limit window must return exactly one numbered content line; got {}",
-            result.content
+            result.content()
         );
         assert_no_client_request(&mut rx, "local ACP read");
     }
@@ -3915,19 +8496,24 @@ providers:
 
         let read = server
             .acp_read_file(
+                test_run(&server),
                 "acp-capability-jail",
+                "call-capability-read",
                 &HashMap::from([(
                     "path".to_string(),
                     Value::String(sentinel.to_string_lossy().into_owned()),
                 )]),
             )
-            .await;
-        assert!(read.is_error);
-        assert!(!read.content.contains("outside-secret"));
+            .await
+            .expect("read arguments are valid");
+        assert!(read.is_error());
+        assert!(!read.content().contains("outside-secret"));
 
         let write = server
             .acp_write_file(
+                test_run(&server),
                 "acp-capability-jail",
+                "call-capability-write",
                 &HashMap::from([
                     (
                         "path".to_string(),
@@ -3936,8 +8522,9 @@ providers:
                     ("content".to_string(), Value::String("changed".to_string())),
                 ]),
             )
-            .await;
-        assert!(write.is_error);
+            .await
+            .expect("write arguments are valid");
+        assert!(write.is_error());
         assert_eq!(
             std::fs::read_to_string(&sentinel).expect("outside sentinel"),
             "outside-secret"
@@ -3945,18 +8532,23 @@ providers:
 
         let traversal = server
             .acp_read_file(
+                test_run(&server),
                 "acp-capability-jail",
+                "call-capability-traversal",
                 &HashMap::from([(
                     "path".to_string(),
                     Value::String("../outside.txt".to_string()),
                 )]),
             )
-            .await;
-        assert!(traversal.is_error);
+            .await
+            .expect("traversal arguments are valid");
+        assert!(traversal.is_error());
 
         let search = server
             .acp_search(
+                test_run(&server),
                 "acp-capability-jail",
+                "call-capability-search",
                 &HashMap::from([
                     ("pattern".to_string(), Value::String("outside".to_string())),
                     (
@@ -3966,9 +8558,10 @@ providers:
                 ]),
                 "grep",
             )
-            .await;
-        assert!(search.is_error);
-        assert!(!search.content.contains("outside-secret"));
+            .await
+            .expect("search arguments are valid");
+        assert!(search.is_error());
+        assert!(!search.content().contains("outside-secret"));
 
         #[cfg(unix)]
         {
@@ -3977,26 +8570,37 @@ providers:
             std::os::unix::fs::symlink(&sentinel, &link).expect("outside symlink");
             let linked = server
                 .acp_read_file(
+                    test_run(&server),
                     "acp-capability-jail",
+                    "call-capability-symlink",
                     &HashMap::from([(
                         "path".to_string(),
                         Value::String(link.to_string_lossy().into_owned()),
                     )]),
                 )
-                .await;
-            assert!(linked.is_error);
-            assert!(!linked.content.contains("outside-secret"));
+                .await
+                .expect("symlink read arguments are valid");
+            assert!(linked.is_error());
+            assert!(!linked.content().contains("outside-secret"));
         }
 
         assert_no_client_request(&mut rx, "locally confined ACP filesystem tools");
     }
 
-    #[test]
-    fn ide_unsaved_buffers_require_session_scoped_file_capability() {
-        let (server, _rx, _tmp) = test_server();
+    #[tokio::test]
+    async fn ide_unsaved_buffers_require_session_scoped_file_capability() {
+        let (mut server, mut rx, _tmp) = test_server();
+        server
+            .handle_session_new_canonical(Some(json!(1)), Value::Null)
+            .await;
+        let created = next_response(&mut rx);
+        let acp_session_id = created["result"]["sessionId"]
+            .as_str()
+            .expect("admitted ACP session")
+            .to_string();
         let state_reader = server.state.clone();
         server.handle_ide_file_opened(&json!({
-            "sessionId": "ide-capability-session",
+            "sessionId": acp_session_id,
             "filePath": "src/lib.rs",
             "text": "unsaved editor contents"
         }));
@@ -4012,7 +8616,7 @@ providers:
         );
 
         server.handle_ide_selection_changed(&json!({
-            "sessionId": "ide-capability-session",
+            "sessionId": acp_session_id,
             "filePath": "src/lib.rs",
             "text": "fn selected() {}",
             "selection": {
@@ -4020,13 +8624,20 @@ providers:
                 "end": {"line": 4, "character": 16}
             }
         }));
-        let prompt = build_acp_system_prompt(None, Some("."), &server.ide_state());
-        assert!(prompt.contains("Selection: src/lib.rs:4 (1 line(s))"));
-        assert!(prompt.contains("fn selected() {}"));
+        let prompt = build_acp_prompt_context(
+            server
+                .run_context_for_acp(&acp_session_id)
+                .expect("admitted IDE session run"),
+            &server.ide_state(),
+        );
+        assert!(prompt
+            .reference_context()
+            .contains("Selection: src/lib.rs:4 (1 line(s))"));
+        assert!(prompt.reference_context().contains("fn selected() {}"));
 
         let outside = tempfile::NamedTempFile::new().expect("outside IDE fixture");
         server.handle_ide_file_opened(&json!({
-            "sessionId": "ide-capability-session",
+            "sessionId": acp_session_id,
             "filePath": outside.path(),
             "text": "outside unsaved secret"
         }));
@@ -4034,6 +8645,17 @@ providers:
             server.ide_state().active_file.as_deref(),
             Some("src/lib.rs"),
             "outside buffer notification must be dropped"
+        );
+
+        server.handle_ide_file_opened(&json!({
+            "sessionId": "unknown-session",
+            "filePath": "src/main.rs",
+            "text": "wrong run"
+        }));
+        assert_eq!(
+            server.ide_state().active_file.as_deref(),
+            Some("src/lib.rs"),
+            "notification for an unknown run must be dropped"
         );
 
         server.handle_ide_file_opened(&json!({
@@ -4056,15 +8678,23 @@ providers:
             ("new_string".to_string(), json!("new")),
         ]);
 
-        let result = server.acp_edit_file("acp-bad-old-string", &args).await;
+        let failure = server
+            .acp_edit_file(
+                test_run(&server),
+                "acp-bad-old-string",
+                "call-bad-old-string",
+                &args,
+            )
+            .await
+            .expect_err("bad old_string must fail argument normalization");
 
-        assert!(result.is_error, "bad old_string must error: {result:?}");
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result
-                .content
+            failure
+                .message
                 .contains("Invalid 'old_string' argument: expected string"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
         assert_no_client_request(&mut rx, "bad edit old_string");
     }
@@ -4078,15 +8708,23 @@ providers:
             ("new_string".to_string(), json!(["new"])),
         ]);
 
-        let result = server.acp_edit_file("acp-bad-new-string", &args).await;
+        let failure = server
+            .acp_edit_file(
+                test_run(&server),
+                "acp-bad-new-string",
+                "call-bad-new-string",
+                &args,
+            )
+            .await
+            .expect_err("bad new_string must fail argument normalization");
 
-        assert!(result.is_error, "bad new_string must error: {result:?}");
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result
-                .content
+            failure
+                .message
                 .contains("Invalid 'new_string' argument: expected string"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
         assert_no_client_request(&mut rx, "bad edit new_string");
     }
@@ -4101,15 +8739,23 @@ providers:
             ("replace_all".to_string(), json!("true")),
         ]);
 
-        let result = server.acp_edit_file("acp-bad-replace-all", &args).await;
+        let failure = server
+            .acp_edit_file(
+                test_run(&server),
+                "acp-bad-replace-all",
+                "call-bad-replace-all",
+                &args,
+            )
+            .await
+            .expect_err("bad replace_all must fail argument normalization");
 
-        assert!(result.is_error, "bad replace_all must error: {result:?}");
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result
-                .content
+            failure
+                .message
                 .contains("Invalid 'replace_all' argument: expected boolean"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
     }
 
@@ -4118,15 +8764,23 @@ providers:
         let (server, mut rx, _tmp) = test_server();
         let args = HashMap::from([("command".to_string(), json!(["echo nope"]))]);
 
-        let result = server.acp_bash("acp-bad-command", &args).await;
+        let failure = server
+            .acp_bash(
+                test_run(&server),
+                "acp-bad-command",
+                "call-bad-command",
+                &args,
+            )
+            .await
+            .expect_err("bad command must fail argument normalization");
 
-        assert!(result.is_error, "bad command must error: {result:?}");
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result
-                .content
+            failure
+                .message
                 .contains("Invalid 'command' argument: expected string"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
         assert_no_client_request(&mut rx, "bad bash command");
     }
@@ -4139,18 +8793,23 @@ providers:
             ("run_in_background".to_string(), json!("true")),
         ]);
 
-        let result = server.acp_bash("acp-bad-background", &args).await;
+        let failure = server
+            .acp_bash(
+                test_run(&server),
+                "acp-bad-background",
+                "call-bad-background",
+                &args,
+            )
+            .await
+            .expect_err("bad run_in_background must fail argument normalization");
 
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result.is_error,
-            "bad run_in_background must error: {result:?}"
-        );
-        assert!(
-            result
-                .content
+            failure
+                .message
                 .contains("Invalid 'run_in_background' argument: expected boolean"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
     }
 
@@ -4162,18 +8821,245 @@ providers:
             ("run_in_background".to_string(), json!(false)),
         ]);
 
-        let result = server.acp_bash("acp-local-bash", &args).await;
+        let result = server
+            .acp_bash(
+                test_run(&server),
+                "acp-local-bash",
+                "call-local-bash",
+                &args,
+            )
+            .await
+            .expect("valid bash arguments");
 
-        assert!(!result.is_error, "local ACP bash failed: {result:?}");
-        assert!(result.content.contains("acp_sandbox_probe"));
+        assert!(!result.is_error(), "local ACP bash failed: {result:?}");
+        assert!(result.content().contains("acp_sandbox_probe"));
         assert_no_client_request(&mut rx, "ACP bash sandbox routing");
+    }
+
+    #[tokio::test]
+    async fn acp_invalid_arguments_are_typed_and_bound_to_the_wire_invocation() {
+        let (server, _rx, _tmp) = test_server();
+        let run = Arc::clone(test_run(&server));
+        let arguments = "[]";
+
+        let result = server
+            .execute_tool_via_acp(
+                &run,
+                "acp-invalid-arguments",
+                "call-invalid-arguments",
+                "bash",
+                arguments,
+            )
+            .await;
+
+        let ToolOutcome::Error { failure } = result.outcome() else {
+            panic!("invalid arguments must produce a typed error: {result:#?}");
+        };
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
+        assert_eq!(result.tool_call_id(), "call-invalid-arguments");
+        assert_eq!(result.handler(), "bash");
+        assert_eq!(result.invocation().raw_arguments, arguments);
+        assert_eq!(result.invocation().arguments, None);
+    }
+
+    #[tokio::test]
+    async fn acp_alias_normalization_restores_the_exact_wire_invocation() {
+        let (server, _rx, _tmp) = test_server();
+        let run = Arc::clone(test_run(&server));
+        let arguments = r#"{ "file_path" : "Cargo.toml", "limit" : 1 }"#;
+
+        let result = server
+            .execute_tool_via_acp(
+                &run,
+                "acp-wire-alias",
+                "call-wire-alias",
+                "read_file",
+                arguments,
+            )
+            .await;
+
+        let ToolOutcome::Partial { continuation, .. } = result.outcome() else {
+            panic!("one-line normalized read must return a typed continuation: {result:#?}");
+        };
+        assert!(continuation.is_some());
+        assert_eq!(result.tool_call_id(), "call-wire-alias");
+        assert_eq!(result.handler(), "read_file");
+        assert_eq!(result.invocation().raw_arguments, arguments);
+        let wire_arguments = result
+            .invocation()
+            .arguments
+            .as_ref()
+            .expect("wire object remains parsed");
+        assert_eq!(wire_arguments["file_path"], "Cargo.toml");
+        assert!(
+            wire_arguments.get("path").is_none(),
+            "canonical local alias must not overwrite provider evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_nonzero_bash_retains_partial_across_provider_and_ui_projections() {
+        let (server, _rx, _tmp) = test_server();
+        let run = Arc::clone(test_run(&server));
+        let arguments = r#"{"command":"false"}"#;
+
+        let result = server
+            .execute_tool_via_acp(
+                &run,
+                "acp-partial-provider",
+                "call-partial-provider",
+                "bash",
+                arguments,
+            )
+            .await;
+
+        assert!(
+            result.is_partial(),
+            "nonzero Bash must remain partial; got {result:#?}"
+        );
+        assert!(!result.is_error(), "partial is distinct from a total error");
+        assert_eq!(result.tool_call_id(), "call-partial-provider");
+        assert_eq!(result.handler(), "bash");
+        assert_eq!(result.invocation().raw_arguments, arguments);
+
+        let provider_message = result.openai_message();
+        let provider_payload: Value = serde_json::from_str(
+            provider_message["content"]
+                .as_str()
+                .expect("provider tool content must be text"),
+        )
+        .expect("provider content must contain the typed result envelope");
+        assert_eq!(provider_payload, result.model_payload());
+        assert_eq!(provider_payload["result"]["outcome"]["status"], "partial");
+
+        let ui_payload = super::acp_tool_call_update_payload(&result);
+        assert_eq!(ui_payload["toolCallId"], "call-partial-provider");
+        assert_eq!(ui_payload["status"], "failed");
+        assert_eq!(ui_payload["output"], result.render_text());
+        assert_eq!(ui_payload["rawOutput"], result.model_payload());
+        assert_eq!(
+            ui_payload["rawOutput"]["result"]["outcome"]["status"],
+            "partial"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_failed_mutation_rolls_back_and_routes_failure_hook_with_exact_typed_result() {
+        let (mut server, _rx, _tmp) = test_server();
+        let run = Arc::clone(test_run(&server));
+        let fixture = tempfile::tempdir_in(run.working_directory())
+            .expect("project-local partial-mutation fixture");
+        let source = fixture.path().join("mutation-observed");
+        let missing = fixture.path().join("missing-source");
+        let destination = fixture.path().join("destination");
+        std::fs::write(&source, "effect-observed\n").expect("partial-mutation source fixture");
+        std::fs::create_dir(&destination).expect("partial-mutation destination fixture");
+        let mutation = destination.join("mutation-observed");
+        // Capture audit input in run-owned scratch rather than relying on a
+        // transactional project mutation to persist the observation.
+        let success_capture = run.private_temp_root().join("post-success.json");
+        let failure_capture = run.private_temp_root().join("post-failure.json");
+        let success_script =
+            write_hook_capture_script(fixture.path(), "capture-success.sh", &success_capture);
+        let failure_script =
+            write_hook_capture_script(fixture.path(), "capture-failure.sh", &failure_capture);
+
+        let hook = |script: &std::path::Path| Hook::Command {
+            command: script.to_string_lossy().into_owned(),
+            shell: false,
+            timeout: 10,
+        };
+        let mut hooks = HooksConfig::default();
+        hooks.post_tool_use.push(HookEntry {
+            matcher: Some("bash".to_string()),
+            hooks: vec![hook(&success_script)],
+        });
+        hooks.post_tool_use_failure.push(HookEntry {
+            matcher: Some("bash".to_string()),
+            hooks: vec![hook(&failure_script)],
+        });
+        hooks.policy = Some(HookPolicy {
+            allowed_commands: Some(std::collections::HashSet::from([
+                success_script.to_string_lossy().into_owned(),
+                failure_script.to_string_lossy().into_owned(),
+            ])),
+            ..Default::default()
+        });
+        server.hook_engine = HookEngine::new(hooks);
+
+        let quote_path = |path: &std::path::Path| {
+            shlex::try_quote(
+                path.to_str()
+                    .expect("partial-mutation path must be valid UTF-8"),
+            )
+            .expect("quote partial-mutation path")
+            .into_owned()
+        };
+        let arguments = json!({
+            "command": format!(
+                "cp {} {} {}",
+                quote_path(&source),
+                quote_path(&missing),
+                quote_path(&destination)
+            )
+        })
+        .to_string();
+
+        let result = server
+            .execute_tool_via_acp(
+                &run,
+                "acp-partial-mutation",
+                "call-partial-mutation",
+                "bash",
+                &arguments,
+            )
+            .await;
+
+        assert!(
+            result.is_partial(),
+            "effectful nonzero Bash must be partial"
+        );
+        assert!(
+            !mutation.exists(),
+            "a failed transactional Bash command published its partial workspace mutation"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&source).expect("the source fixture must remain unchanged"),
+            "effect-observed\n"
+        );
+        assert!(
+            !success_capture.exists(),
+            "partial execution must not fire PostToolUse"
+        );
+        let hook_input: Value = serde_json::from_str(
+            &std::fs::read_to_string(&failure_capture)
+                .expect("PostToolUseFailure capture must exist"),
+        )
+        .expect("hook input must be JSON");
+        assert_eq!(hook_input["event"], "post_tool_use_failure");
+        assert_eq!(hook_input["session_id"], "acp-partial-mutation");
+        assert_eq!(hook_input["tool_name"], "bash");
+        let hook_result: Value = serde_json::from_str(
+            hook_input["tool_output"]
+                .as_str()
+                .expect("hook output must be the text projection"),
+        )
+        .expect("hook output must contain the typed result envelope");
+        assert_eq!(hook_result, result.model_payload());
+        assert_eq!(
+            hook_result["result"]["invocation"]["raw_arguments"],
+            arguments
+        );
+        assert_eq!(hook_result["result"]["outcome"]["status"], "partial");
     }
 
     #[tokio::test]
     #[cfg(unix)]
     async fn acp_foreground_bash_cancellation_terminates_descendants_promptly() {
         let (server, _rx, _tmp) = test_server();
-        let fixture = tempfile::tempdir_in(".").expect("project-local cancellation fixture");
+        let fixture = tempfile::tempdir_in(test_run(&server).working_directory())
+            .expect("project-local cancellation fixture");
         let escaped_marker = fixture.path().join("descendant-survived");
         let marker = shlex::try_quote(
             escaped_marker
@@ -4181,11 +9067,22 @@ providers:
                 .expect("cancellation marker must be UTF-8"),
         )
         .expect("quote cancellation marker");
+        let descendant_script = fixture.path().join("spawn-descendant.sh");
+        std::fs::write(
+            &descendant_script,
+            format!("#!/bin/sh\n(sleep 1; echo escaped > {marker}) &\nsleep 30\n"),
+        )
+        .expect("write cancellation fixture");
+        std::fs::set_permissions(&descendant_script, std::fs::Permissions::from_mode(0o700))
+            .expect("make cancellation fixture executable");
+        let command = shlex::try_quote(
+            descendant_script
+                .to_str()
+                .expect("cancellation script must be UTF-8"),
+        )
+        .expect("quote cancellation script");
         let args = HashMap::from([
-            (
-                "command".to_string(),
-                json!(format!("(sleep 1; echo escaped > {marker}) & sleep 30")),
-            ),
+            ("command".to_string(), json!(command)),
             ("run_in_background".to_string(), json!(false)),
         ]);
         let cancel = Arc::clone(&server.cancel_flag);
@@ -4195,13 +9092,21 @@ providers:
         });
 
         let started = std::time::Instant::now();
-        let result = server.acp_bash("acp-cancel-tree", &args).await;
+        let result = server
+            .acp_bash(
+                test_run(&server),
+                "acp-cancel-tree",
+                "call-cancel-tree",
+                &args,
+            )
+            .await
+            .expect("valid cancellation arguments");
         assert!(
-            result.is_error,
+            result.is_error(),
             "cancelled tool must be reported as an error"
         );
         assert!(
-            result.content.contains("cancelled"),
+            result.content().contains("cancelled"),
             "unexpected cancellation result: {result:?}"
         );
         assert!(
@@ -4220,15 +9125,22 @@ providers:
         let (server, mut rx, _tmp) = test_server();
         let args = HashMap::from([("shell_id".to_string(), json!(42))]);
 
-        let result = server.acp_bash_output("acp-bad-output", &args);
+        let failure = server
+            .acp_bash_output(
+                test_run(&server),
+                "acp-bad-output",
+                "call-bad-output",
+                &args,
+            )
+            .expect_err("bad shell_id must fail argument normalization");
 
-        assert!(result.is_error, "bad shell_id must error: {result:?}");
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result
-                .content
+            failure
+                .message
                 .contains("Invalid 'shell_id' argument: expected string"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
         assert_no_client_request(&mut rx, "bad bash_output shell_id");
     }
@@ -4238,15 +9150,17 @@ providers:
         let (server, mut rx, _tmp) = test_server();
         let args = HashMap::from([("terminal_id".to_string(), json!({"id": "term"}))]);
 
-        let result = server.acp_kill_shell("acp-bad-kill", &args);
+        let failure = server
+            .acp_kill_shell(test_run(&server), "acp-bad-kill", "call-bad-kill", &args)
+            .expect_err("bad terminal_id must fail argument normalization");
 
-        assert!(result.is_error, "bad terminal_id must error: {result:?}");
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result
-                .content
+            failure
+                .message
                 .contains("Invalid 'terminal_id' argument: expected string"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
         assert_no_client_request(&mut rx, "bad kill_shell terminal_id");
     }
@@ -4256,17 +9170,68 @@ providers:
         let (server, mut rx, _tmp) = test_server();
         let args = HashMap::from([("path".to_string(), json!(false))]);
 
-        let result = server.acp_list_files("acp-bad-list-path", &args).await;
+        let failure = server
+            .acp_list_files(
+                test_run(&server),
+                "acp-bad-list-path",
+                "call-bad-list-path",
+                &args,
+            )
+            .await
+            .expect_err("bad list path must fail argument normalization");
 
-        assert!(result.is_error, "bad list path must error: {result:?}");
+        assert_eq!(failure.code, ToolFailureCode::InvalidArguments);
         assert!(
-            result
-                .content
+            failure
+                .message
                 .contains("Invalid 'path' argument: expected string"),
             "unexpected error: {}",
-            result.content
+            failure.message
         );
         assert_no_client_request(&mut rx, "bad list_files path");
+    }
+
+    #[tokio::test]
+    async fn acp_list_files_preserves_pagination_arguments() {
+        let (server, mut rx, _tmp) = test_server();
+        let fixture = tempfile::tempdir_in(".").expect("project-local fixture");
+        std::fs::write(fixture.path().join("a.txt"), "a").expect("first fixture");
+        std::fs::write(fixture.path().join("b.txt"), "b").expect("second fixture");
+        let args = HashMap::from([
+            ("path".to_string(), json!(fixture.path().to_string_lossy())),
+            ("limit".to_string(), json!(1)),
+        ]);
+
+        let result = server
+            .acp_list_files(
+                test_run(&server),
+                "acp-list-pagination",
+                "call-list-pagination",
+                &args,
+            )
+            .await
+            .expect("valid list arguments");
+
+        assert!(
+            result.is_partial(),
+            "first page must be partial: {result:?}"
+        );
+        assert_eq!(
+            result
+                .structured()
+                .and_then(|value| value.pointer("/file_discovery/page/limit"))
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert!(
+            result
+                .structured()
+                .and_then(|value| value.pointer("/file_discovery/page/next_cursor"))
+                .and_then(Value::as_str)
+                .is_some(),
+            "typed ACP result must retain the continuation cursor"
+        );
+        assert_no_client_request(&mut rx, "local list_files pagination");
     }
 
     fn config_option<'a>(response: &'a Value, id: &str) -> &'a Value {
@@ -4278,26 +9243,36 @@ providers:
             .expect("expected config option")
     }
 
-    #[test]
-    fn acp_mode_label_matches_protocol_tokens() {
-        assert_eq!(acp_mode_label(SessionMode::Initializer), "initializer");
-        assert_eq!(acp_mode_label(SessionMode::Coding), "coding");
-    }
-
-    #[test]
-    fn session_set_mode_updates_active_session_without_replacing_id() {
+    #[tokio::test]
+    async fn session_set_mode_updates_active_session_without_replacing_id() {
         let (mut server, mut rx, _tmp) = test_server();
 
-        server.handle_session_new(Some(json!(1)), Value::Null);
-        let _ = next_response(&mut rx);
+        server
+            .handle_session_new_canonical(Some(json!(1)), Value::Null)
+            .await;
+        let created = next_response(&mut rx);
+        let acp_session_id = created["result"]["sessionId"]
+            .as_str()
+            .expect("ACP session id")
+            .to_string();
         let session_id = server
             .session_manager
             .get_session()
             .expect("session/new should create session")
             .id
             .clone();
+        assert_eq!(
+            server
+                .run_context_for_acp(&acp_session_id)
+                .expect("initializer run")
+                .runtime_mode()
+                .class,
+            crate::modes::RuntimeModeClass::ReadOnly
+        );
 
-        server.handle_session_set_mode(Some(json!(2)), &json!({"mode": "coding"}));
+        server
+            .handle_session_set_mode(Some(json!(2)), &json!({"mode": "coding"}))
+            .await;
         let response = next_response(&mut rx);
 
         assert_eq!(response["result"]["mode"], "coding");
@@ -4308,8 +9283,18 @@ providers:
             .expect("session should remain active");
         assert_eq!(session.id, session_id);
         assert_eq!(session.mode, SessionMode::Coding);
+        assert_eq!(
+            server
+                .run_context_for_acp(&acp_session_id)
+                .expect("coding run")
+                .runtime_mode()
+                .class,
+            crate::modes::RuntimeModeClass::Standard
+        );
 
-        server.handle_session_set_mode(Some(json!(3)), &json!({"mode": "initializer"}));
+        server
+            .handle_session_set_mode(Some(json!(3)), &json!({"mode": "initializer"}))
+            .await;
         let response = next_response(&mut rx);
 
         assert_eq!(response["result"]["mode"], "initializer");
@@ -4321,13 +9306,23 @@ providers:
         assert_eq!(session.id, session_id);
         assert_eq!(session.mode, SessionMode::Initializer);
         assert!(session.parent_session_id.is_none());
+        assert_eq!(
+            server
+                .run_context_for_acp(&acp_session_id)
+                .expect("restored initializer run")
+                .runtime_mode()
+                .class,
+            crate::modes::RuntimeModeClass::ReadOnly
+        );
     }
 
-    #[test]
-    fn session_set_mode_auto_creates_and_reports_selected_mode() {
+    #[tokio::test]
+    async fn session_set_mode_auto_creates_and_reports_selected_mode() {
         let (mut server, mut rx, _tmp) = test_server();
 
-        server.handle_session_set_mode(Some(json!(1)), &json!({"mode": "auto"}));
+        server
+            .handle_session_set_mode(Some(json!(1)), &json!({"mode": "auto"}))
+            .await;
         let response = next_response(&mut rx);
 
         assert_eq!(response["result"]["mode"], "auto");
@@ -4342,8 +9337,8 @@ providers:
         );
     }
 
-    #[test]
-    fn session_load_rejects_invalid_session_id_before_creating_session() {
+    #[tokio::test]
+    async fn session_load_rejects_invalid_session_id_before_creating_session() {
         let (mut server, mut rx, _tmp) = test_server();
 
         for (id, params, expected) in [
@@ -4358,7 +9353,7 @@ providers:
                 "sessionId must not be empty",
             ),
         ] {
-            server.handle_session_load(Some(id), &params);
+            server.handle_session_load(Some(id), &params).await;
             let response = next_response(&mut rx);
 
             assert_invalid_params(&response, expected);
@@ -4373,8 +9368,8 @@ providers:
         }
     }
 
-    #[test]
-    fn session_set_mode_rejects_wrong_type_mode_without_mutation() {
+    #[tokio::test]
+    async fn session_set_mode_rejects_wrong_type_mode_without_mutation() {
         let (mut server, mut rx, _tmp) = test_server();
 
         for (id, params, expected) in [
@@ -4389,7 +9384,7 @@ providers:
                 "Invalid 'modeId' parameter: expected string",
             ),
         ] {
-            server.handle_session_set_mode(Some(id), &params);
+            server.handle_session_set_mode(Some(id), &params).await;
             let response = next_response(&mut rx);
 
             assert_invalid_params(&response, expected);
@@ -4400,10 +9395,12 @@ providers:
         }
     }
 
-    #[test]
-    fn session_set_mode_rejects_unknown_modes_without_mutation() {
+    #[tokio::test]
+    async fn session_set_mode_rejects_unknown_modes_without_mutation() {
         let (mut server, mut rx, _tmp) = test_server();
-        server.handle_session_new(Some(json!(1)), Value::Null);
+        server
+            .handle_session_new_canonical(Some(json!(1)), Value::Null)
+            .await;
         let _ = next_response(&mut rx);
         let session_id = server
             .session_manager
@@ -4412,7 +9409,9 @@ providers:
             .id
             .clone();
 
-        server.handle_session_set_mode(Some(json!(2)), &json!({"mode": "plan"}));
+        server
+            .handle_session_set_mode(Some(json!(2)), &json!({"mode": "unsupported"}))
+            .await;
         let response = next_response(&mut rx);
 
         assert_eq!(response["error"]["code"], INVALID_PARAMS);
@@ -4424,14 +9423,16 @@ providers:
         assert_eq!(session.mode, SessionMode::Initializer);
     }
 
-    #[test]
-    fn session_new_advertises_config_options_matching_active_state() {
+    #[tokio::test]
+    async fn session_new_advertises_config_options_matching_active_state() {
         let (mut server, mut rx, _tmp) = test_server();
         server.state.update(|state, _| {
             state.ide.active_file = Some("src/stale.rs".to_string());
         });
 
-        server.handle_session_new(Some(json!(1)), Value::Null);
+        server
+            .handle_session_new_canonical(Some(json!(1)), Value::Null)
+            .await;
         let response = next_response(&mut rx);
 
         assert_eq!(
@@ -4453,26 +9454,186 @@ providers:
             assert!(state.ide.active_file.is_none());
             assert_eq!(state.identity.session_id.as_str(), mapped_session_id);
         });
+        let mode_values = config_option(&response, ACP_CONFIG_MODE_ID)["options"]
+            .as_array()
+            .expect("mode options")
+            .iter()
+            .filter_map(|option| option["value"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mode_values,
+            vec!["initializer", "coding", "plan", "readonly"]
+        );
+        assert_eq!(
+            response["result"]["effectiveCapabilities"]["mode"],
+            "initializer"
+        );
+        assert_eq!(
+            response["result"]["effectiveCapabilities"]["capabilities"]["fs"]["write"],
+            false
+        );
+        assert_eq!(
+            response["result"]["effectiveCapabilities"]["capabilities"]["terminal"],
+            false
+        );
     }
 
-    #[test]
-    fn session_set_config_option_mode_updates_session_and_returns_full_state() {
+    #[tokio::test]
+    async fn negotiated_mode_updates_policy_without_resetting_session_capability() {
         let (mut server, mut rx, _tmp) = test_server();
-        server.handle_session_new(Some(json!(1)), Value::Null);
+        server
+            .handle_session_new_canonical(Some(json!(1)), Value::Null)
+            .await;
+        let created = next_response(&mut rx);
+        let acp_session_id = created["result"]["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        let initializer_generation = created["result"]["effectiveCapabilities"]
+            ["capabilityGeneration"]
+            .as_u64()
+            .expect("initializer capability generation");
+
+        server
+            .handle_session_set_mode(
+                Some(json!(2)),
+                &json!({"sessionId": acp_session_id, "mode": "coding"}),
+            )
+            .await;
+        let coding = next_response(&mut rx);
+        let coding_generation = coding["result"]["effectiveCapabilities"]["capabilityGeneration"]
+            .as_u64()
+            .expect("coding capability generation");
+        assert_eq!(initializer_generation, coding_generation);
+        assert_ne!(
+            created["result"]["effectiveCapabilities"]["runtimeModeGeneration"],
+            coding["result"]["effectiveCapabilities"]["runtimeModeGeneration"]
+        );
+        assert_eq!(coding["result"]["activeMode"], "coding");
+        assert_eq!(
+            coding["result"]["effectiveCapabilities"]["capabilities"]["fs"]["write"],
+            true
+        );
+
+        server
+            .handle_session_set_mode(
+                Some(json!(3)),
+                &json!({"sessionId": acp_session_id, "mode": "readonly"}),
+            )
+            .await;
+        let readonly = next_response(&mut rx);
+        assert_eq!(readonly["result"]["activeMode"], "readonly");
+        assert_eq!(
+            readonly["result"]["effectiveCapabilities"]["capabilities"]["fs"]["write"],
+            false
+        );
+        let run = Arc::clone(
+            server
+                .run_context_for_acp(&acp_session_id)
+                .expect("read-only run"),
+        );
+        let result = server
+            .execute_tool_via_acp(
+                &run,
+                "acp-readonly",
+                "call-write-denied",
+                "write_file",
+                r#"{"path":"forbidden.txt","content":"forbidden"}"#,
+            )
+            .await;
+        let ToolOutcome::Error { failure } = result.outcome() else {
+            panic!("unadvertised write must be rejected: {result:#?}");
+        };
+        assert_eq!(failure.code, ToolFailureCode::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn plan_mode_is_advertised_from_the_canonical_policy() {
+        let (mut server, mut rx, _tmp) = test_server();
+        server
+            .handle_session_new_canonical(Some(json!(1)), Value::Null)
+            .await;
         let created = next_response(&mut rx);
         let acp_session_id = created["result"]["sessionId"]
             .as_str()
             .expect("session id")
             .to_string();
 
-        server.handle_session_set_config_option(
-            Some(json!(2)),
-            &json!({
-                "sessionId": acp_session_id,
-                "configId": "mode",
-                "value": "coding",
-            }),
+        server
+            .handle_session_set_mode(
+                Some(json!(2)),
+                &json!({"sessionId": acp_session_id, "mode": "plan"}),
+            )
+            .await;
+        let response = next_response(&mut rx);
+        assert_eq!(response["result"]["activeMode"], "plan");
+        assert_eq!(response["result"]["effectiveCapabilities"]["mode"], "plan");
+        let available = response["result"]["effectiveCapabilities"]["availableTools"]
+            .as_array()
+            .expect("available tools");
+        for forbidden in ["bash", "edit_file"] {
+            assert!(!available
+                .iter()
+                .any(|name| name.as_str() == Some(forbidden)));
+        }
+        assert!(available
+            .iter()
+            .any(|name| name.as_str() == Some("write_file")));
+        assert_eq!(
+            response["result"]["effectiveCapabilities"]["capabilities"]["fs"]["write"],
+            false
         );
+        assert_eq!(
+            response["result"]["effectiveCapabilities"]["capabilities"]["fs"]
+                ["restrictedWriteTargets"]
+                .as_array()
+                .expect("plan write targets")
+                .len(),
+            1
+        );
+
+        let run = Arc::clone(
+            server
+                .run_context_for_acp(&acp_session_id)
+                .expect("plan run"),
+        );
+        let result = server
+            .execute_tool_via_acp(
+                &run,
+                "acp-plan",
+                "call-plan-write-denied",
+                "write_file",
+                r#"{"path":"outside-plan.md","content":"forbidden"}"#,
+            )
+            .await;
+        let ToolOutcome::Error { failure } = result.outcome() else {
+            panic!("write outside the advertised plan target must fail: {result:#?}");
+        };
+        assert_eq!(failure.code, ToolFailureCode::PolicyDenied);
+    }
+
+    #[tokio::test]
+    async fn session_set_config_option_mode_updates_session_and_returns_full_state() {
+        let (mut server, mut rx, _tmp) = test_server();
+        server
+            .handle_session_new_canonical(Some(json!(1)), Value::Null)
+            .await;
+        let created = next_response(&mut rx);
+        let acp_session_id = created["result"]["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+
+        server
+            .handle_session_set_config_option(
+                Some(json!(2)),
+                &json!({
+                    "sessionId": acp_session_id,
+                    "configId": "mode",
+                    "value": "coding",
+                }),
+            )
+            .await;
         let response = next_response(&mut rx);
 
         assert_eq!(
@@ -4489,26 +9650,30 @@ providers:
         );
     }
 
-    #[test]
-    fn session_set_config_option_model_updates_provider_request_model() {
+    #[tokio::test]
+    async fn session_set_config_option_model_updates_provider_request_model() {
         let (mut server, mut rx, _tmp) = test_server();
         server.config.proxy.target = "anthropic".to_string();
         server.model = "claude-opus-4-8".to_string();
-        server.handle_session_new(Some(json!(1)), Value::Null);
+        server
+            .handle_session_new_canonical(Some(json!(1)), Value::Null)
+            .await;
         let created = next_response(&mut rx);
         let acp_session_id = created["result"]["sessionId"]
             .as_str()
             .expect("session id")
             .to_string();
 
-        server.handle_session_set_config_option(
-            Some(json!(2)),
-            &json!({
-                "sessionId": acp_session_id,
-                "configId": "model",
-                "value": "claude-opus-4-7",
-            }),
-        );
+        server
+            .handle_session_set_config_option(
+                Some(json!(2)),
+                &json!({
+                    "sessionId": acp_session_id,
+                    "configId": "model",
+                    "value": "claude-opus-4-7",
+                }),
+            )
+            .await;
         let response = next_response(&mut rx);
 
         assert_eq!(server.model, "claude-opus-4-7");
@@ -4518,26 +9683,30 @@ providers:
         );
     }
 
-    #[test]
-    fn session_set_config_option_accepts_unadvertised_model_without_static_catalog_gate() {
+    #[tokio::test]
+    async fn session_set_config_option_accepts_unadvertised_model_without_static_catalog_gate() {
         let (mut server, mut rx, _tmp) = test_server();
         server.config.proxy.target = "anthropic".to_string();
         server.model = "claude-opus-4-8".to_string();
-        server.handle_session_new(Some(json!(1)), Value::Null);
+        server
+            .handle_session_new_canonical(Some(json!(1)), Value::Null)
+            .await;
         let created = next_response(&mut rx);
         let acp_session_id = created["result"]["sessionId"]
             .as_str()
             .expect("session id")
             .to_string();
 
-        server.handle_session_set_config_option(
-            Some(json!(2)),
-            &json!({
-                "sessionId": acp_session_id,
-                "configId": "model",
-                "value": "not-advertised",
-            }),
-        );
+        server
+            .handle_session_set_config_option(
+                Some(json!(2)),
+                &json!({
+                    "sessionId": acp_session_id,
+                    "configId": "model",
+                    "value": "not-advertised",
+                }),
+            )
+            .await;
         let response = next_response(&mut rx);
 
         assert_eq!(server.model, "not-advertised");
@@ -4547,31 +9716,36 @@ providers:
         );
     }
 
-    #[test]
-    fn session_set_config_option_rejects_policy_denied_model_without_mutation() {
+    #[tokio::test]
+    async fn session_set_config_option_rejects_policy_denied_model_without_mutation() {
         let (mut server, mut rx, _tmp) = test_server();
         server.model = "allowed-model".to_string();
+        server.initial_model = "allowed-model".to_string();
         server.policy_enforcer = Arc::new(crate::services::policy::PolicyEnforcer::new(
             crate::services::policy::EnterprisePolicy {
                 model_allowlist: std::collections::HashSet::from(["allowed-model".to_string()]),
                 ..Default::default()
             },
         ));
-        server.handle_session_new(Some(json!(1)), Value::Null);
+        server
+            .handle_session_new_canonical(Some(json!(1)), Value::Null)
+            .await;
         let created = next_response(&mut rx);
         let acp_session_id = created["result"]["sessionId"]
             .as_str()
             .expect("session id")
             .to_string();
 
-        server.handle_session_set_config_option(
-            Some(json!(2)),
-            &json!({
-                "sessionId": acp_session_id,
-                "configId": "model",
-                "value": "not-allowed",
-            }),
-        );
+        server
+            .handle_session_set_config_option(
+                Some(json!(2)),
+                &json!({
+                    "sessionId": acp_session_id,
+                    "configId": "model",
+                    "value": "not-allowed",
+                }),
+            )
+            .await;
         let response = next_response(&mut rx);
 
         assert_invalid_params(&response, "Blocked by policy");
@@ -4582,8 +9756,8 @@ providers:
         assert_eq!(server.model, "allowed-model");
     }
 
-    #[test]
-    fn session_set_config_option_rejects_wrong_type_fields_without_mutation() {
+    #[tokio::test]
+    async fn session_set_config_option_rejects_wrong_type_fields_without_mutation() {
         let (mut server, mut rx, _tmp) = test_server();
 
         for (id, params, expected) in [
@@ -4608,7 +9782,9 @@ providers:
                 "Invalid 'key' parameter: expected string",
             ),
         ] {
-            server.handle_session_set_config_option(Some(id), &params);
+            server
+                .handle_session_set_config_option(Some(id), &params)
+                .await;
             let response = next_response(&mut rx);
 
             assert_invalid_params(&response, expected);
@@ -4624,17 +9800,19 @@ providers:
         }
     }
 
-    #[test]
-    fn session_set_config_option_accepts_legacy_key_alias_for_mode() {
+    #[tokio::test]
+    async fn session_set_config_option_accepts_legacy_key_alias_for_mode() {
         let (mut server, mut rx, _tmp) = test_server();
 
-        server.handle_session_set_config_option(
-            Some(json!(1)),
-            &json!({
-                "key": "mode",
-                "value": "coding",
-            }),
-        );
+        server
+            .handle_session_set_config_option(
+                Some(json!(1)),
+                &json!({
+                    "key": "mode",
+                    "value": "coding",
+                }),
+            )
+            .await;
         let response = next_response(&mut rx);
 
         assert_eq!(
@@ -4671,8 +9849,11 @@ providers:
             ),
         ] {
             let (mut server, mut rx, _tmp) = test_server();
+            let calls = Arc::new(std::sync::Mutex::new(super::AcpCallRegistry::default()));
 
-            server.handle_session_prompt(Some(id), params).await;
+            server
+                .handle_session_prompt_with_calls(Some(id), params, &calls)
+                .await;
             let response = next_response(&mut rx);
 
             assert_invalid_params(&response, expected);
@@ -4687,71 +9868,378 @@ providers:
             assert_no_client_request(&mut rx, "invalid session/prompt params");
         }
     }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One end-to-end scenario proves every independently restored field.
+    async fn acp_sessions_restore_independent_transcript_model_config_and_ide_state() {
+        let (mut server, mut rx, _tmp) = test_server();
+        server
+            .handle_session_new_canonical(Some(json!(1)), Value::Null)
+            .await;
+        let created_a = next_response(&mut rx);
+        let session_a = created_a["result"]["sessionId"]
+            .as_str()
+            .expect("session A id")
+            .to_string();
+        server
+            .handle_session_set_mode(
+                Some(json!(2)),
+                &json!({"sessionId": session_a, "mode": "coding"}),
+            )
+            .await;
+        let _ = next_response(&mut rx);
+        server
+            .handle_session_set_config_option(
+                Some(json!(3)),
+                &json!({
+                    "sessionId": session_a,
+                    "configId": "model",
+                    "value": "model-a"
+                }),
+            )
+            .await;
+        let _ = next_response(&mut rx);
+        server.handle_ide_file_opened(&json!({
+            "sessionId": session_a,
+            "filePath": "src/lib.rs",
+            "text": "session A buffer"
+        }));
+        server
+            .messages
+            .push(json!({"role": "user", "content": "session A transcript"}));
+
+        server
+            .handle_session_new_canonical(Some(json!(4)), Value::Null)
+            .await;
+        let created_b = next_response(&mut rx);
+        let session_b = created_b["result"]["sessionId"]
+            .as_str()
+            .expect("session B id")
+            .to_string();
+        assert_ne!(session_a, session_b);
+        assert_eq!(server.model, "local-model");
+        assert!(server.messages.is_empty());
+        assert!(server.ide_state().active_file.is_none());
+        server
+            .handle_session_set_config_option(
+                Some(json!(5)),
+                &json!({
+                    "sessionId": session_b,
+                    "configId": "model",
+                    "value": "model-b"
+                }),
+            )
+            .await;
+        let _ = next_response(&mut rx);
+        server.handle_ide_file_opened(&json!({
+            "sessionId": session_b,
+            "filePath": "src/main.rs",
+            "text": "session B buffer"
+        }));
+
+        server
+            .activate_owned_session(&session_a)
+            .expect("restore session A");
+        assert_eq!(
+            server
+                .session_manager
+                .get_session()
+                .expect("canonical session A")
+                .id,
+            server.session_map[&session_a]
+        );
+        assert_eq!(
+            server
+                .session_manager
+                .get_session()
+                .expect("canonical session A")
+                .mode,
+            SessionMode::Coding
+        );
+        assert_eq!(server.model, "model-a");
+        assert_eq!(server.config_options.get("model"), Some(&json!("model-a")));
+        assert_eq!(
+            server.ide_state().active_file.as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(server.messages[0]["content"], "session A transcript");
+
+        server
+            .activate_owned_session(&session_b)
+            .expect("restore session B");
+        assert_eq!(
+            server
+                .session_manager
+                .get_session()
+                .expect("canonical session B")
+                .id,
+            server.session_map[&session_b]
+        );
+        assert_eq!(
+            server
+                .session_manager
+                .get_session()
+                .expect("canonical session B")
+                .mode,
+            SessionMode::Initializer
+        );
+        assert_eq!(server.model, "model-b");
+        assert_eq!(server.config_options.get("model"), Some(&json!("model-b")));
+        assert_eq!(
+            server.ide_state().active_file.as_deref(),
+            Some("src/main.rs")
+        );
+        assert!(server.messages.is_empty());
+        assert_ne!(
+            server
+                .run_context_for_acp(&session_a)
+                .expect("run A")
+                .run_id(),
+            server
+                .run_context_for_acp(&session_b)
+                .expect("run B")
+                .run_id()
+        );
+
+        server.session_envelopes.remove(&session_a);
+        let mut persisted = server
+            .read_persisted_session_envelope(&session_a)
+            .expect("session A durable envelope");
+        assert_eq!(persisted.wire_session_id, session_a);
+        assert_eq!(persisted.session.model, "model-a");
+        assert!(persisted.generation > 0);
+        server
+            .persist_session_envelope(&persisted)
+            .expect("reconciling an already-published envelope is idempotent");
+        persisted
+            .config_options
+            .insert("model".to_string(), json!("conflicting-model"));
+        assert!(matches!(
+            server.persist_session_envelope(&persisted),
+            Err(super::AcpSessionStoreError::GenerationConflict { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn acp_prompt_generations_cancel_independently_with_cumulative_session_budget() {
+        let (mut server, mut rx, _tmp) = test_server();
+        server
+            .handle_session_new_canonical(Some(json!(1)), Value::Null)
+            .await;
+        let created = next_response(&mut rx);
+        let acp_session_id = created["result"]["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        let oc_session_id = server
+            .oc_session_id_for_acp(&acp_session_id)
+            .expect("canonical session id")
+            .to_string();
+
+        let first = server
+            .prepare_prompt_run_context(&acp_session_id, &oc_session_id)
+            .await
+            .expect("first prompt generation");
+        let second = server
+            .prepare_prompt_run_context(&acp_session_id, &oc_session_id)
+            .await
+            .expect("second prompt generation");
+        assert_ne!(first.run_id(), second.run_id());
+        assert!(first.runtime().cancellation().is_cancelled());
+        assert!(!second.runtime().cancellation().is_cancelled());
+
+        let mut calls = super::AcpCallRegistry::default();
+        let call = calls
+            .reserve_prompt(&acp_session_id, &json!(7))
+            .expect("reserve prompt");
+        calls
+            .bind_run(&acp_session_id, &call.call_id, &second)
+            .expect("bind exact generation");
+        assert!(!calls.request_cancel(&acp_session_id, Some("wrong-call")));
+        assert!(!second.runtime().cancellation().is_cancelled());
+        assert!(calls.request_cancel(&acp_session_id, Some(&call.call_id)));
+        assert!(second.runtime().cancellation().is_cancelled());
+        calls.complete(&acp_session_id, &call.call_id);
+        assert!(calls.calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_load_rejects_unknown_well_formed_id_without_manufacturing_state() {
+        let (mut server, mut rx, _tmp) = test_server();
+        let unknown = uuid::Uuid::new_v4().to_string();
+
+        server
+            .handle_session_load(Some(json!(1)), &json!({"sessionId": unknown}))
+            .await;
+        let response = next_response(&mut rx);
+
+        assert_invalid_params(&response, "Unknown ACP sessionId");
+        assert!(server.session_map.is_empty());
+        assert!(server.session_envelopes.is_empty());
+        assert!(server.session_manager.get_session().is_none());
+    }
 }
 
 #[cfg(test)]
 mod acp_permission_gate_tests {
-    use super::{acp_list_files_command, acp_permission_gate};
+    use super::{
+        acp_list_files_command, execute_local_tool_with_permission, AcpLocalToolRequest,
+        SharedAcpTaskManagers,
+    };
     use crate::permissions::PermissionManager;
-    use serde_json::json;
+    use std::sync::Arc;
 
-    fn enabled(default_allow: Vec<&str>) -> (PermissionManager, tempfile::TempDir) {
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
+
+    fn enabled(default_allow: Vec<String>) -> (PermissionManager, tempfile::TempDir) {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mgr = PermissionManager::new(
-            tmp.path().join("permissions.json"),
-            true,
-            default_allow.into_iter().map(str::to_string).collect(),
-        );
+        let mgr = PermissionManager::new(tmp.path().join("permissions.json"), true, default_allow);
         (mgr, tmp)
+    }
+
+    fn task_managers() -> SharedAcpTaskManagers {
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    #[test]
+    fn planning_tools_use_independent_per_session_manager_locks() {
+        let root_a = tempfile::tempdir().expect("ACP task root A");
+        let root_b = tempfile::tempdir().expect("ACP task root B");
+        let run_a = crate::tools::security::test_run_context_for(root_a.path());
+        let run_b = crate::tools::security::test_run_context_for(root_b.path());
+        let permission_manager = PermissionManager::unrestricted();
+        let task_managers = task_managers();
+        let arguments = r#"{"expected_generation":0,"subject":"task A","description":"A"}"#;
+        let first = execute_local_tool_with_permission(AcpLocalToolRequest {
+            run: &run_a,
+            permission_mgr: &permission_manager,
+            session_id: "acp-a",
+            tool_call_id: "task-a",
+            tool_name: "task_create",
+            arguments_json: arguments,
+            policy_enforcer: None,
+            memory_db: None,
+            app_config: None,
+            task_managers: Arc::clone(&task_managers),
+        });
+        assert!(!first.is_error(), "{}", first.content());
+
+        let manager_a = task_managers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get("acp-a")
+            .map(Arc::clone)
+            .expect("manager A");
+        let _manager_a_guard = manager_a
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let second = execute_local_tool_with_permission(AcpLocalToolRequest {
+            run: &run_b,
+            permission_mgr: &permission_manager,
+            session_id: "acp-b",
+            tool_call_id: "task-b",
+            tool_name: "task_create",
+            arguments_json: r#"{"expected_generation":0,"subject":"task B","description":"B"}"#,
+            policy_enforcer: None,
+            memory_db: None,
+            app_config: None,
+            task_managers: Arc::clone(&task_managers),
+        });
+        assert!(!second.is_error(), "{}", second.content());
+        let managers = task_managers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(managers.len(), 2);
+        assert!(!Arc::ptr_eq(&managers["acp-a"], &managers["acp-b"]));
+        drop(managers);
     }
 
     #[test]
     fn headless_gate_denies_unmatched_bash_instead_of_prompting() {
         let (mgr, _tmp) = enabled(vec![]);
 
-        let blocked = acp_permission_gate(&mgr, "bash", &json!({"command": "cargo test"}))
-            .expect("unmatched ACP bash must default-deny");
+        let blocked = execute_local_tool_with_permission(AcpLocalToolRequest {
+            run: test_run(),
+            permission_mgr: &mgr,
+            session_id: "session-1",
+            tool_call_id: "call-blocked-bash",
+            tool_name: "bash",
+            arguments_json: r#"{"command":"cargo test"}"#,
+            policy_enforcer: None,
+            memory_db: None,
+            app_config: None,
+            task_managers: task_managers(),
+        });
 
-        assert!(blocked.is_error);
+        assert!(blocked.is_error());
         assert!(
-            blocked.content.contains("Permission denied"),
+            blocked.content().contains("Permission denied"),
             "denial should be surfaced as a normal tool error: {}",
-            blocked.content
+            blocked.content()
         );
         assert!(
-            blocked.content.contains("Default-deny"),
+            blocked.content().contains("no interactive prompt"),
             "denial should come from the headless permission context: {}",
-            blocked.content
+            blocked.content()
         );
     }
 
     #[test]
     fn headless_gate_allows_matching_default_allow_rule() {
-        let (mgr, _tmp) = enabled(vec!["git status *"]);
+        let (mgr, _tmp) = enabled(vec!["git status *".to_string()]);
 
-        let outcome = acp_permission_gate(&mgr, "bash", &json!({"command": "git status --short"}));
+        let outcome = execute_local_tool_with_permission(AcpLocalToolRequest {
+            run: test_run(),
+            permission_mgr: &mgr,
+            session_id: "session-1",
+            tool_call_id: "call-allowed-bash",
+            tool_name: "bash",
+            arguments_json: r#"{"command":"git status --short"}"#,
+            policy_enforcer: None,
+            memory_db: None,
+            app_config: None,
+            task_managers: task_managers(),
+        });
 
         assert!(
-            outcome.is_none(),
+            !outcome.is_error(),
             "explicit default_allow rule must still allow ACP bash; got {outcome:?}"
         );
     }
 
     #[test]
-    fn headless_gate_normalizes_file_path_alias_for_write_rules() {
-        let allowed_path = "/tmp/openclaudia-acp-allowed.txt";
-        let (mgr, _tmp) = enabled(vec![allowed_path]);
+    fn headless_gate_applies_tool_scoped_write_rule_to_normalized_acp_call() {
+        let allowed_path = std::path::PathBuf::from(format!(
+            "target/acp-permission-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let (mgr, _store_tmp) = enabled(vec![format!("Write({})", allowed_path.display())]);
 
-        let outcome = acp_permission_gate(
-            &mgr,
-            "write_file",
-            &json!({"file_path": allowed_path, "content": "ok"}),
-        );
+        let arguments = serde_json::json!({"path": allowed_path, "content": "ok"}).to_string();
+        let outcome = execute_local_tool_with_permission(AcpLocalToolRequest {
+            run: test_run(),
+            permission_mgr: &mgr,
+            session_id: "session-1",
+            tool_call_id: "call-allowed-write",
+            tool_name: "write_file",
+            arguments_json: &arguments,
+            policy_enforcer: None,
+            memory_db: None,
+            app_config: None,
+            task_managers: task_managers(),
+        });
 
         assert!(
-            outcome.is_none(),
-            "ACP write_file file_path alias must be checked as the registry path target; got {outcome:?}"
+            !outcome.is_error(),
+            "ACP's normalized write call must match only its explicit Write scope; got {outcome:?}"
         );
+        assert_eq!(
+            std::fs::read_to_string(&allowed_path).expect("written file"),
+            "ok"
+        );
+        std::fs::remove_file(allowed_path).expect("remove test output");
     }
 
     #[test]
@@ -4781,6 +10269,10 @@ mod pre_tool_gate_tests {
     use crate::hooks::HookEngine;
     use serde_json::json;
     use std::io::Write;
+
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        crate::tools::security::test_run_context()
+    }
 
     /// Materialize a hook-script that exits with code 2 and emits
     /// `{"decision":"deny", "reason":"<reason>"}` on stdout. The hook
@@ -4814,15 +10306,16 @@ mod pre_tool_gate_tests {
     /// **Fix #694 — forensic evidence #1**
     ///
     /// A `PreToolUse` hook that denies a tool MUST cause `pre_tool_use_gate`
-    /// to return `Some(AcpToolResult { is_error: true, .. })` and the
-    /// block reason MUST surface in the result's `content`. Before the
+    /// to return the typed lifecycle block and its reason. The ACP dispatcher
+    /// then binds that block to the exact provider invocation. Before the
     /// fix, `execute_local_tool` skipped this gate entirely and
     /// dispatched `execute_tool_with_memory` directly — a hook denial
     /// had no effect on the ACP path. This test fails (gate is `None`)
     /// when the wiring regresses.
     #[tokio::test]
     async fn hook_denial_blocks_tool_dispatch() {
-        let tmp = tempfile::tempdir_in(".").expect("project-local tempdir");
+        let tmp = tempfile::tempdir_in(test_run().working_directory())
+            .expect("run-visible project-local tempdir");
         let script = write_deny_script(tmp.path(), "blocked-by-policy");
 
         let mut cfg = HooksConfig::default();
@@ -4834,18 +10327,23 @@ mod pre_tool_gate_tests {
                 timeout: 10,
             }],
         });
-        cfg.policy = Some(allow_only("deny.sh"));
+        cfg.policy = Some(allow_only(
+            script.to_str().expect("deny script path must be UTF-8"),
+        ));
         let engine = HookEngine::new(cfg);
 
-        let blocked = pre_tool_use_gate(&engine, "bash", &json!({"command": "ls"})).await;
+        let blocked = pre_tool_use_gate(
+            test_run(),
+            &engine,
+            "hook-denial-session",
+            "bash",
+            &json!({"command": "ls"}),
+        )
+        .await;
 
         let blocked = blocked.expect(
             "PreToolUse denial MUST short-circuit the ACP dispatch — \
              gate returned None, which means the regression is back",
-        );
-        assert!(
-            blocked.is_error,
-            "blocked tool result must report is_error=true"
         );
         assert!(
             blocked.content.contains("blocked by PreToolUse hook"),
@@ -4875,11 +10373,19 @@ mod pre_tool_gate_tests {
                 timeout: 10,
             }],
         });
-        cfg.policy = Some(allow_only("deny.sh"));
+        cfg.policy = Some(allow_only(
+            script.to_str().expect("deny script path must be UTF-8"),
+        ));
         let engine = HookEngine::new(cfg);
 
-        let outcome =
-            pre_tool_use_gate(&engine, "read_file", &json!({"file_path": "/tmp/some.txt"})).await;
+        let outcome = pre_tool_use_gate(
+            test_run(),
+            &engine,
+            "allowed-tool-session",
+            "read_file",
+            &json!({"file_path": "/tmp/some.txt"}),
+        )
+        .await;
 
         assert!(
             outcome.is_none(),
@@ -4907,7 +10413,8 @@ mod pre_tool_gate_tests {
             ("memory_save", json!({"key": "k", "value": "v"})),
             ("mcp__svc__op", json!({"arg": "v"})),
         ] {
-            let outcome = pre_tool_use_gate(&engine, tool, &args).await;
+            let outcome =
+                pre_tool_use_gate(test_run(), &engine, "empty-hook-session", tool, &args).await;
             assert!(
                 outcome.is_none(),
                 "empty PreToolUse config must allow {tool}; got {outcome:?}"
@@ -4923,7 +10430,8 @@ mod pre_tool_gate_tests {
     /// is wired correctly through the ACP code path.
     #[tokio::test]
     async fn matcher_match_triggers_deny() {
-        let tmp = tempfile::tempdir_in(".").expect("project-local tempdir");
+        let tmp = tempfile::tempdir_in(test_run().working_directory())
+            .expect("run-visible project-local tempdir");
         let script = write_deny_script(tmp.path(), "bash-not-allowed");
 
         let mut cfg = HooksConfig::default();
@@ -4935,12 +10443,20 @@ mod pre_tool_gate_tests {
                 timeout: 10,
             }],
         });
-        cfg.policy = Some(allow_only("deny.sh"));
+        cfg.policy = Some(allow_only(
+            script.to_str().expect("deny script path must be UTF-8"),
+        ));
         let engine = HookEngine::new(cfg);
 
-        let outcome = pre_tool_use_gate(&engine, "bash", &json!({"command": "rm -rf /"})).await;
+        let outcome = pre_tool_use_gate(
+            test_run(),
+            &engine,
+            "matcher-denial-session",
+            "bash",
+            &json!({"command": "rm -rf /"}),
+        )
+        .await;
         let blocked = outcome.expect("matcher-matched deny hook MUST block");
-        assert!(blocked.is_error);
         assert!(
             blocked.content.contains("bash-not-allowed"),
             "deny reason must propagate; got: {}",

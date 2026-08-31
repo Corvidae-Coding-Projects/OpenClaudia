@@ -17,15 +17,17 @@
 //! - [`transport`] — HTTP plumbing to adversary + builder providers
 //! - [`prompts`] — system prompts and request-template builders
 //! - [`triage`] — three-layer finding triage (duplicate, pattern, AI verification)
-//! - [`sink`] — crosslink issue creation + on-disk session persistence
+//! - [`sink`] — redacted transactional evidence + Crosslink reconciliation
 //! - [`helpers`] — small utilities (truncation, task extraction, advisory formatting)
 //! - [`error`] — `VddError` and result enums
 //! - [`finding`], [`review`], [`parsing`], [`static_analysis`], [`confabulation`] —
 //!   domain types and pre-existing parsing/analysis support
 
+mod canonical;
 pub mod confabulation;
 mod engine;
 mod error;
+mod finalization;
 pub mod finding;
 mod helpers;
 pub mod parsing;
@@ -37,10 +39,36 @@ mod transport;
 mod triage;
 
 // Re-exports for public API
+pub(crate) use canonical::validate_canonical_verifier_model_output;
+pub use canonical::{
+    CanonicalAcceptanceCriterion, CanonicalCriterionOutcome, CanonicalCriterionReport,
+    CanonicalDeterministicReceipt, CanonicalFindingSeverity, CanonicalModelVerdict,
+    CanonicalSourceRange, CanonicalSourceSnapshot, CanonicalVddPreflightError, CanonicalVddReceipt,
+    CanonicalVddRequest, CanonicalVddRequestParts, CanonicalVddTerminalReason, CanonicalVddVerdict,
+    CanonicalVerifierFinding, CanonicalVerifierReport, DeterministicCheckOutcome, VddModelIdentity,
+    VddPromotionAuthority,
+};
 pub use engine::{BuilderProvider, VddEngine};
-pub use error::{VddAdvisoryResult, VddBlockingResult, VddError, VddResult};
+pub use error::{
+    VddAdvisoryResult, VddBlockingResult, VddBlockingTextResult, VddError, VddFinalizationError,
+    VddProviderCallOutcome, VddProviderCallReceipt, VddResult,
+};
+pub(crate) use finalization::blocking_session_has_clean_final_iteration;
+pub use finalization::{
+    finalize_review_result, finalize_text_candidate, finalize_worker_candidate,
+    finalize_worker_candidate_with_receipt, finalize_worker_preflight_failure, VddCandidateBinding,
+    VddFinalizationOutcome, VddFinalizationPolicy, VddFinalizationRequirement, VddNonPassOutcome,
+    VddPublication, VddPublishedCandidate, VddResponseFinalization, VddWithheldCandidate,
+    VddWorkerFinalization, VddWorkerFinalizationRecord,
+};
 pub use finding::{Finding, FindingStatus, Severity};
+pub use helpers::findings_context_observation;
 pub use review::{AdversaryReview, VddIteration, VddSession};
+pub use sink::{
+    VddDeterministicEvidence, VddEvidenceAttempt, VddEvidenceCitation, VddEvidenceError,
+    VddEvidenceLedger, VddEvidenceReceipt, VddEvidenceSensitivity, VddEvidenceStore,
+    VddFindingEvent, VddFindingEvidence, VddFindingState, VddModelEvidence,
+};
 pub use static_analysis::StaticAnalysisResult;
 pub use transport::VddProviderAuth;
 
@@ -49,8 +77,3 @@ pub use transport::VddProviderAuth;
 /// surfacing the internal `RawFinding` / `AdversaryResponse` types
 /// that the parser uses internally.
 pub use triage::{parse_findings, parse_findings_detailed, ParseErrorKind, ParseFindingsOutcome};
-
-/// Advisory-formatting helper re-exported for the same test suite.
-/// Pure function over `Finding` + `StaticAnalysisResult` — no
-/// hidden state, no async surface.
-pub use helpers::format_findings_for_injection;

@@ -1,3 +1,4 @@
+use super::job::{JobOutputStream, JobRead};
 use super::BACKGROUND_SHELLS;
 use crate::tools::args::ToolArgError;
 use crate::tools::safe_truncate;
@@ -5,24 +6,103 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
+/// Classify one `bash_output` call before authorization.
+///
+/// Listing background shells and replaying from an explicit cursor are
+/// observational. Omitting the cursor advances the job's compatibility cursor,
+/// which is a session-local mutation.
+pub fn classify_bash_output(args: &Value) -> Result<crate::tools::effect::TypedEffect, String> {
+    use crate::tools::effect::{ToolEffect, TypedEffect};
+
+    match args.get("shell_id") {
+        None | Some(Value::Null) if args.get("cursor").is_none_or(Value::is_null) => Ok(
+            TypedEffect::new(ToolEffect::ReadOnly, "list", "bash_output"),
+        ),
+        None | Some(Value::Null) => Err("'cursor' requires a 'shell_id'".to_string()),
+        Some(Value::String(shell_id)) if !shell_id.is_empty() => match args.get("cursor") {
+            None | Some(Value::Null) => Ok(TypedEffect::new(
+                ToolEffect::SessionMutation,
+                "poll",
+                shell_id,
+            )),
+            Some(Value::Number(cursor)) if cursor.as_u64().is_some() => {
+                Ok(TypedEffect::new(ToolEffect::ReadOnly, "replay", shell_id))
+            }
+            Some(Value::Number(_)) => Err("'cursor' must be a non-negative integer".to_string()),
+            Some(_) => Err("'cursor' must be an integer".to_string()),
+        },
+        Some(Value::String(_)) => Err("'shell_id' must be a non-empty string".to_string()),
+        Some(_) => Err("'shell_id' must be a string".to_string()),
+    }
+}
+
+/// Every operation `bash_output` can resolve to, for registry validation and
+/// the generated effect matrix.
+#[must_use]
+pub fn bash_output_operations() -> Vec<(&'static str, crate::tools::effect::ToolEffect)> {
+    use crate::tools::effect::ToolEffect;
+    vec![
+        ("list", ToolEffect::ReadOnly),
+        ("poll", ToolEffect::SessionMutation),
+        ("replay", ToolEffect::ReadOnly),
+    ]
+}
+
+fn render_job_read(read: JobRead) -> String {
+    let mut result = format!(
+        "Status: {}\nCursor: {}\nHas more: {}",
+        read.state.label(),
+        read.next_cursor,
+        read.has_more
+    );
+    if read.events.is_empty() {
+        result.push_str("\n(no new output)");
+    } else {
+        result.push_str("\n\n");
+        for event in read.events {
+            match event.stream {
+                JobOutputStream::Stdout => result.push_str(&event.text),
+                JobOutputStream::Stderr => {
+                    result.push_str("[stderr] ");
+                    result.push_str(&event.text);
+                }
+            }
+        }
+    }
+    if read.stdout_truncated {
+        result.push_str("\n[stdout truncated at background-job output limit]");
+    }
+    if read.stderr_truncated {
+        result.push_str("\n[stderr truncated at background-job output limit]");
+    }
+    result
+}
+
 /// Retrieve output from a background shell
-pub fn execute_bash_output(args: &HashMap<String, Value>) -> (String, bool) {
+pub fn execute_bash_output(
+    run: &crate::tools::security::ToolRunContext,
+    args: &HashMap<String, Value>,
+) -> (String, bool) {
     // If no shell_id provided, list all background shells
     let shell_id = match args.get("shell_id") {
         None => {
-            let shells = BACKGROUND_SHELLS.list();
+            let shells = BACKGROUND_SHELLS.summaries(run);
             if shells.is_empty() {
                 return ("No background shells running.".to_string(), false);
             }
             let mut result = format!("Background shells ({}):\n", shells.len());
-            for (id, command, is_running) in shells {
-                let status = if is_running { "running" } else { "finished" };
-                let cmd_preview = if command.len() > 50 {
-                    format!("{}...", safe_truncate(&command, 50))
+            for shell in shells {
+                let cmd_preview = if shell.command.len() > 50 {
+                    format!("{}...", safe_truncate(&shell.command, 50))
                 } else {
-                    command
+                    shell.command
                 };
-                let _ = writeln!(result, "  {id} [{status}]: {cmd_preview}");
+                let _ = writeln!(
+                    result,
+                    "  {} [{}]: {cmd_preview}",
+                    shell.id,
+                    shell.state.label()
+                );
             }
             return (result, false);
         }
@@ -36,25 +116,28 @@ pub fn execute_bash_output(args: &HashMap<String, Value>) -> (String, bool) {
         }
     };
 
-    match BACKGROUND_SHELLS.get_output(shell_id) {
-        Ok((output, is_running, exit_code)) => {
-            let status = if is_running {
-                "running".to_string()
-            } else {
-                exit_code.map_or_else(
-                    || "finished".to_string(),
-                    |code| format!("finished (exit code: {code})"),
+    let cursor = match args.get("cursor") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(value)) => match value.as_u64() {
+            Some(cursor) => Some(cursor),
+            None => {
+                return (
+                    "Invalid 'cursor' argument: expected a non-negative integer".to_string(),
+                    true,
                 )
-            };
-
-            let result = if output.is_empty() {
-                format!("Status: {status}\n(no new output)")
-            } else {
-                format!("Status: {status}\n\n{output}")
-            };
-
-            (result, false)
+            }
+        },
+        Some(_) => {
+            return ToolArgError::WrongType {
+                key: "cursor",
+                expected: "integer",
+            }
+            .into_tool_error();
         }
+    };
+
+    match BACKGROUND_SHELLS.get_output(run, shell_id, cursor) {
+        Ok(read) => (render_job_read(read), false),
         Err(e) => (e, true),
     }
 }
@@ -63,6 +146,18 @@ pub fn execute_bash_output(args: &HashMap<String, Value>) -> (String, bool) {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        static RUN: std::sync::OnceLock<std::sync::Arc<crate::tools::ToolRunContext>> =
+            std::sync::OnceLock::new();
+        RUN.get_or_init(|| {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target/test-workspaces")
+                .join(format!("bash-output-{}", std::process::id()));
+            std::fs::create_dir_all(&root).expect("isolated bash-output fixture root");
+            crate::tools::security::test_run_context_for(&root)
+        })
+    }
 
     // ── Phase 2 pinning tests (crosslink #541) ────────────────────────────────
     // Pins OC's CURRENT bash_output contracts per spec crosslink #526 §B1 + §B3.
@@ -80,7 +175,7 @@ mod tests {
             "shell_id".to_string(),
             serde_json::Value::String("00000000".to_string()),
         );
-        let (msg, is_error) = execute_bash_output(&args);
+        let (msg, is_error) = execute_bash_output(test_run(), &args);
         assert!(
             is_error,
             "b3_output_unknown_id: must be is_error=true; got: {msg}"
@@ -103,7 +198,7 @@ mod tests {
             "shell_id".to_string(),
             serde_json::Value::String(bogus.to_string()),
         );
-        let (msg, is_error) = execute_bash_output(&args);
+        let (msg, is_error) = execute_bash_output(test_run(), &args);
         assert!(is_error, "b3_output_echo_id: must be is_error=true");
         assert!(
             msg.contains(bogus),
@@ -119,7 +214,7 @@ mod tests {
     fn b1_output_no_arg_returns_listing_not_error() {
         let _l = super::super::bg_lock();
         let args: HashMap<String, serde_json::Value> = HashMap::new();
-        let (msg, is_error) = execute_bash_output(&args);
+        let (msg, is_error) = execute_bash_output(test_run(), &args);
         assert!(
             !is_error,
             "b1_output_list: listing must not be is_error=true; got: {msg}"
@@ -134,7 +229,7 @@ mod tests {
     fn b1_output_rejects_non_string_shell_id() {
         let mut args = HashMap::new();
         args.insert("shell_id".to_string(), serde_json::json!(42));
-        let (msg, is_error) = execute_bash_output(&args);
+        let (msg, is_error) = execute_bash_output(test_run(), &args);
         assert!(is_error, "non-string shell_id must be rejected: {msg}");
         assert!(
             msg.contains("Invalid 'shell_id' argument: expected string"),
@@ -151,7 +246,7 @@ mod tests {
     fn b1_output_status_line_format() {
         let _l = super::super::bg_lock();
         let shell_id = super::super::BACKGROUND_SHELLS
-            .spawn("sleep 5")
+            .spawn(test_run(), "sleep 5")
             .expect("b1_output_status: spawn must succeed");
 
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -161,7 +256,7 @@ mod tests {
             "shell_id".to_string(),
             serde_json::Value::String(shell_id.clone()),
         );
-        let (msg, is_error) = execute_bash_output(&args);
+        let (msg, is_error) = execute_bash_output(test_run(), &args);
         assert!(!is_error, "b1_output_status: poll must succeed; got: {msg}");
         assert!(
             msg.starts_with("Status:"),
@@ -169,7 +264,7 @@ mod tests {
         );
         // Clean up so the next mutex holder doesn't see leftover sleep
         // processes from this test.
-        let _ = super::super::BACKGROUND_SHELLS.kill(&shell_id);
+        let _ = super::super::BACKGROUND_SHELLS.kill(test_run(), &shell_id);
     }
 
     /// B1-output-c: running shell reports "running" in the status line.
@@ -178,7 +273,7 @@ mod tests {
     fn b1_output_running_shell_status_is_running() {
         let _l = super::super::bg_lock();
         let shell_id = super::super::BACKGROUND_SHELLS
-            .spawn("sleep 5")
+            .spawn(test_run(), "sleep 5")
             .expect("b1_output_running: spawn must succeed");
 
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -188,12 +283,12 @@ mod tests {
             "shell_id".to_string(),
             serde_json::Value::String(shell_id.clone()),
         );
-        let (msg, _) = execute_bash_output(&args);
+        let (msg, _) = execute_bash_output(test_run(), &args);
         assert!(
             msg.contains("running"),
             "b1_output_running: running shell must report 'running'; got: {msg}"
         );
-        let _ = super::super::BACKGROUND_SHELLS.kill(&shell_id);
+        let _ = super::super::BACKGROUND_SHELLS.kill(test_run(), &shell_id);
     }
 
     /// B1-output-d: incremental drain — second poll does not re-emit first poll's output.
@@ -205,7 +300,7 @@ mod tests {
     fn b1_output_buffers_drained_on_each_poll() {
         let _l = super::super::bg_lock();
         let shell_id = super::super::BACKGROUND_SHELLS
-            .spawn("echo sentinel_b1d; sleep 3")
+            .spawn(test_run(), "echo sentinel_b1d; sleep 3")
             .expect("b1_output_drain: spawn must succeed");
 
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -217,19 +312,19 @@ mod tests {
         );
 
         // First poll: should contain the echoed line
-        let (first, _) = execute_bash_output(&args.clone());
+        let (first, _) = execute_bash_output(test_run(), &args.clone());
         assert!(
             first.contains("sentinel_b1d"),
             "b1_output_drain: first poll must see buffered output; got: {first}"
         );
 
         // Second poll: buffer was swapped; should NOT re-emit the same line
-        let (second, _) = execute_bash_output(&args);
+        let (second, _) = execute_bash_output(test_run(), &args);
         assert!(
             !second.contains("sentinel_b1d"),
             "b1_output_drain: second poll must NOT re-emit drained output; got: {second}"
         );
-        let _ = super::super::BACKGROUND_SHELLS.kill(&shell_id);
+        let _ = super::super::BACKGROUND_SHELLS.kill(test_run(), &shell_id);
     }
 
     /// B1-output-e: finished shell shows "finished" in status, not "running".
@@ -240,15 +335,24 @@ mod tests {
     fn b1_output_finished_shell_status_says_finished() {
         let _l = super::super::bg_lock();
         let shell_id = super::super::BACKGROUND_SHELLS
-            .spawn("echo done_b1e")
+            .spawn(test_run(), "echo done_b1e")
             .expect("b1_output_finished: spawn must succeed");
-
-        // Wait for the shell to finish
-        std::thread::sleep(std::time::Duration::from_millis(400));
 
         let mut args = HashMap::new();
         args.insert("shell_id".to_string(), serde_json::Value::String(shell_id));
-        let (msg, is_error) = execute_bash_output(&args);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (msg, is_error) = loop {
+            let result = execute_bash_output(test_run(), &args);
+            if result.0.contains("finished") {
+                break result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "b1_output_finished: shell did not settle; last response: {}",
+                result.0
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         assert!(
             !is_error,
             "b1_output_finished: poll must succeed; got: {msg}"

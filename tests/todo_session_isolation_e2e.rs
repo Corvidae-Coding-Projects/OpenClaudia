@@ -1,28 +1,29 @@
-//! End-to-end tests for `tools::todo` types — `TodoStatus`
-//! serde + `TodoItem` shape + `SessionIdGuard` RAII +
-//! per-session bucketing semantics.
+//! End-to-end tests for `tools::todo` wire types and explicit per-session
+//! bucketing semantics.
 //!
 //! Sprint 110 of the verification effort. Sprint 49 (via
 //! `integration_tests.rs`) covered the basic
 //! `execute_todo_*` round-trip; this file pins the
-//! `TodoStatus` `snake_case` wire shape, the `TodoItem`
-//! `activeForm` camelCase serde rename, the
-//! `SessionIdGuard` RAII lifecycle, and the
-//! `get_todo_list` / `clear_todo_list` accessor pair without
-//! going through `execute_tool`.
+//! `TodoStatus` `snake_case` wire shape, the `TodoItem` `activeForm`
+//! camelCase serde rename, and accessor isolation without ambient or
+//! thread-local fallback identity.
 
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
 use openclaudia::tools::{
-    clear_all_todo_lists, clear_todo_list, get_todo_list, SessionIdGuard, TodoItem, TodoStatus,
+    clear_all_todo_lists, clear_todo_list, execute_tool, get_todo_list, FunctionCall, TodoItem,
+    TodoStatus, ToolCall, ToolRunContext,
 };
+use serde_json::json;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+mod support;
+
 // ───────────────────────────────────────────────────────────────────────────
-// Global lock — TODO_LISTS is process-wide; tests serialize via this lock
-// so they don't race on the shared HashMap.
+// The compatibility graph map is process-wide; serialize legacy adapter
+// assertions while production frontends use explicit task managers.
 // ───────────────────────────────────────────────────────────────────────────
 
 fn todo_lock() -> MutexGuard<'static, ()> {
@@ -60,6 +61,8 @@ fn todo_status_deserializes_from_snake_case_strings() {
         ("\"pending\"", TodoStatus::Pending),
         ("\"in_progress\"", TodoStatus::InProgress),
         ("\"completed\"", TodoStatus::Completed),
+        ("\"failed\"", TodoStatus::Failed),
+        ("\"canceled\"", TodoStatus::Canceled),
     ] {
         let parsed: TodoStatus = serde_json::from_str(input).expect("de");
         assert_eq!(parsed, *expected);
@@ -74,11 +77,13 @@ fn todo_status_rejects_uppercase_or_kebab_case() {
 }
 
 #[test]
-fn todo_status_round_trips_all_3_variants() {
+fn todo_status_round_trips_all_variants() {
     for v in &[
         TodoStatus::Pending,
         TodoStatus::InProgress,
         TodoStatus::Completed,
+        TodoStatus::Failed,
+        TodoStatus::Canceled,
     ] {
         let json = serde_json::to_string(v).expect("ser");
         let back: TodoStatus = serde_json::from_str(&json).expect("de");
@@ -95,6 +100,8 @@ fn todo_status_is_copy_and_pairwise_distinct() {
     assert_ne!(TodoStatus::Pending, TodoStatus::InProgress);
     assert_ne!(TodoStatus::InProgress, TodoStatus::Completed);
     assert_ne!(TodoStatus::Pending, TodoStatus::Completed);
+    assert_ne!(TodoStatus::Completed, TodoStatus::Failed);
+    assert_ne!(TodoStatus::Failed, TodoStatus::Canceled);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -104,6 +111,8 @@ fn todo_status_is_copy_and_pairwise_distinct() {
 #[test]
 fn todo_item_serializes_active_form_as_camel_case_active_form() {
     let item = TodoItem {
+        task_id: "task-1".to_string(),
+        revision: 1,
         content: "do thing".to_string(),
         status: TodoStatus::Pending,
         active_form: "Doing thing".to_string(),
@@ -123,6 +132,8 @@ fn todo_item_serializes_active_form_as_camel_case_active_form() {
 #[test]
 fn todo_item_deserializes_from_active_form_camel_case() {
     let json = r#"{
+        "task_id": "task-1",
+        "revision": 1,
         "content": "task",
         "status": "in_progress",
         "activeForm": "Tasking"
@@ -136,6 +147,8 @@ fn todo_item_deserializes_from_active_form_camel_case() {
 #[test]
 fn todo_item_round_trips_full_shape() {
     let original = TodoItem {
+        task_id: "task-2".to_string(),
+        revision: 7,
         content: "implement feature".to_string(),
         status: TodoStatus::InProgress,
         active_form: "Implementing feature".to_string(),
@@ -145,11 +158,15 @@ fn todo_item_round_trips_full_shape() {
     assert_eq!(back.content, original.content);
     assert_eq!(back.status, original.status);
     assert_eq!(back.active_form, original.active_form);
+    assert_eq!(back.task_id, original.task_id);
+    assert_eq!(back.revision, original.revision);
 }
 
 #[test]
-fn todo_item_clone_preserves_all_three_fields() {
+fn todo_item_clone_preserves_all_fields() {
     let original = TodoItem {
+        task_id: "task-3".to_string(),
+        revision: 9,
         content: "c".to_string(),
         status: TodoStatus::Completed,
         active_form: "C".to_string(),
@@ -158,143 +175,70 @@ fn todo_item_clone_preserves_all_three_fields() {
     assert_eq!(cloned.content, original.content);
     assert_eq!(cloned.status, original.status);
     assert_eq!(cloned.active_form, original.active_form);
+    assert_eq!(cloned.task_id, original.task_id);
+    assert_eq!(cloned.revision, original.revision);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section C — get_todo_list / clear_todo_list on default session
+// Section C — explicit session access and dispatch isolation
 // ───────────────────────────────────────────────────────────────────────────
 
+fn write_one(run: &std::sync::Arc<ToolRunContext>, content: &str) {
+    let result = execute_tool(
+        run,
+        &ToolCall {
+            id: format!("todo-{content}"),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "todo_write".to_string(),
+                arguments: json!({
+                    "expected_generation": 0,
+                    "todos": [{
+                        "content": content,
+                        "status": "in_progress",
+                        "activeForm": format!("Doing {content}")
+                    }]
+                })
+                .to_string(),
+            },
+        },
+    );
+    assert!(!result.is_error(), "todo write failed: {result:?}");
+}
+
 #[test]
-fn get_todo_list_on_fresh_default_session_is_empty() {
+fn get_todo_list_on_fresh_explicit_session_is_empty() {
     let _l = todo_lock();
     clear_all_todo_lists();
-    let list = get_todo_list();
+    let list = get_todo_list("fresh-session");
     assert!(list.is_empty());
 }
 
 #[test]
-fn clear_todo_list_after_no_writes_is_no_op() {
+fn dispatch_uses_exact_run_session_buckets() {
     let _l = todo_lock();
     clear_all_todo_lists();
-    clear_todo_list();
-    // No panic, list still empty.
-    assert!(get_todo_list().is_empty());
+    let first = support::test_run_context(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+    let second = support::test_run_context(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+
+    write_one(&first, "first task");
+    assert!(get_todo_list(second.session_id()).is_empty());
+    write_one(&second, "second task");
+
+    assert_eq!(get_todo_list(first.session_id())[0].content, "first task");
+    assert_eq!(get_todo_list(second.session_id())[0].content, "second task");
 }
 
 #[test]
-fn clear_all_todo_lists_can_be_called_idempotently() {
+fn single_session_clear_cannot_mutate_another_bucket() {
     let _l = todo_lock();
     clear_all_todo_lists();
-    clear_all_todo_lists();
-    clear_all_todo_lists();
-    assert!(get_todo_list().is_empty());
-}
+    let first = support::test_run_context(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+    let second = support::test_run_context(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
+    write_one(&first, "first task");
+    write_one(&second, "second task");
 
-// ───────────────────────────────────────────────────────────────────────────
-// Section D — SessionIdGuard RAII
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn session_id_guard_returns_must_use_guard() {
-    let _l = todo_lock();
-    // Compile-time MUST: the guard is #[must_use], so binding
-    // to `_` is the documented "ignore" pattern.
-    let guard = SessionIdGuard::set("test-session-123");
-    drop(guard);
-}
-
-#[test]
-fn session_id_guard_drop_restores_previous_value() {
-    let _l = todo_lock();
-    clear_all_todo_lists();
-    // Inside the guard, get_todo_list bucket is the test
-    // session.
-    {
-        let _g = SessionIdGuard::set("session-a");
-        // No writes yet; bucket starts empty.
-        assert!(get_todo_list().is_empty());
-    }
-    // After drop, the guard has restored the previous
-    // session id (which was None — default key).
-    assert!(get_todo_list().is_empty());
-}
-
-#[test]
-fn session_id_guard_nested_guards_restore_to_outer_value() {
-    let _l = todo_lock();
-    clear_all_todo_lists();
-    {
-        let _outer = SessionIdGuard::set("outer");
-        {
-            let _inner = SessionIdGuard::set("inner");
-            // Inside inner: session-id is "inner".
-            // Each session has its own bucket.
-        }
-        // After inner drops, outer's session-id is restored.
-        // get_todo_list reads the outer bucket — still empty
-        // because no writes.
-        assert!(get_todo_list().is_empty());
-    }
-    // After outer drops, default-key bucket is active.
-    assert!(get_todo_list().is_empty());
-}
-
-#[test]
-fn session_id_guard_can_be_constructed_with_borrowed_string() {
-    let _l = todo_lock();
-    let id = String::from("borrowed-session");
-    let guard = SessionIdGuard::set(&id);
-    drop(guard);
-}
-
-#[test]
-fn session_id_guard_can_be_constructed_with_owned_string() {
-    let _l = todo_lock();
-    let guard = SessionIdGuard::set(String::from("owned-session"));
-    drop(guard);
-}
-
-#[test]
-fn session_id_guard_can_be_constructed_with_str_literal() {
-    let _l = todo_lock();
-    let guard = SessionIdGuard::set("literal-session");
-    drop(guard);
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Section E — Per-session bucketing
-// ───────────────────────────────────────────────────────────────────────────
-
-#[test]
-fn distinct_sessions_have_distinct_todo_buckets() {
-    let _l = todo_lock();
-    clear_all_todo_lists();
-
-    // Both sessions start empty.
-    {
-        let _g = SessionIdGuard::set("session-x");
-        assert!(get_todo_list().is_empty());
-    }
-    {
-        let _g = SessionIdGuard::set("session-y");
-        assert!(get_todo_list().is_empty());
-    }
-    // Default bucket also empty.
-    assert!(get_todo_list().is_empty());
-}
-
-#[test]
-fn clear_all_todo_lists_clears_every_session_bucket() {
-    let _l = todo_lock();
-    // Just verify it doesn't panic when called with multiple
-    // distinct session ids in play.
-    clear_all_todo_lists();
-    {
-        let _g = SessionIdGuard::set("sess-1");
-        clear_all_todo_lists();
-    }
-    {
-        let _g = SessionIdGuard::set("sess-2");
-        clear_all_todo_lists();
-    }
+    clear_todo_list(first.session_id());
+    assert!(get_todo_list(first.session_id()).is_empty());
+    assert_eq!(get_todo_list(second.session_id())[0].content, "second task");
 }

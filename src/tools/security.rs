@@ -1,31 +1,670 @@
-//! Immutable security capabilities for one agent/tool session.
+//! Explicit immutable capabilities for one canonical agent run.
 //!
-//! Security-sensitive tools must resolve paths and subprocess working
-//! directories from this context rather than ambient process state. Contexts
-//! are pinned on first use for a session and cannot later be replaced with a
-//! different project root.
+//! The host composition root constructs one [`ToolRunContext`] from explicit
+//! session and workspace inputs, then passes the same `Arc` through every tool
+//! and helper call. This module deliberately has no process-global registry,
+//! thread-local lookup, default session, or current-directory fallback.
 
+use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
-const DEFAULT_SESSION_KEY: &str = "__default__";
+use thiserror::Error;
+
+use crate::runtime::{
+    Actor, ActorId, ActorRole, BudgetGeneration, BudgetId, BudgetLimits, CapabilityBinding,
+    CapabilityGeneration, CapabilityKind, ContentDigest, IsolatedWorkspaceDescriptor,
+    ProviderContinuation, ProviderId, RunBudget, RunContext, RunDescriptor, RunDescriptorParts,
+    RunId, StateGeneration, StateSnapshot, TracingTraceSink, WorkspaceBinding, WorkspaceGeneration,
+};
+use crate::state::SessionId;
+
+static NEXT_CAPABILITY_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn runtime_mode_name(mode: &crate::modes::RuntimeMode) -> String {
+    match mode {
+        crate::modes::RuntimeMode::Behavioral(behavior) => behavior.display_name(),
+        crate::modes::RuntimeMode::Plan => "plan".to_string(),
+        crate::modes::RuntimeMode::Initializer => "initializer".to_string(),
+        crate::modes::RuntimeMode::Coordinator => "coordinator".to_string(),
+    }
+}
+
+/// Workspace mutation authority attached to a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceAccess {
+    ReadOnly,
+    ReadWrite,
+}
+
+/// Concrete host resource required by a tool/helper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolResource {
+    WorkspaceRead,
+    WorkspaceWrite,
+    Process,
+    Network,
+    Secrets,
+    /// Host-owned, workspace-bound technical-memory service.
+    Memory,
+    /// Run-owned Model Context Protocol manager and its registered servers.
+    Mcp,
+}
+
+/// Typed fail-closed resource error.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum ToolCapabilityError {
+    #[error("run capability {resource:?} is unavailable for run {run_id} generation {generation}")]
+    Unavailable {
+        resource: ToolResource,
+        run_id: RunId,
+        generation: CapabilityGeneration,
+    },
+    #[error("run capability binding does not match its canonical descriptor: {detail}")]
+    BindingMismatch { detail: String },
+    #[error("run {run_id} generation {generation} is no longer the active workspace generation ({state})")]
+    InactiveWorkspaceGeneration {
+        run_id: RunId,
+        generation: CapabilityGeneration,
+        state: &'static str,
+    },
+    #[error("isolated workspace capability is stale: {detail}")]
+    StaleWorkspace { detail: String },
+}
+
+/// Failure to publish a host-only isolated-workspace run transition.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum WorkspaceTransitionError {
+    #[error("workspace transition gate is unavailable: {0}")]
+    GateUnavailable(String),
+    #[error("workspace transition does not belong to the active run: {0}")]
+    WrongSource(String),
+    #[error("workspace transition conflicts with current lifecycle: {0}")]
+    LifecycleConflict(String),
+    #[error("isolated workspace identity is invalid or stale: {0}")]
+    StaleWorkspace(String),
+    #[error("cannot transition while background effects are active: shells={shell_ids:?}, agents={agent_ids:?}")]
+    InFlightBackgroundEffects {
+        shell_ids: Vec<String>,
+        agent_ids: Vec<String>,
+    },
+    #[error("cannot construct the replacement run generation: {0}")]
+    Construction(String),
+}
+
+/// Failure to install a new run-scoped behavioral capability generation.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum RuntimeModeTransitionError {
+    #[error("{detail}")]
+    InvalidProfile { detail: String },
+    #[error("background-effect lifecycle is unavailable: {detail}")]
+    LifecycleUnavailable { detail: String },
+    #[error(
+        "Cannot enter runtime mode '{requested_mode}' while this run owns {shell_count} active background shell(s) and {agent_count} active background agent(s). Stop them with kill_shell/task_stop, then retry. shell_ids={shell_ids:?}, agent_ids={agent_ids:?}"
+    )]
+    InFlightBackgroundEffects {
+        requested_mode: String,
+        shell_count: usize,
+        agent_count: usize,
+        shell_ids: Vec<String>,
+        agent_ids: Vec<String>,
+    },
+}
+
+/// Holds the run lifecycle boundary until one background effect is registered.
+pub(crate) struct BackgroundEffectRegistration<'a> {
+    _guard: MutexGuard<'a, ()>,
+}
+
+const WORKSPACE_RUN_ACTIVE: u8 = 0;
+const WORKSPACE_RUN_SUSPENDED: u8 = 1;
+const WORKSPACE_RUN_RETIRED: u8 = 2;
+
+#[derive(Default)]
+struct WorkspaceTransitionGate {
+    state: Mutex<WorkspaceGateState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct WorkspaceGateState {
+    active_operations: usize,
+    transitioning: bool,
+}
+
+/// Keeps one ordinary tool operation inside a single workspace generation.
+pub(crate) struct WorkspaceOperationGuard {
+    gate: Arc<WorkspaceTransitionGate>,
+}
+
+impl Drop for WorkspaceOperationGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active_operations = state.active_operations.saturating_sub(1);
+        if state.active_operations == 0 {
+            self.gate.changed.notify_all();
+        }
+    }
+}
+
+struct WorkspaceTransitionLease {
+    gate: Arc<WorkspaceTransitionGate>,
+}
+
+impl Drop for WorkspaceTransitionLease {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.transitioning = false;
+        drop(state);
+        self.gate.changed.notify_all();
+    }
+}
+
+/// Failure to resolve an executable through one run's immutable process
+/// capability.
+#[derive(Debug, Error)]
+pub enum ToolExecutableError {
+    #[error(transparent)]
+    Capability(#[from] ToolCapabilityError),
+    #[error("executable '{executable}' could not be resolved on the run-bound PATH: {source}")]
+    Resolve {
+        executable: String,
+        #[source]
+        source: which::Error,
+    },
+}
+
+/// Builder for a host-created [`ToolRunContext`].
+enum EnvironmentGrantSource {
+    Raw(HashMap<String, String>),
+    Protected(crate::secrets::EnvironmentGrants),
+}
+
+pub struct ToolRunContextBuilder {
+    run_id: Option<RunId>,
+    session_id: SessionId,
+    evidence_session_key: Option<String>,
+    project_root: PathBuf,
+    working_directory: PathBuf,
+    read_only_roots: Option<Vec<PathBuf>>,
+    read_write_roots: Option<Vec<PathBuf>>,
+    project_secret_masks: Option<Vec<PathBuf>>,
+    environment_grants: Option<EnvironmentGrantSource>,
+    mcp_environment_grants: Option<EnvironmentGrantSource>,
+    executable_search_path: Option<OsString>,
+    host_home: Option<PathBuf>,
+    skill_access: Option<crate::skills::SkillRunAccess>,
+    remote_actions: super::remote_trigger::WebhookRegistry,
+    web_egress_grants: crate::web_egress::WebEgressGrants,
+    inherit_host_startup_grants: bool,
+    workspace_access: Option<WorkspaceAccess>,
+    process: Option<bool>,
+    network: Option<bool>,
+    secrets: Option<bool>,
+    process_owner: String,
+    actor_role: ActorRole,
+    provider: String,
+    budget_limits: Option<BudgetLimits>,
+    parent_budget: Option<crate::runtime::RunBudgetAuthority>,
+    parent_cancellation: Option<crate::runtime::CancellationHandle>,
+    runtime_mode: crate::modes::RuntimeMode,
+    behavior_scope_targets: crate::modes::BehaviorScopeTargets,
+    background_job_storage: BackgroundJobStorage,
+    bounded_inference_profile: bool,
+    isolated_workspace: Option<IsolatedWorkspaceDescriptor>,
+    workspace_parent: Option<Arc<ToolRunContext>>,
+    workspace_control: Option<Arc<ToolRunContext>>,
+    workspace_transition_gate: Option<Arc<WorkspaceTransitionGate>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BackgroundJobStorage {
+    Durable,
+    Ephemeral,
+}
+
+impl ToolRunContextBuilder {
+    fn new(session_id: SessionId, project_root: PathBuf) -> Self {
+        let process_owner = session_id.as_str().to_string();
+        Self {
+            run_id: None,
+            session_id,
+            evidence_session_key: None,
+            working_directory: project_root.clone(),
+            project_root,
+            read_only_roots: None,
+            read_write_roots: None,
+            project_secret_masks: None,
+            environment_grants: None,
+            mcp_environment_grants: None,
+            executable_search_path: None,
+            host_home: None,
+            skill_access: None,
+            remote_actions: super::remote_trigger::WebhookRegistry::new(),
+            web_egress_grants: crate::web_egress::WebEgressGrants::public_only(),
+            inherit_host_startup_grants: false,
+            workspace_access: None,
+            process: None,
+            network: None,
+            secrets: None,
+            process_owner,
+            actor_role: ActorRole::Frontend,
+            provider: "local".to_string(),
+            budget_limits: None,
+            parent_budget: None,
+            parent_cancellation: None,
+            runtime_mode: crate::modes::RuntimeMode::default(),
+            behavior_scope_targets: crate::modes::BehaviorScopeTargets::workspace_root(),
+            background_job_storage: if cfg!(test) {
+                BackgroundJobStorage::Ephemeral
+            } else {
+                BackgroundJobStorage::Durable
+            },
+            bounded_inference_profile: false,
+            isolated_workspace: None,
+            workspace_parent: None,
+            workspace_control: None,
+            workspace_transition_gate: None,
+        }
+    }
+
+    #[must_use]
+    pub fn working_directory(mut self, path: impl Into<PathBuf>) -> Self {
+        self.working_directory = path.into();
+        self
+    }
+
+    #[must_use]
+    pub const fn workspace_access(mut self, access: WorkspaceAccess) -> Self {
+        self.workspace_access = Some(access);
+        self
+    }
+
+    /// Explicitly opt this top-level run into operator-provided startup grants.
+    ///
+    /// Without this call, callers must supply both root lists and the exact
+    /// environment map. Derived runs should always do that so they can only
+    /// inherit authority from their parent generation, never rediscover it
+    /// from mutable process state.
+    #[must_use]
+    pub const fn host_startup_grants(mut self) -> Self {
+        self.inherit_host_startup_grants = true;
+        self
+    }
+
+    #[must_use]
+    pub fn read_only_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.read_only_roots = Some(roots);
+        self
+    }
+
+    #[must_use]
+    pub fn read_write_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.read_write_roots = Some(roots);
+        self
+    }
+
+    /// Supply project-relative subtrees that stay masked from this run.
+    ///
+    /// Derived runs should pass the parent's mask list so a mutable host
+    /// environment cannot silently change filesystem authority between
+    /// generations. Omitting this field uses the built-in control-directory
+    /// masks; top-level host startup grants may add operator-configured masks.
+    #[must_use]
+    pub fn project_secret_masks(mut self, masks: Vec<PathBuf>) -> Self {
+        self.project_secret_masks = Some(masks);
+        self
+    }
+
+    /// Supply the exact environment values visible to this run's processes.
+    ///
+    /// Derived runs must pass their parent's map so a later process-environment
+    /// mutation cannot widen or replace authority. Top-level composition roots
+    /// may instead opt into [`Self::host_startup_grants`].
+    #[must_use]
+    pub fn environment_grants(mut self, grants: HashMap<String, String>) -> Self {
+        self.environment_grants = Some(EnvironmentGrantSource::Raw(grants));
+        self
+    }
+
+    /// Inherit an already-protected environment capability without copying
+    /// any secret bytes.
+    #[must_use]
+    pub(crate) fn protected_environment_grants(
+        mut self,
+        grants: crate::secrets::EnvironmentGrants,
+    ) -> Self {
+        self.environment_grants = Some(EnvironmentGrantSource::Protected(grants));
+        self
+    }
+
+    /// Supply the exact host values that trusted MCP configuration may place
+    /// in a child server environment.
+    ///
+    /// This is separate from ordinary agent environment grants: an MCP plugin
+    /// may need a credential that must never become visible to Bash or hook
+    /// processes. Top-level composition roots snapshot
+    /// `OPENCLAUDIA_MCP_ENV_GRANTS`; derived MCP runs copy this map from their
+    /// parent instead of rereading mutable process state.
+    #[must_use]
+    pub fn mcp_environment_grants(mut self, grants: HashMap<String, String>) -> Self {
+        self.mcp_environment_grants = Some(EnvironmentGrantSource::Raw(grants));
+        self
+    }
+
+    /// Inherit an already-protected MCP-only environment capability.
+    #[must_use]
+    pub(crate) fn protected_mcp_environment_grants(
+        mut self,
+        grants: crate::secrets::EnvironmentGrants,
+    ) -> Self {
+        self.mcp_environment_grants = Some(EnvironmentGrantSource::Protected(grants));
+        self
+    }
+
+    /// Supply the executable search path captured by the parent run.
+    ///
+    /// Top-level composition roots normally obtain this once through
+    /// [`Self::host_startup_grants`]. Derived runs must copy the parent's value
+    /// instead of consulting a mutable process `PATH` during tool execution.
+    #[must_use]
+    pub fn executable_search_path(mut self, path: impl Into<OsString>) -> Self {
+        self.executable_search_path = Some(path.into());
+        self
+    }
+
+    /// Supply the host-home snapshot associated with a captured toolchain.
+    ///
+    /// Linux sandbox construction uses this exact path only to expose
+    /// conventional Cargo and Rustup trees read-only. Derived runs must copy
+    /// their parent's value; top-level composition roots normally capture it
+    /// through [`Self::host_startup_grants`].
+    #[must_use]
+    pub fn host_home(mut self, path: Option<PathBuf>) -> Self {
+        self.host_home = path;
+        self
+    }
+
+    /// Supply an already-captured skill discovery/trust capability.
+    ///
+    /// Derived runs copy this value from their parent. Top-level production
+    /// runs normally capture it through [`Self::host_startup_grants`].
+    #[must_use]
+    pub fn skill_access(mut self, access: crate::skills::SkillRunAccess) -> Self {
+        self.skill_access = Some(access);
+        self
+    }
+
+    /// Bind an already-validated host-owned named-action catalog to this run.
+    ///
+    /// The catalog is immutable after construction and still requires the
+    /// run's explicit network and secret capabilities at publication and
+    /// dispatch time.
+    #[must_use]
+    pub fn remote_actions(mut self, registry: super::remote_trigger::WebhookRegistry) -> Self {
+        self.remote_actions = registry;
+        self
+    }
+
+    /// Bind trusted exact-origin web authority to this run generation.
+    #[must_use]
+    pub fn web_egress_grants(mut self, grants: crate::web_egress::WebEgressGrants) -> Self {
+        self.web_egress_grants = grants;
+        self
+    }
+
+    #[must_use]
+    pub const fn process(mut self, available: bool) -> Self {
+        self.process = Some(available);
+        self
+    }
+
+    #[must_use]
+    pub const fn network(mut self, available: bool) -> Self {
+        self.network = Some(available);
+        self
+    }
+
+    #[must_use]
+    pub const fn secrets(mut self, available: bool) -> Self {
+        self.secrets = Some(available);
+        self
+    }
+
+    /// Set the logical process owner shown to the model and lifecycle APIs.
+    ///
+    /// Exact process access is still keyed by the unforgeable run id. This
+    /// label preserves stable subagent/session UX without granting authority.
+    #[must_use]
+    pub fn process_owner(mut self, owner: impl Into<String>) -> Self {
+        self.process_owner = owner.into();
+        self
+    }
+
+    /// Select the Reality-ledger bucket for authoritative tool observations.
+    ///
+    /// Derived agents share their parent session id, so their evidence bucket
+    /// must be explicit rather than inferred from that shared persistence id.
+    #[must_use]
+    pub(crate) fn evidence_session_key(mut self, key: impl Into<String>) -> Self {
+        self.evidence_session_key = Some(key.into());
+        self
+    }
+
+    #[must_use]
+    pub const fn actor_role(mut self, role: ActorRole) -> Self {
+        self.actor_role = role;
+        self
+    }
+
+    #[must_use]
+    pub fn provider(mut self, provider: impl Into<String>) -> Self {
+        self.provider = provider.into();
+        self
+    }
+
+    /// Bind a host-derived identity to a non-interactive canonical run.
+    ///
+    /// This is crate-private because model- or project-controlled callers must
+    /// never choose run identities. Durable schedulers use it to derive the
+    /// same idempotency key for one exact schedule occurrence after restart.
+    #[must_use]
+    pub(crate) const fn scheduled_run_id(mut self, run_id: RunId) -> Self {
+        self.run_id = Some(run_id);
+        self
+    }
+
+    /// Bind explicit immutable limits to this run generation.
+    #[must_use]
+    pub const fn budget_limits(mut self, limits: BudgetLimits) -> Self {
+        self.budget_limits = Some(limits);
+        self
+    }
+
+    /// Attach a derived run to its parent's live hierarchical budget.
+    #[must_use]
+    pub(crate) fn parent_budget(mut self, parent: crate::runtime::RunBudgetAuthority) -> Self {
+        self.parent_budget = Some(parent);
+        self
+    }
+
+    /// Attach a derived run beneath its parent's live cancellation node.
+    #[must_use]
+    pub(crate) fn parent_cancellation(
+        mut self,
+        parent: crate::runtime::CancellationHandle,
+    ) -> Self {
+        self.parent_cancellation = Some(parent);
+        self
+    }
+
+    /// Bind the initial host-enforced behavioral capability profile.
+    #[must_use]
+    pub fn runtime_mode(mut self, mode: crate::modes::RuntimeMode) -> Self {
+        self.runtime_mode = mode;
+        self
+    }
+
+    /// Bind persisted user/task-approved behavioral targets to this run.
+    #[must_use]
+    pub fn behavior_scope_targets(mut self, targets: crate::modes::BehaviorScopeTargets) -> Self {
+        self.behavior_scope_targets = targets;
+        self
+    }
+
+    /// Keep durable background-job artifacts inside this run's private scratch
+    /// root. This is intended for hermetic tests and embedded ephemeral runs;
+    /// normal frontends retain the default user-state-backed restart record.
+    #[must_use]
+    pub const fn ephemeral_background_jobs(mut self) -> Self {
+        self.background_job_storage = BackgroundJobStorage::Ephemeral;
+        self
+    }
+
+    /// Select a bounded inference run's no-tools/no-persistence capability set.
+    ///
+    /// The profile keeps only context assembly, provider dispatch, hooks,
+    /// tracing, and explicitly requested network/secret grants. Project skill
+    /// discovery remains governed by its dedicated `SkillRunAccess`; it does
+    /// not widen the ordinary workspace, memory, MCP, process, or durable
+    /// background-job surfaces.
+    #[must_use]
+    pub const fn bounded_inference_profile(mut self) -> Self {
+        self.bounded_inference_profile = true;
+        self.background_job_storage = BackgroundJobStorage::Ephemeral;
+        self
+    }
+
+    /// Select the one-shot print frontend's bounded inference profile.
+    #[must_use]
+    pub const fn bounded_print_profile(self) -> Self {
+        self.bounded_inference_profile()
+    }
+
+    const fn background_job_storage(mut self, storage: BackgroundJobStorage) -> Self {
+        self.background_job_storage = storage;
+        self
+    }
+
+    fn isolated_workspace_binding(
+        mut self,
+        descriptor: IsolatedWorkspaceDescriptor,
+        parent: Arc<ToolRunContext>,
+        control: Arc<ToolRunContext>,
+        transition_gate: Arc<WorkspaceTransitionGate>,
+    ) -> Self {
+        self.isolated_workspace = Some(descriptor);
+        self.workspace_parent = Some(parent);
+        self.workspace_control = Some(control);
+        self.workspace_transition_gate = Some(transition_gate);
+        self
+    }
+
+    /// Construct and validate the complete immutable run capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when roots cannot be pinned, host capability inputs
+    /// are invalid, or the concrete capability and descriptor generations do
+    /// not agree.
+    pub fn build(self) -> Result<Arc<ToolRunContext>, String> {
+        ToolRunContext::new(self).map(Arc::new)
+    }
+}
 
 /// Filesystem capabilities pinned to one session.
-#[derive(Debug)]
-pub struct ToolSecurityContext {
-    session_id: String,
+pub struct ToolRunContext {
+    runtime: Arc<RunContext>,
+    generation: CapabilityGeneration,
+    lsp_service: crate::services::LspServerManager,
+    runtime_mode: crate::modes::RuntimeModeAuthority,
+    background_effect_lifecycle: Mutex<()>,
+    workspace_transition_gate: Arc<WorkspaceTransitionGate>,
+    workspace_lifecycle: AtomicU8,
+    isolated_workspace: Option<IsolatedWorkspaceDescriptor>,
+    workspace_parent: Option<Arc<Self>>,
+    workspace_control: Option<Arc<Self>>,
+    tool_catalog: super::catalog::RunToolCatalog,
     project_root: PathBuf,
     working_directory: PathBuf,
     private_temp: PrivateTempDir,
+    background_job_storage: BackgroundJobStorage,
     read_only_roots: Vec<PathBuf>,
     read_write_roots: Vec<PathBuf>,
     denied_paths: Vec<PathBuf>,
-    environment_grants: HashMap<String, String>,
+    agent_plan_file: PathBuf,
+    project_secret_masks: Vec<PathBuf>,
+    environment_grants: crate::secrets::EnvironmentGrants,
+    mcp_environment_grants: crate::secrets::EnvironmentGrants,
+    executable_search_path: OsString,
+    host_home: Option<PathBuf>,
+    skill_access: crate::skills::SkillRunAccess,
+    remote_actions: super::remote_trigger::RemoteActionService,
+    web_egress_grants: crate::web_egress::WebEgressGrants,
+    skill_touched_paths: Mutex<BTreeSet<PathBuf>>,
     network_policy: AgentNetworkPolicy,
-    #[cfg(unix)]
+    process_available: bool,
+    network_available: bool,
+    secrets_available: bool,
+    process_owner: String,
+    evidence_session_key: String,
+    #[cfg(any(unix, windows))]
     root_handles: Vec<CapabilityRootHandle>,
 }
+
+impl std::fmt::Debug for ToolRunContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ToolRunContext")
+            .field("run_id", &self.run_id())
+            .field("generation", &self.generation)
+            .field("runtime_mode", &self.runtime_mode.snapshot())
+            .field("session_id", &self.session_id())
+            .field("project_root", &self.project_root)
+            .field("working_directory", &self.working_directory)
+            .field("private_temp", &self.private_temp.path())
+            .field("read_only_root_count", &self.read_only_roots.len())
+            .field("read_write_root_count", &self.read_write_roots.len())
+            .field(
+                "project_secret_mask_count",
+                &self.project_secret_masks.len(),
+            )
+            .field("agent_plan_file", &self.agent_plan_file)
+            .field("environment_grant_count", &self.environment_grants.len())
+            .field(
+                "mcp_environment_grant_count",
+                &self.mcp_environment_grants.len(),
+            )
+            .field("executable_search_path", &"<redacted>")
+            .field("host_home_bound", &self.host_home.is_some())
+            .field("skill_access", &self.skill_access)
+            .field("remote_action_count", &self.remote_actions.registry().len())
+            .field("web_egress_grants", &self.web_egress_grants)
+            .field("process_available", &self.process_available)
+            .field("network_available", &self.network_available)
+            .field("secrets_available", &self.secrets_available)
+            .field("process_owner", &self.process_owner)
+            .field("evidence_session_key", &self.evidence_session_key)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Compatibility name for leaf filesystem/sandbox code. The value is the
+/// complete explicit run context, not a separately discoverable security
+/// singleton.
+pub type ToolSecurityContext = ToolRunContext;
 
 /// Network authority carried by an agent session.
 ///
@@ -37,7 +676,7 @@ pub enum AgentNetworkPolicy {
     Denied,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Debug)]
 struct CapabilityRootHandle {
     path: PathBuf,
@@ -52,21 +691,119 @@ pub(crate) struct LinuxBindRoot {
     pub(crate) directory: std::os::fd::OwnedFd,
 }
 
-impl ToolSecurityContext {
-    fn new(
-        session_id: &str,
-        project_root: &Path,
-        working_directory: &Path,
-        read_only_roots: &[PathBuf],
-        read_write_roots: &[PathBuf],
-    ) -> Result<Self, String> {
-        let project_root = canonical_directory(project_root, "project root")?;
-        let working_directory = canonical_directory(working_directory, "working directory")?;
+impl ToolRunContext {
+    /// Begin explicit run-capability construction at a host composition root.
+    #[must_use]
+    pub fn builder(
+        session_id: SessionId,
+        project_root: impl Into<PathBuf>,
+    ) -> ToolRunContextBuilder {
+        ToolRunContextBuilder::new(session_id, project_root.into())
+    }
+
+    #[allow(clippy::too_many_lines)] // Capability validation and descriptor binding are one transaction.
+    fn new(builder: ToolRunContextBuilder) -> Result<Self, String> {
+        let ToolRunContextBuilder {
+            run_id,
+            session_id,
+            evidence_session_key,
+            project_root,
+            working_directory,
+            read_only_roots,
+            read_write_roots,
+            project_secret_masks,
+            environment_grants,
+            mcp_environment_grants,
+            executable_search_path,
+            host_home,
+            skill_access,
+            remote_actions,
+            web_egress_grants,
+            inherit_host_startup_grants,
+            workspace_access,
+            process,
+            network,
+            secrets,
+            process_owner,
+            actor_role,
+            provider,
+            budget_limits,
+            parent_budget,
+            parent_cancellation,
+            runtime_mode,
+            behavior_scope_targets,
+            background_job_storage,
+            bounded_inference_profile,
+            isolated_workspace,
+            workspace_parent,
+            workspace_control,
+            workspace_transition_gate,
+        } = builder;
+        let evidence_session_key =
+            evidence_session_key.unwrap_or_else(|| session_id.as_str().to_string());
+        if isolated_workspace.is_some() != workspace_parent.is_some()
+            || isolated_workspace.is_some() != workspace_control.is_some()
+        {
+            return Err(
+                "Isolated workspace construction requires descriptor, parent, and control generations"
+                    .to_string(),
+            );
+        }
+        let workspace_access = workspace_access.ok_or_else(|| {
+            "Run construction requires an explicit workspace access capability".to_string()
+        })?;
+        let process = process.ok_or_else(|| {
+            "Run construction requires an explicit process capability decision".to_string()
+        })?;
+        let network = network.ok_or_else(|| {
+            "Run construction requires an explicit network capability decision".to_string()
+        })?;
+        let secrets = secrets.ok_or_else(|| {
+            "Run construction requires an explicit secret capability decision".to_string()
+        })?;
+        if web_egress_grants.has_browser_persistence() && !secrets {
+            return Err(
+                "Encrypted browser persistence requires the run's explicit secrets capability"
+                    .to_string(),
+            );
+        }
+        let read_only_roots = match read_only_roots {
+            Some(roots) => roots,
+            None if inherit_host_startup_grants => {
+                startup_root_grants("OPENCLAUDIA_AGENT_READ_ONLY_ROOTS")?
+            }
+            None => {
+                return Err(
+                    "Run construction requires explicit read-only roots or host startup grants"
+                        .to_string(),
+                )
+            }
+        };
+        let read_write_roots =
+            match read_write_roots {
+                Some(roots) => roots,
+                None if inherit_host_startup_grants => {
+                    startup_root_grants("OPENCLAUDIA_AGENT_READ_WRITE_ROOTS")?
+                }
+                None => return Err(
+                    "Run construction requires explicit read-write roots or host startup grants"
+                        .to_string(),
+                ),
+            };
+        let project_root = canonical_directory(&project_root, "project root")?;
+        let working_directory = canonical_directory(&working_directory, "working directory")?;
+        let runtime_mode = crate::modes::RuntimeModeAuthority::new_for_run(
+            runtime_mode,
+            behavior_scope_targets,
+            &project_root,
+        )?;
+        let mut canonical_read_only = canonical_roots(&read_only_roots, "read-only")?;
+        let mut canonical_read_write = canonical_roots(&read_write_roots, "read-write")?;
         if !path_is_within(&working_directory, &project_root)
-            && !read_only_roots
+            && !canonical_read_only
                 .iter()
-                .chain(read_write_roots)
-                .any(|root| working_directory.starts_with(root))
+                .chain(&canonical_read_write)
+                .any(|root| path_is_within(&working_directory, root))
         {
             return Err(format!(
                 "Working directory '{}' is outside the session project root '{}'",
@@ -80,39 +817,1080 @@ impl ToolSecurityContext {
                 project_root.display()
             ));
         }
-
-        let canonical_read_only = canonical_roots(read_only_roots, "read-only")?;
-        let mut canonical_read_write = canonical_roots(read_write_roots, "read-write")?;
-        if !canonical_read_write.contains(&project_root) {
-            canonical_read_write.push(project_root.clone());
+        if process_owner.is_empty()
+            || process_owner.len() > 128
+            || !process_owner
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(
+                "Process owner must be 1-128 ASCII letters, digits, '-' or '_'".to_string(),
+            );
+        }
+        if evidence_session_key.is_empty()
+            || evidence_session_key.len() > 128
+            || !evidence_session_key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(
+                "Evidence session key must be 1-128 ASCII letters, digits, or '-'".to_string(),
+            );
+        }
+        match workspace_access {
+            WorkspaceAccess::ReadOnly => {
+                if !canonical_read_write.is_empty() {
+                    return Err(
+                        "A read-only workspace capability cannot include writable roots"
+                            .to_string(),
+                    );
+                }
+                if !canonical_read_only.contains(&project_root) {
+                    canonical_read_only.push(project_root.clone());
+                }
+            }
+            WorkspaceAccess::ReadWrite => {
+                if !canonical_read_write.contains(&project_root) {
+                    canonical_read_write.push(project_root.clone());
+                }
+            }
+        }
+        if bounded_inference_profile {
+            canonical_read_only.clear();
+            canonical_read_write.clear();
         }
         let private_temp = PrivateTempDir::create()?;
         canonical_read_write.push(private_temp.path().to_path_buf());
-        let denied_paths = restricted_project_paths(&project_root)?;
-        let environment_grants = startup_environment_grants()?;
-        let network_policy = startup_network_policy()?;
-        #[cfg(unix)]
+        let project_secret_masks = match project_secret_masks {
+            Some(masks) => validate_project_secret_masks(masks)?,
+            None if inherit_host_startup_grants => startup_project_secret_masks()?,
+            None => default_project_secret_masks(),
+        };
+        let denied_paths = project_secret_masks
+            .iter()
+            .map(|mask| project_root.join(mask))
+            .collect::<Vec<_>>();
+        let agent_plan_file = project_plan_file(&project_root, session_id.as_str());
+        let environment_grants =
+            match environment_grants {
+                Some(EnvironmentGrantSource::Raw(grants)) => {
+                    protect_environment_grants(validate_environment_grants(grants)?)?
+                }
+                Some(EnvironmentGrantSource::Protected(grants)) => {
+                    for name in grants.keys() {
+                        validate_environment_grant_name(name)?;
+                    }
+                    grants
+                }
+                None if inherit_host_startup_grants => {
+                    protect_environment_grants(startup_environment_grants()?)?
+                }
+                None => return Err(
+                    "Run construction requires explicit environment grants or host startup grants"
+                        .to_string(),
+                ),
+            };
+        let mcp_environment_grants = match mcp_environment_grants {
+            Some(EnvironmentGrantSource::Raw(grants)) => {
+                protect_environment_grants(validate_mcp_environment_grants(grants)?)?
+            }
+            Some(EnvironmentGrantSource::Protected(grants)) => {
+                for name in grants.keys() {
+                    validate_mcp_environment_grant_name(name)?;
+                }
+                grants
+            }
+            None if inherit_host_startup_grants => {
+                protect_environment_grants(startup_mcp_environment_grants()?)?
+            }
+            None => crate::secrets::EnvironmentGrants::new(),
+        };
+        let executable_search_path = match executable_search_path {
+            Some(path) => path,
+            None if inherit_host_startup_grants => {
+                std::env::var_os("PATH").unwrap_or_else(default_executable_search_path)
+            }
+            None => default_executable_search_path(),
+        };
+        let host_home = match host_home {
+            Some(path) => Some(canonical_directory(&path, "host home")?),
+            None if inherit_host_startup_grants => {
+                dirs::home_dir().and_then(|path| path.canonicalize().ok())
+            }
+            None => None,
+        };
+        let skill_access = skill_access.unwrap_or_else(|| {
+            if inherit_host_startup_grants {
+                crate::skills::SkillRunAccess::capture(&project_root, host_home.as_deref())
+            } else {
+                crate::skills::SkillRunAccess::default()
+            }
+        });
+        let remote_actions = super::remote_trigger::RemoteActionService::new(remote_actions);
+        if !secrets {
+            if let Some(name) = environment_grants
+                .keys()
+                .chain(mcp_environment_grants.keys())
+                .find(|name| super::is_sensitive_env(name))
+            {
+                return Err(format!(
+                    "Environment grant '{name}' requires an explicit secret capability"
+                ));
+            }
+        }
+        let network_policy = if inherit_host_startup_grants {
+            startup_network_policy()?
+        } else {
+            AgentNetworkPolicy::Denied
+        };
+        #[cfg(any(unix, windows))]
         let root_handles = open_capability_roots(&canonical_read_only, &canonical_read_write)?;
 
-        Ok(Self {
-            session_id: session_id.to_string(),
+        #[cfg(not(any(unix, windows)))]
+        return Err(
+            "Run construction is unsupported because this platform has no handle-relative filesystem capability backend"
+                .to_string(),
+        );
+
+        let generation = next_capability_generation()?;
+        let workspace_generation = WorkspaceGeneration::new(generation.get())
+            .ok_or_else(|| "workspace generation must be non-zero".to_string())?;
+        let run_id = run_id.unwrap_or_else(RunId::new);
+        let mut grants = if bounded_inference_profile {
+            BTreeSet::from([
+                CapabilityKind::ContextAssembly,
+                CapabilityKind::Provider,
+                CapabilityKind::Hooks,
+                CapabilityKind::Trace,
+            ])
+        } else {
+            BTreeSet::from([
+                CapabilityKind::ContextAssembly,
+                CapabilityKind::Provider,
+                CapabilityKind::WorkspaceRead,
+                CapabilityKind::Hooks,
+                CapabilityKind::Memory,
+                CapabilityKind::Mcp,
+                CapabilityKind::Trace,
+            ])
+        };
+        if !bounded_inference_profile && workspace_access == WorkspaceAccess::ReadWrite {
+            grants.insert(CapabilityKind::WorkspaceWrite);
+        }
+        if process {
+            grants.insert(CapabilityKind::Process);
+        }
+        if network {
+            grants.insert(CapabilityKind::Network);
+        }
+        if secrets {
+            grants.insert(CapabilityKind::Secrets);
+        }
+        let manifest_digest = capability_manifest_digest(
+            run_id,
+            generation,
+            &project_root,
+            &working_directory,
+            private_temp.path(),
+            &canonical_read_only,
+            &canonical_read_write,
+            &denied_paths,
+            &agent_plan_file,
+            &environment_grants,
+            &mcp_environment_grants,
+            remote_actions.authority_digest(),
+            web_egress_grants.authority_digest(),
+            &executable_search_path,
+            host_home.as_deref(),
+            network_policy,
+            &grants,
+            &process_owner,
+            &evidence_session_key,
+            isolated_workspace.as_ref(),
+        );
+        let cancellation = parent_cancellation.map_or_else(
+            || crate::runtime::CancellationTree::new().root(),
+            |parent| parent.child(),
+        );
+        let descriptor = RunDescriptor::new(RunDescriptorParts {
+            run_id,
+            session_id,
+            actor: Actor {
+                id: ActorId::new(),
+                role: actor_role,
+            },
+            workspace: WorkspaceBinding::new(
+                project_root.clone(),
+                workspace_generation,
+                ContentDigest::sha256(project_root.as_os_str().as_encoded_bytes()),
+            )
+            .map_err(|error| error.to_string())?,
+            capabilities: CapabilityBinding {
+                generation,
+                manifest_digest,
+                grants,
+            },
+            budget: run_budget(generation, budget_limits.unwrap_or_default())?,
+            provider_continuation: ProviderContinuation::Fresh {
+                provider: ProviderId::new(provider).map_err(|error| error.to_string())?,
+            },
+            cancellation_root: cancellation.root_id(),
+            initial_state: StateSnapshot {
+                generation: StateGeneration::new(1)
+                    .ok_or_else(|| "initial state generation must be non-zero".to_string())?,
+                digest: ContentDigest::sha256(b"tool-run-initial-state"),
+            },
+        })
+        .map_err(|error| error.to_string())?;
+        let runtime = Arc::new(if let Some(parent_budget) = parent_budget.as_ref() {
+            RunContext::new_child(
+                descriptor,
+                cancellation,
+                Arc::new(TracingTraceSink),
+                parent_budget,
+            )?
+        } else {
+            RunContext::new(descriptor, cancellation, Arc::new(TracingTraceSink))
+                .map_err(|error| error.to_string())?
+        });
+
+        let context = Self {
+            runtime,
+            generation,
+            lsp_service: crate::services::LspServerManager::new(),
+            runtime_mode,
+            background_effect_lifecycle: Mutex::new(()),
+            workspace_transition_gate: workspace_transition_gate
+                .unwrap_or_else(|| Arc::new(WorkspaceTransitionGate::default())),
+            workspace_lifecycle: AtomicU8::new(WORKSPACE_RUN_ACTIVE),
+            isolated_workspace,
+            workspace_parent,
+            workspace_control,
+            tool_catalog: super::catalog::RunToolCatalog::default(),
             project_root,
             working_directory,
             private_temp,
+            background_job_storage,
             read_only_roots: canonical_read_only,
             read_write_roots: canonical_read_write,
             denied_paths,
+            agent_plan_file,
+            project_secret_masks,
             environment_grants,
+            mcp_environment_grants,
+            executable_search_path,
+            host_home,
+            skill_access,
+            remote_actions,
+            web_egress_grants,
+            skill_touched_paths: Mutex::new(BTreeSet::new()),
             network_policy,
-            #[cfg(unix)]
+            process_available: process,
+            network_available: network,
+            secrets_available: secrets,
+            process_owner,
+            evidence_session_key,
+            #[cfg(any(unix, windows))]
             root_handles,
-        })
+        };
+        context
+            .validate_binding()
+            .map_err(|error| error.to_string())?;
+        Ok(context)
+    }
+
+    /// Canonical runtime identity paired with these concrete resources.
+    #[must_use]
+    pub const fn runtime(&self) -> &Arc<RunContext> {
+        &self.runtime
+    }
+
+    /// Atomic hierarchical budget authority carried by this run.
+    #[must_use]
+    pub fn budget(&self) -> &crate::runtime::RunBudgetAuthority {
+        self.runtime.budget()
+    }
+
+    /// Stable identity of this exact run generation.
+    #[must_use]
+    pub fn run_id(&self) -> RunId {
+        self.runtime.descriptor().run_id
+    }
+
+    /// Capability-manifest generation bound to descriptors and scratch space.
+    #[must_use]
+    pub const fn generation(&self) -> CapabilityGeneration {
+        self.generation
+    }
+
+    /// Stateful language-server service owned by this exact run generation.
+    #[must_use]
+    pub const fn lsp_service(&self) -> &crate::services::LspServerManager {
+        &self.lsp_service
+    }
+
+    /// Progressive tool-catalog state owned by this exact run generation.
+    ///
+    /// Catalog selection is mutable runtime state, but it cannot grant host
+    /// authority: dispatch still revalidates the immutable capability binding,
+    /// effect policy, approval, and guardrails for every invocation.
+    #[must_use]
+    pub const fn tool_catalog(&self) -> &super::catalog::RunToolCatalog {
+        &self.tool_catalog
+    }
+
+    /// Current immutable mode capability generation.
+    #[must_use]
+    pub fn runtime_mode(&self) -> crate::modes::RuntimeModeSnapshot {
+        self.runtime_mode.snapshot()
+    }
+
+    /// Atomically validate and install a new mode capability generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a conflicting mode or exhausted generation.
+    pub fn transition_runtime_mode(
+        &self,
+        mode: crate::modes::RuntimeMode,
+    ) -> Result<crate::modes::RuntimeModeSnapshot, String> {
+        self.try_transition_runtime_mode(mode)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Atomically validate and install a mode, preserving typed refusal data.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the profile is invalid, lifecycle state is
+    /// unavailable, or this run still owns effects that can mutate after a
+    /// restrictive generation would be published.
+    pub fn try_transition_runtime_mode(
+        &self,
+        mode: crate::modes::RuntimeMode,
+    ) -> Result<crate::modes::RuntimeModeSnapshot, RuntimeModeTransitionError> {
+        let targets = self.runtime_mode.snapshot().scope_targets;
+        self.try_transition_runtime_mode_scoped(mode, targets)
+    }
+
+    /// Atomically install a mode and its exact approved target set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before mutation when the target set cannot be bound to
+    /// this run's project or the requested mode is ambiguous/conflicting.
+    pub fn transition_runtime_mode_scoped(
+        &self,
+        mode: crate::modes::RuntimeMode,
+        targets: crate::modes::BehaviorScopeTargets,
+    ) -> Result<crate::modes::RuntimeModeSnapshot, String> {
+        self.try_transition_runtime_mode_scoped(mode, targets)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Atomically install a scoped mode while preserving typed refusal data.
+    ///
+    /// Restrictive transitions do not implicitly destroy user work. They fail
+    /// before publication until the exact run's active shells and workers have
+    /// been explicitly stopped or have completed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error before mutation when validation or the restrictive
+    /// transition precondition fails.
+    pub fn try_transition_runtime_mode_scoped(
+        &self,
+        mode: crate::modes::RuntimeMode,
+        targets: crate::modes::BehaviorScopeTargets,
+    ) -> Result<crate::modes::RuntimeModeSnapshot, RuntimeModeTransitionError> {
+        let _lifecycle = self.background_effect_lifecycle.lock().map_err(|error| {
+            RuntimeModeTransitionError::LifecycleUnavailable {
+                detail: error.to_string(),
+            }
+        })?;
+        let class = self
+            .runtime_mode
+            .validate_scoped_transition(&mode, &targets)
+            .map_err(|detail| RuntimeModeTransitionError::InvalidProfile { detail })?;
+        if matches!(
+            class,
+            crate::modes::RuntimeModeClass::Plan | crate::modes::RuntimeModeClass::ReadOnly
+        ) {
+            let shell_ids = crate::tools::BACKGROUND_SHELLS.active_ids_for_run(self);
+            let agent_ids = crate::subagent::BACKGROUND_AGENTS
+                .active_ids_for_run(self)
+                .map_err(|detail| RuntimeModeTransitionError::LifecycleUnavailable { detail })?;
+            if !shell_ids.is_empty() || !agent_ids.is_empty() {
+                return Err(RuntimeModeTransitionError::InFlightBackgroundEffects {
+                    requested_mode: runtime_mode_name(&mode),
+                    shell_count: shell_ids.len(),
+                    agent_count: agent_ids.len(),
+                    shell_ids,
+                    agent_ids,
+                });
+            }
+        }
+        self.runtime_mode
+            .transition_scoped(mode, targets)
+            .map_err(|detail| RuntimeModeTransitionError::InvalidProfile { detail })
+    }
+
+    /// Serialize final background registration with restrictive transitions.
+    ///
+    /// The mode is rechecked after taking the lifecycle gate, closing the race
+    /// between canonical dispatch admission and process/worker registration.
+    pub(crate) fn begin_background_effect_registration(
+        &self,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<BackgroundEffectRegistration<'_>, String> {
+        let guard = self
+            .background_effect_lifecycle
+            .lock()
+            .map_err(|error| format!("background-effect lifecycle is unavailable: {error}"))?;
+        self.admit_runtime_mode_tool(tool_name, arguments)?;
+        Ok(BackgroundEffectRegistration { _guard: guard })
+    }
+
+    /// Serialize lower-level child-run registration with mode publication.
+    ///
+    /// This covers callers that enter the subagent runner without passing
+    /// through the model-facing `task` adapter.
+    pub(crate) fn begin_child_run_registration(
+        &self,
+    ) -> Result<BackgroundEffectRegistration<'_>, String> {
+        let guard = self
+            .background_effect_lifecycle
+            .lock()
+            .map_err(|error| format!("background-effect lifecycle is unavailable: {error}"))?;
+        let snapshot = self.runtime_mode();
+        if !snapshot.allows_child_runs() {
+            return Err(format!(
+                "Runtime mode '{}' generation {} denies child-run registration",
+                snapshot.display_name(),
+                snapshot.generation
+            ));
+        }
+        Ok(BackgroundEffectRegistration { _guard: guard })
+    }
+
+    /// Validate a prospective mode against this run's current target set
+    /// without changing the installed generation.
+    pub(crate) fn validate_runtime_mode_transition(
+        &self,
+        mode: &crate::modes::RuntimeMode,
+    ) -> Result<(), String> {
+        let _lifecycle = self
+            .background_effect_lifecycle
+            .lock()
+            .map_err(|error| format!("background-effect lifecycle is unavailable: {error}"))?;
+        let class = self.runtime_mode.validate_transition(mode)?;
+        if matches!(
+            class,
+            crate::modes::RuntimeModeClass::Plan | crate::modes::RuntimeModeClass::ReadOnly
+        ) {
+            let shell_ids = crate::tools::BACKGROUND_SHELLS.active_ids_for_run(self);
+            let agent_ids = crate::subagent::BACKGROUND_AGENTS.active_ids_for_run(self)?;
+            if !shell_ids.is_empty() || !agent_ids.is_empty() {
+                return Err(format!(
+                    "cannot enter {} mode while this run owns {} background shell(s) and {} background agent(s)",
+                    runtime_mode_name(mode),
+                    shell_ids.len(),
+                    agent_ids.len()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Serialize a reviewed plan's durable/session publication with the
+    /// exact runtime-mode activation that makes it executable.
+    ///
+    /// The callback runs while the current mode generation and background
+    /// lifecycle are exclusively held. It must perform every fallible
+    /// publication step; only after it succeeds does the mode authority
+    /// install the returned plan binding.
+    pub(crate) fn transition_plan_approval<T>(
+        &self,
+        expected_generation: u64,
+        mode: crate::modes::RuntimeMode,
+        commit: impl FnOnce(u64) -> Result<(T, crate::modes::PlanExecutionBinding), String>,
+    ) -> Result<(crate::modes::RuntimeModeSnapshot, T), String> {
+        let _lifecycle = self
+            .background_effect_lifecycle
+            .lock()
+            .map_err(|error| format!("background-effect lifecycle is unavailable: {error}"))?;
+        if self.runtime.cancellation().is_cancelled() {
+            return Err("cancelled run cannot activate plan execution authority".to_string());
+        }
+        let shell_ids = crate::tools::BACKGROUND_SHELLS.active_ids_for_run(self);
+        let agent_ids = crate::subagent::BACKGROUND_AGENTS.active_ids_for_run(self)?;
+        if !shell_ids.is_empty() || !agent_ids.is_empty() {
+            return Err(format!(
+                "plan approval cannot activate while this run owns {} background shell(s) and {} background agent(s)",
+                shell_ids.len(),
+                agent_ids.len()
+            ));
+        }
+        self.runtime_mode
+            .transition_plan_approval(expected_generation, mode, commit)
+    }
+
+    /// Enforce the active mode against a concrete classified tool call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the call is malformed, unclassified, or denied
+    /// by the current runtime mode.
+    pub fn admit_runtime_mode_tool(
+        &self,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<(), String> {
+        let snapshot = self.runtime_mode();
+        if snapshot.class == crate::modes::RuntimeModeClass::Standard
+            && snapshot.approved_plan().is_none()
+            && matches!(
+                &snapshot.mode,
+                crate::modes::RuntimeMode::Behavioral(mode)
+                    if mode.scope == crate::modes::Scope::Adjacent
+            )
+            && !snapshot.scope_targets.is_explicit()
+        {
+            return Ok(());
+        }
+        let resolved = super::effect::resolve_for_call(tool_name, arguments)
+            .map_err(|error| error.reason())?;
+        self.admit_runtime_mode_resolved(tool_name, &resolved, arguments)
+    }
+
+    /// Re-check mode authority at the final effect reservation boundary.
+    pub(crate) fn admit_runtime_mode_resolved(
+        &self,
+        tool_name: &str,
+        resolved: &super::effect::ResolvedEffect,
+        arguments: &serde_json::Value,
+    ) -> Result<(), String> {
+        let canonical_path = if matches!(
+            resolved.target_kind,
+            super::effect::ToolTargetKind::Path | super::effect::ToolTargetKind::PathScope
+        ) {
+            Some(super::resolve_capability_path(self, &resolved.target)?)
+        } else {
+            None
+        };
+        self.runtime_mode.admit_resolved_tool_for_run(
+            self,
+            tool_name,
+            resolved,
+            canonical_path.as_deref(),
+            arguments,
+            &self.agent_plan_file,
+        )
+    }
+
+    /// Gate effectful frontend shortcuts that bypass the model tool dispatcher.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the current runtime mode denies direct effects.
+    pub fn admit_runtime_mode_direct_operation(&self, operation: &str) -> Result<(), String> {
+        self.runtime_mode
+            .admit_direct_operation_for_run(self, operation)
+    }
+
+    pub(crate) fn validate_plan_execution(
+        &self,
+        binding: &crate::modes::PlanExecutionBinding,
+        tool_name: &str,
+        effect: super::effect::ToolEffect,
+    ) -> Result<(), String> {
+        if binding.run_id != self.run_id()
+            || binding.capability_generation != self.generation.get()
+            || binding.capability_manifest_digest
+                != self
+                    .runtime
+                    .descriptor()
+                    .capabilities
+                    .manifest_digest
+                    .to_string()
+        {
+            return Err(
+                "approved plan belongs to a different run capability generation".to_string(),
+            );
+        }
+        if binding.task_graph_generation == 0 {
+            return Err("approved plan lacks a committed canonical task generation".to_string());
+        }
+        if self.runtime.cancellation().is_cancelled() {
+            return Err("approved plan authority was invalidated by run cancellation".to_string());
+        }
+        if chrono::Utc::now() >= binding.expires_at {
+            return Err("approved plan authority has expired".to_string());
+        }
+        let budget = self
+            .budget()
+            .snapshot()
+            .map_err(|error| format!("approved plan budget is unavailable: {error}"))?;
+        if budget.generation.get() != binding.budget_generation
+            || budget.limits != binding.budget_limits
+        {
+            return Err("approved plan budget generation or limits changed".to_string());
+        }
+        if binding.plan_realpath != self.agent_plan_file {
+            return Err("approved plan artifact path no longer matches this run".to_string());
+        }
+        let (_, content) = crate::tools::read_capability_text_attachment(
+            self,
+            &binding.plan_realpath.to_string_lossy(),
+        )
+        .map_err(|error| format!("approved plan artifact cannot be re-read: {error}"))?;
+        let digest = crate::runtime::ContentDigest::sha256(content.as_bytes()).to_string();
+        if digest.strip_prefix("sha256:") != Some(binding.plan_digest.as_str()) {
+            return Err("approved plan artifact changed after activation".to_string());
+        }
+        if !binding.allows_effect(tool_name, effect) {
+            return Err(format!(
+                "approved plan artifact {} does not grant effect {} through tool '{}'",
+                binding.artifact_digest,
+                effect.as_str(),
+                tool_name
+            ));
+        }
+        Ok(())
     }
 
     /// Session identifier that owns these capabilities.
     #[must_use]
     pub fn session_id(&self) -> &str {
-        &self.session_id
+        self.runtime.descriptor().session_id.as_str()
+    }
+
+    /// Provider identity captured when this immutable run was created.
+    #[must_use]
+    pub fn provider_id(&self) -> &str {
+        match &self.runtime.descriptor().provider_continuation {
+            crate::runtime::ProviderContinuation::Fresh { provider }
+            | crate::runtime::ProviderContinuation::Resume { provider, .. } => provider.as_str(),
+        }
+    }
+
+    /// Stable logical owner label for model-facing process lifecycle tools.
+    #[must_use]
+    pub fn process_owner(&self) -> &str {
+        &self.process_owner
+    }
+
+    /// Reality-ledger bucket that owns authoritative observations for this run.
+    #[must_use]
+    pub(crate) fn evidence_session_key(&self) -> &str {
+        &self.evidence_session_key
+    }
+
+    /// Active isolated-workspace descriptor, if this run is rebound.
+    #[must_use]
+    pub const fn isolated_workspace(&self) -> Option<&IsolatedWorkspaceDescriptor> {
+        self.isolated_workspace.as_ref()
+    }
+
+    /// Private main-tree capability used only by the transactional worktree
+    /// lifecycle handler while the user-visible parent generation is suspended.
+    pub(crate) fn workspace_control_run(&self) -> &Self {
+        self.workspace_control.as_deref().unwrap_or(self)
+    }
+
+    /// Admit one operation against this exact workspace generation.
+    ///
+    /// The returned guard prevents enter/exit publication until the operation
+    /// finishes. It owns only an `Arc`, so it remains safe across async waits.
+    pub(crate) fn begin_workspace_operation(
+        &self,
+    ) -> Result<WorkspaceOperationGuard, ToolCapabilityError> {
+        self.require_active_workspace_generation()?;
+        let mut state = self
+            .workspace_transition_gate
+            .state
+            .lock()
+            .map_err(|error| ToolCapabilityError::BindingMismatch {
+                detail: format!("workspace transition gate is unavailable: {error}"),
+            })?;
+        if state.transitioning {
+            return Err(ToolCapabilityError::BindingMismatch {
+                detail: "workspace generation is currently transitioning".to_string(),
+            });
+        }
+        self.require_active_workspace_generation()?;
+        state.active_operations = state.active_operations.saturating_add(1);
+        drop(state);
+        Ok(WorkspaceOperationGuard {
+            gate: Arc::clone(&self.workspace_transition_gate),
+        })
+    }
+
+    /// Atomically publish a trusted enter/exit transition after its tool call
+    /// has completed and all ordinary calls on the source generation drained.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal for forged/stale ownership, active background
+    /// effects, removed/replaced roots, or invalid lifecycle order.
+    #[allow(clippy::too_many_lines)] // Keep authentication and lifecycle publication in one auditable transaction.
+    pub fn apply_workspace_transition(
+        current: &Arc<Self>,
+        transition: &crate::tools::WorkspaceTransition,
+    ) -> Result<Arc<Self>, WorkspaceTransitionError> {
+        if transition.source_run() != current.run_id()
+            || transition.source_generation() != current.generation()
+        {
+            return Err(WorkspaceTransitionError::WrongSource(format!(
+                "expected run {} generation {}, got run {} generation {}",
+                current.run_id(),
+                current.generation(),
+                transition.source_run(),
+                transition.source_generation()
+            )));
+        }
+        let require_live_root = matches!(
+            transition.kind(),
+            crate::tools::WorkspaceTransitionKind::Enter
+        );
+        let lease = current.begin_workspace_transition(require_live_root)?;
+        let descriptor = transition.descriptor();
+        let result = match transition.kind() {
+            crate::tools::WorkspaceTransitionKind::Enter => {
+                if current.isolated_workspace.is_some() {
+                    return Err(WorkspaceTransitionError::LifecycleConflict(
+                        "enter_worktree cannot replace an already isolated generation".to_string(),
+                    ));
+                }
+                if descriptor.owner_session().as_str() != current.session_id()
+                    || descriptor.owner_run() != current.run_id()
+                    || descriptor.owner_actor() != current.runtime.descriptor().actor.id
+                    || descriptor.repository_root() != current.project_root()
+                {
+                    return Err(WorkspaceTransitionError::WrongSource(
+                        "descriptor owner or repository root differs from the source run"
+                            .to_string(),
+                    ));
+                }
+                validate_isolated_workspace_roots(descriptor)
+                    .map_err(WorkspaceTransitionError::StaleWorkspace)?;
+                current.reject_background_workspace_transition()?;
+                let replacement = current
+                    .derive_isolated_workspace(descriptor.clone())
+                    .map_err(WorkspaceTransitionError::Construction)?;
+                current
+                    .workspace_lifecycle
+                    .compare_exchange(
+                        WORKSPACE_RUN_ACTIVE,
+                        WORKSPACE_RUN_SUSPENDED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .map_err(|state| {
+                        WorkspaceTransitionError::LifecycleConflict(format!(
+                            "source generation is {}",
+                            workspace_lifecycle_name(state)
+                        ))
+                    })?;
+                replacement
+            }
+            crate::tools::WorkspaceTransitionKind::Exit => {
+                let Some(bound) = current.isolated_workspace.as_ref() else {
+                    return Err(WorkspaceTransitionError::LifecycleConflict(
+                        "exit_worktree transition requires an isolated generation".to_string(),
+                    ));
+                };
+                if bound != descriptor {
+                    return Err(WorkspaceTransitionError::WrongSource(
+                        "exit descriptor differs from the active isolated capability".to_string(),
+                    ));
+                }
+                current.reject_background_workspace_transition()?;
+                let parent = current.workspace_parent.as_ref().ok_or_else(|| {
+                    WorkspaceTransitionError::LifecycleConflict(
+                        "isolated generation has no retained parent".to_string(),
+                    )
+                })?;
+                current
+                    .workspace_lifecycle
+                    .compare_exchange(
+                        WORKSPACE_RUN_ACTIVE,
+                        WORKSPACE_RUN_RETIRED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .map_err(|state| {
+                        WorkspaceTransitionError::LifecycleConflict(format!(
+                            "isolated generation is {}",
+                            workspace_lifecycle_name(state)
+                        ))
+                    })?;
+                if let Err(state) = parent.workspace_lifecycle.compare_exchange(
+                    WORKSPACE_RUN_SUSPENDED,
+                    WORKSPACE_RUN_ACTIVE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    current
+                        .workspace_lifecycle
+                        .store(WORKSPACE_RUN_ACTIVE, Ordering::Release);
+                    return Err(WorkspaceTransitionError::LifecycleConflict(format!(
+                        "retained parent generation is {}",
+                        workspace_lifecycle_name(state)
+                    )));
+                }
+                Arc::clone(parent)
+            }
+        };
+        drop(lease);
+        Ok(result)
+    }
+
+    /// Reacquire a persisted isolated workspace for a freshly constructed
+    /// session run. Repository identity is inspected again and ownership is
+    /// rebound to the new run before the ordinary enter transition executes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when persisted identity, ownership, repository
+    /// state, or lifecycle publication can no longer be validated.
+    pub fn resume_isolated_workspace(
+        current: &Arc<Self>,
+        persisted: &IsolatedWorkspaceDescriptor,
+    ) -> Result<Arc<Self>, WorkspaceTransitionError> {
+        let rebound = super::worktree::rebind_workspace_descriptor(current, persisted)
+            .map_err(WorkspaceTransitionError::StaleWorkspace)?;
+        let transition = crate::tools::WorkspaceTransition::enter(
+            current.run_id(),
+            current.generation(),
+            rebound,
+        );
+        Self::apply_workspace_transition(current, &transition)
+    }
+
+    fn begin_workspace_transition(
+        &self,
+        require_live_root: bool,
+    ) -> Result<WorkspaceTransitionLease, WorkspaceTransitionError> {
+        self.require_active_workspace_lifecycle().map_err(|state| {
+            WorkspaceTransitionError::LifecycleConflict(format!("source generation is {state}"))
+        })?;
+        if require_live_root {
+            self.require_active_workspace_generation()
+                .map_err(|error| WorkspaceTransitionError::LifecycleConflict(error.to_string()))?;
+        }
+        let gate = Arc::clone(&self.workspace_transition_gate);
+        let mut state = gate
+            .state
+            .lock()
+            .map_err(|error| WorkspaceTransitionError::GateUnavailable(error.to_string()))?;
+        if state.transitioning {
+            return Err(WorkspaceTransitionError::LifecycleConflict(
+                "another workspace transition is already in progress".to_string(),
+            ));
+        }
+        self.require_active_workspace_lifecycle().map_err(|state| {
+            WorkspaceTransitionError::LifecycleConflict(format!("source generation is {state}"))
+        })?;
+        state.transitioning = true;
+        while state.active_operations != 0 {
+            state = gate
+                .changed
+                .wait(state)
+                .map_err(|error| WorkspaceTransitionError::GateUnavailable(error.to_string()))?;
+        }
+        drop(state);
+        Ok(WorkspaceTransitionLease { gate })
+    }
+
+    fn reject_background_workspace_transition(&self) -> Result<(), WorkspaceTransitionError> {
+        let _lifecycle = self.background_effect_lifecycle.lock().map_err(|error| {
+            WorkspaceTransitionError::LifecycleConflict(format!(
+                "background-effect lifecycle is unavailable: {error}"
+            ))
+        })?;
+        let shell_ids = crate::tools::BACKGROUND_SHELLS.active_ids_for_run(self);
+        let agent_ids = crate::subagent::BACKGROUND_AGENTS
+            .active_ids_for_run(self)
+            .map_err(WorkspaceTransitionError::LifecycleConflict)?;
+        if shell_ids.is_empty() && agent_ids.is_empty() {
+            Ok(())
+        } else {
+            Err(WorkspaceTransitionError::InFlightBackgroundEffects {
+                shell_ids,
+                agent_ids,
+            })
+        }
+    }
+
+    fn require_active_workspace_generation(&self) -> Result<(), ToolCapabilityError> {
+        self.require_active_workspace_lifecycle().map_err(|state| {
+            ToolCapabilityError::InactiveWorkspaceGeneration {
+                run_id: self.run_id(),
+                generation: self.generation,
+                state,
+            }
+        })?;
+        if let Some(descriptor) = self.isolated_workspace.as_ref() {
+            validate_isolated_workspace_roots(descriptor)
+                .map_err(|detail| ToolCapabilityError::StaleWorkspace { detail })?;
+        }
+        Ok(())
+    }
+
+    fn require_active_workspace_lifecycle(&self) -> Result<(), &'static str> {
+        let state = self.workspace_lifecycle.load(Ordering::Acquire);
+        if state != WORKSPACE_RUN_ACTIVE {
+            return Err(workspace_lifecycle_name(state));
+        }
+        Ok(())
+    }
+
+    /// Require one concrete resource or return a typed unavailable error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolCapabilityError::BindingMismatch`] when the immutable
+    /// descriptor no longer matches its concrete resources, or
+    /// [`ToolCapabilityError::Unavailable`] when the requested grant is absent.
+    pub fn require(&self, resource: ToolResource) -> Result<(), ToolCapabilityError> {
+        self.require_active_workspace_generation()?;
+        if let Err(error) = self.validate_binding() {
+            tracing::error!(
+                target: "openclaudia::capabilities",
+                event = "capability_binding_mismatch",
+                run_id = %self.run_id(),
+                generation = %self.generation,
+                detail = %error,
+                "Rejected an invalid run capability binding"
+            );
+            return Err(error);
+        }
+        let available = self.grants_resource(resource);
+        if available {
+            Ok(())
+        } else {
+            tracing::warn!(
+                target: "openclaudia::capabilities",
+                event = "capability_unavailable",
+                run_id = %self.run_id(),
+                generation = %self.generation,
+                resource = ?resource,
+                "Denied unavailable run resource"
+            );
+            Err(ToolCapabilityError::Unavailable {
+                resource,
+                run_id: self.run_id(),
+                generation: self.generation,
+            })
+        }
+    }
+
+    /// Inspect an already-validated immutable grant without recording a denied
+    /// access attempt.
+    ///
+    /// This is crate-visible only for deriving a child run's authority. Tool
+    /// and helper boundaries must call [`Self::require`] so an actual denied
+    /// operation produces a typed error and trace event.
+    #[must_use]
+    pub(crate) fn grants_resource(&self, resource: ToolResource) -> bool {
+        let kind = match resource {
+            ToolResource::WorkspaceRead => CapabilityKind::WorkspaceRead,
+            ToolResource::WorkspaceWrite => CapabilityKind::WorkspaceWrite,
+            ToolResource::Process => CapabilityKind::Process,
+            ToolResource::Network => CapabilityKind::Network,
+            ToolResource::Secrets => CapabilityKind::Secrets,
+            ToolResource::Memory => CapabilityKind::Memory,
+            ToolResource::Mcp => CapabilityKind::Mcp,
+        };
+        self.runtime
+            .descriptor()
+            .capabilities
+            .grants
+            .contains(&kind)
+    }
+
+    fn validate_binding(&self) -> Result<(), ToolCapabilityError> {
+        let descriptor = self.runtime.descriptor();
+        if descriptor.capabilities.generation != self.generation {
+            return Err(ToolCapabilityError::BindingMismatch {
+                detail: "capability generation differs".to_string(),
+            });
+        }
+        if descriptor.workspace.root() != self.project_root {
+            return Err(ToolCapabilityError::BindingMismatch {
+                detail: "workspace root differs".to_string(),
+            });
+        }
+        if descriptor.workspace.generation.get() != self.generation.get() {
+            return Err(ToolCapabilityError::BindingMismatch {
+                detail: "workspace generation differs".to_string(),
+            });
+        }
+        if let Some(isolated) = self.isolated_workspace.as_ref() {
+            if isolated.workspace_root() != self.project_root
+                || isolated.owner_session().as_str() != self.session_id()
+                || self.workspace_parent.is_none()
+                || self.workspace_control.is_none()
+            {
+                return Err(ToolCapabilityError::BindingMismatch {
+                    detail: "isolated workspace descriptor differs from concrete run resources"
+                        .to_string(),
+                });
+            }
+        } else if self.workspace_parent.is_some() || self.workspace_control.is_some() {
+            return Err(ToolCapabilityError::BindingMismatch {
+                detail: "workspace parent exists without an isolated descriptor".to_string(),
+            });
+        }
+        let grants = &descriptor.capabilities.grants;
+        let binding_pairs = [
+            (
+                CapabilityKind::WorkspaceWrite,
+                self.read_write_roots
+                    .iter()
+                    .any(|root| path_is_within(&self.project_root, root)),
+            ),
+            (CapabilityKind::Process, self.process_available),
+            (CapabilityKind::Network, self.network_available),
+            (CapabilityKind::Secrets, self.secrets_available),
+        ];
+        for (kind, available) in binding_pairs {
+            if grants.contains(&kind) != available {
+                return Err(ToolCapabilityError::BindingMismatch {
+                    detail: format!("{kind:?} availability differs from descriptor grant"),
+                });
+            }
+        }
+        let expected_manifest = capability_manifest_digest(
+            descriptor.run_id,
+            self.generation,
+            &self.project_root,
+            &self.working_directory,
+            self.private_temp.path(),
+            &self.read_only_roots,
+            &self.read_write_roots,
+            &self.denied_paths,
+            &self.agent_plan_file,
+            &self.environment_grants,
+            &self.mcp_environment_grants,
+            self.remote_actions.authority_digest(),
+            self.web_egress_grants.authority_digest(),
+            &self.executable_search_path,
+            self.host_home.as_deref(),
+            self.network_policy,
+            grants,
+            &self.process_owner,
+            &self.evidence_session_key,
+            self.isolated_workspace.as_ref(),
+        );
+        if descriptor.capabilities.manifest_digest != expected_manifest {
+            return Err(ToolCapabilityError::BindingMismatch {
+                detail: "capability manifest digest differs".to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Canonical immutable project root.
@@ -131,6 +1909,185 @@ impl ToolSecurityContext {
     #[must_use]
     pub fn private_temp_root(&self) -> &Path {
         self.private_temp.path()
+    }
+
+    pub(crate) fn background_job_storage_root(&self) -> Result<PathBuf, String> {
+        match self.background_job_storage {
+            BackgroundJobStorage::Ephemeral => Ok(self.private_temp.path().join("background-jobs")),
+            BackgroundJobStorage::Durable => dirs::data_local_dir()
+                .or_else(dirs::data_dir)
+                .map(|root| root.join("openclaudia").join("background-jobs"))
+                .ok_or_else(|| {
+                    "Cannot resolve a host user-data directory for background-job state".to_string()
+                }),
+        }
+    }
+
+    /// Derive a new frontend session from this run's immutable authority.
+    ///
+    /// The requested project and working directory must already be contained
+    /// by this run's filesystem grants. Intrinsic roots owned by the parent
+    /// generation are replaced with roots for the child generation, while
+    /// operator-provided additional roots and all non-filesystem grants are
+    /// copied exactly. No process environment or current directory is read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either requested directory is outside the parent
+    /// authority or the derived capability cannot be pinned and validated.
+    pub fn derive_frontend_session(
+        &self,
+        session_id: SessionId,
+        project_root: &Path,
+        working_directory: &Path,
+        provider: &str,
+    ) -> Result<Arc<Self>, String> {
+        let project_root = canonical_directory(project_root, "derived project root")?;
+        let working_directory =
+            canonical_directory(working_directory, "derived working directory")?;
+        let workspace_access = if self.grants_resource(ToolResource::WorkspaceWrite) {
+            WorkspaceAccess::ReadWrite
+        } else {
+            WorkspaceAccess::ReadOnly
+        };
+        let permits_workspace = |path: &Path| match workspace_access {
+            WorkspaceAccess::ReadOnly => self.permits_read(path),
+            WorkspaceAccess::ReadWrite => self.permits_write(path),
+        };
+        if !permits_workspace(&project_root) {
+            return Err(format!(
+                "Derived project root '{}' is outside the parent run's {:?} workspace authority",
+                project_root.display(),
+                workspace_access
+            ));
+        }
+        if !permits_workspace(&working_directory) {
+            return Err(format!(
+                "Derived working directory '{}' is outside the parent run's {:?} workspace authority",
+                working_directory.display(),
+                workspace_access
+            ));
+        }
+
+        self.build_derived_frontend(
+            session_id,
+            &project_root,
+            &working_directory,
+            provider,
+            None,
+        )
+    }
+
+    fn derive_isolated_workspace(
+        self: &Arc<Self>,
+        descriptor: IsolatedWorkspaceDescriptor,
+    ) -> Result<Arc<Self>, String> {
+        descriptor.validate().map_err(|error| error.to_string())?;
+        validate_isolated_workspace_roots(&descriptor)?;
+        if descriptor.owner_session().as_str() != self.session_id()
+            || descriptor.owner_run() != self.run_id()
+            || descriptor.owner_actor() != self.runtime.descriptor().actor.id
+            || descriptor.owner_label() != self.process_owner()
+        {
+            return Err("isolated workspace descriptor does not belong to this run".to_string());
+        }
+        let workspace_root = descriptor.workspace_root().to_path_buf();
+        let permitted = if self.grants_resource(ToolResource::WorkspaceWrite) {
+            self.permits_write(&workspace_root)
+        } else {
+            self.permits_read(&workspace_root)
+        };
+        if !permitted {
+            return Err(format!(
+                "isolated workspace '{}' is outside the source run authority",
+                workspace_root.display()
+            ));
+        }
+        let control = self.build_derived_frontend(
+            self.runtime.descriptor().session_id.clone(),
+            &self.project_root,
+            &self.working_directory,
+            self.provider_id(),
+            None,
+        )?;
+        self.build_derived_frontend(
+            self.runtime.descriptor().session_id.clone(),
+            &workspace_root,
+            &workspace_root,
+            self.provider_id(),
+            Some((descriptor, Arc::clone(self), control)),
+        )
+    }
+
+    fn build_derived_frontend(
+        &self,
+        session_id: SessionId,
+        project_root: &Path,
+        working_directory: &Path,
+        provider: &str,
+        isolated: Option<(IsolatedWorkspaceDescriptor, Arc<Self>, Arc<Self>)>,
+    ) -> Result<Arc<Self>, String> {
+        let workspace_access = if self.grants_resource(ToolResource::WorkspaceWrite) {
+            WorkspaceAccess::ReadWrite
+        } else {
+            WorkspaceAccess::ReadOnly
+        };
+        let is_parent_intrinsic_root = |root: &&PathBuf| {
+            root.as_path() == self.project_root || root.as_path() == self.private_temp.path()
+        };
+        let read_only_roots = self
+            .read_only_roots
+            .iter()
+            .filter(|root| !is_parent_intrinsic_root(root))
+            .cloned()
+            .collect();
+        let read_write_roots = self
+            .read_write_roots
+            .iter()
+            .filter(|root| !is_parent_intrinsic_root(root))
+            .cloned()
+            .collect();
+        let process_owner = session_id.as_str().to_string();
+        let runtime_mode = self.runtime_mode();
+
+        let mut builder = Self::builder(session_id, project_root)
+            .working_directory(working_directory)
+            .read_only_roots(read_only_roots)
+            .read_write_roots(read_write_roots)
+            .project_secret_masks(self.project_secret_masks.clone())
+            .protected_environment_grants(self.environment_grants.clone())
+            .protected_mcp_environment_grants(self.mcp_environment_grants.clone())
+            .executable_search_path(&self.executable_search_path)
+            .host_home(self.host_home.clone())
+            .skill_access(self.skill_access.clone())
+            .remote_actions(self.remote_actions.registry().clone())
+            .web_egress_grants(self.web_egress_grants.clone())
+            .workspace_access(workspace_access)
+            .process(self.grants_resource(ToolResource::Process))
+            .network(self.grants_resource(ToolResource::Network))
+            .secrets(self.grants_resource(ToolResource::Secrets))
+            .process_owner(process_owner)
+            .evidence_session_key(self.evidence_session_key.clone())
+            .actor_role(ActorRole::Frontend)
+            .provider(provider)
+            .budget_limits(self.runtime.descriptor().budget.limits.clone())
+            .parent_budget(self.runtime.budget().clone())
+            .runtime_mode(runtime_mode.mode)
+            .behavior_scope_targets(runtime_mode.scope_targets)
+            .background_job_storage(self.background_job_storage);
+        if let Some((descriptor, parent, control)) = isolated {
+            builder = builder.isolated_workspace_binding(
+                descriptor,
+                parent,
+                control,
+                Arc::clone(&self.workspace_transition_gate),
+            );
+        }
+        let child = builder.build()?;
+        child
+            .lsp_service()
+            .configure_plugins(self.lsp_service.plugin_servers());
+        Ok(child)
     }
 
     /// Whether a canonical path is readable by this session.
@@ -172,10 +2129,155 @@ impl ToolSecurityContext {
         &self.denied_paths
     }
 
+    /// The only masked project-control file exposed to this exact run.
+    ///
+    /// Plan-mode dispatch separately restricts writes to this path. Binding
+    /// it to the immutable session identity prevents one concurrent session
+    /// from reading or mutating another session's plan.
+    #[must_use]
+    pub fn agent_plan_file(&self) -> &Path {
+        &self.agent_plan_file
+    }
+
+    /// Project-relative masks inherited by derived run generations.
+    #[must_use]
+    pub fn project_secret_masks(&self) -> &[PathBuf] {
+        &self.project_secret_masks
+    }
+
     /// Exact host-approved environment values inherited by agent processes.
     #[must_use]
-    pub const fn environment_grants(&self) -> &HashMap<String, String> {
+    pub const fn environment_grants(&self) -> &crate::secrets::EnvironmentGrants {
         &self.environment_grants
+    }
+
+    /// Exact host-approved values available only to trusted MCP server
+    /// configuration for this run generation.
+    #[must_use]
+    pub const fn mcp_environment_grants(&self) -> &crate::secrets::EnvironmentGrants {
+        &self.mcp_environment_grants
+    }
+
+    /// Sanitize untrusted process/provider diagnostics against every secret
+    /// capability bound to this run generation.
+    #[must_use]
+    pub fn sanitize_diagnostic(&self, raw: &str) -> crate::secrets::SafeDiagnostic {
+        let environment_safe = self.environment_grants.sanitize_diagnostic(raw);
+        self.mcp_environment_grants
+            .sanitize_diagnostic(environment_safe.as_str())
+    }
+
+    /// Exact executable search path captured when this run was constructed.
+    #[must_use]
+    pub fn executable_search_path(&self) -> &OsStr {
+        &self.executable_search_path
+    }
+
+    /// Host-home path captured at composition time for local toolchain mounts.
+    ///
+    /// The sandbox never exposes this directory wholesale. It may bind only
+    /// conventional Cargo binary/registry and Rustup subtrees read-only.
+    #[must_use]
+    pub fn host_home(&self) -> Option<&Path> {
+        self.host_home.as_deref()
+    }
+
+    /// Skill roots and repository trust captured for this run generation.
+    #[must_use]
+    pub const fn skill_access(&self) -> &crate::skills::SkillRunAccess {
+        &self.skill_access
+    }
+
+    /// Exact host-owned named actions bound to this run generation.
+    #[must_use]
+    pub const fn remote_actions(&self) -> &super::remote_trigger::RemoteActionService {
+        &self.remote_actions
+    }
+
+    /// Exact private/local web origins bound to this run generation.
+    #[must_use]
+    pub const fn web_egress_grants(&self) -> &crate::web_egress::WebEgressGrants {
+        &self.web_egress_grants
+    }
+
+    /// Record a project-relative file touched by a real workspace operation.
+    ///
+    /// Conditional skill activation consults this bounded set. Paths outside
+    /// the exact project capability and control-directory paths are ignored.
+    pub(crate) fn record_skill_path_touch(&self, path: &Path) {
+        const MAX_TOUCHED_PATHS: usize = 256;
+
+        let supplied = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.working_directory.join(path)
+        };
+        let resolved = supplied
+            .canonicalize()
+            .unwrap_or_else(|_| normalize_lexical_path(&supplied));
+        let Ok(relative) = resolved.strip_prefix(&self.project_root) else {
+            return;
+        };
+        if relative.as_os_str().is_empty() || self.is_denied_path(&resolved) {
+            return;
+        }
+        let mut touched = self
+            .skill_touched_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if touched.len() < MAX_TOUCHED_PATHS || touched.contains(relative) {
+            touched.insert(relative.to_path_buf());
+            drop(touched);
+        } else {
+            drop(touched);
+            tracing::warn!(
+                target: "openclaudia::skills",
+                event = "skill_touched_path_limit",
+                max_touched_paths = MAX_TOUCHED_PATHS,
+                "Conditional skill path tracking reached its run ceiling"
+            );
+        }
+    }
+
+    /// Snapshot project-relative paths available to conditional skills.
+    #[must_use]
+    pub(crate) fn skill_touched_paths(&self) -> Vec<PathBuf> {
+        self.skill_touched_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Resolve an executable using only the immutable search path captured by
+    /// this run.
+    ///
+    /// This is the sole resolver for process-capability helpers. It prevents a
+    /// later mutation of the host process environment from redirecting an
+    /// agent subprocess and fails with the same typed unavailable error used
+    /// by tool dispatch when this run has no process authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolExecutableError::Capability`] when process execution is
+    /// unavailable, or [`ToolExecutableError::Resolve`] when the program is
+    /// absent from the captured search path.
+    pub fn resolve_executable(
+        &self,
+        executable: impl AsRef<OsStr>,
+    ) -> Result<PathBuf, ToolExecutableError> {
+        self.require(ToolResource::Process)?;
+        let executable = executable.as_ref();
+        which::which_in(
+            executable,
+            Some(&self.executable_search_path),
+            &self.working_directory,
+        )
+        .map_err(|source| ToolExecutableError::Resolve {
+            executable: executable.to_string_lossy().into_owned(),
+            source,
+        })
     }
 
     /// Immutable session network policy.
@@ -187,17 +2289,19 @@ impl ToolSecurityContext {
     /// Whether a path names or descends from a masked control/secret subtree.
     #[must_use]
     pub fn is_denied_path(&self, path: &Path) -> bool {
-        self.denied_paths
-            .iter()
-            .any(|denied| path == denied || path.starts_with(denied))
+        path != self.agent_plan_file
+            && self
+                .denied_paths
+                .iter()
+                .any(|denied| path_is_within(path, denied))
     }
 
-    /// Return the longest matching pre-opened Linux capability-root handle.
+    /// Return the longest matching pre-opened capability-root handle.
     ///
     /// Root descriptors are pinned when the session is created. File tools
     /// must anchor authoritative lookups to these descriptors rather than
     /// reopening a root by pathname after policy validation.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn root_handle_for(
         &self,
         path: &Path,
@@ -211,10 +2315,7 @@ impl ToolSecurityContext {
         }
         self.root_handles
             .iter()
-            .filter(|root| {
-                (!write || root.writable)
-                    && (path == root.path.as_path() || path.starts_with(&root.path))
-            })
+            .filter(|root| (!write || root.writable) && path_is_within(path, &root.path))
             .max_by_key(|root| root.path.components().count())
             .map(|root| (root.path.as_path(), &root.directory))
             .ok_or_else(|| {
@@ -222,6 +2323,40 @@ impl ToolSecurityContext {
                 format!(
                     "Path '{}' is outside the session's {access} capability roots",
                     path.display()
+                )
+            })
+    }
+
+    /// Return the pinned project-root handle for host-owned control state.
+    ///
+    /// Agent file tools must use [`Self::root_handle_for`], which rejects
+    /// `.openclaudia`, `.claude`, and configured secret masks. Frontend
+    /// lifecycle code occasionally needs to maintain files inside those
+    /// masked subtrees (for example plan-mode and branch snapshots). This
+    /// separate boundary keeps that authority explicit and refuses paths that
+    /// are either outside the exact run project or not masked control state.
+    #[cfg(any(unix, windows))]
+    pub(crate) fn host_control_root_handle_for(
+        &self,
+        path: &Path,
+        write: bool,
+    ) -> Result<(&Path, &std::fs::File), String> {
+        if !self.is_denied_path(path) || !path_is_within(path, &self.project_root) {
+            return Err(format!(
+                "Path '{}' is not host-owned control state for run project '{}'",
+                path.display(),
+                self.project_root.display()
+            ));
+        }
+        self.root_handles
+            .iter()
+            .find(|root| root.path == self.project_root && (!write || root.writable))
+            .map(|root| (root.path.as_path(), &root.directory))
+            .ok_or_else(|| {
+                let access = if write { "writable" } else { "readable" };
+                format!(
+                    "Run project '{}' has no pinned {access} host-control capability",
+                    self.project_root.display()
                 )
             })
     }
@@ -254,39 +2389,265 @@ impl ToolSecurityContext {
     }
 }
 
-fn restricted_project_paths(project_root: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut denied = vec![
-        project_root.join(".openclaudia"),
-        project_root.join(".claude"),
-    ];
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+const fn workspace_lifecycle_name(state: u8) -> &'static str {
+    match state {
+        WORKSPACE_RUN_ACTIVE => "active",
+        WORKSPACE_RUN_SUSPENDED => "suspended",
+        WORKSPACE_RUN_RETIRED => "retired",
+        _ => "invalid",
+    }
+}
+
+fn validate_isolated_workspace_roots(
+    descriptor: &IsolatedWorkspaceDescriptor,
+) -> Result<(), String> {
+    descriptor.validate().map_err(|error| error.to_string())?;
+    let repository_root = std::fs::canonicalize(descriptor.repository_root()).map_err(|error| {
+        format!(
+            "cannot resolve repository root '{}': {error}",
+            descriptor.repository_root().display()
+        )
+    })?;
+    let workspace_root = std::fs::canonicalize(descriptor.workspace_root()).map_err(|error| {
+        format!(
+            "cannot resolve isolated root '{}': {error}",
+            descriptor.workspace_root().display()
+        )
+    })?;
+    if repository_root != descriptor.repository_root()
+        || workspace_root != descriptor.workspace_root()
+    {
+        return Err("isolated workspace roots no longer resolve to their bound paths".to_string());
+    }
+    let repository_id = crate::persistence::PersistentStorage::open(&repository_root)
+        .map_err(|error| format!("cannot pin repository root: {error}"))?
+        .root_id();
+    let workspace_id = crate::persistence::PersistentStorage::open(&workspace_root)
+        .map_err(|error| format!("cannot pin isolated root: {error}"))?
+        .root_id();
+    if repository_id != descriptor.repository_root_id()
+        || workspace_id != descriptor.workspace_root_id()
+    {
+        return Err("isolated workspace root identity changed".to_string());
+    }
+    Ok(())
+}
+
+impl Drop for ToolRunContext {
+    fn drop(&mut self) {
+        if self.isolated_workspace.is_some() {
+            let _ = super::worktree::release_workspace_descriptor_owner(self);
+        }
+        self.lsp_service.shutdown();
+        // The last `Arc` is the run lifecycle boundary. Remove the exact-run
+        // read-before-edit bucket so completed runs cannot accumulate process-
+        // global path observations or leave authority-looking residue behind.
+        super::file::READ_TRACKER.clear_run(self);
+        crate::guardrails::release_run(self);
+    }
+}
+
+fn next_capability_generation() -> Result<CapabilityGeneration, String> {
+    let generation = NEXT_CAPABILITY_GENERATION
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| "run capability generation space exhausted".to_string())?;
+    CapabilityGeneration::new(generation)
+        .ok_or_else(|| "run capability generation must be non-zero".to_string())
+}
+
+#[allow(clippy::too_many_arguments)] // Hash every explicit capability field at one binding boundary.
+fn capability_manifest_digest(
+    run_id: RunId,
+    generation: CapabilityGeneration,
+    project_root: &Path,
+    working_directory: &Path,
+    scratch_root: &Path,
+    read_only_roots: &[PathBuf],
+    read_write_roots: &[PathBuf],
+    denied_paths: &[PathBuf],
+    agent_plan_file: &Path,
+    environment_grants: &crate::secrets::EnvironmentGrants,
+    mcp_environment_grants: &crate::secrets::EnvironmentGrants,
+    remote_actions_digest: ContentDigest,
+    web_egress_grants_digest: ContentDigest,
+    executable_search_path: &OsStr,
+    host_home: Option<&Path>,
+    network_policy: AgentNetworkPolicy,
+    grants: &BTreeSet<CapabilityKind>,
+    process_owner: &str,
+    evidence_session_key: &str,
+    isolated_workspace: Option<&IsolatedWorkspaceDescriptor>,
+) -> ContentDigest {
+    let mut manifest = format!(
+        "run={run_id}\ngeneration={generation}\nproject={}\nworking={}\nscratch={}\n",
+        project_root.display(),
+        working_directory.display(),
+        scratch_root.display()
+    );
+    manifest.push_str("process_owner=");
+    manifest.push_str(process_owner);
+    manifest.push('\n');
+    manifest.push_str("evidence_session_key=");
+    manifest.push_str(evidence_session_key);
+    manifest.push('\n');
+    manifest.push_str("isolated_workspace=");
+    if let Some(descriptor) = isolated_workspace {
+        let encoded = serde_json::to_vec(descriptor)
+            .expect("validated isolated-workspace descriptor serialization cannot fail");
+        manifest.push_str(&ContentDigest::sha256(encoded).to_string());
+    }
+    manifest.push('\n');
+    for root in read_only_roots {
+        manifest.push_str("read_only=");
+        manifest.push_str(&root.to_string_lossy());
+        manifest.push('\n');
+    }
+    for root in read_write_roots {
+        manifest.push_str("read_write=");
+        manifest.push_str(&root.to_string_lossy());
+        manifest.push('\n');
+    }
+    for path in denied_paths {
+        manifest.push_str("denied=");
+        manifest.push_str(&path.to_string_lossy());
+        manifest.push('\n');
+    }
+    manifest.push_str("agent_plan_file=");
+    manifest.push_str(&agent_plan_file.to_string_lossy());
+    manifest.push('\n');
+    for (name, digest) in environment_grants.sorted_name_digests() {
+        manifest.push_str("environment=");
+        manifest.push_str(name);
+        manifest.push(':');
+        manifest.push_str(&digest);
+        manifest.push('\n');
+    }
+    for (name, digest) in mcp_environment_grants.sorted_name_digests() {
+        manifest.push_str("mcp_environment=");
+        manifest.push_str(name);
+        manifest.push(':');
+        manifest.push_str(&digest);
+        manifest.push('\n');
+    }
+    manifest.push_str("remote_actions=");
+    manifest.push_str(&remote_actions_digest.to_string());
+    manifest.push('\n');
+    manifest.push_str("web_egress_grants=");
+    manifest.push_str(&web_egress_grants_digest.to_string());
+    manifest.push('\n');
+    manifest.push_str("executable_search_path=");
+    manifest
+        .push_str(&ContentDigest::sha256(executable_search_path.as_encoded_bytes()).to_string());
+    manifest.push('\n');
+    manifest.push_str("host_home=");
+    if let Some(path) = host_home {
+        manifest.push_str(&path.to_string_lossy());
+    }
+    manifest.push('\n');
+    manifest.push_str("network_policy=");
+    let _ = write!(manifest, "{network_policy:?}");
+    manifest.push('\n');
+    for grant in grants {
+        manifest.push_str("grant=");
+        let _ = write!(manifest, "{grant:?}");
+        manifest.push('\n');
+    }
+    ContentDigest::sha256(manifest)
+}
+
+fn default_executable_search_path() -> OsString {
+    #[cfg(windows)]
+    {
+        OsString::new()
+    }
+    #[cfg(not(windows))]
+    {
+        OsString::from("/usr/local/bin:/usr/bin:/bin")
+    }
+}
+
+fn run_budget(generation: CapabilityGeneration, limits: BudgetLimits) -> Result<RunBudget, String> {
+    Ok(RunBudget {
+        id: BudgetId::new(),
+        generation: BudgetGeneration::new(generation.get())
+            .ok_or_else(|| "budget generation must be non-zero".to_string())?,
+        limits,
+    })
+}
+
+fn default_project_secret_masks() -> Vec<PathBuf> {
+    vec![PathBuf::from(".openclaudia"), PathBuf::from(".claude")]
+}
+
+fn project_plan_file(project_root: &Path, session_id: &str) -> PathBuf {
+    let safe_session_id: String = session_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    project_root
+        .join(".openclaudia/plans")
+        .join(format!("{safe_session_id}.md"))
+}
+
+fn startup_project_secret_masks() -> Result<Vec<PathBuf>, String> {
+    let mut masks = default_project_secret_masks();
     let Some(raw) = std::env::var_os("OPENCLAUDIA_PROJECT_SECRET_MASKS") else {
-        return Ok(denied);
+        return Ok(masks);
     };
     let raw = raw.to_str().ok_or_else(|| {
         "OPENCLAUDIA_PROJECT_SECRET_MASKS contains non-Unicode data; refusing to create session capabilities"
             .to_string()
     })?;
-    for entry in raw
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-    {
-        let path = Path::new(entry);
+    masks.extend(
+        raw.split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(PathBuf::from),
+    );
+    validate_project_secret_masks(masks)
+}
+
+fn validate_project_secret_masks(masks: Vec<PathBuf>) -> Result<Vec<PathBuf>, String> {
+    let mut validated = Vec::with_capacity(masks.len());
+    for path in masks {
         if path.is_absolute()
+            || path.as_os_str().is_empty()
             || !path
                 .components()
                 .all(|component| matches!(component, std::path::Component::Normal(_)))
         {
             return Err(format!(
-                "Invalid project secret mask '{entry}': use a non-empty relative path without '.' or '..'"
+                "Invalid project secret mask '{}': use a non-empty relative path without '.' or '..'",
+                path.display()
             ));
         }
-        let path = project_root.join(path);
-        if !denied.contains(&path) {
-            denied.push(path);
+        if !validated.contains(&path) {
+            validated.push(path);
         }
     }
-    Ok(denied)
+    Ok(validated)
 }
 
 fn startup_environment_grants() -> Result<HashMap<String, String>, String> {
@@ -303,38 +2664,7 @@ fn startup_environment_grants() -> Result<HashMap<String, String>, String> {
         .map(str::trim)
         .filter(|name| !name.is_empty())
     {
-        let mut chars = name.chars();
-        let valid = chars
-            .next()
-            .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
-            && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric());
-        let upper = name.to_ascii_uppercase();
-        let reserved = matches!(
-            upper.as_str(),
-            "HOME"
-                | "PATH"
-                | "TMP"
-                | "TEMP"
-                | "TMPDIR"
-                | "SSH_AUTH_SOCK"
-                | "DBUS_SESSION_BUS_ADDRESS"
-                | "DISPLAY"
-                | "WAYLAND_DISPLAY"
-                | "XDG_RUNTIME_DIR"
-                | "LD_PRELOAD"
-                | "DYLD_INSERT_LIBRARIES"
-                | "GCONV_PATH"
-                | "GLIBC_TUNABLES"
-                | "LOCPATH"
-                | "NLSPATH"
-        ) || upper.starts_with("LD_")
-            || upper.starts_with("DYLD_")
-            || upper.starts_with("OPENCLAUDIA_");
-        if !valid || reserved {
-            return Err(format!(
-                "Invalid or policy-reserved agent environment grant '{name}'"
-            ));
-        }
+        validate_environment_grant_name(name)?;
         if let Some(value) = std::env::var_os(name) {
             let value = value.to_str().ok_or_else(|| {
                 format!("Granted environment variable '{name}' is not valid UTF-8")
@@ -342,7 +2672,117 @@ fn startup_environment_grants() -> Result<HashMap<String, String>, String> {
             grants.insert(name.to_string(), value.to_string());
         }
     }
+    validate_environment_grants(grants)
+}
+
+fn startup_mcp_environment_grants() -> Result<HashMap<String, String>, String> {
+    let Some(raw) = std::env::var_os("OPENCLAUDIA_MCP_ENV_GRANTS") else {
+        return Ok(HashMap::new());
+    };
+    let raw = raw.to_str().ok_or_else(|| {
+        "OPENCLAUDIA_MCP_ENV_GRANTS contains non-Unicode data; refusing session startup".to_string()
+    })?;
+    let mut grants = HashMap::new();
+    for name in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        validate_mcp_environment_grant_name(name)?;
+        if let Some(value) = std::env::var_os(name) {
+            let value = value.to_str().ok_or_else(|| {
+                format!("Granted MCP environment variable '{name}' is not valid UTF-8")
+            })?;
+            grants.insert(name.to_string(), value.to_string());
+        }
+    }
+    validate_mcp_environment_grants(grants)
+}
+
+fn validate_mcp_environment_grants(
+    grants: HashMap<String, String>,
+) -> Result<HashMap<String, String>, String> {
+    for (name, value) in &grants {
+        validate_mcp_environment_grant_name(name)?;
+        if value.contains('\0') {
+            return Err(format!(
+                "Granted MCP environment variable '{name}' contains a NUL byte"
+            ));
+        }
+    }
     Ok(grants)
+}
+
+fn protect_environment_grants(
+    grants: HashMap<String, String>,
+) -> Result<crate::secrets::EnvironmentGrants, String> {
+    crate::secrets::EnvironmentGrants::from_validated(grants)
+        .map_err(|error| format!("Invalid environment grant value: {error}"))
+}
+
+fn validate_mcp_environment_grant_name(name: &str) -> Result<(), String> {
+    let mut chars = name.chars();
+    let valid = chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric());
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "Invalid environment variable name in OPENCLAUDIA_MCP_ENV_GRANTS: '{name}'"
+        ))
+    }
+}
+
+fn validate_environment_grants(
+    grants: HashMap<String, String>,
+) -> Result<HashMap<String, String>, String> {
+    for (name, value) in &grants {
+        validate_environment_grant_name(name)?;
+        if value.contains('\0') {
+            return Err(format!(
+                "Granted environment variable '{name}' contains a NUL byte"
+            ));
+        }
+    }
+    Ok(grants)
+}
+
+fn validate_environment_grant_name(name: &str) -> Result<(), String> {
+    let mut chars = name.chars();
+    let valid = chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric());
+    let upper = name.to_ascii_uppercase();
+    let reserved = matches!(
+        upper.as_str(),
+        "HOME"
+            | "PATH"
+            | "TMP"
+            | "TEMP"
+            | "TMPDIR"
+            | "SSH_AUTH_SOCK"
+            | "DBUS_SESSION_BUS_ADDRESS"
+            | "DISPLAY"
+            | "WAYLAND_DISPLAY"
+            | "XDG_RUNTIME_DIR"
+            | "LD_PRELOAD"
+            | "DYLD_INSERT_LIBRARIES"
+            | "GCONV_PATH"
+            | "GLIBC_TUNABLES"
+            | "LOCPATH"
+            | "NLSPATH"
+    ) || upper.starts_with("LD_")
+        || upper.starts_with("DYLD_")
+        || upper.starts_with("OPENCLAUDIA_");
+    if !valid || reserved {
+        return Err(format!(
+            "Invalid or policy-reserved agent environment grant '{name}'"
+        ));
+    }
+    Ok(())
 }
 
 fn startup_network_policy() -> Result<AgentNetworkPolicy, String> {
@@ -402,6 +2842,37 @@ fn open_capability_roots(
     Ok(handles)
 }
 
+#[cfg(windows)]
+fn open_capability_roots(
+    read_only_roots: &[PathBuf],
+    read_write_roots: &[PathBuf],
+) -> Result<Vec<CapabilityRootHandle>, String> {
+    let mut handles = Vec::with_capacity(read_only_roots.len() + read_write_roots.len());
+    for (path, writable) in read_only_roots
+        .iter()
+        .map(|path| (path, false))
+        .chain(read_write_roots.iter().map(|path| (path, true)))
+    {
+        let directory = if writable {
+            crate::windows_fs::open_absolute_directory_for_write(path)
+        } else {
+            crate::windows_fs::open_absolute_directory(path)
+        }
+        .map_err(|error| {
+            format!(
+                "Cannot pin Windows capability root '{}': {error}",
+                path.display()
+            )
+        })?;
+        handles.push(CapabilityRootHandle {
+            path: path.clone(),
+            writable,
+            directory,
+        });
+    }
+    Ok(handles)
+}
+
 #[derive(Debug)]
 struct PrivateTempDir {
     path: PathBuf,
@@ -409,6 +2880,10 @@ struct PrivateTempDir {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(windows)]
+    volume: u64,
+    #[cfg(windows)]
+    file_id: [u8; 16],
 }
 
 impl PrivateTempDir {
@@ -416,6 +2891,41 @@ impl PrivateTempDir {
         let parent = std::env::temp_dir();
         for _ in 0..16 {
             let path = parent.join(format!("openclaudia-agent-{}", uuid::Uuid::new_v4()));
+            #[cfg(windows)]
+            {
+                match crate::windows_fs::create_new_private_directory(&path) {
+                    Ok(directory) => {
+                        let identity =
+                            crate::windows_fs::file_identity(&directory).map_err(|error| {
+                                let _ = std::fs::remove_dir(&path);
+                                format!(
+                                    "Cannot pin private session temp identity '{}': {error}",
+                                    path.display()
+                                )
+                            })?;
+                        let canonical = path.canonicalize().map_err(|error| {
+                            let _ = std::fs::remove_dir(&path);
+                            format!(
+                                "Cannot resolve private session temp directory '{}': {error}",
+                                path.display()
+                            )
+                        })?;
+                        return Ok(Self {
+                            path: canonical,
+                            volume: identity.volume,
+                            file_id: identity.id,
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "Cannot create private session temp directory below '{}': {error}",
+                            parent.display()
+                        ));
+                    }
+                }
+            }
+            #[cfg(not(windows))]
             match std::fs::create_dir(&path) {
                 Ok(()) => {
                     #[cfg(unix)]
@@ -453,7 +2963,7 @@ impl PrivateTempDir {
                             inode: metadata.ino(),
                         });
                     }
-                    #[cfg(not(unix))]
+                    #[cfg(not(any(unix, windows)))]
                     return Ok(Self { path: canonical });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -492,10 +3002,10 @@ impl Drop for PrivateTempDir {
             Ok(metadata)
                 if metadata.file_type().is_dir()
                     && !metadata.file_type().is_symlink()
-                    && private_temp_identity_matches(self, &metadata) =>
+                    && private_temp_identity_matches(self, &tombstone, &metadata) =>
             {
-                // `remove_dir_all` uses descriptor-relative, no-follow
-                // traversal on supported Unix platforms. The unpredictable
+                // `remove_dir_all` uses no-follow traversal on supported
+                // platforms. The unpredictable
                 // tombstone name also prevents reuse of the original
                 // capability path while cleanup proceeds.
                 if let Err(error) = std::fs::remove_dir_all(&tombstone) {
@@ -525,42 +3035,38 @@ impl Drop for PrivateTempDir {
 }
 
 #[cfg(unix)]
-fn private_temp_identity_matches(temp: &PrivateTempDir, metadata: &std::fs::Metadata) -> bool {
+fn private_temp_identity_matches(
+    temp: &PrivateTempDir,
+    _path: &Path,
+    metadata: &std::fs::Metadata,
+) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     metadata.dev() == temp.device && metadata.ino() == temp.inode
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn private_temp_identity_matches(
+    temp: &PrivateTempDir,
+    path: &Path,
+    _metadata: &std::fs::Metadata,
+) -> bool {
+    let Ok(identity) = crate::windows_fs::open_absolute_directory(path)
+        .and_then(|directory| crate::windows_fs::file_identity(&directory))
+    else {
+        return false;
+    };
+    let same_volume = identity.volume == temp.volume;
+    let same_file = identity.id == temp.file_id;
+    same_volume && same_file
+}
+
+#[cfg(not(any(unix, windows)))]
 const fn private_temp_identity_matches(
     _temp: &PrivateTempDir,
+    _path: &Path,
     _metadata: &std::fs::Metadata,
 ) -> bool {
     true
-}
-
-type ContextMap = HashMap<String, Result<Arc<ToolSecurityContext>, String>>;
-
-static SESSION_CONTEXTS: LazyLock<Mutex<ContextMap>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn contexts(operation: &'static str) -> Result<MutexGuard<'static, ContextMap>, String> {
-    SESSION_CONTEXTS.lock().map_err(|error| {
-        tracing::error!(operation, %error, "Tool security-context lock poisoned");
-        "Tool security contexts are unavailable because their lock is poisoned".to_string()
-    })
-}
-
-/// Pin a default context for `session_id`, using the current directory only at
-/// this explicit session-boundary call.
-pub(crate) fn ensure_session_context(session_id: &str) -> Result<Arc<ToolSecurityContext>, String> {
-    let existing = contexts("lookup")?.get(session_id).cloned();
-    if let Some(existing) = existing {
-        return existing;
-    }
-    let cwd = std::env::current_dir()
-        .map_err(|error| format!("Cannot resolve session working directory: {error}"))?;
-    let read_only = startup_root_grants("OPENCLAUDIA_AGENT_READ_ONLY_ROOTS")?;
-    let read_write = startup_root_grants("OPENCLAUDIA_AGENT_READ_WRITE_ROOTS")?;
-    register_session_context(session_id, &cwd, &cwd, &read_only, &read_write)
 }
 
 fn startup_root_grants(name: &str) -> Result<Vec<PathBuf>, String> {
@@ -578,74 +3084,16 @@ fn startup_root_grants(name: &str) -> Result<Vec<PathBuf>, String> {
         .collect()
 }
 
-/// Register explicit immutable capabilities for a session.
-pub(crate) fn register_session_context(
-    session_id: &str,
-    project_root: &Path,
-    working_directory: &Path,
-    read_only_roots: &[PathBuf],
-    read_write_roots: &[PathBuf],
-) -> Result<Arc<ToolSecurityContext>, String> {
-    let mut map = contexts("register")?;
-    if let Some(existing) = map.get(session_id) {
-        let existing = existing.as_ref().map_err(Clone::clone)?;
-        let requested_root = project_root
-            .canonicalize()
-            .map_err(|error| format!("Cannot resolve requested project root: {error}"))?;
-        if existing.project_root() != requested_root {
-            return Err(format!(
-                "Session '{session_id}' is already pinned to project root '{}'; refusing replacement with '{}'",
-                existing.project_root().display(),
-                requested_root.display()
-            ));
-        }
-        return Ok(Arc::clone(existing));
-    }
-
-    let created = ToolSecurityContext::new(
-        session_id,
-        project_root,
-        working_directory,
-        read_only_roots,
-        read_write_roots,
-    )
-    .map(Arc::new);
-    if let Ok(context) = &created {
-        tracing::info!(
-            target: "openclaudia::sandbox",
-            event = "session_capabilities_registered",
-            session_id = context.session_id(),
-            read_only_roots = context.read_only_roots().len(),
-            read_write_roots = context.read_write_roots().len(),
-            denied_paths = context.denied_paths().len(),
-            environment_grants = context.environment_grants().len(),
-            network = "denied",
-            "Registered immutable agent session capabilities"
-        );
-    }
-    map.insert(session_id.to_string(), created.clone());
-    created
-}
-
-/// Resolve the context for the thread's active session.
-///
-/// # Errors
-///
-/// Returns an error when the session context cannot be initialized or the
-/// immutable capability registry is unavailable.
-pub fn current_context() -> Result<Arc<ToolSecurityContext>, String> {
-    let session_id = super::todo::current_session_key();
-    if session_id == DEFAULT_SESSION_KEY {
-        return ensure_session_context(DEFAULT_SESSION_KEY);
-    }
-    ensure_session_context(&session_id)
-}
-
 /// Validate an IDE/client buffer path against the active immutable
 /// capability without opening the file. Existing symlink components are
 /// rejected so a client cannot label an outside buffer as project-local.
-pub(crate) fn validate_client_buffer_path(path: &Path) -> Result<PathBuf, String> {
-    let context = current_context()?;
+pub(crate) fn validate_client_buffer_path(
+    context: &ToolRunContext,
+    path: &Path,
+) -> Result<PathBuf, String> {
+    context
+        .require(ToolResource::WorkspaceRead)
+        .map_err(|error| error.to_string())?;
     let candidate = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -667,13 +3115,20 @@ pub(crate) fn validate_client_buffer_path(path: &Path) -> Result<PathBuf, String
     if !context.permits_read(&normalized) {
         return Err("IDE buffer path is outside or masked from the session capability".to_string());
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let (root, _) = context.root_handle_for(&normalized, false)?;
+        #[cfg(unix)]
         let relative = normalized
             .strip_prefix(root)
-            .map_err(|_| "IDE buffer path escaped its capability root".to_string())?;
+            .map_err(|_| "IDE buffer path escaped its capability root".to_string())?
+            .to_path_buf();
+        #[cfg(windows)]
+        let relative = crate::windows_fs::relative_to_root(&normalized, root)
+            .map_err(|error| format!("IDE buffer path escaped its capability root: {error}"))?;
+        #[cfg(unix)]
         let mut walked = root.to_path_buf();
+        #[cfg(unix)]
         for component in relative.components() {
             let std::path::Component::Normal(name) = component else {
                 continue;
@@ -688,9 +3143,11 @@ pub(crate) fn validate_client_buffer_path(path: &Path) -> Result<PathBuf, String
                 Err(error) => return Err(format!("Cannot inspect IDE buffer path: {error}")),
             }
         }
+        #[cfg(windows)]
+        validate_windows_client_buffer_path(context, root, &relative)?;
         Ok(normalized)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = normalized;
         Err(
@@ -700,17 +3157,81 @@ pub(crate) fn validate_client_buffer_path(path: &Path) -> Result<PathBuf, String
     }
 }
 
-/// Drop the registry's ownership at session end. The private temp directory is
-/// removed when no in-flight tool still holds the context.
-pub(crate) fn release_session_context(session_id: &str) {
-    match contexts("release") {
-        Ok(mut map) => {
-            map.remove(session_id);
-        }
-        Err(error) => {
-            tracing::error!(session_id, %error, "Failed to release tool security context");
+#[cfg(windows)]
+fn validate_windows_client_buffer_path(
+    context: &ToolRunContext,
+    root: &Path,
+    relative: &Path,
+) -> Result<(), String> {
+    let (_, root_handle) = context.root_handle_for(root, false)?;
+    let components = relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_os_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut directory = root_handle
+        .try_clone()
+        .map_err(|error| format!("Cannot duplicate IDE capability root: {error}"))?;
+    for (index, component) in components.iter().enumerate() {
+        let is_last = index + 1 == components.len();
+        let component_path = Path::new(component);
+        let opened = if is_last {
+            match crate::windows_fs::open_relative(
+                &directory,
+                component_path,
+                crate::windows_fs::ObjectKind::Regular,
+                crate::windows_fs::OpenAccess::Read,
+                crate::windows_fs::OpenDisposition::Open,
+                None,
+            ) {
+                Ok(opened) => Some(opened.file),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) if error.kind() == std::io::ErrorKind::IsADirectory => Some(
+                    crate::windows_fs::open_relative(
+                        &directory,
+                        component_path,
+                        crate::windows_fs::ObjectKind::Directory,
+                        crate::windows_fs::OpenAccess::Read,
+                        crate::windows_fs::OpenDisposition::Open,
+                        None,
+                    )
+                    .map_err(|error| format!("Cannot inspect IDE buffer directory: {error}"))?
+                    .file,
+                ),
+                Err(error) => {
+                    return Err(format!(
+                        "Cannot inspect IDE buffer path without following reparse points: {error}"
+                    ))
+                }
+            }
+        } else {
+            match crate::windows_fs::open_relative(
+                &directory,
+                component_path,
+                crate::windows_fs::ObjectKind::Directory,
+                crate::windows_fs::OpenAccess::Read,
+                crate::windows_fs::OpenDisposition::Open,
+                None,
+            ) {
+                Ok(opened) => Some(opened.file),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(format!(
+                        "Cannot inspect IDE buffer path without following reparse points: {error}"
+                    ))
+                }
+            }
+        };
+        let Some(opened) = opened else {
+            break;
+        };
+        if !is_last {
+            directory = opened;
         }
     }
+    Ok(())
 }
 
 fn canonical_roots(roots: &[PathBuf], kind: &str) -> Result<Vec<PathBuf>, String> {
@@ -743,8 +3264,15 @@ fn canonical_directory(path: &Path, label: &str) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
-fn path_is_within(path: &Path, root: &Path) -> bool {
-    path == root || path.starts_with(root)
+pub(super) fn path_is_within(path: &Path, root: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        crate::windows_fs::path_is_within(path, root)
+    }
+    #[cfg(not(windows))]
+    {
+        path == root || path.starts_with(root)
+    }
 }
 
 fn is_unsafe_broad_root(path: &Path) -> bool {
@@ -764,43 +3292,587 @@ fn is_unsafe_broad_root(path: &Path) -> bool {
     false
 }
 
+/// Explicit crate-test capability rooted at this checkout.
+///
+/// This helper is compiled only into the crate's unit-test harness. Production
+/// code has no default, registry, or ambient lookup path.
 #[cfg(test)]
-pub(crate) fn clear_contexts_for_test() {
-    if let Ok(mut map) = SESSION_CONTEXTS.lock() {
-        map.clear();
-    }
+pub(crate) fn test_run_context() -> &'static Arc<ToolRunContext> {
+    static RUN: std::sync::OnceLock<Arc<ToolRunContext>> = std::sync::OnceLock::new();
+    RUN.get_or_init(|| {
+        ToolRunContext::builder(SessionId::new(), Path::new(env!("CARGO_MANIFEST_DIR")))
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::new())
+            .workspace_access(WorkspaceAccess::ReadWrite)
+            .process(true)
+            .network(true)
+            .secrets(true)
+            .provider("unit-test")
+            .build()
+            .expect("crate test root must produce an explicit run capability")
+    })
+}
+
+/// Build an isolated crate-test capability for a caller-owned root.
+#[cfg(test)]
+pub(crate) fn test_run_context_for(root: &Path) -> Arc<ToolRunContext> {
+    test_run_context_for_provider(root, "unit-test")
+}
+
+#[cfg(test)]
+pub(crate) fn test_run_context_for_provider(root: &Path, provider: &str) -> Arc<ToolRunContext> {
+    ToolRunContext::builder(SessionId::new(), root)
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(HashMap::new())
+        .workspace_access(WorkspaceAccess::ReadWrite)
+        .process(true)
+        .network(true)
+        .secrets(true)
+        .provider(provider)
+        .build()
+        .expect("test root must produce an explicit run capability")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing_subscriber::fmt::MakeWriter;
 
-    #[test]
-    fn sessions_receive_distinct_private_temp_roots() {
-        clear_contexts_for_test();
-        let root = tempfile::tempdir().expect("project root");
-        let first = register_session_context("security-a", root.path(), root.path(), &[], &[])
-            .expect("first context");
-        let second = register_session_context("security-b", root.path(), root.path(), &[], &[])
-            .expect("second context");
-        assert_ne!(first.private_temp_root(), second.private_temp_root());
-        assert!(first.permits_write(first.private_temp_root()));
-        assert!(!first.permits_read(second.private_temp_root()));
-        release_session_context("security-a");
-        release_session_context("security-b");
+    #[derive(Clone, Default)]
+    struct TraceWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for TraceWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for TraceWriter {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
     }
 
     #[test]
-    fn session_root_cannot_be_replaced() {
-        clear_contexts_for_test();
-        let first = tempfile::tempdir().expect("first root");
-        let second = tempfile::tempdir().expect("second root");
-        register_session_context("security-pinned", first.path(), first.path(), &[], &[])
-            .expect("register");
-        let error =
-            register_session_context("security-pinned", second.path(), second.path(), &[], &[])
-                .expect_err("replacement must fail");
-        assert!(error.contains("already pinned"));
-        release_session_context("security-pinned");
+    fn sessions_receive_distinct_private_temp_roots() {
+        let root = tempfile::tempdir().expect("project root");
+        let first = ToolRunContext::builder(SessionId::new(), root.path())
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::new())
+            .workspace_access(WorkspaceAccess::ReadWrite)
+            .process(false)
+            .network(false)
+            .secrets(false)
+            .build()
+            .expect("first context");
+        let second = ToolRunContext::builder(SessionId::new(), root.path())
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::new())
+            .workspace_access(WorkspaceAccess::ReadWrite)
+            .process(false)
+            .network(false)
+            .secrets(false)
+            .build()
+            .expect("second context");
+        assert_ne!(first.private_temp_root(), second.private_temp_root());
+        assert_ne!(first.run_id(), second.run_id());
+        assert_ne!(first.generation(), second.generation());
+        assert!(first.permits_write(first.private_temp_root()));
+        assert!(!first.permits_read(second.private_temp_root()));
+    }
+
+    #[test]
+    fn derived_frontend_session_narrows_roots_and_never_rediscovers_host_grants() {
+        let root = tempfile::tempdir().expect("parent project root");
+        let child_root = root.path().join("child");
+        std::fs::create_dir(&child_root).expect("child project root");
+        let foreign = tempfile::tempdir().expect("foreign project root");
+        let host_home = tempfile::tempdir().expect("host-home snapshot");
+        let parent = ToolRunContext::builder(SessionId::new(), root.path())
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::from([(
+                "S019_DERIVED_ENV".to_string(),
+                "immutable".to_string(),
+            )]))
+            .host_home(Some(host_home.path().to_path_buf()))
+            .workspace_access(WorkspaceAccess::ReadWrite)
+            .process(true)
+            .network(false)
+            .secrets(false)
+            .provider("parent")
+            .build()
+            .expect("parent run");
+        let child_session = SessionId::new();
+        let child = parent
+            .derive_frontend_session(
+                child_session.clone(),
+                &child_root,
+                &child_root,
+                "child-provider",
+            )
+            .expect("authorized child session");
+
+        assert_eq!(child.session_id(), child_session.as_str());
+        assert_eq!(child.project_root(), child_root.canonicalize().unwrap());
+        assert_ne!(child.run_id(), parent.run_id());
+        assert_ne!(child.generation(), parent.generation());
+        assert!(child
+            .environment_grants()
+            .matches_value("S019_DERIVED_ENV", "immutable"));
+        assert_eq!(child.host_home(), parent.host_home());
+        assert_eq!(
+            child.host_home(),
+            Some(host_home.path().canonicalize().unwrap().as_path())
+        );
+        assert!(child.require(ToolResource::Process).is_ok());
+        assert!(matches!(
+            child.require(ToolResource::Network),
+            Err(ToolCapabilityError::Unavailable {
+                resource: ToolResource::Network,
+                ..
+            })
+        ));
+        assert!(child.permits_write(&child_root));
+        assert!(
+            !child.permits_read(root.path()),
+            "a narrowed generation must not retain its parent's broader intrinsic root"
+        );
+
+        let error = parent
+            .derive_frontend_session(
+                SessionId::new(),
+                foreign.path(),
+                foreign.path(),
+                "foreign-provider",
+            )
+            .expect_err("foreign root must not become authority during derivation");
+        assert!(error.contains("outside the parent run's"));
+    }
+
+    #[test]
+    fn read_only_workspace_omits_write_capability_and_handle() {
+        let root = tempfile::tempdir().expect("project root");
+        let context = ToolRunContext::builder(SessionId::new(), root.path())
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::new())
+            .workspace_access(WorkspaceAccess::ReadOnly)
+            .process(false)
+            .network(false)
+            .secrets(false)
+            .build()
+            .expect("read-only context");
+        assert!(context.require(ToolResource::WorkspaceRead).is_ok());
+        assert!(matches!(
+            context.require(ToolResource::WorkspaceWrite),
+            Err(ToolCapabilityError::Unavailable {
+                resource: ToolResource::WorkspaceWrite,
+                ..
+            })
+        ));
+        assert!(context.permits_read(context.project_root()));
+        assert!(!context.permits_write(context.project_root()));
+        assert!(context.permits_write(context.private_temp_root()));
+    }
+
+    #[test]
+    fn bounded_print_profile_has_no_tool_or_durable_persistence_capabilities() {
+        let root = tempfile::tempdir().expect("project root");
+        let context = ToolRunContext::builder(SessionId::new(), root.path())
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::new())
+            .workspace_access(WorkspaceAccess::ReadOnly)
+            .process(false)
+            .network(true)
+            .secrets(true)
+            .provider("openai")
+            .bounded_print_profile()
+            .build()
+            .expect("bounded print context");
+        let grants = &context.runtime().descriptor().capabilities.grants;
+
+        assert!(grants.contains(&CapabilityKind::ContextAssembly));
+        assert!(grants.contains(&CapabilityKind::Provider));
+        assert!(grants.contains(&CapabilityKind::Hooks));
+        assert!(grants.contains(&CapabilityKind::Trace));
+        assert!(grants.contains(&CapabilityKind::Network));
+        assert!(grants.contains(&CapabilityKind::Secrets));
+        assert!(!grants.contains(&CapabilityKind::WorkspaceRead));
+        assert!(!grants.contains(&CapabilityKind::WorkspaceWrite));
+        assert!(!grants.contains(&CapabilityKind::Process));
+        assert!(!grants.contains(&CapabilityKind::Memory));
+        assert!(!grants.contains(&CapabilityKind::Mcp));
+        assert!(!context.permits_read(root.path()));
+        assert!(!context.permits_write(root.path()));
+        assert!(matches!(
+            context.background_job_storage,
+            BackgroundJobStorage::Ephemeral
+        ));
+    }
+
+    #[test]
+    fn unavailable_resource_trace_binds_exact_run_and_generation() {
+        let root = tempfile::tempdir().expect("project root");
+        let context = ToolRunContext::builder(SessionId::new(), root.path())
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::new())
+            .workspace_access(WorkspaceAccess::ReadOnly)
+            .process(false)
+            .network(false)
+            .secrets(false)
+            .build()
+            .expect("restricted context");
+        let writer = TraceWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(writer.clone())
+            .finish();
+
+        let error = tracing::subscriber::with_default(subscriber, || {
+            context
+                .require(ToolResource::Network)
+                .expect_err("network must be unavailable")
+        });
+        assert!(matches!(
+            error,
+            ToolCapabilityError::Unavailable {
+                resource: ToolResource::Network,
+                ..
+            }
+        ));
+        let trace = String::from_utf8(
+            writer
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+        .expect("trace output is UTF-8");
+        assert!(trace.contains("capability_unavailable"), "{trace}");
+        assert!(trace.contains(&context.run_id().to_string()), "{trace}");
+        assert!(trace.contains(&context.generation().to_string()), "{trace}");
+        assert!(trace.contains("Network"), "{trace}");
+    }
+
+    #[test]
+    fn explicit_environment_grants_are_validated_and_bound() {
+        let root = tempfile::tempdir().expect("project root");
+        let context = ToolRunContext::builder(SessionId::new(), root.path())
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::from([(
+                "S019_TEST_MARKER".to_string(),
+                "run-specific".to_string(),
+            )]))
+            .workspace_access(WorkspaceAccess::ReadWrite)
+            .process(true)
+            .network(false)
+            .secrets(false)
+            .build()
+            .expect("explicit environment grant");
+        assert!(context
+            .environment_grants()
+            .matches_value("S019_TEST_MARKER", "run-specific"));
+
+        let rejected = ToolRunContext::builder(SessionId::new(), root.path())
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::from([(
+                "PATH".to_string(),
+                "/attacker-controlled".to_string(),
+            )]))
+            .workspace_access(WorkspaceAccess::ReadWrite)
+            .process(true)
+            .network(false)
+            .secrets(false)
+            .build()
+            .expect_err("policy-reserved values must be rejected");
+        assert!(rejected.contains("policy-reserved"), "{rejected}");
+
+        let secret_without_capability = ToolRunContext::builder(SessionId::new(), root.path())
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::from([(
+                "SERVICE_API_KEY".to_string(),
+                "secret".to_string(),
+            )]))
+            .workspace_access(WorkspaceAccess::ReadWrite)
+            .process(true)
+            .network(false)
+            .secrets(false)
+            .build()
+            .expect_err("secret environment values require secret capability");
+        assert!(
+            secret_without_capability.contains("secret capability"),
+            "{secret_without_capability}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_resolution_is_process_authorized_and_run_bound() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("project root");
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).expect("binary directory");
+        let executable = bin.join("s019-run-bound-probe");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").expect("probe executable");
+        let mut permissions = std::fs::metadata(&executable)
+            .expect("probe metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).expect("probe permissions");
+
+        let authorized = ToolRunContext::builder(SessionId::new(), root.path())
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::new())
+            .executable_search_path(bin.as_os_str())
+            .workspace_access(WorkspaceAccess::ReadWrite)
+            .process(true)
+            .network(false)
+            .secrets(false)
+            .build()
+            .expect("process-capable run");
+        assert_eq!(
+            authorized
+                .resolve_executable("s019-run-bound-probe")
+                .expect("probe must resolve through the run path"),
+            executable
+        );
+        assert!(matches!(
+            authorized.resolve_executable("sh"),
+            Err(ToolExecutableError::Resolve { .. })
+        ));
+
+        let denied = ToolRunContext::builder(SessionId::new(), root.path())
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::new())
+            .executable_search_path(bin.as_os_str())
+            .workspace_access(WorkspaceAccess::ReadWrite)
+            .process(false)
+            .network(false)
+            .secrets(false)
+            .build()
+            .expect("process-denied run");
+        assert!(matches!(
+            denied.resolve_executable("s019-run-bound-probe"),
+            Err(ToolExecutableError::Capability(
+                ToolCapabilityError::Unavailable {
+                    resource: ToolResource::Process,
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn capability_manifest_changes_with_environment_value() {
+        let root = tempfile::tempdir().expect("project root");
+        let scratch = tempfile::tempdir().expect("scratch root");
+        let run_id = RunId::new();
+        let generation = CapabilityGeneration::new(7).expect("generation");
+        let grants = BTreeSet::from([CapabilityKind::WorkspaceRead]);
+        let roots = vec![root.path().to_path_buf()];
+        let first_environment =
+            crate::secrets::EnvironmentGrants::from_validated(HashMap::from([(
+                "S019_MARKER".to_string(),
+                "first".to_string(),
+            )]))
+            .expect("environment");
+        let second_environment = crate::secrets::EnvironmentGrants::from_validated(HashMap::from(
+            [("S019_MARKER".to_string(), "second".to_string())],
+        ))
+        .expect("environment");
+        let empty_environment = crate::secrets::EnvironmentGrants::new();
+        let first = capability_manifest_digest(
+            run_id,
+            generation,
+            root.path(),
+            root.path(),
+            scratch.path(),
+            &[],
+            &roots,
+            &[],
+            &root.path().join(".openclaudia/plans/run.md"),
+            &first_environment,
+            &empty_environment,
+            ContentDigest::sha256(b"empty-remote-actions"),
+            ContentDigest::sha256(b"empty-web-egress-grants"),
+            OsStr::new("/usr/bin"),
+            None,
+            AgentNetworkPolicy::Denied,
+            &grants,
+            "owner",
+            "evidence",
+            None,
+        );
+        let second = capability_manifest_digest(
+            run_id,
+            generation,
+            root.path(),
+            root.path(),
+            scratch.path(),
+            &[],
+            &roots,
+            &[],
+            &root.path().join(".openclaudia/plans/run.md"),
+            &second_environment,
+            &empty_environment,
+            ContentDigest::sha256(b"empty-remote-actions"),
+            ContentDigest::sha256(b"empty-web-egress-grants"),
+            OsStr::new("/usr/bin"),
+            None,
+            AgentNetworkPolicy::Denied,
+            &grants,
+            "owner",
+            "evidence",
+            None,
+        );
+        assert_ne!(first, second, "environment values must bind the manifest");
+    }
+
+    #[test]
+    fn mcp_secret_environment_is_generation_bound_and_requires_secret_authority() {
+        let root = tempfile::tempdir().expect("project root");
+        let grants = HashMap::from([("SERVICE_API_KEY".to_string(), "first".to_string())]);
+        let context = ToolRunContext::builder(SessionId::new(), root.path())
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::new())
+            .mcp_environment_grants(grants.clone())
+            .workspace_access(WorkspaceAccess::ReadOnly)
+            .process(true)
+            .network(false)
+            .secrets(true)
+            .build()
+            .expect("MCP secret-authorized run");
+        assert!(context
+            .mcp_environment_grants()
+            .matches_value("SERVICE_API_KEY", "first"));
+        context.validate_binding().expect("manifest remains exact");
+
+        let error = ToolRunContext::builder(SessionId::new(), root.path())
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::new())
+            .mcp_environment_grants(grants)
+            .workspace_access(WorkspaceAccess::ReadOnly)
+            .process(true)
+            .network(false)
+            .secrets(false)
+            .build()
+            .expect_err("secret MCP values require secret capability");
+        assert!(error.contains("SERVICE_API_KEY"), "{error}");
+    }
+
+    #[test]
+    fn omitted_capability_decisions_fail_closed() {
+        let root = tempfile::tempdir().expect("project root");
+        let error = ToolRunContext::builder(SessionId::new(), root.path())
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(HashMap::new())
+            .build()
+            .expect_err("resource decisions must not default to broad authority");
+        assert!(error.contains("workspace access capability"), "{error}");
+    }
+
+    #[test]
+    fn read_only_workspace_rejects_explicit_writable_roots() {
+        let root = tempfile::tempdir().expect("project root");
+        let extra = tempfile::tempdir().expect("extra writable root");
+        let error = ToolRunContext::builder(SessionId::new(), root.path())
+            .read_only_roots(Vec::new())
+            .read_write_roots(vec![extra.path().to_path_buf()])
+            .environment_grants(HashMap::new())
+            .workspace_access(WorkspaceAccess::ReadOnly)
+            .process(false)
+            .network(false)
+            .secrets(false)
+            .build()
+            .expect_err("read-only descriptors must not retain writable handles");
+        assert!(error.contains("read-only workspace"), "{error}");
+    }
+
+    #[test]
+    fn omitted_roots_and_environment_fail_closed_independently() {
+        let root = tempfile::tempdir().expect("project root");
+        let missing_roots = ToolRunContext::builder(SessionId::new(), root.path())
+            .environment_grants(HashMap::new())
+            .workspace_access(WorkspaceAccess::ReadWrite)
+            .process(false)
+            .network(false)
+            .secrets(false)
+            .build()
+            .expect_err("root grants must be explicit");
+        assert!(missing_roots.contains("read-only roots"), "{missing_roots}");
+
+        let missing_environment = ToolRunContext::builder(SessionId::new(), root.path())
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .workspace_access(WorkspaceAccess::ReadWrite)
+            .process(false)
+            .network(false)
+            .secrets(false)
+            .build()
+            .expect_err("environment grants must be explicit");
+        assert!(
+            missing_environment.contains("environment grants"),
+            "{missing_environment}"
+        );
+    }
+
+    #[test]
+    fn every_resource_decision_is_mandatory() {
+        let root = tempfile::tempdir().expect("project root");
+        let base = || {
+            ToolRunContext::builder(SessionId::new(), root.path())
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(HashMap::new())
+                .workspace_access(WorkspaceAccess::ReadWrite)
+        };
+
+        let missing_process = base()
+            .network(false)
+            .secrets(false)
+            .build()
+            .expect_err("process decision must be explicit");
+        assert!(missing_process.contains("process capability"));
+
+        let missing_network = base()
+            .process(false)
+            .secrets(false)
+            .build()
+            .expect_err("network decision must be explicit");
+        assert!(missing_network.contains("network capability"));
+
+        let missing_secrets = base()
+            .process(false)
+            .network(false)
+            .build()
+            .expect_err("secret decision must be explicit");
+        assert!(missing_secrets.contains("secret capability"));
     }
 }

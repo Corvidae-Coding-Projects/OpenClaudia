@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::fmt::Write as _;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -72,7 +73,7 @@ pub struct TurnMetrics {
     pub estimated_input_tokens: usize,
     /// Actual usage reported by the provider (if available)
     pub actual_usage: Option<TokenUsage>,
-    /// Tokens consumed by injected context (rules, hooks, session, MCP tools)
+    /// Tokens consumed by injected context (hooks, session, MCP tools, plugins)
     pub injected_context_tokens: usize,
     /// Tokens consumed by system prompt
     pub system_prompt_tokens: usize,
@@ -266,6 +267,556 @@ impl PlanModeState {
     }
 }
 
+/// Install the canonical interactive plan state and runtime capability.
+///
+/// CLI and TUI entrypoints share this host-owned transition so neither can
+/// display a Plan label without a pinned plan artifact and enforced mode.
+///
+/// # Errors
+///
+/// Returns an error when the run cannot create or pin its exact plan file, or
+/// when the runtime mode transition cannot be installed.
+pub fn install_interactive_plan_mode(
+    run: &crate::tools::ToolRunContext,
+    chat_session: &crate::state::Session,
+) -> Result<PathBuf, String> {
+    run.require(crate::tools::ToolResource::WorkspaceWrite)
+        .map_err(|error| format!("plan mode requires workspace write capability: {error}"))?;
+    let plan_file = run.agent_plan_file().to_path_buf();
+    if chat_session.agent_mode() == crate::state::AgentMode::Plan {
+        if let Some(existing) = chat_session.inspect_state(|state| {
+            state
+                .conversation
+                .plan_mode
+                .as_ref()
+                .filter(|plan| plan.active)
+                .cloned()
+        }) {
+            if existing.plan_realpath != plan_file {
+                return Err("active plan state belongs to a different run capability".to_string());
+            }
+            if run.runtime_mode().class != crate::modes::RuntimeModeClass::Plan {
+                run.transition_runtime_mode(crate::modes::RuntimeMode::Plan)?;
+            }
+            return Ok(plan_file);
+        }
+    }
+    if !plan_file.exists() {
+        let header = format!(
+            "# Implementation Plan\n\nSession: {}\nCreated: {}\n\n## Plan\n\n",
+            chat_session.id(),
+            chrono::Utc::now().format("%Y-%m-%d %H:%M UTC")
+        );
+        crate::tools::create_capability_text_file(run, &plan_file.to_string_lossy(), &header)
+            .map_err(|error| format!("failed to create plan file: {error}"))?;
+    }
+
+    let current_mode = chat_session.agent_mode();
+    let previous_mode = (current_mode != crate::state::AgentMode::Plan)
+        .then(|| current_mode.as_token().to_string());
+    let plan_state = PlanModeState::enter_with_previous_mode(plan_file.clone(), previous_mode)
+        .map_err(|error| format!("plan file identity pin failed: {error}"))?;
+
+    run.transition_runtime_mode(crate::modes::RuntimeMode::Plan)?;
+    chat_session.update_state(|state, _| state.conversation.plan_mode = Some(plan_state));
+    chat_session.set_agent_mode(crate::state::AgentMode::Plan);
+    Ok(plan_file)
+}
+
+/// Exact plan bytes displayed to a user before an approval decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedPlanApproval {
+    plan_content: String,
+    plan_digest: String,
+    plan_realpath: PathBuf,
+    previous_mode: Option<String>,
+    runtime_mode_generation: u64,
+    capability_generation: u64,
+    capability_manifest_digest: String,
+    actor: crate::runtime::Actor,
+    run_id: crate::runtime::RunId,
+    budget: crate::runtime::BudgetSnapshot,
+    prepared_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    proposed_effects: Vec<PlanProposedEffect>,
+    effect_grants: Vec<crate::modes::PlanEffectGrant>,
+    unrestricted_within_run_capabilities: bool,
+}
+
+impl PreparedPlanApproval {
+    /// Plan text the frontend must display for approval.
+    #[must_use]
+    pub fn plan_content(&self) -> &str {
+        &self.plan_content
+    }
+
+    /// SHA-256 digest of the exact displayed bytes.
+    #[must_use]
+    pub fn plan_digest(&self) -> &str {
+        &self.plan_digest
+    }
+
+    /// Runtime mode generation under which the proposal was prepared.
+    #[must_use]
+    pub const fn runtime_mode_generation(&self) -> u64 {
+        self.runtime_mode_generation
+    }
+
+    /// Structured effect proposal reviewed beside the exact plan bytes.
+    #[must_use]
+    pub fn proposed_effects(&self) -> &[PlanProposedEffect] {
+        &self.proposed_effects
+    }
+}
+
+/// Current immutable schema for an activated plan artifact.
+pub const APPROVED_PLAN_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+
+/// One typed proposed effect displayed to the approving user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanProposedEffect {
+    pub tool: String,
+    pub canonical: String,
+    pub effect: String,
+    pub prompt_digest: String,
+}
+
+/// Evidence that the host's interactive decision activated one exact plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanApprovalEvidence {
+    pub provenance: String,
+    pub prepared_at: DateTime<Utc>,
+    pub approved_at: DateTime<Utc>,
+    pub evidence_digest: String,
+}
+
+/// Immutable versioned artifact bound into both task state and live authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedPlanArtifact {
+    pub schema_version: u32,
+    pub artifact_generation: u64,
+    pub plan_digest: String,
+    pub task_id: String,
+    pub task_graph_generation: u64,
+    pub proposed_effects: Vec<PlanProposedEffect>,
+    pub unrestricted_within_run_capabilities: bool,
+    pub budget: crate::runtime::BudgetSnapshot,
+    pub expires_at: DateTime<Utc>,
+    pub actor: crate::runtime::Actor,
+    pub run_id: crate::runtime::RunId,
+    pub capability_generation: u64,
+    pub capability_manifest_digest: String,
+    pub prepared_runtime_mode_generation: u64,
+    pub activated_runtime_mode_generation: u64,
+    pub restored_mode: String,
+    pub evidence: PlanApprovalEvidence,
+}
+
+impl ApprovedPlanArtifact {
+    /// Stable digest over the complete artifact, including graph and
+    /// capability generations.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if serialization of this statically serializable artifact
+    /// shape fails.
+    #[must_use]
+    pub fn digest(&self) -> String {
+        let encoded = serde_json::to_vec(self)
+            .expect("approved plan artifact contains only serializable fields");
+        approved_plan_digest_bytes(&encoded)
+    }
+}
+
+/// Durable task-graph binding created by an approved plan transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedPlanReceipt {
+    /// Stable task representing this plan lifecycle.
+    pub task_id: String,
+    /// Canonical task-graph generation containing the binding.
+    pub task_graph_generation: u64,
+    /// Digest of the exact approved plan bytes.
+    pub plan_digest: String,
+    /// Runtime capability generation restored after approval.
+    pub runtime_mode_generation: u64,
+    /// Digest of the complete immutable approval artifact.
+    pub artifact_digest: String,
+    /// Time after which the run-local plan authority fails closed.
+    pub expires_at: DateTime<Utc>,
+    /// Complete immutable artifact activated by this transition.
+    pub artifact: ApprovedPlanArtifact,
+    /// Exact approved-plan context message to append after the resolving tool
+    /// result. Frontends own transcript ordering at that protocol boundary.
+    pub context_message: serde_json::Value,
+}
+
+fn approved_plan_digest(plan_content: &str) -> String {
+    approved_plan_digest_bytes(plan_content.as_bytes())
+}
+
+fn approved_plan_digest_bytes(content: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = Sha256::digest(content);
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn restored_plan_agent_mode(previous_mode: Option<&str>) -> crate::state::AgentMode {
+    previous_mode.map_or(
+        crate::state::AgentMode::Build,
+        crate::state::AgentMode::from_token,
+    )
+}
+
+/// Read and bind the exact plan bytes a frontend will present to the user.
+///
+/// # Errors
+///
+/// Returns an error unless the session and run are in the same active plan
+/// generation and the pinned plan artifact can be read through the run.
+pub fn prepare_interactive_plan_approval(
+    run: &crate::tools::ToolRunContext,
+    chat_session: &crate::state::Session,
+) -> Result<PreparedPlanApproval, String> {
+    prepare_interactive_plan_approval_with_effects(run, chat_session, &[])
+}
+
+/// Prepare the exact plan bytes and structured effect proposal that a
+/// frontend will display in one approval decision.
+///
+/// # Errors
+///
+/// Returns an error for stale plan state, an unknown proposed tool, an
+/// unavailable budget, or an artifact/expiry value outside supported bounds.
+pub fn prepare_interactive_plan_approval_with_effects(
+    run: &crate::tools::ToolRunContext,
+    chat_session: &crate::state::Session,
+    allowed_prompts: &[crate::tools::ToolAllowedPrompt],
+) -> Result<PreparedPlanApproval, String> {
+    let runtime_mode = run.runtime_mode();
+    if runtime_mode.class != crate::modes::RuntimeModeClass::Plan {
+        return Err("runtime capability is not in plan mode".to_string());
+    }
+    let plan_state = chat_session
+        .inspect_state(|state| state.conversation.plan_mode.clone())
+        .filter(|state| state.active)
+        .ok_or_else(|| "session is not in active plan mode".to_string())?;
+    if plan_state.plan_realpath != run.agent_plan_file() {
+        return Err("active plan artifact belongs to a different run capability".to_string());
+    }
+    let (_, plan_content) = crate::tools::read_capability_text_attachment(
+        run,
+        &plan_state.plan_realpath.to_string_lossy(),
+    )
+    .map_err(|error| format!("failed to read the pinned plan artifact: {error}"))?;
+    let (proposed_effects, effect_grants, unrestricted_within_run_capabilities) =
+        prepare_plan_effects(allowed_prompts)?;
+    let budget = run
+        .budget()
+        .snapshot()
+        .map_err(|error| format!("failed to snapshot plan budget: {error}"))?;
+    let prepared_at = Utc::now();
+    let remaining_millis = i64::try_from(budget.remaining_elapsed_millis)
+        .map_err(|_| "plan approval expiry exceeds the supported duration".to_string())?;
+    let remaining = chrono::TimeDelta::try_milliseconds(remaining_millis)
+        .ok_or_else(|| "plan approval expiry exceeds the supported duration".to_string())?;
+    let expires_at = prepared_at
+        .checked_add_signed(remaining)
+        .ok_or_else(|| "plan approval expiry is outside the supported time range".to_string())?;
+    let descriptor = run.runtime().descriptor();
+    Ok(PreparedPlanApproval {
+        plan_digest: approved_plan_digest(&plan_content),
+        plan_content,
+        plan_realpath: plan_state.plan_realpath,
+        previous_mode: plan_state.previous_mode,
+        runtime_mode_generation: runtime_mode.generation,
+        capability_generation: run.generation().get(),
+        capability_manifest_digest: descriptor.capabilities.manifest_digest.to_string(),
+        actor: descriptor.actor.clone(),
+        run_id: descriptor.run_id,
+        budget,
+        prepared_at,
+        expires_at,
+        proposed_effects,
+        effect_grants,
+        unrestricted_within_run_capabilities,
+    })
+}
+
+fn prepare_plan_effects(
+    allowed_prompts: &[crate::tools::ToolAllowedPrompt],
+) -> Result<
+    (
+        Vec<PlanProposedEffect>,
+        Vec<crate::modes::PlanEffectGrant>,
+        bool,
+    ),
+    String,
+> {
+    if allowed_prompts.len() > 64 {
+        return Err("a plan may propose at most 64 allowed operations".to_string());
+    }
+    let mut proposed = Vec::with_capacity(allowed_prompts.len());
+    let mut grants = Vec::with_capacity(allowed_prompts.len());
+    for prompt in allowed_prompts {
+        let tool = prompt.tool.trim().to_ascii_lowercase();
+        if tool.is_empty() || tool.len() > 128 || prompt.prompt.len() > 4_096 {
+            return Err(
+                "plan allowed operations exceed their bounded tool/prompt size".to_string(),
+            );
+        }
+        let (_, spec) = crate::tools::effect::lookup(&tool)
+            .ok_or_else(|| format!("plan proposes unknown tool '{}'", prompt.tool))?;
+        proposed.push(PlanProposedEffect {
+            tool: tool.clone(),
+            canonical: spec.canonical.to_string(),
+            effect: spec.effect.as_str().to_string(),
+            prompt_digest: approved_plan_digest(&prompt.prompt),
+        });
+        grants.push(crate::modes::PlanEffectGrant {
+            tool,
+            effect: spec.effect,
+        });
+    }
+    Ok((proposed, grants, allowed_prompts.is_empty()))
+}
+
+/// Commit a user decision for exactly one prepared plan artifact.
+///
+/// The plan is re-read before publication. A changed plan, replaced session
+/// state, or changed runtime generation leaves plan mode active and grants no
+/// wider capability. The canonical task binding is published before runtime
+/// capabilities are restored; session state is then updated in one closure.
+///
+/// # Errors
+///
+/// Returns an error on stale plan bytes/state, task-graph publication failure,
+/// or an invalid runtime restoration profile.
+#[allow(clippy::too_many_lines)] // Validation and publication form one auditable transaction boundary.
+pub fn commit_interactive_plan_approval(
+    run: &crate::tools::ToolRunContext,
+    chat_session: &crate::state::Session,
+    task_manager: &std::sync::Mutex<crate::session::TaskManager>,
+    prepared: &PreparedPlanApproval,
+    allowed_prompts: &[crate::tools::ToolAllowedPrompt],
+    restore_mode: crate::modes::RuntimeMode,
+) -> Result<ApprovedPlanReceipt, String> {
+    if prepared.run_id != run.run_id()
+        || prepared.capability_generation != run.generation().get()
+        || prepared.capability_manifest_digest
+            != run
+                .runtime()
+                .descriptor()
+                .capabilities
+                .manifest_digest
+                .to_string()
+    {
+        return Err("prepared plan belongs to a different run capability generation".to_string());
+    }
+    let runtime_mode = run.runtime_mode();
+    if runtime_mode.class != crate::modes::RuntimeModeClass::Plan
+        || runtime_mode.generation != prepared.runtime_mode_generation
+    {
+        return Err("plan approval is stale for the current runtime mode generation".to_string());
+    }
+    let current_plan_state = chat_session
+        .inspect_state(|state| state.conversation.plan_mode.clone())
+        .filter(|state| state.active)
+        .ok_or_else(|| "session is no longer in active plan mode".to_string())?;
+    if current_plan_state.plan_realpath != prepared.plan_realpath
+        || current_plan_state.previous_mode != prepared.previous_mode
+    {
+        return Err("plan approval is stale for the current session plan state".to_string());
+    }
+    let (_, current_content) = crate::tools::read_capability_text_attachment(
+        run,
+        &prepared.plan_realpath.to_string_lossy(),
+    )
+    .map_err(|error| format!("failed to re-read the pinned plan artifact: {error}"))?;
+    if approved_plan_digest(&current_content) != prepared.plan_digest
+        || current_content != prepared.plan_content
+    {
+        return Err("plan artifact changed after it was displayed for approval".to_string());
+    }
+    let (proposed_effects, effect_grants, unrestricted) = prepare_plan_effects(allowed_prompts)?;
+    if proposed_effects != prepared.proposed_effects
+        || effect_grants != prepared.effect_grants
+        || unrestricted != prepared.unrestricted_within_run_capabilities
+    {
+        return Err(
+            "proposed plan effects changed after they were displayed for approval".to_string(),
+        );
+    }
+    if Utc::now() >= prepared.expires_at {
+        return Err("prepared plan approval expired before activation".to_string());
+    }
+    let current_budget = run
+        .budget()
+        .snapshot()
+        .map_err(|error| format!("failed to revalidate plan budget: {error}"))?;
+    if current_budget.generation != prepared.budget.generation
+        || current_budget.limits != prepared.budget.limits
+    {
+        return Err("plan budget generation or limits changed after review".to_string());
+    }
+
+    let restored_agent_mode = restored_plan_agent_mode(prepared.previous_mode.as_deref());
+    let allowed_operations = if allowed_prompts.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Allowed operations:\n{}",
+            allowed_prompts
+                .iter()
+                .map(|prompt| format!("- {}: {}", prompt.tool, prompt.prompt))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    let restored_mode_label = runtime_mode_label(&restore_mode);
+    let plan_id = format!("plan-{}", chat_session.id());
+    let (restored_runtime, receipt) = run.transition_plan_approval(
+        prepared.runtime_mode_generation,
+        restore_mode,
+        |activated_mode_generation| {
+            chat_session.update_state(|state, _| {
+                let active = state
+                    .conversation
+                    .plan_mode
+                    .as_ref()
+                    .filter(|plan| plan.active)
+                    .ok_or_else(|| "session is no longer in active plan mode".to_string())?;
+                if active.plan_realpath != prepared.plan_realpath
+                    || active.previous_mode != prepared.previous_mode
+                {
+                    return Err("plan approval is stale for the current session plan state".to_string());
+                }
+                let (_, final_content) = crate::tools::read_capability_text_attachment(
+                    run,
+                    &prepared.plan_realpath.to_string_lossy(),
+                )
+                .map_err(|error| format!("failed to re-read the pinned plan artifact: {error}"))?;
+                if final_content != prepared.plan_content
+                    || approved_plan_digest(&final_content) != prepared.plan_digest
+                {
+                    return Err("plan artifact changed during approval commit".to_string());
+                }
+                if run.runtime().cancellation().is_cancelled() {
+                    return Err("run was cancelled during plan approval".to_string());
+                }
+                let mut manager = task_manager
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let task_id = manager
+                    .reconcile_approved_plan(&plan_id, prepared.plan_digest.clone())?
+                    .id
+                    .clone();
+                let task_graph_generation = manager.generation().get();
+                drop(manager);
+                let approved_at = Utc::now();
+                let evidence_digest = crate::runtime::ContentDigest::sha256(format!(
+                    "{}:{}:{}:{}",
+                    prepared.plan_digest,
+                    prepared.run_id,
+                    prepared.prepared_at.to_rfc3339(),
+                    approved_at.to_rfc3339()
+                ))
+                .to_string();
+                let artifact = ApprovedPlanArtifact {
+                    schema_version: APPROVED_PLAN_ARTIFACT_SCHEMA_VERSION,
+                    artifact_generation: activated_mode_generation,
+                    plan_digest: prepared.plan_digest.clone(),
+                    task_id: task_id.clone(),
+                    task_graph_generation,
+                    proposed_effects: prepared.proposed_effects.clone(),
+                    unrestricted_within_run_capabilities: prepared
+                        .unrestricted_within_run_capabilities,
+                    budget: prepared.budget.clone(),
+                    expires_at: prepared.expires_at,
+                    actor: prepared.actor.clone(),
+                    run_id: prepared.run_id,
+                    capability_generation: prepared.capability_generation,
+                    capability_manifest_digest: prepared.capability_manifest_digest.clone(),
+                    prepared_runtime_mode_generation: prepared.runtime_mode_generation,
+                    activated_runtime_mode_generation: activated_mode_generation,
+                    restored_mode: restored_mode_label.clone(),
+                    evidence: PlanApprovalEvidence {
+                        provenance: "interactive_user".to_string(),
+                        prepared_at: prepared.prepared_at,
+                        approved_at,
+                        evidence_digest,
+                    },
+                };
+                let artifact_digest = artifact.digest();
+                let context_message = serde_json::json!({
+                    "role": "system",
+                    "content": format!(
+                        "[Approved Implementation Plan]\nThe user has approved the following plan. Execute it step by step.\n\n{}\n\n{}",
+                        prepared.plan_content,
+                        allowed_operations
+                    ),
+                    "metadata": {
+                        "openclaudia_context_source": "user_approved_plan",
+                        "canonical_task_id": task_id,
+                        "canonical_task_graph_generation": task_graph_generation,
+                        "approved_plan_digest": prepared.plan_digest,
+                        "approved_plan_artifact_digest": artifact_digest
+                    }
+                });
+                state.modes.agent_mode = restored_agent_mode;
+                state.conversation.plan_mode = None;
+                state.conversation.approved_plan = Some(prepared.plan_content.clone());
+                let binding = crate::modes::PlanExecutionBinding {
+                    artifact_digest: artifact_digest.clone(),
+                    plan_digest: prepared.plan_digest.clone(),
+                    plan_realpath: prepared.plan_realpath.clone(),
+                    run_id: prepared.run_id,
+                    capability_generation: prepared.capability_generation,
+                    capability_manifest_digest: prepared.capability_manifest_digest.clone(),
+                    budget_generation: prepared.budget.generation.get(),
+                    budget_limits: prepared.budget.limits.clone(),
+                    task_graph_generation,
+                    activated_mode_generation,
+                    expires_at: prepared.expires_at,
+                    proposed_effects: (!prepared.unrestricted_within_run_capabilities)
+                        .then(|| prepared.effect_grants.clone()),
+                };
+                Ok((
+                    ApprovedPlanReceipt {
+                        task_id,
+                        task_graph_generation,
+                        plan_digest: prepared.plan_digest.clone(),
+                        runtime_mode_generation: activated_mode_generation,
+                        artifact_digest,
+                        expires_at: prepared.expires_at,
+                        artifact,
+                        context_message,
+                    },
+                    binding,
+                ))
+            })
+        },
+    )?;
+    debug_assert_eq!(restored_runtime.generation, receipt.runtime_mode_generation);
+    Ok(receipt)
+}
+
+fn runtime_mode_label(mode: &crate::modes::RuntimeMode) -> String {
+    match mode {
+        crate::modes::RuntimeMode::Behavioral(behavior) => behavior.display_name(),
+        crate::modes::RuntimeMode::Plan => "plan".to_string(),
+        crate::modes::RuntimeMode::Initializer => "initializer".to_string(),
+        crate::modes::RuntimeMode::Coordinator => "coordinator".to_string(),
+    }
+}
+
 /// An allowed prompt constraint for plan mode exit
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AllowedPrompt {
@@ -275,14 +826,12 @@ pub struct AllowedPrompt {
     pub prompt: String,
 }
 
-/// Tools that are allowed in plan mode (read-only + user interaction).
+/// Common tools displayed when plan mode starts.
 ///
-/// Single source of truth for "known plan-mode-safe tools".
-///
-/// `is_tool_allowed_in_plan_mode` enforces hard default-deny: any tool name
-/// not in this list (and not the `write_file`-to-plan-file special case nor
-/// the plan-mode marker tools below) is **rejected** regardless of whether
-/// it is a built-in, MCP-registered, or plugin-contributed tool.
+/// This is explanatory UI, not the authorization source of truth. Runtime
+/// admission uses the mandatory effect declaration for the concrete call so
+/// newly registered read-only tools do not require a second hand-maintained
+/// list. Opaque, networked, orchestration, and mutating families remain denied.
 ///
 /// `enter_plan_mode` / `exit_plan_mode` are special and handled inline in
 /// [`is_tool_allowed_in_plan_mode`]; they are not in this list because they
@@ -292,18 +841,15 @@ pub const PLAN_MODE_ALLOWED_TOOLS: &[&str] = &[
     "read_file",
     "grounding_context",
     "list_files",
+    "glob",
     "grep",
-    "web_fetch",
-    #[cfg(feature = "browser")]
-    "web_search",
-    #[cfg(feature = "browser")]
-    "web_browser",
+    "tool_search",
     "ask_user_question",
-    "task",
-    "agent_output",
-    "todo_read",
-    "crosslink",
-    "bash_output",
+    "memory_search",
+    "memory_list",
+    "memory_learning_status",
+    "memory_conflicts",
+    "memory_source_status",
 ];
 
 /// MCP tool name prefix.
@@ -320,32 +866,27 @@ pub const MCP_TOOL_PREFIX: &str = "mcp__";
 /// in plan mode by default for the same reason as MCP tools.
 pub const PLUGIN_TOOL_PREFIX: &str = "plugin__";
 
-/// Policy for plan-mode tool gating.
+/// Compatibility policy for plan-mode tool gating.
 ///
-/// Default is *hard* default-deny: every tool not in
-/// [`PLAN_MODE_ALLOWED_TOOLS`] is refused, including any MCP or plugin
-/// tool that happens to be named like a built-in. Operators may opt into
-/// MCP/plugin tools in plan mode by setting `allow_mcp_tools` /
-/// `allow_plugin_tools` to `true`, but doing so still requires the tool
-/// name to appear in [`PLAN_MODE_ALLOWED_TOOLS`] -- the prefix flags only
-/// _lift the prefix-based hard refusal_, they do **not** bypass the
-/// allowlist (crosslink #341).
+/// MCP and plugin tools remain denied by the compiled runtime profile. The
+/// fields are retained for configuration compatibility; setting them does not
+/// widen the mode's capabilities.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PlanModePolicy {
-    /// Permit `mcp__*` tools to be considered by the allowlist. Default `false`.
+    /// Retained legacy setting; the runtime profile still denies MCP tools.
     pub allow_mcp_tools: bool,
-    /// Permit `plugin__*` tools to be considered by the allowlist. Default `false`.
+    /// Retained legacy setting; the runtime profile still denies plugin tools.
     pub allow_plugin_tools: bool,
 }
 
-/// Check if a tool is allowed in plan mode (hard default-deny).
+/// Check if a concrete tool call is allowed in plan mode.
 ///
 /// Thin wrapper over [`is_tool_allowed_in_plan_mode_with_policy`] using
 /// the default policy ([`PlanModePolicy::default`]), which denies all MCP
 /// and plugin tools. Existing callers keep their behaviour after the
 /// crosslink #341 refactor.
 ///
-/// # Hard default-deny (crosslink #341)
+/// # Effect-based default-deny
 ///
 /// The previous implementation used a "not in allowlist *and* not in
 /// blocklist → fall through" pattern that silently passed any name not in
@@ -356,11 +897,11 @@ pub struct PlanModePolicy {
 /// branch that fails open. The new implementation collapses the decision
 /// to a single explicit flow:
 ///
-/// 1. `mcp__*` / `plugin__*` prefixes → hard-deny by default (configurable).
+/// 1. `mcp__*` / `plugin__*` prefixes → hard-deny.
 /// 2. `enter_plan_mode` / `exit_plan_mode` → allow (plan-mode markers).
 /// 3. `write_file` → allow **only** if target canonicalizes to `plan_realpath`.
-/// 4. Name in [`PLAN_MODE_ALLOWED_TOOLS`] → allow.
-/// 5. Anything else → **deny**.
+/// 4. Resolve the call through the mandatory effect registry.
+/// 5. Allow only local observation tools admitted by the runtime profile.
 ///
 /// # Security: TOCTOU-safe `write_file` gate (crosslink #334)
 ///
@@ -387,15 +928,8 @@ pub fn is_tool_allowed_in_plan_mode(
     )
 }
 
-/// Policy-aware plan-mode allow check.
-///
-/// See [`is_tool_allowed_in_plan_mode`] for the decision flow. This entry
-/// point exists so the harness can opt into MCP/plugin tools when an
-/// operator has explicitly configured `plan_mode.allow_mcp_tools = true`
-/// (or the plugin equivalent) in the project config. Even with those
-/// flags lifted, the tool name still has to appear in
-/// [`PLAN_MODE_ALLOWED_TOOLS`] -- there is no path to "fall through"
-/// into allowed.
+/// Policy-aware compatibility entry point. See
+/// [`is_tool_allowed_in_plan_mode`] for the authoritative decision flow.
 #[must_use]
 pub fn is_tool_allowed_in_plan_mode_with_policy(
     tool_name: &str,
@@ -403,21 +937,15 @@ pub fn is_tool_allowed_in_plan_mode_with_policy(
     args: &serde_json::Value,
     policy: PlanModePolicy,
 ) -> bool {
-    // Step 1: Prefix-based hard refusal for opaque tool sources.
-    //
-    // MCP / plugin tools are denied by default. We refuse *before* the
-    // allowlist check because a malicious MCP server could otherwise
-    // register a tool whose suffix shadows an allow-listed built-in
-    // (e.g. `mcp__evil__read_file`). The prefix gate forces such tools
-    // to keep their `mcp__` / `plugin__` prefix in the dispatcher, so
-    // the refusal here applies before the name-based allowlist is even
-    // consulted.
-    if tool_name.starts_with(MCP_TOOL_PREFIX) && !policy.allow_mcp_tools {
+    // Preserve the old configuration shape without allowing it to widen the
+    // compiled mode profile. This also rejects shadow names before lookup.
+    if tool_name.starts_with(MCP_TOOL_PREFIX) {
         return false;
     }
-    if tool_name.starts_with(PLUGIN_TOOL_PREFIX) && !policy.allow_plugin_tools {
+    if tool_name.starts_with(PLUGIN_TOOL_PREFIX) {
         return false;
     }
+    let _ = policy;
 
     // Step 2: Plan-mode marker tools (always allowed -- they manage
     // plan-mode state itself, not user-facing side effects).
@@ -460,15 +988,9 @@ pub fn is_tool_allowed_in_plan_mode_with_policy(
         return target_canonical == plan_realpath;
     }
 
-    // Step 4: Explicit allowlist.
-    if PLAN_MODE_ALLOWED_TOOLS.contains(&tool_name) {
-        return true;
-    }
-
-    // Step 5: Hard default-deny. Any tool name not handled above --
-    // unknown built-ins, typo'd names, late-registered MCP/plugin tools
-    // that somehow lost their prefix, etc. -- is refused.
-    false
+    // Step 4/5: mandatory effect resolution with no permissive fallback.
+    crate::tools::effect::resolve_for_call(tool_name, args)
+        .is_ok_and(|resolved| crate::modes::observation_tool_allowed(tool_name, resolved.effect))
 }
 
 /// Context to inject at session start based on mode
@@ -511,6 +1033,25 @@ mod plan_mode_tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn plan_agent_mode_restore_preserves_known_modes_and_defaults_unknown_tokens() {
+        for mode in [
+            crate::state::AgentMode::Build,
+            crate::state::AgentMode::Extend,
+            crate::state::AgentMode::Refactor,
+        ] {
+            assert_eq!(restored_plan_agent_mode(Some(mode.as_token())), mode);
+        }
+        assert_eq!(
+            restored_plan_agent_mode(None),
+            crate::state::AgentMode::Build
+        );
+        assert_eq!(
+            restored_plan_agent_mode(Some("some_future_mode")),
+            crate::state::AgentMode::Build
+        );
+    }
 
     /// Entry refuses when the plan file does not exist (#334).
     #[test]
@@ -621,20 +1162,23 @@ mod plan_mode_tests {
         );
     }
 
-    /// Static allow-list preserved, and explicit write/mutate tools refused
-    /// after the #334 / #341 refactor (block-list is now redundant; the
-    /// hard default-deny in [`is_tool_allowed_in_plan_mode`] subsumes it).
+    /// Documented observation tools remain visible while concrete malformed
+    /// calls and mutation families are refused.
     #[test]
-    fn allow_check_preserves_static_allow_and_block_lists() {
+    fn plan_profile_preserves_documented_observations_and_denies_mutations() {
         let dir = TempDir::new().unwrap();
         let plan = dir.path().join("plan.md");
         std::fs::write(&plan, "# plan\n").unwrap();
         let state = PlanModeState::enter(plan).expect("enter must succeed");
         let no_args = json!({});
+        let authority = crate::modes::RuntimeModeAuthority::new(crate::modes::RuntimeMode::Plan)
+            .expect("plan profile");
         for allowed in PLAN_MODE_ALLOWED_TOOLS {
+            let (_, spec) = crate::tools::effect::lookup(allowed)
+                .unwrap_or_else(|| panic!("documented tool {allowed} must be classified"));
             assert!(
-                is_tool_allowed_in_plan_mode(allowed, &state.plan_realpath, &no_args),
-                "{allowed} must remain in the allow-list after the #334 refactor"
+                authority.definition_denial(allowed, spec.effect).is_none(),
+                "{allowed} must remain visible in the compiled plan profile"
             );
         }
         // Previously-blocklisted write/mutate tools: each must be refused
@@ -642,10 +1186,23 @@ mod plan_mode_tests {
         // is gone (crosslink #341).
         for blocked in &[
             "bash",
+            "bash_output",
             "edit_file",
             "kill_shell",
             "kill_shells_for_agent",
+            "crosslink",
+            "task",
+            "agent_output",
+            "task_get",
+            "task_list",
             "todo_write",
+            "todo_read",
+            "web_fetch",
+            "web_search",
+            "web_browser",
+            "enter_worktree",
+            "exit_worktree",
+            "list_worktrees",
         ] {
             assert!(
                 !is_tool_allowed_in_plan_mode(blocked, &state.plan_realpath, &no_args),
@@ -671,28 +1228,29 @@ mod plan_mode_tests {
 
     // ─── Crosslink #341: Hard default-deny for unknown / MCP / plugin tools ──
 
-    /// #341 — every name in [`PLAN_MODE_ALLOWED_TOOLS`] is permitted under
-    /// the new explicit-allowlist gate. Positive control: if this fails,
-    /// the hard default-deny has collapsed onto legitimate known tools
-    /// and the harness is unusable in plan mode.
+    /// Concrete, well-formed observation calls are admitted by their effect.
     #[test]
     fn known_tool_allowed_in_plan_mode_341() {
         let dir = TempDir::new().unwrap();
         let plan = dir.path().join("plan.md");
         std::fs::write(&plan, "# plan\n").unwrap();
         let state = PlanModeState::enter(plan).expect("enter must succeed");
-        let no_args = json!({});
+        let read_args = json!({"path": state.plan_realpath});
         assert!(
-            is_tool_allowed_in_plan_mode("read_file", &state.plan_realpath, &no_args),
-            "known allow-listed tool must be permitted (#341 positive control)"
+            is_tool_allowed_in_plan_mode("read_file", &state.plan_realpath, &read_args),
+            "well-formed read_file call must be permitted"
         );
         assert!(
-            is_tool_allowed_in_plan_mode("grounding_context", &state.plan_realpath, &no_args),
+            is_tool_allowed_in_plan_mode("grounding_context", &state.plan_realpath, &json!({})),
             "grounding_context must be permitted as a read-only plan-mode tool"
         );
         assert!(
-            is_tool_allowed_in_plan_mode("grep", &state.plan_realpath, &no_args),
-            "known allow-listed tool must be permitted (#341 positive control)"
+            is_tool_allowed_in_plan_mode(
+                "grep",
+                &state.plan_realpath,
+                &json!({"pattern": "plan", "path": state.plan_realpath})
+            ),
+            "well-formed grep call must be permitted"
         );
     }
 
@@ -718,7 +1276,7 @@ mod plan_mode_tests {
         );
         assert!(
             !is_tool_allowed_in_plan_mode("memory_save", &state.plan_realpath, &no_args),
-            "newly added tool not yet in allowlist must be refused (#341)"
+            "technical-memory mutation must be refused in plan mode (#341)"
         );
     }
 

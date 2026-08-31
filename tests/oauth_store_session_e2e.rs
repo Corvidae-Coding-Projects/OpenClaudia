@@ -13,6 +13,15 @@
 
 use chrono::{Duration, Utc};
 use openclaudia::oauth::{AuthMode, OAuthCredentials, OAuthSession, OAuthStore, PkceParams};
+use openclaudia::secrets::OAuthToken;
+
+fn authorization_state(pkce: &PkceParams) -> String {
+    url::Url::parse(&pkce.build_auth_url())
+        .expect("authorization URL")
+        .query_pairs()
+        .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+        .expect("state query parameter")
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // Section A — Challenge store/take round-trip
@@ -20,20 +29,20 @@ use openclaudia::oauth::{AuthMode, OAuthCredentials, OAuthSession, OAuthStore, P
 
 #[test]
 fn store_and_take_challenge_roundtrip_by_state() {
-    let store = OAuthStore::new();
+    let store = OAuthStore::ephemeral();
     let pkce = PkceParams::generate();
-    let state = pkce.state.clone();
+    let state = authorization_state(&pkce);
     let verifier = pkce.verifier.clone();
     store.store_challenge(pkce);
 
     let taken = store.take_challenge(&state).expect("present");
-    assert_eq!(taken.state, state);
+    assert!(taken.state.matches(&state));
     assert_eq!(taken.verifier, verifier);
 }
 
 #[test]
 fn take_challenge_with_unknown_state_returns_none() {
-    let store = OAuthStore::new();
+    let store = OAuthStore::ephemeral();
     let outcome = store.take_challenge("bogus-state-167");
     assert!(outcome.is_none());
 }
@@ -42,9 +51,9 @@ fn take_challenge_with_unknown_state_returns_none() {
 fn take_challenge_consumes_entry_so_second_take_returns_none() {
     // PINS TAKE-ONCE: storing once + taking twice → second
     // call returns None (CSRF state is single-use).
-    let store = OAuthStore::new();
+    let store = OAuthStore::ephemeral();
     let pkce = PkceParams::generate();
-    let state = pkce.state.clone();
+    let state = authorization_state(&pkce);
     store.store_challenge(pkce);
 
     let first = store.take_challenge(&state);
@@ -55,11 +64,11 @@ fn take_challenge_consumes_entry_so_second_take_returns_none() {
 
 #[test]
 fn multiple_challenges_for_distinct_states_coexist() {
-    let store = OAuthStore::new();
+    let store = OAuthStore::ephemeral();
     let p1 = PkceParams::generate();
     let p2 = PkceParams::generate();
-    let s1 = p1.state.clone();
-    let s2 = p2.state.clone();
+    let s1 = authorization_state(&p1);
+    let s2 = authorization_state(&p2);
     assert_ne!(s1, s2, "PKCE states MUST be distinct");
     store.store_challenge(p1);
     store.store_challenge(p2);
@@ -75,13 +84,16 @@ fn fresh_session(id: &str) -> OAuthSession {
     OAuthSession {
         id: id.to_string(),
         credentials: OAuthCredentials {
-            access_token: "test-token-167".to_string(),
-            refresh_token: Some("refresh-167".to_string()),
+            access_token: OAuthToken::try_from_string("test-token-167".to_string()).unwrap(),
+            refresh_token: Some(OAuthToken::try_from_string("refresh-167".to_string()).unwrap()),
             expires_at: Utc::now() + Duration::hours(1),
         },
         api_key: None,
         auth_mode: AuthMode::ApiKey,
-        granted_scopes: vec!["org:create_api_key".to_string()],
+        granted_scopes: vec![
+            "org:create_api_key".to_string(),
+            "user:inference".to_string(),
+        ],
         created_at: Utc::now(),
         user_id: None,
     }
@@ -89,7 +101,7 @@ fn fresh_session(id: &str) -> OAuthSession {
 
 #[test]
 fn store_and_get_session_roundtrip_preserves_id_and_token() {
-    let store = OAuthStore::new();
+    let store = OAuthStore::ephemeral();
     let session = fresh_session("session-167-a");
     let expected_token = session.credentials.access_token.clone();
     store.store_session(session);
@@ -101,7 +113,7 @@ fn store_and_get_session_roundtrip_preserves_id_and_token() {
 
 #[test]
 fn get_session_unknown_id_returns_none() {
-    let store = OAuthStore::new();
+    let store = OAuthStore::ephemeral();
     let outcome = store.get_session("definitely-not-a-session-167");
     assert!(outcome.is_none());
 }
@@ -109,7 +121,7 @@ fn get_session_unknown_id_returns_none() {
 #[test]
 fn get_session_does_not_consume_entry_unlike_take_challenge() {
     // PINS ASYMMETRY: get_session is read-only; challenge.take is take-once.
-    let store = OAuthStore::new();
+    let store = OAuthStore::ephemeral();
     let session = fresh_session("session-167-b");
     store.store_session(session);
     let first = store.get_session("session-167-b");
@@ -121,17 +133,17 @@ fn get_session_does_not_consume_entry_unlike_take_challenge() {
 #[test]
 fn store_session_with_same_id_overwrites() {
     // PINS UPSERT: store_session with same id replaces prior.
-    let store = OAuthStore::new();
+    let store = OAuthStore::ephemeral();
     let mut s1 = fresh_session("session-167-c");
-    s1.credentials.access_token = "token-v1".to_string();
+    s1.credentials.access_token = OAuthToken::try_from_string("token-v1".to_string()).unwrap();
     store.store_session(s1);
 
     let mut s2 = fresh_session("session-167-c");
-    s2.credentials.access_token = "token-v2".to_string();
+    s2.credentials.access_token = OAuthToken::try_from_string("token-v2".to_string()).unwrap();
     store.store_session(s2);
 
     let retrieved = store.get_session("session-167-c").expect("present");
-    assert_eq!(retrieved.credentials.access_token, "token-v2");
+    assert!(retrieved.credentials.access_token.matches("token-v2"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -141,7 +153,7 @@ fn store_session_with_same_id_overwrites() {
 #[test]
 fn credentials_expired_when_expires_at_in_past() {
     let creds = OAuthCredentials {
-        access_token: "x".to_string(),
+        access_token: OAuthToken::try_from_string("x".to_string()).unwrap(),
         refresh_token: None,
         expires_at: Utc::now() - Duration::hours(1),
     };
@@ -151,7 +163,7 @@ fn credentials_expired_when_expires_at_in_past() {
 #[test]
 fn credentials_not_expired_when_expires_at_in_future() {
     let creds = OAuthCredentials {
-        access_token: "x".to_string(),
+        access_token: OAuthToken::try_from_string("x".to_string()).unwrap(),
         refresh_token: None,
         expires_at: Utc::now() + Duration::hours(1),
     };
@@ -161,7 +173,7 @@ fn credentials_not_expired_when_expires_at_in_future() {
 #[test]
 fn credentials_far_future_not_expired() {
     let creds = OAuthCredentials {
-        access_token: "x".to_string(),
+        access_token: OAuthToken::try_from_string("x".to_string()).unwrap(),
         refresh_token: None,
         expires_at: Utc::now() + Duration::days(365),
     };
@@ -171,7 +183,7 @@ fn credentials_far_future_not_expired() {
 #[test]
 fn credentials_far_past_expired() {
     let creds = OAuthCredentials {
-        access_token: "x".to_string(),
+        access_token: OAuthToken::try_from_string("x".to_string()).unwrap(),
         refresh_token: None,
         expires_at: Utc::now() - Duration::days(365),
     };
@@ -231,10 +243,10 @@ fn can_create_api_key_case_sensitive_rejects_uppercase() {
 
 #[test]
 fn distinct_stores_have_independent_challenge_state() {
-    let store_a = OAuthStore::new();
-    let store_b = OAuthStore::new();
+    let store_a = OAuthStore::ephemeral();
+    let store_b = OAuthStore::ephemeral();
     let pkce = PkceParams::generate();
-    let state = pkce.state.clone();
+    let state = authorization_state(&pkce);
     store_a.store_challenge(pkce);
     // store_b knows nothing about it.
     assert!(store_b.take_challenge(&state).is_none());
@@ -244,14 +256,9 @@ fn distinct_stores_have_independent_challenge_state() {
 
 #[test]
 fn store_a_session_is_visible_to_store_a_get() {
-    // AUTHORING DISCOVERY: OAuthStore::new() loads from a
-    // shared on-disk persistence file (~/.local/share/openclaudia/
-    // oauth_sessions.json), so two `new()` instances are NOT
-    // independent — they share session state via the persist file.
-    // We pin the actually-true contract: store_a can read back
-    // its own stored session. The "isolation" property tested
-    // before was false; that's now documented here.
-    let store_a = OAuthStore::new();
+    // Tests use the explicit in-memory constructor and never mutate the
+    // operator's real OAuth session document.
+    let store_a = OAuthStore::ephemeral();
     let uniq = format!("sprint-167-{}", std::process::id());
     let session = fresh_session(&uniq);
     store_a.store_session(session);

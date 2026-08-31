@@ -43,11 +43,6 @@ providers:
 #       hooks:
 #         - type: command
 #           command: python .openclaudia/hooks/validate-write.py
-#   user_prompt_submit:
-#     - hooks:
-#         - type: command
-#           command: python .openclaudia/hooks/prompt-guard.py
-
 session:
   timeout_minutes: 30
   persist_path: .openclaudia/session

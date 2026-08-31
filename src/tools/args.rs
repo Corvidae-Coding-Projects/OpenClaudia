@@ -163,9 +163,17 @@ pub enum ToolError {
     /// The arguments parsed but failed a domain validation rule (e.g.
     /// command on the bash denylist, length cap exceeded, malformed path).
     InvalidInput(String),
+    /// A required immutable run resource is absent or invalid.
+    Unavailable(String),
     /// An external operation failed (subprocess, filesystem, HTTP, …).
     /// The message is the upstream error rendered for human consumption.
     External(String),
+    /// An external operation produced an observable effect before failing.
+    ///
+    /// The legacy tuple projection remains `(message, true)`, while the
+    /// canonical handler adapter preserves this as `ToolOutcome::Partial` so
+    /// effect accounting cannot mistake a failed completion for no effect.
+    PartialExternal(String),
     /// The permissions layer rejected the call. Distinct from
     /// `InvalidInput` so policy-enforcement code can surface the rejection
     /// distinctly from a user typo.
@@ -181,7 +189,9 @@ impl std::fmt::Display for ToolError {
         match self {
             Self::InvalidArgument(e) => write!(f, "{e}"),
             Self::InvalidInput(msg)
+            | Self::Unavailable(msg)
             | Self::External(msg)
+            | Self::PartialExternal(msg)
             | Self::PermissionDenied(msg)
             | Self::Other(msg) => write!(f, "{msg}"),
         }
@@ -233,6 +243,7 @@ impl From<ToolOutput> for (String, bool) {
 /// free function so call sites read as `into_legacy(result)` instead of
 /// fan-out `match` arms.
 #[must_use]
+#[cfg(test)]
 pub fn into_legacy(result: Result<ToolOutput, ToolError>) -> (String, bool) {
     match result {
         Ok(out) => out.into(),
@@ -300,6 +311,10 @@ pub trait ToolArgs {
     /// Returns [`ToolArgError::WrongType`] when `key` is present but not a
     /// JSON boolean.
     fn arg_bool_or_strict(&self, key: &'static str, default: bool) -> Result<bool, ToolArgError>;
+
+    /// Required non-negative integer argument, rejecting floats, strings,
+    /// negative values, and omission.
+    fn arg_u64_strict(&self, key: &'static str) -> Result<u64, ToolArgError>;
 }
 
 impl<S: BuildHasher> ToolArgs for HashMap<String, Value, S> {
@@ -345,6 +360,20 @@ impl<S: BuildHasher> ToolArgs for HashMap<String, Value, S> {
                 expected: "boolean",
             })
         })
+    }
+
+    fn arg_u64_strict(&self, key: &'static str) -> Result<u64, ToolArgError> {
+        match self.get(key) {
+            None => Err(ToolArgError::MissingOrWrongType { key }),
+            Some(Value::Number(value)) => value.as_u64().ok_or(ToolArgError::WrongType {
+                key,
+                expected: "non-negative integer",
+            }),
+            Some(_) => Err(ToolArgError::WrongType {
+                key,
+                expected: "non-negative integer",
+            }),
+        }
     }
 }
 

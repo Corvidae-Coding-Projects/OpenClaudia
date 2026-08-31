@@ -17,16 +17,27 @@
 //! - `.openclaudia/plugins/` (project plugins)
 //! - Tracked in `~/.openclaudia/plugins/installed_plugins.json`
 
+pub mod activation;
 pub mod git;
 pub mod install;
 pub mod manager;
 pub mod manifest;
 pub mod marketplace;
 pub mod policy;
+pub mod transaction;
 pub mod validate;
 pub mod zip_cache;
 
 // Re-export all public types for backward compatibility
+pub use activation::{
+    PluginActivationError, PluginAgentDefinition, PluginAgentInvocation, PluginAgentRegistration,
+    PluginCapabilityRegistration, PluginCapabilityRegistry, PluginCapabilityRequest,
+    PluginCapabilityRevocation, PluginCommandInvocation, PluginCommandRegistration,
+    PluginComponentKind, PluginEffectDeclaration, PluginHookRegistration, PluginLifecycleOwner,
+    PluginLspRegistration, PluginMcpRegistration, PluginPackageProvenance,
+    PluginRegistrationMetadata, PluginSkillInvocation, PluginSkillRegistration,
+    PLUGIN_CAPABILITY_SCHEMA,
+};
 pub use git::copy_dir_recursive;
 pub use install::{InstallScope, InstalledPlugins, PluginInstallEntry};
 pub use manager::PluginManager;
@@ -39,17 +50,37 @@ pub use marketplace::{
     GitHubSource, MarketplaceManifest, MarketplaceMetadata, MarketplacePlugin, MarketplaceSource,
     NpmSource, PipSource, PluginSource, PluginSourceDef, UrlSource,
 };
+pub use policy::{ArtifactTrustPolicy, TrustedArtifactSigner};
+pub use transaction::{
+    canonical_statement_bytes, digest_package_tree, public_key_id, ArtifactDependency,
+    ArtifactEnvelope, ArtifactGenerationReceipt, ArtifactSignature, ArtifactSourceProvenance,
+    ArtifactStatement, ArtifactVerificationLevel, PluginInstallTransaction, PluginTransactionError,
+    ARTIFACT_ENVELOPE_PATH, ARTIFACT_SCHEMA_VERSION,
+};
 pub use validate::{
     derive_dir_name_from_url, validate_plugin_dir_name, validate_source_url, PublicKey,
     SignatureError,
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 use tracing::{debug, warn};
+
+/// Stable schema for host-bound package identities.
+pub const PLUGIN_IDENTITY_SCHEMA: &str = "openclaudia.plugin_identity.v1";
+/// Exact host interpretation of `.claude-plugin/plugin.json`.
+pub const CLAUDE_PLUGIN_MANIFEST_SCHEMA: &str = "claude-code.plugin-manifest.v1";
+/// Exact host interpretation of root `plugin.json` compatibility packages.
+pub const ROOT_PLUGIN_MANIFEST_SCHEMA: &str = "claude-code.root-plugin-manifest.v1";
+/// Exact host interpretation of legacy `OpenClaudia` manifests.
+pub const LEGACY_PLUGIN_MANIFEST_SCHEMA: &str = "openclaudia.legacy-plugin-manifest.v1";
+
+const MAX_PLUGIN_METADATA_FILE_BYTES: u64 = 256 * 1024;
+const MAX_PLUGIN_NAME_BYTES: usize = 128;
+const MAX_PLUGIN_COMPONENTS_PER_KIND: usize = 512;
 
 // ---------------------------------------------------------------------------
 // Path safety helpers (crosslink #347)
@@ -176,14 +207,60 @@ fn validate_plugin_path(root: &Path, rel: &str) -> Result<PathBuf, PluginError> 
 /// so an attacker who can plant `.claude-plugin/plugin.json` as a
 /// symlink to `/etc/shadow` cannot make us read it.
 fn read_plugin_file(path: &Path) -> Result<String, PluginError> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => Err(PluginError::InvalidManifest(format!(
-            "plugin file is a symlink (refusing to follow): {}",
+    let observed =
+        fs::symlink_metadata(path).map_err(|error| PluginError::IoError(error.to_string()))?;
+    if observed.file_type().is_symlink() || !observed.is_file() {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin metadata must be a regular file, not a link or special entry: {}",
             path.display()
-        ))),
-        Ok(_) => fs::read_to_string(path).map_err(|e| PluginError::IoError(e.to_string())),
-        Err(e) => Err(PluginError::IoError(e.to_string())),
+        )));
     }
+    if observed.len() > MAX_PLUGIN_METADATA_FILE_BYTES {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin metadata {} exceeds {MAX_PLUGIN_METADATA_FILE_BYTES} bytes",
+            path.display()
+        )));
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| PluginError::IoError(error.to_string()))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| PluginError::IoError(error.to_string()))?;
+    if !opened.is_file() || opened.len() != observed.len() {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin metadata changed while being opened: {}",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(opened.len())
+            .unwrap_or(0)
+            .min(usize::try_from(MAX_PLUGIN_METADATA_FILE_BYTES).unwrap_or(0)),
+    );
+    file.take(MAX_PLUGIN_METADATA_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| PluginError::IoError(error.to_string()))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_PLUGIN_METADATA_FILE_BYTES {
+        return Err(PluginError::InvalidManifest(format!(
+            "plugin metadata changed beyond {MAX_PLUGIN_METADATA_FILE_BYTES} bytes while being read: {}",
+            path.display()
+        )));
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        PluginError::InvalidManifest(format!(
+            "plugin metadata is not UTF-8 at {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +311,19 @@ pub enum PluginError {
     /// tampered with after signing).
     #[error("plugin '{0}' signature is cryptographically invalid (manifest may be tampered)")]
     SignatureMismatch(String),
+
+    /// Staged package verification, publication, or recovery failed.
+    #[error(transparent)]
+    Transaction(#[from] transaction::PluginTransactionError),
+
+    /// Offline cache lookup, integrity, or extraction failed.
+    #[error(transparent)]
+    ZipCache(#[from] zip_cache::ZipCacheError),
+
+    /// A reviewed package could not be compiled into one atomic capability
+    /// generation. No component from that generation was published.
+    #[error(transparent)]
+    CapabilityActivation(#[from] activation::PluginActivationError),
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +331,7 @@ pub enum PluginError {
 // ---------------------------------------------------------------------------
 
 /// A resolved hook from a plugin, ready for the hook engine
+#[derive(Debug, Clone)]
 pub struct PluginHook {
     /// Hook event type (`PreToolUse`, `PostToolUse`, `SessionStart`, etc.)
     pub event: String,
@@ -257,6 +348,7 @@ pub struct PluginHook {
 }
 
 /// A resolved command from a plugin
+#[derive(Debug, Clone)]
 pub struct PluginCommand {
     /// Command name (used as /plugin-name:command)
     pub name: String,
@@ -379,6 +471,7 @@ fn parse_command_front_matter(content: &str) -> CommandFrontMatter {
 }
 
 /// A resolved MCP server from a plugin
+#[derive(Debug, Clone)]
 pub struct PluginMcpServer {
     /// Server name
     pub name: String,
@@ -391,49 +484,17 @@ pub struct PluginMcpServer {
     /// URL (for http)
     pub url: Option<String>,
     /// Environment variables
-    pub env: HashMap<String, String>,
+    pub env: crate::secrets::EnvironmentGrants,
     /// Static HTTP headers
-    pub headers: HashMap<String, String>,
+    pub headers: crate::secrets::SensitiveHeaders,
     /// Dynamic header helper command
     pub headers_helper: Option<String>,
+    /// Optional standards-based OAuth owner configuration.
+    pub oauth: Option<crate::mcp_oauth::McpOAuthClientConfig>,
     /// Per-server tool execution timeout in milliseconds
     pub timeout: Option<u64>,
     /// Whether Claude Code should eagerly load this server's tools
     pub always_load: Option<bool>,
-}
-
-fn process_env_lookup(name: &str) -> Result<Option<String>, String> {
-    let grants = env::var_os("OPENCLAUDIA_MCP_ENV_GRANTS")
-        .map(|value| {
-            value
-                .to_str()
-                .ok_or_else(|| "OPENCLAUDIA_MCP_ENV_GRANTS contains non-Unicode data".to_string())
-                .and_then(|value| {
-                    value
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|entry| !entry.is_empty())
-                        .try_fold(std::collections::HashSet::new(), |mut grants, entry| {
-                            validate_mcp_env_var_name(entry)?;
-                            grants.insert(entry.to_string());
-                            Ok(grants)
-                        })
-                })
-        })
-        .transpose()?
-        .unwrap_or_default();
-    if !grants.contains(name) {
-        // An ungranted variable behaves as absent, allowing `${VAR:-safe}`
-        // defaults without exposing ambient host state.
-        return Ok(None);
-    }
-    match env::var(name) {
-        Ok(value) => Ok(Some(value)),
-        Err(env::VarError::NotPresent) => Ok(None),
-        Err(env::VarError::NotUnicode(_)) => {
-            Err(format!("environment variable {name} is not valid UTF-8"))
-        }
-    }
 }
 
 fn validate_mcp_env_var_name(name: &str) -> Result<(), String> {
@@ -457,9 +518,13 @@ fn validate_mcp_env_var_name(name: &str) -> Result<(), String> {
     }
 }
 
-fn expand_mcp_env_vars_with<F>(value: &str, lookup: &F) -> Result<String, String>
+fn expand_mcp_env_vars_with<F>(
+    value: &str,
+    lookup: &F,
+    allow_protected_value: bool,
+) -> Result<String, String>
 where
-    F: Fn(&str) -> Result<Option<String>, String>,
+    F: Fn(&str) -> Result<Option<crate::secrets::SecretString>, String>,
 {
     let mut expanded = String::with_capacity(value.len());
     let mut rest = value;
@@ -479,7 +544,14 @@ where
         validate_mcp_env_var_name(name)?;
 
         match lookup(name)? {
-            Some(value) => expanded.push_str(&value),
+            Some(value) => {
+                if !allow_protected_value {
+                    return Err(format!(
+                        "protected environment variable {name} may only be expanded into an MCP environment value or HTTP header"
+                    ));
+                }
+                value.expose(|raw| expanded.push_str(raw));
+            }
             None => match default_value {
                 Some(value) => expanded.push_str(value),
                 None => return Err(format!("required environment variable {name} is not set")),
@@ -493,30 +565,90 @@ where
     Ok(expanded)
 }
 
-fn expand_mcp_config_value_with<F>(field: &str, value: &str, lookup: &F) -> Result<String, String>
+fn expand_mcp_config_value_with<F>(
+    field: &str,
+    value: &str,
+    lookup: &F,
+    allow_protected_value: bool,
+) -> Result<String, String>
 where
-    F: Fn(&str) -> Result<Option<String>, String>,
+    F: Fn(&str) -> Result<Option<crate::secrets::SecretString>, String>,
 {
-    expand_mcp_env_vars_with(value, lookup).map_err(|err| format!("{field}: {err}"))
+    expand_mcp_env_vars_with(value, lookup, allow_protected_value)
+        .map_err(|err| format!("{field}: {err}"))
 }
 
-fn expand_mcp_config_map_with<F>(
-    field: &str,
-    values: &HashMap<String, String>,
+fn expand_mcp_environment_map_with<F>(
+    values: &crate::secrets::EnvironmentGrants,
     lookup: &F,
-) -> Result<HashMap<String, String>, String>
+) -> Result<crate::secrets::EnvironmentGrants, String>
 where
-    F: Fn(&str) -> Result<Option<String>, String>,
+    F: Fn(&str) -> Result<Option<crate::secrets::SecretString>, String>,
 {
-    let expand_entry = |key: &String, value: &String| {
-        expand_mcp_config_value_with(&format!("{field}.{key}"), value, lookup)
-            .map(|expanded| (key.clone(), expanded))
-    };
+    let mut expanded = crate::secrets::EnvironmentGrants::new();
+    for key in values.keys() {
+        validate_mcp_env_var_name(key)?;
+        let value = values
+            .with_value(key, |value| {
+                expand_mcp_config_value_with(&format!("env.{key}"), value, lookup, true)
+            })
+            .ok_or_else(|| format!("env.{key}: template disappeared during expansion"))??;
+        expanded
+            .insert_validated(key.clone(), value)
+            .map_err(|error| format!("env.{key}: {error}"))?;
+    }
+    Ok(expanded)
+}
 
-    values
-        .iter()
-        .map(|(key, value)| expand_entry(key, value))
-        .collect()
+fn expand_mcp_header_map_with<F>(
+    values: &crate::secrets::SensitiveHeaders,
+    lookup: &F,
+) -> Result<crate::secrets::SensitiveHeaders, String>
+where
+    F: Fn(&str) -> Result<Option<crate::secrets::SecretString>, String>,
+{
+    let mut expanded = crate::secrets::SensitiveHeaders::new();
+    for key in values.names() {
+        let key = key.as_str();
+        let value = values
+            .with_value(key, |value| {
+                expand_mcp_config_value_with(&format!("headers.{key}"), value, lookup, true)
+            })
+            .ok_or_else(|| format!("headers.{key}: template disappeared during expansion"))??;
+        expanded
+            .insert_literal(key, value)
+            .map_err(|error| format!("headers.{key}: {error}"))?;
+    }
+    Ok(expanded)
+}
+
+fn expand_mcp_oauth_config_with<F>(
+    config: Option<&crate::mcp_oauth::McpOAuthClientConfig>,
+    lookup: &F,
+) -> Result<Option<crate::mcp_oauth::McpOAuthClientConfig>, String>
+where
+    F: Fn(&str) -> Result<Option<crate::secrets::SecretString>, String>,
+{
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let client_secret = config
+        .client_secret
+        .as_ref()
+        .map(|secret| {
+            secret
+                .expose(|raw| expand_mcp_config_value_with("oauth.clientSecret", raw, lookup, true))
+        })
+        .transpose()?
+        .map(crate::secrets::SecretString::try_from_string)
+        .transpose()
+        .map_err(|error| format!("oauth.clientSecret: {error}"))?;
+    Ok(Some(crate::mcp_oauth::McpOAuthClientConfig {
+        client_id: config.client_id.clone(),
+        client_secret,
+        redirect_uri: config.redirect_uri.clone(),
+        scopes: config.scopes.clone(),
+    }))
 }
 
 fn resolved_mcp_server_from_config_with<F>(
@@ -525,7 +657,7 @@ fn resolved_mcp_server_from_config_with<F>(
     lookup: &F,
 ) -> Result<PluginMcpServer, String>
 where
-    F: Fn(&str) -> Result<Option<String>, String>,
+    F: Fn(&str) -> Result<Option<crate::secrets::SecretString>, String>,
 {
     Ok(PluginMcpServer {
         name: name.to_string(),
@@ -533,39 +665,128 @@ where
         command: config
             .command
             .as_deref()
-            .map(|value| expand_mcp_config_value_with("command", value, lookup))
+            .map(|value| expand_mcp_config_value_with("command", value, lookup, false))
             .transpose()?,
         args: config
             .args
             .iter()
             .enumerate()
             .map(|(index, value)| {
-                expand_mcp_config_value_with(&format!("args[{index}]"), value, lookup)
+                expand_mcp_config_value_with(&format!("args[{index}]"), value, lookup, false)
             })
             .collect::<Result<Vec<_>, _>>()?,
         url: config
             .url
             .as_deref()
-            .map(|value| expand_mcp_config_value_with("url", value, lookup))
+            .map(|value| expand_mcp_config_value_with("url", value, lookup, false))
             .transpose()?,
-        env: expand_mcp_config_map_with("env", &config.env, lookup)?,
-        headers: expand_mcp_config_map_with("headers", &config.headers, lookup)?,
+        env: expand_mcp_environment_map_with(&config.env, lookup)?,
+        headers: expand_mcp_header_map_with(&config.headers, lookup)?,
         headers_helper: config.headers_helper.clone(),
+        oauth: expand_mcp_oauth_config_with(config.oauth.as_ref(), lookup)?,
         timeout: config.timeout,
         always_load: config.always_load,
     })
 }
 
-fn resolved_mcp_server_from_config(
-    name: &str,
-    config: &McpServerConfig,
-) -> Result<PluginMcpServer, String> {
-    resolved_mcp_server_from_config_with(name, config, &process_env_lookup)
-}
-
 // ---------------------------------------------------------------------------
 // Plugin loading
 // ---------------------------------------------------------------------------
+
+/// Host-bound identity of one immutable plugin package snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PluginPackageIdentity {
+    /// Identity record schema owned by the host.
+    pub schema: &'static str,
+    /// Normalized package key used for collision detection.
+    pub normalized_package: String,
+    /// Catalogue/search authority selected by the host.
+    pub host_scope: InstallScope,
+    /// Canonical source observed by the host, including its source family.
+    pub canonical_source: String,
+    /// SHA-256 of the complete bounded package tree.
+    pub artifact_digest: String,
+    /// Immutable source revision, or the tree digest for directory packages.
+    pub source_revision: String,
+    /// Exact parser schema used for the package manifest.
+    pub manifest_schema: &'static str,
+    /// Host or verified publisher identity responsible for the package.
+    pub owner: String,
+}
+
+fn normalized_plugin_name(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
+fn canonical_artifact_source(source: &ArtifactSourceProvenance) -> Result<String, PluginError> {
+    const MAX_CANONICAL_SOURCE_BYTES: usize = 16 * 1024;
+    if source.kind.trim().is_empty()
+        || source.locator.trim().is_empty()
+        || source.kind.len().saturating_add(source.locator.len()) > MAX_CANONICAL_SOURCE_BYTES
+        || source.kind.chars().any(char::is_control)
+        || source.locator.chars().any(char::is_control)
+    {
+        return Err(PluginError::InvalidManifest(
+            "installed receipt has an invalid or oversized canonical source".to_string(),
+        ));
+    }
+    let locator = url::Url::parse(&source.locator).map_or_else(
+        |_| source.locator.clone(),
+        |mut url| {
+            url.set_fragment(None);
+            url.to_string()
+        },
+    );
+    Ok(format!("{}:{locator}", source.kind))
+}
+
+fn validate_manifest_component_bounds(manifest: &PluginManifest) -> Result<(), PluginError> {
+    fn reject_if_oversized(kind: &str, count: usize) -> Result<(), PluginError> {
+        if count > MAX_PLUGIN_COMPONENTS_PER_KIND {
+            Err(PluginError::InvalidManifest(format!(
+                "plugin manifest declares {count} {kind}; maximum is {MAX_PLUGIN_COMPONENTS_PER_KIND}"
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    let commands = manifest
+        .commands
+        .as_ref()
+        .map_or(0, |commands| match commands {
+            CommandsSpec::Path(_) => 1,
+            CommandsSpec::Paths(paths) => paths.len(),
+            CommandsSpec::Map(commands) => commands.len(),
+        });
+    let hooks = manifest.hooks.as_ref().map_or(0, |hooks| match hooks {
+        HooksSpec::Path(_) | HooksSpec::Inline(_) => 1,
+        HooksSpec::Array(entries) => entries.len(),
+    });
+    let agents = manifest.agents.as_ref().map_or(0, |agents| match agents {
+        AgentsSpec::Path(_) => 1,
+        AgentsSpec::Paths(paths) => paths.len(),
+    });
+    let skills = manifest.skills.as_ref().map_or(0, |skills| match skills {
+        SkillsSpec::Path(_) => 1,
+        SkillsSpec::Paths(paths) => paths.len(),
+    });
+    let mcp = manifest
+        .mcp_servers
+        .as_ref()
+        .map_or(0, |servers| match servers {
+            McpServersSpec::Path(_) | McpServersSpec::Map(_) => 1,
+            McpServersSpec::Array(entries) => entries.len(),
+        });
+    let lsp = manifest.lsp_servers.as_ref().map_or(0, HashMap::len);
+
+    reject_if_oversized("command entries", commands)?;
+    reject_if_oversized("hook entries", hooks)?;
+    reject_if_oversized("agent entries", agents)?;
+    reject_if_oversized("skill entries", skills)?;
+    reject_if_oversized("MCP entries", mcp)?;
+    reject_if_oversized("LSP entries", lsp)
+}
 
 /// A loaded plugin
 #[derive(Debug, Clone)]
@@ -596,6 +817,12 @@ pub struct Plugin {
     pub agent_paths: Vec<PathBuf>,
     /// Resolved skill paths
     pub skill_paths: Vec<PathBuf>,
+    /// Detached receipt for an immutable installed generation. Convention
+    /// plugins have no receipt and are bound to a host-observed tree digest
+    /// when their capability generation is compiled.
+    generation_receipt: Option<ArtifactGenerationReceipt>,
+    /// Stable package identity bound before the package can be activated.
+    identity: PluginPackageIdentity,
 }
 
 impl Plugin {
@@ -603,43 +830,87 @@ impl Plugin {
     ///
     /// # Errors
     /// Returns an error if plugin loading fails.
+    #[allow(clippy::too_many_lines)] // Package probing, manifest validation, digesting, and identity sealing are one load transaction.
     pub fn load(path: &Path) -> Result<Self, PluginError> {
+        let root_metadata =
+            fs::symlink_metadata(path).map_err(|error| PluginError::IoError(error.to_string()))?;
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin root must be a real directory, not a link or special entry: {}",
+                path.display()
+            )));
+        }
+        let canonical_root = path.canonicalize().map_err(|error| {
+            PluginError::IoError(format!(
+                "cannot canonicalize plugin root {}: {error}",
+                path.display()
+            ))
+        })?;
+        let initial_digest = digest_package_tree(&canonical_root)?;
+
         // Try Claude Code format first: .claude-plugin/plugin.json
-        let cc_manifest_path = path.join(".claude-plugin").join("plugin.json");
+        let cc_manifest_path = canonical_root.join(".claude-plugin").join("plugin.json");
         // Also try plugin.json at root (legacy Claude Code location)
-        let root_plugin_json = path.join("plugin.json");
+        let root_plugin_json = canonical_root.join("plugin.json");
         // Legacy OpenClaudia format
-        let legacy_manifest_path = path.join("manifest.json");
+        let legacy_manifest_path = canonical_root.join("manifest.json");
+
+        let candidates = [
+            (&cc_manifest_path, CLAUDE_PLUGIN_MANIFEST_SCHEMA),
+            (&root_plugin_json, ROOT_PLUGIN_MANIFEST_SCHEMA),
+            (&legacy_manifest_path, LEGACY_PLUGIN_MANIFEST_SCHEMA),
+        ]
+        .into_iter()
+        .filter_map(
+            |(candidate, schema)| match fs::symlink_metadata(candidate) {
+                Ok(_) => Some(Ok((candidate, schema))),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => Some(Err(PluginError::IoError(error.to_string()))),
+            },
+        )
+        .collect::<Result<Vec<_>, _>>()?;
+        if candidates.len() > 1 {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin package has ambiguous manifests under {}",
+                canonical_root.display()
+            )));
+        }
+        let Some((manifest_path, manifest_schema)) = candidates.first().copied() else {
+            return Err(PluginError::ManifestNotFound(canonical_root));
+        };
 
         // Manifest reads MUST go through `read_plugin_file` so that a
         // symlinked `plugin.json` (pointing at e.g. `/etc/shadow`) is
         // rejected before we touch its contents. See crosslink #347.
-        let manifest: PluginManifest = if cc_manifest_path.exists() {
-            debug!(path = ?cc_manifest_path, "Loading Claude Code plugin manifest");
-            let content = read_plugin_file(&cc_manifest_path)?;
+        let manifest: PluginManifest = if manifest_schema == CLAUDE_PLUGIN_MANIFEST_SCHEMA {
+            debug!(path = ?manifest_path, "Loading Claude Code plugin manifest");
+            let content = read_plugin_file(manifest_path)?;
             serde_json::from_str(&content).map_err(|e| {
-                PluginError::InvalidManifest(format!("{}: {}", cc_manifest_path.display(), e))
+                PluginError::InvalidManifest(format!("{}: {}", manifest_path.display(), e))
             })?
-        } else if root_plugin_json.exists() {
-            debug!(path = ?root_plugin_json, "Loading plugin.json from root");
-            let content = read_plugin_file(&root_plugin_json)?;
+        } else if manifest_schema == ROOT_PLUGIN_MANIFEST_SCHEMA {
+            debug!(path = ?manifest_path, "Loading plugin.json from root");
+            let content = read_plugin_file(manifest_path)?;
             serde_json::from_str(&content).map_err(|e| {
-                PluginError::InvalidManifest(format!("{}: {}", root_plugin_json.display(), e))
+                PluginError::InvalidManifest(format!("{}: {}", manifest_path.display(), e))
             })?
-        } else if legacy_manifest_path.exists() {
-            debug!(path = ?legacy_manifest_path, "Loading legacy manifest.json");
-            Self::load_legacy_manifest(&legacy_manifest_path)?
+        } else if manifest_schema == LEGACY_PLUGIN_MANIFEST_SCHEMA {
+            debug!(path = ?manifest_path, "Loading legacy manifest.json");
+            Self::load_legacy_manifest(manifest_path)?
         } else {
-            return Err(PluginError::ManifestNotFound(path.to_path_buf()));
+            return Err(PluginError::InvalidManifest(
+                "plugin manifest schema is unsupported".to_string(),
+            ));
         };
 
         Self::validate_manifest(&manifest)?;
+        let normalized_package = normalized_plugin_name(&manifest.name);
 
         let mut plugin = Self {
             id: manifest.name.clone(),
             source: "local".to_string(),
             manifest,
-            path: path.to_path_buf(),
+            path: canonical_root.clone(),
             enabled: true,
             command_paths: Vec::new(),
             command_metadata: HashMap::new(),
@@ -648,15 +919,58 @@ impl Plugin {
             lsp_configs: HashMap::new(),
             agent_paths: Vec::new(),
             skill_paths: Vec::new(),
+            generation_receipt: None,
+            identity: PluginPackageIdentity {
+                schema: PLUGIN_IDENTITY_SCHEMA,
+                normalized_package,
+                host_scope: InstallScope::Local,
+                canonical_source: format!("local-directory:{}", canonical_root.display()),
+                artifact_digest: initial_digest.clone(),
+                source_revision: initial_digest.clone(),
+                manifest_schema,
+                owner: "host-observed-local".to_string(),
+            },
         };
 
         // Resolve all components
         plugin.resolve_commands();
         plugin.resolve_hooks();
-        plugin.resolve_mcp_servers();
+        plugin.resolve_mcp_servers()?;
         plugin.resolve_lsp_servers();
         plugin.resolve_agents();
         plugin.resolve_skills();
+
+        for (kind, count) in [
+            (
+                "commands",
+                plugin
+                    .command_paths
+                    .len()
+                    .saturating_add(plugin.command_metadata.len()),
+            ),
+            ("hooks", plugin.hook_definitions.len()),
+            ("MCP servers", plugin.mcp_configs.len()),
+            ("LSP servers", plugin.lsp_configs.len()),
+            ("agents", plugin.agent_paths.len()),
+            ("skills", plugin.skill_paths.len()),
+        ] {
+            if count > MAX_PLUGIN_COMPONENTS_PER_KIND {
+                return Err(PluginError::InvalidManifest(format!(
+                    "plugin discovery found {count} {kind}; maximum is {MAX_PLUGIN_COMPONENTS_PER_KIND}"
+                )));
+            }
+        }
+
+        for command_path in &plugin.command_paths {
+            read_plugin_file(command_path)?;
+        }
+
+        let final_digest = digest_package_tree(&canonical_root)?;
+        if final_digest != initial_digest {
+            return Err(PluginError::InvalidManifest(
+                "plugin package changed while discovery was reading it".to_string(),
+            ));
+        }
 
         Ok(plugin)
     }
@@ -714,11 +1028,12 @@ impl Plugin {
                                     .collect()
                             })
                             .unwrap_or_default(),
-                        env: HashMap::new(),
+                        env: crate::secrets::EnvironmentGrants::new(),
                         transport,
                         url: server["url"].as_str().map(String::from),
-                        headers: HashMap::new(),
+                        headers: crate::secrets::SensitiveHeaders::new(),
                         headers_helper: None,
+                        oauth: None,
                         timeout: None,
                         always_load: None,
                     },
@@ -768,7 +1083,16 @@ impl Plugin {
                     .to_string(),
             ));
         }
+        if manifest.name.len() > MAX_PLUGIN_NAME_BYTES
+            || !manifest.name.is_ascii()
+            || manifest.name.contains('@')
+        {
+            return Err(PluginError::InvalidManifest(format!(
+                "Plugin name must be unscoped ASCII without '@' and no longer than {MAX_PLUGIN_NAME_BYTES} bytes"
+            )));
+        }
         validate_plugin_dir_name(&manifest.name)?;
+        validate_manifest_component_bounds(manifest)?;
         Ok(())
     }
 
@@ -931,6 +1255,7 @@ impl Plugin {
     fn load_hooks_file(path: &Path) -> Result<HooksDefinition, PluginError> {
         // Try wrapper format: { "description": "...", "hooks": { ... } }
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct HooksWrapper {
             #[serde(default)]
             description: Option<String>,
@@ -959,23 +1284,14 @@ impl Plugin {
     /// `if let Ok(...)` chains with no `else`, which meant a plugin author who
     /// shipped a broken `.mcp.json` got zero diagnostic — the plugin loaded
     /// with the broken server silently absent.
-    fn resolve_mcp_servers(&mut self) {
+    fn resolve_mcp_servers(&mut self) -> Result<(), PluginError> {
         // Convention: .mcp.json at plugin root. Use the symlink-rejecting
         // reader so an attacker cannot swap .mcp.json for a symlink to
         // a sensitive file. See crosslink #347.
         let mcp_json = self.path.join(".mcp.json");
         if mcp_json.exists() {
-            match read_plugin_file(&mcp_json) {
-                Ok(content) => self.parse_mcp_json_file(&mcp_json, &content),
-                Err(e) => {
-                    warn!(
-                        path = ?mcp_json,
-                        plugin = %self.manifest.name,
-                        error = %e,
-                        "Plugin .mcp.json unreadable; skipping MCP servers from this file"
-                    );
-                }
-            }
+            let content = read_plugin_file(&mcp_json)?;
+            self.parse_mcp_json_file(&mcp_json, &content)?;
         }
 
         // Manifest-specified MCP servers — paths go through
@@ -991,21 +1307,19 @@ impl Plugin {
             match mcp_spec {
                 McpServersSpec::Path(p) => match validate_plugin_path(&self.path, &p) {
                     Ok(resolved) if resolved.exists() => {
-                        self.load_mcp_servers_from_path(&p, &resolved);
+                        self.load_mcp_servers_from_path(&p, &resolved)?;
                     }
                     Ok(_) => {
-                        warn!(
-                            path = %p,
-                            plugin = %self.manifest.name,
-                            "Plugin manifest mcp_servers path does not exist"
-                        );
+                        return Err(PluginError::InvalidManifest(format!(
+                            "plugin manifest MCP path does not exist: {p}"
+                        )));
                     }
                     Err(e) => {
-                        warn!(path = %p, plugin = %self.manifest.name, error = %e, "Rejected unsafe mcp_servers path");
+                        return Err(e);
                     }
                 },
                 McpServersSpec::Map(map) => {
-                    self.mcp_configs.extend(map);
+                    self.insert_mcp_configs(map)?;
                 }
                 McpServersSpec::Array(entries) => {
                     for entry in entries {
@@ -1013,34 +1327,33 @@ impl Plugin {
                             McpServersSpecEntry::Path(p) => {
                                 match validate_plugin_path(&self.path, &p) {
                                     Ok(resolved) if resolved.exists() => {
-                                        self.load_mcp_servers_from_path(&p, &resolved);
+                                        self.load_mcp_servers_from_path(&p, &resolved)?;
                                     }
                                     Ok(_) => {
-                                        warn!(
-                                            path = %p,
-                                            plugin = %self.manifest.name,
-                                            "Plugin manifest mcp_servers path does not exist"
-                                        );
+                                        return Err(PluginError::InvalidManifest(format!(
+                                            "plugin manifest MCP path does not exist: {p}"
+                                        )));
                                     }
                                     Err(e) => {
-                                        warn!(path = %p, plugin = %self.manifest.name, error = %e, "Rejected unsafe mcp_servers path");
+                                        return Err(e);
                                     }
                                 }
                             }
                             McpServersSpecEntry::Map(map) => {
-                                self.mcp_configs.extend(map);
+                                self.insert_mcp_configs(map)?;
                             }
                         }
                     }
                 }
             }
         }
+        Ok(())
     }
 
     /// Parse a `.mcp.json` body (the convention file at the plugin root) and
     /// extend `self.mcp_configs`. Every parse failure logs a `warn!` with the
     /// plugin name and path so operators can spot a broken file (crosslink #799).
-    fn parse_mcp_json_file(&mut self, path: &Path, content: &str) {
+    fn parse_mcp_json_file(&mut self, path: &Path, content: &str) -> Result<(), PluginError> {
         // .mcp.json can be `{ "mcpServers": { ... } }` or a direct map.
         match serde_json::from_str::<HashMap<String, serde_json::Value>>(content) {
             Ok(wrapper) => {
@@ -1049,42 +1362,56 @@ impl Plugin {
                         servers_val.clone(),
                     ) {
                         Ok(servers) => {
-                            self.mcp_configs.extend(servers);
+                            self.insert_mcp_configs(servers)?;
                         }
                         Err(e) => {
-                            warn!(
-                                path = ?path,
-                                plugin = %self.manifest.name,
-                                error = %e,
-                                "Plugin .mcp.json `mcpServers` block could not be decoded as McpServerConfig map"
-                            );
+                            return Err(PluginError::InvalidManifest(format!(
+                                "plugin MCP file {} has an invalid mcpServers block: {e}",
+                                path.display()
+                            )));
                         }
                     }
                 } else {
                     match serde_json::from_str::<HashMap<String, McpServerConfig>>(content) {
                         Ok(servers) => {
-                            self.mcp_configs.extend(servers);
+                            self.insert_mcp_configs(servers)?;
                         }
                         Err(e) => {
-                            warn!(
-                                path = ?path,
-                                plugin = %self.manifest.name,
-                                error = %e,
-                                "Plugin .mcp.json (direct-map form) could not be decoded as McpServerConfig map"
-                            );
+                            return Err(PluginError::InvalidManifest(format!(
+                                "plugin MCP file {} is not a valid server map: {e}",
+                                path.display()
+                            )));
                         }
                     }
                 }
             }
             Err(e) => {
-                warn!(
-                    path = ?path,
-                    plugin = %self.manifest.name,
-                    error = %e,
-                    "Plugin .mcp.json is not valid JSON; skipping MCP servers from this file"
-                );
+                return Err(PluginError::InvalidManifest(format!(
+                    "plugin MCP file {} is not valid JSON: {e}",
+                    path.display()
+                )));
             }
         }
+        Ok(())
+    }
+
+    fn insert_mcp_configs(
+        &mut self,
+        servers: HashMap<String, McpServerConfig>,
+    ) -> Result<(), PluginError> {
+        if self.mcp_configs.len().saturating_add(servers.len()) > MAX_PLUGIN_COMPONENTS_PER_KIND {
+            return Err(PluginError::InvalidManifest(format!(
+                "plugin declares more than {MAX_PLUGIN_COMPONENTS_PER_KIND} MCP servers"
+            )));
+        }
+        for (name, config) in servers {
+            if self.mcp_configs.insert(name.clone(), config).is_some() {
+                return Err(PluginError::InvalidManifest(format!(
+                    "plugin declares duplicate MCP server '{name}'"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Read and parse a manifest-referenced MCP servers file. Logs every
@@ -1092,19 +1419,17 @@ impl Plugin {
     /// `{ "mcpServers": { ... } }` wrapper form and the bare-map form so
     /// manifest-Path branches and the convention `.mcp.json` branch agree
     /// on accepted shapes (crosslink #919).
-    fn load_mcp_servers_from_path(&mut self, declared: &str, resolved: &Path) {
-        match read_plugin_file(resolved) {
-            Ok(content) => self.parse_mcp_json_file(resolved, &content),
-            Err(e) => {
-                warn!(
-                    declared = %declared,
-                    resolved = ?resolved,
-                    plugin = %self.manifest.name,
-                    error = %e,
-                    "Plugin manifest mcp_servers file unreadable"
-                );
-            }
-        }
+    fn load_mcp_servers_from_path(
+        &mut self,
+        declared: &str,
+        resolved: &Path,
+    ) -> Result<(), PluginError> {
+        let content = read_plugin_file(resolved).map_err(|error| {
+            PluginError::InvalidManifest(format!(
+                "plugin manifest MCP path {declared} is unreadable: {error}"
+            ))
+        })?;
+        self.parse_mcp_json_file(resolved, &content)
     }
 
     /// Resolve plugin-declared LSP server registrations (CC parity with
@@ -1204,6 +1529,57 @@ impl Plugin {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.path
+    }
+
+    /// Immutable installation receipt attached by tracked discovery.
+    #[must_use]
+    pub const fn generation_receipt(&self) -> Option<&ArtifactGenerationReceipt> {
+        self.generation_receipt.as_ref()
+    }
+
+    /// Stable host-bound package identity used by activation and grants.
+    #[must_use]
+    pub const fn identity(&self) -> &PluginPackageIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn bind_host_identity(
+        &mut self,
+        scope: InstallScope,
+        owner: String,
+        canonical_source: String,
+    ) {
+        self.identity.host_scope = scope;
+        self.identity.owner = owner;
+        self.identity.canonical_source = canonical_source;
+    }
+
+    pub(crate) fn bind_generation_receipt(
+        &mut self,
+        scope: InstallScope,
+        receipt: ArtifactGenerationReceipt,
+    ) -> Result<(), PluginError> {
+        if receipt.plugin_id != self.id
+            || receipt.statement.package != self.manifest.name
+            || receipt.statement.version != self.manifest.version
+            || receipt.statement.artifact_digest != self.identity.artifact_digest
+            || receipt.statement.source_revision != receipt.source.resolved_revision
+            || receipt.source.resolved_revision.trim().is_empty()
+            || receipt.statement.publisher.trim().is_empty()
+        {
+            return Err(PluginError::InvalidManifest(format!(
+                "installed receipt does not bind the loaded package identity for {}",
+                self.manifest.name
+            )));
+        }
+        self.identity.host_scope = scope;
+        self.identity.owner.clone_from(&receipt.statement.publisher);
+        self.identity.canonical_source = canonical_artifact_source(&receipt.source)?;
+        self.identity
+            .source_revision
+            .clone_from(&receipt.source.resolved_revision);
+        self.generation_receipt = Some(receipt);
+        Ok(())
     }
 
     /// Get environment variables to set when running plugin scripts
@@ -1318,7 +1694,7 @@ impl Plugin {
             // a "command" with no description, no body, and no flags — the
             // plugin author who shipped an unreadable file got zero signal.
             // Log and skip the entry so operators can grep for the warning.
-            let raw_content = match fs::read_to_string(path) {
+            let raw_content = match read_plugin_file(path) {
                 Ok(c) => c,
                 Err(e) => {
                     warn!(
@@ -1383,10 +1759,30 @@ impl Plugin {
     /// Get all resolved MCP servers
     #[must_use]
     pub fn resolved_mcp_servers(&self) -> Vec<PluginMcpServer> {
+        self.resolved_mcp_servers_with_lookup(&|_| Ok(None))
+    }
+
+    /// Resolve MCP configuration only from one immutable run environment
+    /// snapshot. Missing names may still use manifest defaults, but can never
+    /// fall back to the mutable host process environment.
+    #[must_use]
+    pub fn resolved_mcp_servers_for_run(
+        &self,
+        run: &crate::tools::ToolRunContext,
+    ) -> Vec<PluginMcpServer> {
+        self.resolved_mcp_servers_with_lookup(&|name| {
+            Ok(run.mcp_environment_grants().get(name).cloned())
+        })
+    }
+
+    fn resolved_mcp_servers_with_lookup<F>(&self, lookup: &F) -> Vec<PluginMcpServer>
+    where
+        F: Fn(&str) -> Result<Option<crate::secrets::SecretString>, String>,
+    {
         self.mcp_configs
             .iter()
-            .filter_map(
-                |(name, config)| match resolved_mcp_server_from_config(name, config) {
+            .filter_map(|(name, config)| {
+                match resolved_mcp_server_from_config_with(name, config, lookup) {
                     Ok(server) => Some(server),
                     Err(error) => {
                         warn!(
@@ -1397,8 +1793,8 @@ impl Plugin {
                         );
                         None
                     }
-                },
-            )
+                }
+            })
             .collect()
     }
 }
@@ -1417,6 +1813,10 @@ mod tests {
         value.push_str(name);
         value.push('}');
         value
+    }
+
+    fn protected(value: &str) -> crate::secrets::SecretString {
+        crate::secrets::SecretString::try_from_string(value.to_string()).expect("secret")
     }
 
     fn mcp_env_default(name: &str, default_value: &str) -> String {
@@ -1898,10 +2298,10 @@ mod tests {
 
     #[test]
     fn mcp_env_expansion_supports_required_vars_defaults_and_repeats() {
-        let lookup = |name: &str| -> Result<Option<String>, String> {
+        let lookup = |name: &str| -> Result<Option<crate::secrets::SecretString>, String> {
             Ok(match name {
-                "TOKEN" => Some("secret".to_string()),
-                "EMPTY" => Some(String::new()),
+                "TOKEN" => Some(protected("secret")),
+                "EMPTY" => Some(protected("")),
                 _ => None,
             })
         };
@@ -1913,17 +2313,64 @@ mod tests {
             mcp_env_ref("EMPTY"),
         ]
         .join(":");
-        let expanded = expand_mcp_env_vars_with(&template, &lookup).unwrap();
+        let expanded = expand_mcp_env_vars_with(&template, &lookup, true).unwrap();
 
         assert_eq!(expanded, "secret:fallback:secret:");
     }
 
     #[test]
+    fn mcp_resolution_uses_each_run_snapshot_without_ambient_lookup() {
+        let root = TempDir::new().unwrap();
+        create_cc_plugin(root.path(), "snapshot-mcp");
+        let plugin_dir = root.path().join("snapshot-mcp");
+        fs::write(
+            plugin_dir.join(".mcp.json"),
+            serde_json::json!({
+                "mcpServers": {
+                    "snapshot": {
+                        "transport": "stdio",
+                        "command": "runner",
+                        "env": {"SNAPSHOT_TOKEN": "${S019_MCP_TOKEN}"}
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let plugin = Plugin::load(&plugin_dir).unwrap();
+        let build_run = |value: &str| {
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), root.path())
+                .workspace_access(crate::tools::WorkspaceAccess::ReadOnly)
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .mcp_environment_grants(HashMap::from([(
+                    "S019_MCP_TOKEN".to_string(),
+                    value.to_string(),
+                )]))
+                .environment_grants(HashMap::new())
+                .process(false)
+                .network(false)
+                .secrets(true)
+                .provider("plugin-mcp-snapshot-test")
+                .build()
+                .unwrap()
+        };
+        let run_a = build_run("run-a");
+        let run_b = build_run("run-b");
+
+        let resolved_a = plugin.resolved_mcp_servers_for_run(&run_a);
+        let resolved_b = plugin.resolved_mcp_servers_for_run(&run_b);
+        assert!(resolved_a[0].env.matches_value("SNAPSHOT_TOKEN", "run-a"));
+        assert!(resolved_b[0].env.matches_value("SNAPSHOT_TOKEN", "run-b"));
+    }
+
+    #[test]
     fn mcp_env_expansion_rejects_unset_required_vars() {
-        let lookup = |_name: &str| -> Result<Option<String>, String> { Ok(None) };
+        let lookup =
+            |_name: &str| -> Result<Option<crate::secrets::SecretString>, String> { Ok(None) };
 
         let template = format!("Bearer {}", mcp_env_ref("MISSING_TOKEN"));
-        let err = expand_mcp_env_vars_with(&template, &lookup).unwrap_err();
+        let err = expand_mcp_env_vars_with(&template, &lookup, true).unwrap_err();
 
         assert!(
             err.contains("MISSING_TOKEN"),
@@ -1933,15 +2380,16 @@ mod tests {
 
     #[test]
     fn mcp_env_expansion_rejects_malformed_expressions() {
-        let lookup = |_name: &str| -> Result<Option<String>, String> { Ok(None) };
+        let lookup =
+            |_name: &str| -> Result<Option<crate::secrets::SecretString>, String> { Ok(None) };
 
-        let unterminated = expand_mcp_env_vars_with("${TOKEN", &lookup).unwrap_err();
+        let unterminated = expand_mcp_env_vars_with("${TOKEN", &lookup, true).unwrap_err();
         assert!(
             unterminated.contains("unterminated"),
             "unterminated expression should be explicit; got: {unterminated}"
         );
 
-        let invalid_name = expand_mcp_env_vars_with("${TOKEN-NAME}", &lookup).unwrap_err();
+        let invalid_name = expand_mcp_env_vars_with("${TOKEN-NAME}", &lookup, true).unwrap_err();
         assert!(
             invalid_name.contains("may only contain"),
             "invalid variable name should be explicit; got: {invalid_name}"
@@ -1950,32 +2398,37 @@ mod tests {
 
     #[test]
     fn resolved_mcp_server_expands_documented_fields_only() {
-        let lookup = |name: &str| -> Result<Option<String>, String> {
+        let lookup = |name: &str| -> Result<Option<crate::secrets::SecretString>, String> {
             Ok(match name {
-                "HOST" => Some("mcp.example.test".to_string()),
-                "TOKEN" => Some("secret".to_string()),
+                "TOKEN" => Some(protected("secret")),
                 _ => None,
             })
         };
 
-        let mut env = HashMap::new();
-        env.insert("AUTH_TOKEN".to_string(), mcp_env_ref("TOKEN"));
-        env.insert("MODE".to_string(), mcp_env_default("MODE", "production"));
+        let env = crate::secrets::EnvironmentGrants::try_from(HashMap::from([
+            ("AUTH_TOKEN".to_string(), mcp_env_ref("TOKEN")),
+            ("MODE".to_string(), mcp_env_default("MODE", "production")),
+        ]))
+        .expect("valid environment templates");
 
-        let mut headers = HashMap::new();
-        headers.insert(
+        let headers = crate::secrets::SensitiveHeaders::try_from(HashMap::from([(
             "Authorization".to_string(),
             format!("Bearer {}", mcp_env_ref("TOKEN")),
-        );
+        )]))
+        .expect("valid header templates");
 
         let config = McpServerConfig {
             command: Some(mcp_env_default("BIN", "node")),
-            args: vec![format!("--token={}", mcp_env_ref("TOKEN"))],
+            args: vec![mcp_env_default("MODE", "safe")],
             env,
             transport: "http".to_string(),
-            url: Some(format!("https://{}/mcp", mcp_env_ref("HOST"))),
+            url: Some(format!(
+                "https://{}/mcp",
+                mcp_env_default("HOST", "mcp.example.test")
+            )),
             headers,
             headers_helper: Some(format!("printf '%s' '{}'", mcp_env_ref("TOKEN"))),
+            oauth: None,
             timeout: Some(250),
             always_load: Some(true),
         };
@@ -1983,23 +2436,72 @@ mod tests {
         let server = resolved_mcp_server_from_config_with("remote", &config, &lookup).unwrap();
 
         assert_eq!(server.command.as_deref(), Some("node"));
-        assert_eq!(server.args, vec!["--token=secret"]);
+        assert_eq!(server.args, vec!["safe"]);
         assert_eq!(server.url.as_deref(), Some("https://mcp.example.test/mcp"));
-        assert_eq!(
-            server.env.get("AUTH_TOKEN").map(String::as_str),
-            Some("secret")
-        );
-        assert_eq!(
-            server.env.get("MODE").map(String::as_str),
-            Some("production")
-        );
-        assert_eq!(
-            server.headers.get("Authorization").map(String::as_str),
-            Some("Bearer secret")
-        );
+        assert!(server.env.matches_value("AUTH_TOKEN", "secret"));
+        assert!(server.env.matches_value("MODE", "production"));
+        assert!(server
+            .headers
+            .matches_value("Authorization", "Bearer secret"));
         assert_eq!(server.headers_helper, config.headers_helper);
         assert_eq!(server.timeout, Some(250));
         assert_eq!(server.always_load, Some(true));
+    }
+
+    #[test]
+    fn resolved_mcp_server_expands_oauth_client_secret_without_exposing_it() {
+        let lookup = |name: &str| -> Result<Option<crate::secrets::SecretString>, String> {
+            Ok((name == "TOKEN").then(|| protected("oauth-secret-sentinel")))
+        };
+        let config = McpServerConfig {
+            command: None,
+            args: Vec::new(),
+            env: crate::secrets::EnvironmentGrants::new(),
+            transport: "http".to_string(),
+            url: Some("https://mcp.example.test".to_string()),
+            headers: crate::secrets::SensitiveHeaders::new(),
+            headers_helper: None,
+            oauth: Some(crate::mcp_oauth::McpOAuthClientConfig {
+                client_id: "public-client".to_string(),
+                client_secret: Some(protected(&mcp_env_ref("TOKEN"))),
+                redirect_uri: "http://127.0.0.1:7777/callback".to_string(),
+                scopes: vec!["mcp.read".to_string()],
+            }),
+            timeout: None,
+            always_load: None,
+        };
+        let resolved = resolved_mcp_server_from_config_with("remote", &config, &lookup)
+            .expect("resolved OAuth config");
+        let oauth = resolved.oauth.expect("OAuth config");
+        assert!(oauth
+            .client_secret
+            .as_ref()
+            .is_some_and(|secret| secret.matches("oauth-secret-sentinel")));
+        let rendered = format!("{oauth:?}");
+        assert!(!rendered.contains("oauth-secret-sentinel"), "{rendered}");
+    }
+
+    #[test]
+    fn resolved_mcp_server_rejects_protected_values_in_process_arguments() {
+        let lookup = |name: &str| -> Result<Option<crate::secrets::SecretString>, String> {
+            Ok((name == "TOKEN").then(|| protected("secret")))
+        };
+        let config = McpServerConfig {
+            command: Some("runner".to_string()),
+            args: vec![format!("--token={}", mcp_env_ref("TOKEN"))],
+            env: crate::secrets::EnvironmentGrants::new(),
+            transport: "stdio".to_string(),
+            url: None,
+            headers: crate::secrets::SensitiveHeaders::new(),
+            headers_helper: None,
+            oauth: None,
+            timeout: None,
+            always_load: None,
+        };
+        let Err(error) = resolved_mcp_server_from_config_with("unsafe", &config, &lookup) else {
+            panic!("protected values must not enter observable argv");
+        };
+        assert!(error.contains("may only be expanded"));
     }
 
     #[test]
@@ -2631,7 +3133,10 @@ Based on the above changes, create a single git commit.
 
         let err = read_plugin_file(&manifest_path).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("symlink"), "expected symlink rejection: {msg}");
+        assert!(
+            msg.contains("link"),
+            "expected linked-file rejection: {msg}"
+        );
         // Forensic: the secret contents MUST NOT appear in the error.
         assert!(
             !msg.contains("SUPER-SECRET"),
@@ -2660,8 +3165,8 @@ Based on the above changes, create a single git commit.
         assert!(result.is_err(), "symlinked manifest must be rejected");
         let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("symlink"),
-            "expected symlink error, got: {msg}"
+            msg.contains("link"),
+            "expected linked-file error, got: {msg}"
         );
         assert!(
             !msg.contains("OUTSIDE"),
@@ -2757,8 +3262,12 @@ Based on the above changes, create a single git commit.
                 "mcpServers": "../../../etc/passwd",
             }),
         );
-        let plugin = Plugin::load(&plugin_dir).unwrap();
-        assert!(plugin.mcp_configs.is_empty());
+        let error = Plugin::load(&plugin_dir)
+            .expect_err("unsafe MCP path must reject the complete plugin package");
+        assert!(
+            error.to_string().contains("traversal"),
+            "unexpected MCP path error: {error}"
+        );
     }
 
     #[test]

@@ -15,7 +15,11 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
+mod support;
+
 use openclaudia::hooks::{HookError, HookEvent, HookInput};
+use openclaudia::runtime::{CapabilityGeneration, RunId};
+use openclaudia::tools::{ToolCapabilityError, ToolResource};
 use serde_json::json;
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -77,6 +81,12 @@ fn hook_error_denied_display_includes_binary_name() {
 #[test]
 fn hook_error_variants_have_distinct_displays() {
     let errs: Vec<String> = vec![
+        HookError::Capability(ToolCapabilityError::Unavailable {
+            resource: ToolResource::Secrets,
+            run_id: RunId::new(),
+            generation: CapabilityGeneration::new(1).expect("non-zero generation"),
+        })
+        .to_string(),
         HookError::Timeout(5).to_string(),
         HookError::CommandFailed("x".to_string()).to_string(),
         HookError::ParseError("x".to_string()).to_string(),
@@ -93,7 +103,7 @@ fn hook_error_variants_have_distinct_displays() {
     assert_eq!(
         sorted.len(),
         errs.len(),
-        "all 6 HookError variants MUST produce distinct Display strings"
+        "all 7 HookError variants MUST produce distinct Display strings"
     );
 }
 
@@ -231,31 +241,33 @@ fn deny_intent_events_count_matches_documented_2() {
 
 #[test]
 fn match_tool_returns_some_when_tool_name_set() {
-    let input = HookInput::new(HookEvent::PreToolUse).with_tool("bash", json!({"command": "ls"}));
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::PreToolUse)
+        .with_tool("bash", json!({"command": "ls"}));
     assert_eq!(input.match_tool(), Some("bash"));
 }
 
 #[test]
 fn match_tool_returns_none_when_tool_name_absent() {
-    let input = HookInput::new(HookEvent::SessionStart);
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::SessionStart);
     assert!(input.match_tool().is_none());
 }
 
 #[test]
 fn match_prompt_returns_some_when_prompt_set() {
-    let input = HookInput::new(HookEvent::UserPromptSubmit).with_prompt("hi there");
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::UserPromptSubmit)
+        .with_prompt("hi there");
     assert_eq!(input.match_prompt(), Some("hi there"));
 }
 
 #[test]
 fn match_prompt_returns_none_when_prompt_absent() {
-    let input = HookInput::new(HookEvent::SessionStart);
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::SessionStart);
     assert!(input.match_prompt().is_none());
 }
 
 #[test]
 fn match_accessors_independent_tool_and_prompt_can_both_be_set() {
-    let input = HookInput::new(HookEvent::PreToolUse)
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::PreToolUse)
         .with_tool("bash", json!({}))
         .with_prompt("context prompt");
     assert_eq!(input.match_tool(), Some("bash"));
@@ -268,7 +280,7 @@ fn match_accessors_independent_tool_and_prompt_can_both_be_set() {
 
 #[test]
 fn with_session_id_replaces_when_called_twice() {
-    let input = HookInput::new(HookEvent::SessionStart)
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::SessionStart)
         .with_session_id("first")
         .with_session_id("second");
     // Last write wins (builder pattern).
@@ -277,7 +289,7 @@ fn with_session_id_replaces_when_called_twice() {
 
 #[test]
 fn with_extra_multiple_keys_all_persist() {
-    let input = HookInput::new(HookEvent::Notification)
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::Notification)
         .with_extra("key1", json!("value1"))
         .with_extra("key2", json!(42))
         .with_extra("key3", json!({"nested": true}));
@@ -289,7 +301,7 @@ fn with_extra_multiple_keys_all_persist() {
 
 #[test]
 fn with_extra_same_key_twice_last_wins() {
-    let input = HookInput::new(HookEvent::Notification)
+    let input = HookInput::for_run(support::shared_run_context(), HookEvent::Notification)
         .with_extra("k", json!("first"))
         .with_extra("k", json!("second"));
     assert_eq!(input.extra.len(), 1);

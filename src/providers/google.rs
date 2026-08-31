@@ -1,23 +1,917 @@
 //! Google Gemini API adapter.
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use tracing::debug;
 
 use crate::config::ThinkingConfig;
 use crate::proxy::{ChatCompletionRequest, ChatMessage, ContentPart, MessageContent};
+use crate::runtime::{
+    ContinuationGeneration, ProviderNativeItem, ProviderNativeItemPurpose, ProviderNativeState,
+    ProviderStateFacet, ProviderWireProtocol,
+};
 use crate::session::TokenUsage;
+use crate::tools::{FunctionCall, ToolCall};
 
 use super::{ProviderAdapter, ProviderError};
 
-/// Build a deterministic Gemini tool-call id from `(ordinal, function name)`.
+const GEMINI_TURN_FORMAT: &str = "gemini_generate_content_turn_v1";
+const GEMINI_CONTENT_FORMAT: &str = "gemini_generate_content_content_v1";
+const GEMINI_HISTORY_KEY: &str = "_openclaudia_gemini_portable_history";
+
+/// Build a deterministic local identity for older Gemini responses that omit
+/// the provider-owned `functionCall.id` field.
+fn gemini_tool_call_id(assistant_ordinal: u64, call_index: usize) -> String {
+    format!("call_gemini_{assistant_ordinal}_{call_index}")
+}
+
+fn provider_error(error: impl std::fmt::Display) -> ProviderError {
+    ProviderError::InvalidResponse(error.to_string())
+}
+
+fn validate_call_id(id: &str, context: &str) -> Result<(), ProviderError> {
+    if id.is_empty() || id.len() > 512 || id.chars().any(char::is_control) {
+        Err(provider_error(format!("{context} has an invalid call id")))
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct GeminiCallBinding {
+    portable_id: String,
+    provider_id: Option<String>,
+    name: String,
+    arguments: Value,
+    part_index: usize,
+}
+
+impl GeminiCallBinding {
+    fn to_value(&self) -> Value {
+        json!({
+            "portable_id": self.portable_id,
+            "provider_id": self.provider_id,
+            "name": self.name,
+            "arguments": self.arguments,
+            "part_index": self.part_index,
+        })
+    }
+
+    fn from_value(value: &Value, index: usize) -> Result<Self, ProviderError> {
+        let portable_id = value
+            .get("portable_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                provider_error(format!("Gemini call binding {index} missing portable_id"))
+            })?;
+        validate_call_id(portable_id, "Gemini portable call binding")?;
+        let provider_id = match value.get("provider_id") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id)) => {
+                validate_call_id(id, "Gemini provider call binding")?;
+                Some(id.clone())
+            }
+            Some(_) => {
+                return Err(provider_error(format!(
+                    "Gemini call binding {index} has malformed provider_id"
+                )))
+            }
+        };
+        let name = value
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| provider_error(format!("Gemini call binding {index} missing name")))?;
+        let arguments = value
+            .get("arguments")
+            .filter(|arguments| arguments.is_object())
+            .cloned()
+            .ok_or_else(|| {
+                provider_error(format!(
+                    "Gemini call binding {index} has malformed arguments"
+                ))
+            })?;
+        let part_index = value
+            .get("part_index")
+            .and_then(Value::as_u64)
+            .and_then(|part_index| usize::try_from(part_index).ok())
+            .ok_or_else(|| {
+                provider_error(format!(
+                    "Gemini call binding {index} has invalid part_index"
+                ))
+            })?;
+        Ok(Self {
+            portable_id: portable_id.to_string(),
+            provider_id,
+            name: name.to_string(),
+            arguments,
+            part_index,
+        })
+    }
+}
+
+/// Exact provider-owned content from one completed Gemini `GenerateContent` turn.
 ///
-/// Crosslink #785: parsing the same Gemini response twice must produce the
-/// same `tool_calls[i].id` so callers can cache / diff / log-correlate
-/// without burning an entry per re-parse. The ordinal prefix disambiguates
-/// repeated calls to the same function in a single turn.
-fn gemini_tool_call_id(ordinal: usize, function_name: &str) -> String {
-    format!("call_{ordinal}_{function_name}")
+/// The content is retained only in the provider-native state lane. It may
+/// contain opaque thought signatures and therefore deliberately does not
+/// implement `Debug`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GeminiGenerateContentTurnOutput {
+    content: Value,
+}
+
+impl GeminiGenerateContentTurnOutput {
+    /// Capture and validate `candidates[0].content` without flattening native
+    /// parts, call ids, ordering, or thought signatures.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed provider error for a missing/malformed candidate or an
+    /// unsupported part that the portable projection cannot represent safely.
+    pub fn new(response: &Value) -> Result<Self, ProviderError> {
+        let content = response
+            .get("candidates")
+            .and_then(|candidates| candidates.get(0))
+            .and_then(|candidate| candidate.get("content"))
+            .filter(|content| content.is_object())
+            .cloned()
+            .ok_or_else(|| provider_error("Gemini response missing candidates[0].content"))?;
+        Self::from_content(content)
+    }
+
+    fn from_content(content: Value) -> Result<Self, ProviderError> {
+        match content.get("role") {
+            None => {}
+            Some(Value::String(role)) if role == "model" => {}
+            Some(Value::String(_)) => {
+                return Err(provider_error(
+                    "Gemini candidate content has unsupported role; expected 'model'",
+                ))
+            }
+            Some(_) => {
+                return Err(provider_error(
+                    "Gemini candidate content has non-string 'role'",
+                ))
+            }
+        }
+        let parts = content
+            .get("parts")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                provider_error("Gemini candidate content missing 'content.parts' array")
+            })?;
+        if parts.is_empty() {
+            return Err(provider_error("Gemini candidate content has no parts"));
+        }
+        validate_gemini_parts(parts)?;
+        Ok(Self { content })
+    }
+
+    /// Borrow the exact native content object.
+    #[must_use]
+    pub const fn content(&self) -> &Value {
+        &self.content
+    }
+
+    /// Extract visible text while retaining all native parts separately.
+    ///
+    /// # Errors
+    ///
+    /// Returns a provider error for malformed text parts.
+    pub fn text(&self) -> Result<String, ProviderError> {
+        let parts = self
+            .content
+            .get("parts")
+            .and_then(Value::as_array)
+            .ok_or_else(|| provider_error("validated Gemini output lost its parts array"))?;
+        extract_gemini_text_content(parts)
+    }
+
+    /// Build deterministic portable tool-call projections for this exact turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns a provider error for duplicate/invalid native ids or malformed
+    /// function-call arguments.
+    pub fn tool_calls(&self, assistant_ordinal: u64) -> Result<Vec<ToolCall>, ProviderError> {
+        self.call_bindings(assistant_ordinal)?
+            .into_iter()
+            .map(|binding| {
+                let arguments = serde_json::to_string(&binding.arguments).map_err(|error| {
+                    provider_error(format!("Gemini arguments failed to serialize: {error}"))
+                })?;
+                Ok(ToolCall {
+                    id: binding.portable_id,
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: binding.name,
+                        arguments,
+                    },
+                })
+            })
+            .collect()
+    }
+
+    fn call_bindings(
+        &self,
+        assistant_ordinal: u64,
+    ) -> Result<Vec<GeminiCallBinding>, ProviderError> {
+        let parts = self
+            .content
+            .get("parts")
+            .and_then(Value::as_array)
+            .expect("validated Gemini output retains parts");
+        let mut bindings = Vec::new();
+        let mut ids = BTreeSet::new();
+        for (part_index, part) in parts.iter().enumerate() {
+            let Some(call) = part.get("functionCall") else {
+                continue;
+            };
+            let name = call
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .expect("validated Gemini function call retains name");
+            let arguments = call
+                .get("args")
+                .filter(|arguments| arguments.is_object())
+                .cloned()
+                .expect("validated Gemini function call retains arguments");
+            let provider_id = call.get("id").and_then(Value::as_str).map(str::to_string);
+            let portable_id = provider_id
+                .clone()
+                .unwrap_or_else(|| gemini_tool_call_id(assistant_ordinal, bindings.len()));
+            validate_call_id(&portable_id, "Gemini functionCall")?;
+            if !ids.insert(portable_id.clone()) {
+                return Err(provider_error(format!(
+                    "Gemini completion repeated function call id {portable_id:?}"
+                )));
+            }
+            bindings.push(GeminiCallBinding {
+                portable_id,
+                provider_id,
+                name: name.to_string(),
+                arguments,
+                part_index,
+            });
+        }
+        Ok(bindings)
+    }
+}
+
+fn validate_gemini_parts(parts: &[Value]) -> Result<(), ProviderError> {
+    for (index, part) in parts.iter().enumerate() {
+        let object = part.as_object().ok_or_else(|| {
+            provider_error(format!(
+                "Gemini content part at index {index} is not an object"
+            ))
+        })?;
+        if let Some(signature) = object.get("thoughtSignature") {
+            if signature.as_str().is_none_or(str::is_empty) {
+                return Err(provider_error(format!(
+                    "Gemini content part at index {index} has invalid thoughtSignature"
+                )));
+            }
+        }
+        if let Some(thought) = object.get("thought") {
+            if !thought.is_boolean() {
+                return Err(provider_error(format!(
+                    "Gemini content part at index {index} has non-boolean thought"
+                )));
+            }
+        }
+        match (object.get("text"), object.get("functionCall")) {
+            (Some(Value::String(_)), None) => {}
+            (Some(_), None) => {
+                return Err(provider_error(format!(
+                    "Gemini content part at index {index} has non-string 'text'"
+                )))
+            }
+            (None, Some(Value::Object(call))) => {
+                let name = call
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| {
+                        provider_error(format!(
+                            "Gemini functionCall at part {index} missing non-empty name"
+                        ))
+                    })?;
+                let _ = name;
+                if !call.get("args").is_some_and(Value::is_object) {
+                    return Err(provider_error(format!(
+                        "Gemini functionCall at part {index} missing object args"
+                    )));
+                }
+                if let Some(id) = call.get("id") {
+                    let id = id.as_str().ok_or_else(|| {
+                        provider_error(format!(
+                            "Gemini functionCall at part {index} has non-string id"
+                        ))
+                    })?;
+                    validate_call_id(id, "Gemini functionCall")?;
+                }
+            }
+            (None, Some(_)) => {
+                return Err(provider_error(format!(
+                    "Gemini functionCall at part {index} is not an object"
+                )))
+            }
+            (Some(_), Some(_)) => {
+                return Err(provider_error(format!(
+                    "Gemini content part at index {index} mixes text and functionCall"
+                )))
+            }
+            (None, None) => {
+                return Err(provider_error(format!(
+                "Gemini content part at index {index} has no supported text or functionCall field"
+            )))
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct GeminiReplayGroup {
+    content: Value,
+    calls: Vec<GeminiCallBinding>,
+}
+
+fn gemini_content_facet(
+    output: &GeminiGenerateContentTurnOutput,
+    call_count: usize,
+) -> ProviderStateFacet {
+    if call_count > 1 {
+        ProviderStateFacet::ParallelToolCalls
+    } else if call_count == 1 {
+        ProviderStateFacet::ToolCalls
+    } else if output
+        .content()
+        .get("parts")
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts
+                .iter()
+                .any(|part| part.get("thoughtSignature").is_some())
+        })
+    {
+        ProviderStateFacet::Reasoning
+    } else {
+        ProviderStateFacet::NativeMessage
+    }
+}
+
+fn parse_gemini_turn_header(
+    payload: &Value,
+) -> Result<(u64, Vec<GeminiCallBinding>), ProviderError> {
+    if payload.get("format").and_then(Value::as_str) != Some(GEMINI_TURN_FORMAT) {
+        return Err(provider_error("unrecognized Gemini turn evidence format"));
+    }
+    let ordinal = payload
+        .get("assistant_ordinal")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| provider_error("Gemini turn evidence missing assistant_ordinal"))?;
+    if payload.get("content_count").and_then(Value::as_u64) != Some(1) {
+        return Err(provider_error(
+            "Gemini turn evidence must bind exactly one content object",
+        ));
+    }
+    let calls = payload
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .ok_or_else(|| provider_error("Gemini turn evidence missing tool_calls array"))?
+        .iter()
+        .enumerate()
+        .map(|(index, value)| GeminiCallBinding::from_value(value, index))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut ids = BTreeSet::new();
+    for call in &calls {
+        if !ids.insert(call.portable_id.clone()) {
+            return Err(provider_error(format!(
+                "Gemini turn evidence repeats portable call id {:?}",
+                call.portable_id
+            )));
+        }
+    }
+    Ok((ordinal, calls))
+}
+
+fn parse_gemini_replay_groups(
+    state: &ProviderNativeState,
+) -> Result<BTreeMap<u64, GeminiReplayGroup>, ProviderError> {
+    let mut groups = BTreeMap::new();
+    let mut pending: Option<(u64, Vec<GeminiCallBinding>)> = None;
+    let mut all_call_ids = BTreeSet::new();
+    let mut previous_ordinal = None;
+
+    for item in state.items() {
+        match item.purpose() {
+            ProviderNativeItemPurpose::Evidence => {
+                if pending.is_some() {
+                    return Err(provider_error(
+                        "Gemini turn evidence is missing its native content item",
+                    ));
+                }
+                if item.facet() != ProviderStateFacet::NativeMessage {
+                    return Err(provider_error(
+                        "Gemini turn evidence has the wrong native-state facet",
+                    ));
+                }
+                let (ordinal, calls) = parse_gemini_turn_header(item.payload())?;
+                if previous_ordinal.is_some_and(|previous| previous >= ordinal) {
+                    return Err(provider_error(format!(
+                        "Gemini assistant ordinal {ordinal} is not ordered after the prior turn"
+                    )));
+                }
+                for call in &calls {
+                    if !all_call_ids.insert(call.portable_id.clone()) {
+                        return Err(provider_error(format!(
+                            "Gemini continuation repeats call id {:?}",
+                            call.portable_id
+                        )));
+                    }
+                }
+                previous_ordinal = Some(ordinal);
+                pending = Some((ordinal, calls));
+            }
+            ProviderNativeItemPurpose::Continuation => {
+                let (ordinal, expected_calls) = pending.take().ok_or_else(|| {
+                    provider_error("Gemini native content has no preceding turn evidence")
+                })?;
+                let payload = item.payload();
+                if payload.get("format").and_then(Value::as_str) != Some(GEMINI_CONTENT_FORMAT) {
+                    return Err(provider_error("unrecognized Gemini native content format"));
+                }
+                if payload.get("assistant_ordinal").and_then(Value::as_u64) != Some(ordinal) {
+                    return Err(provider_error(format!(
+                        "Gemini native content does not match assistant ordinal {ordinal}"
+                    )));
+                }
+                let content = payload
+                    .get("content")
+                    .filter(|content| content.is_object())
+                    .cloned()
+                    .ok_or_else(|| provider_error("Gemini native content payload is malformed"))?;
+                let output = GeminiGenerateContentTurnOutput::from_content(content.clone())?;
+                let actual_calls = output.call_bindings(ordinal)?;
+                if actual_calls != expected_calls {
+                    return Err(provider_error(format!(
+                        "Gemini native content call mapping disagrees at assistant ordinal {ordinal}"
+                    )));
+                }
+                let expected_facet = gemini_content_facet(&output, actual_calls.len());
+                if item.facet() != expected_facet {
+                    return Err(provider_error(format!(
+                        "Gemini native content facet {:?} does not match {expected_facet:?}",
+                        item.facet()
+                    )));
+                }
+                if groups
+                    .insert(
+                        ordinal,
+                        GeminiReplayGroup {
+                            content,
+                            calls: actual_calls,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(provider_error(format!(
+                        "duplicate Gemini assistant ordinal {ordinal}"
+                    )));
+                }
+            }
+        }
+    }
+    if pending.is_some() {
+        return Err(provider_error(
+            "Gemini turn evidence is missing its native content item",
+        ));
+    }
+    let turn_count = u64::try_from(groups.len())
+        .map_err(|_| provider_error("Gemini continuation turn count overflow"))?;
+    if turn_count != state.generation().get() {
+        return Err(provider_error(format!(
+            "Gemini continuation generation {} does not match its {turn_count} retained turns",
+            state.generation().get()
+        )));
+    }
+    Ok(groups)
+}
+
+/// Advance a Gemini `GenerateContent` continuation with one exact completed turn.
+///
+/// # Errors
+///
+/// Returns a provider error for identity/protocol drift, duplicate or stale
+/// assistant/call identity, malformed native output, generation exhaustion, or
+/// the S-044 item/byte bounds.
+pub fn advance_gemini_generate_content_state(
+    provider: &str,
+    model: &str,
+    previous: Option<&ProviderNativeState>,
+    assistant_ordinal: u64,
+    output: &GeminiGenerateContentTurnOutput,
+) -> Result<ProviderNativeState, ProviderError> {
+    let mut items = if let Some(previous) = previous {
+        previous
+            .validate_binding(provider, model, ProviderWireProtocol::GeminiGenerateContent)
+            .map_err(provider_error)?;
+        super::GEMINI_GENERATE_CONTENT_STATE_CONTRACT
+            .validate_state(previous)
+            .map_err(provider_error)?;
+        let groups = parse_gemini_replay_groups(previous)?;
+        if groups
+            .last_key_value()
+            .is_some_and(|(ordinal, _)| *ordinal >= assistant_ordinal)
+        {
+            return Err(provider_error(format!(
+                "Gemini assistant ordinal {assistant_ordinal} does not advance the continuation"
+            )));
+        }
+        previous.items().to_vec()
+    } else {
+        Vec::new()
+    };
+
+    let calls = output.call_bindings(assistant_ordinal)?;
+    if let Some(previous) = previous {
+        let previous_groups = parse_gemini_replay_groups(previous)?;
+        let previous_ids = previous_groups
+            .values()
+            .flat_map(|group| group.calls.iter().map(|call| call.portable_id.as_str()))
+            .collect::<BTreeSet<_>>();
+        if let Some(duplicate) = calls
+            .iter()
+            .find(|call| previous_ids.contains(call.portable_id.as_str()))
+        {
+            return Err(provider_error(format!(
+                "Gemini call id {:?} was already captured",
+                duplicate.portable_id
+            )));
+        }
+    }
+
+    items.push(
+        ProviderNativeItem::new(
+            ProviderStateFacet::NativeMessage,
+            ProviderNativeItemPurpose::Evidence,
+            json!({
+                "format": GEMINI_TURN_FORMAT,
+                "assistant_ordinal": assistant_ordinal,
+                "content_count": 1,
+                "tool_calls": calls.iter().map(GeminiCallBinding::to_value).collect::<Vec<_>>(),
+            }),
+        )
+        .map_err(provider_error)?,
+    );
+    items.push(
+        ProviderNativeItem::new(
+            gemini_content_facet(output, calls.len()),
+            ProviderNativeItemPurpose::Continuation,
+            json!({
+                "format": GEMINI_CONTENT_FORMAT,
+                "assistant_ordinal": assistant_ordinal,
+                "content": output.content(),
+            }),
+        )
+        .map_err(provider_error)?,
+    );
+
+    let generation = match previous {
+        Some(state) => state
+            .generation()
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| provider_error("Gemini continuation generation exhausted"))?,
+        None => 1,
+    };
+    let generation = ContinuationGeneration::new(generation)
+        .ok_or_else(|| provider_error("Gemini continuation generation exhausted"))?;
+    let state = ProviderNativeState::new(
+        provider,
+        model,
+        ProviderWireProtocol::GeminiGenerateContent,
+        generation,
+        items,
+    )
+    .map_err(provider_error)?;
+    super::GEMINI_GENERATE_CONTENT_STATE_CONTRACT
+        .validate_state(&state)
+        .map_err(provider_error)?;
+    parse_gemini_replay_groups(&state)?;
+    Ok(state)
+}
+
+fn binding_wire_index(entry: &Value, ordinal: u64) -> Result<usize, ProviderError> {
+    entry
+        .get("wire_index")
+        .and_then(Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or_else(|| {
+            provider_error(format!(
+                "Gemini portable history ordinal {ordinal} has invalid wire_index"
+            ))
+        })
+}
+
+fn validate_bound_assistant_calls(
+    entry: &Value,
+    ordinal: u64,
+    expected: &[GeminiCallBinding],
+) -> Result<(), ProviderError> {
+    let calls = entry
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            provider_error(format!(
+                "Gemini assistant history binding {ordinal} missing tool_calls"
+            ))
+        })?;
+    if calls.len() != expected.len() {
+        return Err(provider_error(format!(
+            "Gemini assistant history binding {ordinal} has {} calls; expected {}",
+            calls.len(),
+            expected.len()
+        )));
+    }
+    for (index, (actual, expected)) in calls.iter().zip(expected).enumerate() {
+        let id = actual.get("id").and_then(Value::as_str).ok_or_else(|| {
+            provider_error(format!(
+                "Gemini assistant binding {ordinal} call {index} missing id"
+            ))
+        })?;
+        let name = actual.get("name").and_then(Value::as_str).ok_or_else(|| {
+            provider_error(format!(
+                "Gemini assistant binding {ordinal} call {index} missing name"
+            ))
+        })?;
+        let arguments = actual
+            .get("arguments")
+            .filter(|arguments| arguments.is_object())
+            .ok_or_else(|| {
+                provider_error(format!(
+                    "Gemini assistant binding {ordinal} call {index} has malformed arguments"
+                ))
+            })?;
+        if id != expected.portable_id || name != expected.name || arguments != &expected.arguments {
+            return Err(provider_error(format!(
+                "Gemini assistant binding {ordinal} call {index} disagrees with native state"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_bound_function_response(
+    contents: &mut [Value],
+    entry: &Value,
+    ordinal: u64,
+    expected: &GeminiCallBinding,
+) -> Result<(), ProviderError> {
+    let call_id = entry
+        .get("tool_call_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            provider_error(format!(
+                "Gemini tool history binding {ordinal} missing tool_call_id"
+            ))
+        })?;
+    let name = entry.get("name").and_then(Value::as_str).ok_or_else(|| {
+        provider_error(format!(
+            "Gemini tool history binding {ordinal} missing name"
+        ))
+    })?;
+    if call_id != expected.portable_id || name != expected.name {
+        return Err(provider_error(format!(
+            "Gemini tool result at ordinal {ordinal} is missing, duplicated, or reordered"
+        )));
+    }
+    let wire_index = binding_wire_index(entry, ordinal)?;
+    let part_index = entry
+        .get("part_index")
+        .and_then(Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or_else(|| {
+            provider_error(format!(
+                "Gemini tool history binding {ordinal} has invalid part_index"
+            ))
+        })?;
+    let response = contents
+        .get_mut(wire_index)
+        .and_then(|content| content.get_mut("parts"))
+        .and_then(Value::as_array_mut)
+        .and_then(|parts| parts.get_mut(part_index))
+        .and_then(|part| part.get_mut("functionResponse"))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            provider_error(format!(
+                "Gemini tool result at ordinal {ordinal} lost its functionResponse projection"
+            ))
+        })?;
+    if response.get("id").and_then(Value::as_str) != Some(call_id)
+        || response.get("name").and_then(Value::as_str) != Some(name)
+        || !response.get("response").is_some_and(Value::is_object)
+    {
+        return Err(provider_error(format!(
+            "Gemini functionResponse at ordinal {ordinal} disagrees with portable history"
+        )));
+    }
+    if let Some(provider_id) = &expected.provider_id {
+        response.insert("id".to_string(), Value::String(provider_id.clone()));
+    } else {
+        response.remove("id");
+    }
+    Ok(())
+}
+
+fn validate_contiguous_gemini_history(history: &[Value]) -> Result<(), ProviderError> {
+    for (expected, entry) in history.iter().enumerate() {
+        let expected = u64::try_from(expected)
+            .map_err(|_| provider_error("Gemini portable history count overflow"))?;
+        if entry.get("ordinal").and_then(Value::as_u64) != Some(expected) {
+            return Err(provider_error(
+                "Gemini portable history bindings are not contiguous",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_complete_gemini_bindings(
+    history: &[Value],
+    bound_assistants: &BTreeSet<u64>,
+    bound_results: &BTreeSet<u64>,
+) -> Result<(), ProviderError> {
+    for entry in history {
+        let ordinal = entry
+            .get("ordinal")
+            .and_then(Value::as_u64)
+            .expect("contiguous history binding retains ordinal");
+        match entry.get("role").and_then(Value::as_str) {
+            Some("assistant") => {
+                let has_calls = entry
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| !calls.is_empty());
+                if has_calls && !bound_assistants.contains(&ordinal) {
+                    return Err(provider_error(format!(
+                        "Gemini assistant tool history at ordinal {ordinal} has no native state"
+                    )));
+                }
+            }
+            Some("tool") if !bound_results.contains(&ordinal) => {
+                return Err(provider_error(format!(
+                    "Gemini tool result at ordinal {ordinal} is orphaned"
+                )));
+            }
+            Some("user" | "tool") => {}
+            Some(role) => {
+                return Err(provider_error(format!(
+                    "Gemini portable history has unsupported binding role {role:?}"
+                )));
+            }
+            None => return Err(provider_error("Gemini history binding missing role")),
+        }
+    }
+    Ok(())
+}
+
+fn apply_gemini_state(
+    request: &mut Value,
+    state: &ProviderNativeState,
+) -> Result<(), ProviderError> {
+    super::GEMINI_GENERATE_CONTENT_STATE_CONTRACT
+        .validate_state(state)
+        .map_err(provider_error)?;
+    let history = request
+        .as_object_mut()
+        .ok_or_else(|| provider_error("Gemini request must be an object"))?
+        .remove(GEMINI_HISTORY_KEY)
+        .ok_or_else(|| provider_error("Gemini request is missing portable history bindings"))?;
+    let history = history
+        .as_array()
+        .ok_or_else(|| provider_error("Gemini portable history binding must be an array"))?;
+    validate_contiguous_gemini_history(history)?;
+
+    let groups = parse_gemini_replay_groups(state)?;
+    let contents = request
+        .get_mut("contents")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| provider_error("Gemini request contents must be an array"))?;
+    let mut bound_assistants = BTreeSet::new();
+    let mut bound_results = BTreeSet::new();
+
+    for (ordinal, group) in &groups {
+        let entry_index = usize::try_from(*ordinal)
+            .map_err(|_| provider_error("Gemini assistant ordinal overflow"))?;
+        let entry = history.get(entry_index).ok_or_else(|| {
+            provider_error(format!(
+                "Gemini native state references missing assistant ordinal {ordinal}"
+            ))
+        })?;
+        if entry.get("role").and_then(Value::as_str) != Some("assistant") {
+            return Err(provider_error(format!(
+                "Gemini native turn at ordinal {ordinal} is not bound to an assistant message"
+            )));
+        }
+        validate_bound_assistant_calls(entry, *ordinal, &group.calls)?;
+        let wire_index = binding_wire_index(entry, *ordinal)?;
+        let projected = contents.get(wire_index).ok_or_else(|| {
+            provider_error(format!(
+                "Gemini assistant ordinal {ordinal} references missing wire message"
+            ))
+        })?;
+        if projected.get("role").and_then(Value::as_str) != Some("model") {
+            return Err(provider_error(format!(
+                "Gemini assistant ordinal {ordinal} lost its model projection"
+            )));
+        }
+        contents[wire_index] = group.content.clone();
+        bound_assistants.insert(*ordinal);
+
+        for (call_index, call) in group.calls.iter().enumerate() {
+            let result_ordinal = ordinal
+                .checked_add(1)
+                .and_then(|ordinal| ordinal.checked_add(u64::try_from(call_index).ok()?))
+                .ok_or_else(|| provider_error("Gemini tool result ordinal overflow"))?;
+            let result_index = usize::try_from(result_ordinal)
+                .map_err(|_| provider_error("Gemini tool result ordinal overflow"))?;
+            let result_entry = history.get(result_index).ok_or_else(|| {
+                provider_error(format!(
+                    "Gemini call {:?} is missing its tool result",
+                    call.portable_id
+                ))
+            })?;
+            if result_entry.get("role").and_then(Value::as_str) != Some("tool") {
+                return Err(provider_error(format!(
+                    "Gemini call {:?} is missing its ordered tool result",
+                    call.portable_id
+                )));
+            }
+            rewrite_bound_function_response(contents, result_entry, result_ordinal, call)?;
+            if !bound_results.insert(result_ordinal) {
+                return Err(provider_error(format!(
+                    "Gemini tool result ordinal {result_ordinal} is bound more than once"
+                )));
+            }
+        }
+    }
+
+    validate_complete_gemini_bindings(history, &bound_assistants, &bound_results)
+}
+
+/// Adapt the JSON Schema keywords used by the canonical registry to Gemini's
+/// `parametersJsonSchema` dialect.
+///
+/// Gemini does not accept JSON Schema's `const` keyword for function
+/// declarations. A one-element `enum` has the same model-facing constraint;
+/// canonical host validation remains authoritative when the call returns.
+fn normalize_gemini_json_schema(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+
+    if let Some(constant) = object.remove("const") {
+        object.insert("enum".to_string(), Value::Array(vec![constant]));
+    }
+
+    for map_key in ["properties", "$defs", "definitions", "patternProperties"] {
+        if let Some(children) = object.get_mut(map_key).and_then(Value::as_object_mut) {
+            for child in children.values_mut() {
+                normalize_gemini_json_schema(child);
+            }
+        }
+    }
+
+    for schema_key in [
+        "items",
+        "additionalProperties",
+        "not",
+        "contains",
+        "propertyNames",
+        "if",
+        "then",
+        "else",
+    ] {
+        if let Some(child) = object.get_mut(schema_key) {
+            normalize_gemini_json_schema(child);
+        }
+    }
+
+    for schema_array_key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+        if let Some(children) = object
+            .get_mut(schema_array_key)
+            .and_then(Value::as_array_mut)
+        {
+            for child in children {
+                normalize_gemini_json_schema(child);
+            }
+        }
+    }
 }
 
 /// Convert `OpenAI` tools to Gemini function declarations.
@@ -36,7 +930,7 @@ pub fn convert_tools_to_gemini_functions(tools: &[Value]) -> Result<Vec<Value>, 
             .filter(|value| value.is_object())
             .ok_or_else(|| {
                 ProviderError::RequestFailed(format!(
-                    "Tool at index {index} missing required 'function' object: {tool}"
+                    "Tool at index {index} missing required 'function' object"
                 ))
             })?;
 
@@ -46,7 +940,7 @@ pub fn convert_tools_to_gemini_functions(tools: &[Value]) -> Result<Vec<Value>, 
             .filter(|name| !name.is_empty())
             .ok_or_else(|| {
                 ProviderError::RequestFailed(format!(
-                    "Tool at index {index} missing non-empty string 'function.name': {tool}"
+                    "Tool at index {index} missing non-empty string 'function.name'"
                 ))
             })?;
 
@@ -55,25 +949,26 @@ pub fn convert_tools_to_gemini_functions(tools: &[Value]) -> Result<Vec<Value>, 
             Some(value @ Value::String(_)) => value.clone(),
             Some(_) => {
                 return Err(ProviderError::RequestFailed(format!(
-                    "Tool at index {index} has non-string 'function.description': {tool}"
+                    "Tool at index {index} has non-string 'function.description'"
                 )));
             }
         };
 
-        let parameters = match func.get("parameters") {
+        let mut parameters_json_schema = match func.get("parameters") {
             None => json!({}),
             Some(value @ Value::Object(_)) => value.clone(),
             Some(_) => {
                 return Err(ProviderError::RequestFailed(format!(
-                    "Tool at index {index} has non-object 'function.parameters': {tool}"
+                    "Tool at index {index} has non-object 'function.parameters'"
                 )));
             }
         };
+        normalize_gemini_json_schema(&mut parameters_json_schema);
 
         functions.push(json!({
             "name": name,
             "description": description,
-            "parameters": parameters
+            "parametersJsonSchema": parameters_json_schema
         }));
     }
 
@@ -94,6 +989,413 @@ pub fn convert_tools_to_gemini(tools: &[Value]) -> Result<Value, ProviderError> 
 /// Google Gemini API adapter
 pub struct GoogleAdapter;
 
+#[derive(Clone)]
+struct PortableGeminiCall {
+    id: String,
+    name: String,
+    arguments: Value,
+}
+
+fn parse_portable_gemini_calls(
+    message: &ChatMessage,
+    message_index: usize,
+) -> Result<Vec<PortableGeminiCall>, ProviderError> {
+    let Some(tool_calls) = message.tool_calls.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let mut calls = Vec::with_capacity(tool_calls.len());
+    let mut ids = BTreeSet::new();
+    for (call_index, call) in tool_calls.iter().enumerate() {
+        let id = call
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                ProviderError::RequestFailed(format!(
+                    "Google assistant message at index {message_index} tool_call[{call_index}] missing non-empty id"
+                ))
+            })?;
+        validate_call_id(id, "Google portable tool call")
+            .map_err(|error| ProviderError::RequestFailed(error.to_string()))?;
+        if !ids.insert(id.to_string()) {
+            return Err(ProviderError::RequestFailed(format!(
+                "Google assistant message at index {message_index} repeats tool call id {id:?}"
+            )));
+        }
+        if call.get("type").and_then(Value::as_str) != Some("function") {
+            return Err(ProviderError::RequestFailed(format!(
+                "Google assistant message at index {message_index} tool_call[{call_index}] must have type 'function'"
+            )));
+        }
+        let function = call
+            .get("function")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                ProviderError::RequestFailed(format!(
+                    "Google assistant message at index {message_index} tool_call[{call_index}] missing function object"
+                ))
+            })?;
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                ProviderError::RequestFailed(format!(
+                    "Google assistant message at index {message_index} tool_call[{call_index}] missing function.name"
+                ))
+            })?;
+        let arguments_text = function
+            .get("arguments")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProviderError::RequestFailed(format!(
+                    "Google assistant message at index {message_index} tool_call[{call_index}] missing string function.arguments"
+                ))
+            })?;
+        let arguments = serde_json::from_str::<Value>(arguments_text).map_err(|error| {
+            ProviderError::RequestFailed(format!(
+                "Google assistant message at index {message_index} tool_call[{call_index}] has invalid JSON arguments: {error}"
+            ))
+        })?;
+        if !arguments.is_object() {
+            return Err(ProviderError::RequestFailed(format!(
+                "Google assistant message at index {message_index} tool_call[{call_index}] arguments must encode an object"
+            )));
+        }
+        calls.push(PortableGeminiCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments,
+        });
+    }
+    Ok(calls)
+}
+
+fn gemini_tool_result_payload(
+    message: &ChatMessage,
+    message_index: usize,
+) -> Result<Value, ProviderError> {
+    let MessageContent::Text(content) = &message.content else {
+        return Err(ProviderError::Unsupported(format!(
+            "Google tool message at index {message_index} must use text content"
+        )));
+    };
+    match serde_json::from_str::<Value>(content) {
+        Ok(Value::Object(object)) => Ok(Value::Object(object)),
+        Ok(value) => Ok(json!({"result": value})),
+        Err(_) => Ok(json!({"result": content})),
+    }
+}
+
+fn supports_multimodal_function_response(model: &str) -> bool {
+    model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase()
+        .starts_with("gemini-3")
+}
+
+fn supports_function_response_media(media_type: &str) -> bool {
+    matches!(
+        media_type,
+        "image/png" | "image/jpeg" | "image/webp" | "application/pdf" | "text/plain"
+    )
+}
+
+fn filter_function_response_attachments(
+    model: &str,
+    response: &mut Value,
+    attachments: Vec<crate::tools::ResolvedToolAttachment>,
+) -> Vec<crate::tools::ResolvedToolAttachment> {
+    let mut supported = Vec::new();
+    let mut diagnostics = Vec::new();
+    for attachment in attachments {
+        if !supports_multimodal_function_response(model) {
+            diagnostics.push(format!(
+                "Google model '{model}' does not support multimodal function responses for attachment {}",
+                attachment.digest
+            ));
+        } else if !supports_function_response_media(&attachment.media_type) {
+            diagnostics.push(format!(
+                "Google multimodal function responses do not support MIME type {} for attachment {}",
+                attachment.media_type, attachment.digest
+            ));
+        } else {
+            supported.push(attachment);
+        }
+    }
+    if !diagnostics.is_empty() {
+        let object = response
+            .as_object_mut()
+            .expect("Gemini tool-result payload is always an object");
+        object.insert(
+            "attachment_diagnostics".to_string(),
+            serde_json::json!(diagnostics),
+        );
+    }
+    supported
+}
+
+#[derive(Default)]
+struct GeminiHistoryBuilder {
+    converted: Vec<Value>,
+    history: Vec<Value>,
+    portable_ordinal: u64,
+    pending_calls: VecDeque<PortableGeminiCall>,
+    tool_result_wire_index: Option<usize>,
+    model: String,
+}
+
+impl GeminiHistoryBuilder {
+    fn new(model: &str) -> Self {
+        Self {
+            model: model.to_string(),
+            ..Self::default()
+        }
+    }
+
+    fn push(&mut self, message: &ChatMessage, message_index: usize) -> Result<(), ProviderError> {
+        if message.role == "system" {
+            return self.validate_system(message, message_index);
+        }
+        let ordinal = self.portable_ordinal;
+        self.portable_ordinal = self.portable_ordinal.checked_add(1).ok_or_else(|| {
+            ProviderError::RequestFailed("Google portable history ordinal overflow".to_string())
+        })?;
+        match message.role.as_str() {
+            "assistant" => self.push_assistant(message, message_index, ordinal),
+            "tool" => self.push_tool(message, message_index, ordinal),
+            _ => self.push_user(message, message_index, ordinal),
+        }
+    }
+
+    fn validate_system(
+        &self,
+        message: &ChatMessage,
+        message_index: usize,
+    ) -> Result<(), ProviderError> {
+        if !self.pending_calls.is_empty() {
+            return Err(ProviderError::RequestFailed(format!(
+                "Google system message at index {message_index} interrupts tool results"
+            )));
+        }
+        if message.tool_calls.is_some() || message.tool_call_id.is_some() {
+            return Err(ProviderError::RequestFailed(format!(
+                "Google system message at index {message_index} carries tool protocol fields"
+            )));
+        }
+        Ok(())
+    }
+
+    fn push_user(
+        &mut self,
+        message: &ChatMessage,
+        message_index: usize,
+        ordinal: u64,
+    ) -> Result<(), ProviderError> {
+        if !self.pending_calls.is_empty() {
+            return Err(ProviderError::RequestFailed(format!(
+                "Google message at index {message_index} arrived before all prior tool results"
+            )));
+        }
+        if message.tool_calls.is_some() || message.tool_call_id.is_some() {
+            return Err(ProviderError::RequestFailed(format!(
+                "Google user message at index {message_index} carries tool protocol fields"
+            )));
+        }
+        let parts = match &message.content {
+            MessageContent::Text(text) => vec![json!({"text": text})],
+            MessageContent::Parts(parts) => {
+                GoogleAdapter::convert_content_parts(message_index, &message.role, parts)?
+            }
+        };
+        let wire_index = self.converted.len();
+        self.converted.push(json!({"role": "user", "parts": parts}));
+        self.history.push(json!({
+            "ordinal": ordinal,
+            "wire_index": wire_index,
+            "role": "user",
+        }));
+        self.tool_result_wire_index = None;
+        Ok(())
+    }
+
+    fn push_assistant(
+        &mut self,
+        message: &ChatMessage,
+        message_index: usize,
+        ordinal: u64,
+    ) -> Result<(), ProviderError> {
+        if !self.pending_calls.is_empty() {
+            return Err(ProviderError::RequestFailed(format!(
+                "Google assistant message at index {message_index} arrived before all prior tool results"
+            )));
+        }
+        if message.tool_call_id.is_some() {
+            return Err(ProviderError::RequestFailed(format!(
+                "Google assistant message at index {message_index} carries tool_call_id"
+            )));
+        }
+        let calls = parse_portable_gemini_calls(message, message_index)?;
+        let mut parts = match &message.content {
+            MessageContent::Text(text) => (!text.is_empty())
+                .then(|| json!({"text": text}))
+                .into_iter()
+                .collect(),
+            MessageContent::Parts(parts) => {
+                GoogleAdapter::convert_content_parts(message_index, &message.role, parts)?
+            }
+        };
+        parts.extend(calls.iter().map(|call| {
+            json!({
+                "functionCall": {
+                    "id": call.id,
+                    "name": call.name,
+                    "args": call.arguments,
+                }
+            })
+        }));
+        if parts.is_empty() {
+            parts.push(json!({"text": ""}));
+        }
+        let wire_index = self.converted.len();
+        self.converted
+            .push(json!({"role": "model", "parts": parts}));
+        self.history.push(json!({
+            "ordinal": ordinal,
+            "wire_index": wire_index,
+            "role": "assistant",
+            "tool_calls": calls.iter().map(|call| json!({
+                "id": call.id,
+                "name": call.name,
+                "arguments": call.arguments,
+            })).collect::<Vec<_>>(),
+        }));
+        self.pending_calls.extend(calls);
+        self.tool_result_wire_index = None;
+        Ok(())
+    }
+
+    fn push_tool(
+        &mut self,
+        message: &ChatMessage,
+        message_index: usize,
+        ordinal: u64,
+    ) -> Result<(), ProviderError> {
+        if message.tool_calls.is_some() {
+            return Err(ProviderError::RequestFailed(format!(
+                "Google tool message at index {message_index} carries tool_calls"
+            )));
+        }
+        let call_id = message
+            .tool_call_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                ProviderError::RequestFailed(format!(
+                    "Google tool message at index {message_index} missing tool_call_id"
+                ))
+            })?;
+        let expected = self.pending_calls.front().ok_or_else(|| {
+            ProviderError::RequestFailed(format!(
+                "Google tool message at index {message_index} is orphaned"
+            ))
+        })?;
+        if expected.id != call_id {
+            return Err(ProviderError::RequestFailed(format!(
+                "Google tool result at index {message_index} is reordered: expected {:?}, found {call_id:?}",
+                expected.id
+            )));
+        }
+        if message
+            .name
+            .as_deref()
+            .is_some_and(|name| name != expected.name)
+        {
+            return Err(ProviderError::RequestFailed(format!(
+                "Google tool result at index {message_index} name does not match call {call_id:?}"
+            )));
+        }
+        let mut response = gemini_tool_result_payload(message, message_index)?;
+        let attachments = match crate::tools::resolve_tool_attachments(
+            message
+                .extra
+                .get(crate::tools::TOOL_ATTACHMENTS_MESSAGE_KEY),
+        ) {
+            Ok(attachments) => attachments,
+            Err(error) => {
+                let object = response
+                    .as_object_mut()
+                    .expect("Gemini tool-result payload is always an object");
+                object.insert(
+                    "attachment_diagnostic".to_string(),
+                    Value::String(format!("Native tool attachment unavailable: {error}")),
+                );
+                Vec::new()
+            }
+        };
+        let supported_attachments =
+            filter_function_response_attachments(&self.model, &mut response, attachments);
+        let wire_index = self.tool_result_wire_index.unwrap_or_else(|| {
+            let wire_index = self.converted.len();
+            self.converted.push(json!({"role": "user", "parts": []}));
+            self.tool_result_wire_index = Some(wire_index);
+            wire_index
+        });
+        let parts = self.converted[wire_index]
+            .get_mut("parts")
+            .and_then(Value::as_array_mut)
+            .expect("tool result batch owns parts array");
+        let part_index = parts.len();
+        let mut function_response = json!({
+            "id": expected.id,
+            "name": expected.name,
+            "response": response,
+        });
+        if !supported_attachments.is_empty() {
+            function_response["parts"] = Value::Array(
+                supported_attachments
+                    .into_iter()
+                    .map(|attachment| {
+                        json!({
+                            "inlineData": {
+                                "mimeType": attachment.media_type,
+                                "data": base64::engine::general_purpose::STANDARD
+                                    .encode(attachment.bytes.as_ref()),
+                            }
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        parts.push(json!({"functionResponse": function_response}));
+        self.history.push(json!({
+            "ordinal": ordinal,
+            "wire_index": wire_index,
+            "part_index": part_index,
+            "role": "tool",
+            "tool_call_id": expected.id,
+            "name": expected.name,
+        }));
+        self.pending_calls.pop_front();
+        if self.pending_calls.is_empty() {
+            self.tool_result_wire_index = None;
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<(Vec<Value>, Vec<Value>), ProviderError> {
+        if let Some(call) = self.pending_calls.front() {
+            return Err(ProviderError::RequestFailed(format!(
+                "Google history is missing result for tool call {:?}",
+                call.id
+            )));
+        }
+        Ok((self.converted, self.history))
+    }
+}
+
 impl GoogleAdapter {
     #[must_use]
     pub const fn new() -> Self {
@@ -101,43 +1403,20 @@ impl GoogleAdapter {
     }
 
     /// Convert `OpenAI` messages to Gemini format
-    fn convert_messages(messages: &[ChatMessage]) -> Result<Vec<Value>, ProviderError> {
-        let mut converted = Vec::new();
-
-        for (msg_index, message) in messages.iter().enumerate() {
-            if message.role == "system" {
-                // System handled via systemInstruction.
-                continue;
-            }
-
-            let role = match message.role.as_str() {
-                "assistant" => "model",
-                _ => "user",
-            };
-
-            let parts = match &message.content {
-                MessageContent::Text(text) => json!([{"text": text}]),
-                MessageContent::Parts(parts) => {
-                    json!(Self::convert_content_parts(
-                        msg_index,
-                        &message.role,
-                        parts
-                    )?)
-                }
-            };
-
-            converted.push(json!({
-                "role": role,
-                "parts": parts
-            }));
+    fn convert_messages(
+        model: &str,
+        messages: &[ChatMessage],
+    ) -> Result<(Vec<Value>, Vec<Value>), ProviderError> {
+        let mut builder = GeminiHistoryBuilder::new(model);
+        for (message_index, message) in messages.iter().enumerate() {
+            builder.push(message, message_index)?;
         }
-
-        Ok(converted)
+        builder.finish()
     }
 
     fn convert_content_parts(
         msg_index: usize,
-        role: &str,
+        _role: &str,
         parts: &[ContentPart],
     ) -> Result<Vec<Value>, ProviderError> {
         let mut converted = Vec::with_capacity(parts.len());
@@ -147,7 +1426,7 @@ impl GoogleAdapter {
                 "text" => {
                     let text = part.text.as_ref().ok_or_else(|| {
                         ProviderError::RequestFailed(format!(
-                            "Google message at index {msg_index} role '{role}' text part at \
+                            "Google message at index {msg_index} text part at \
                              index {part_index} missing 'text'"
                         ))
                     })?;
@@ -156,16 +1435,16 @@ impl GoogleAdapter {
                 "image" | "image_url" => {
                     let image = part.image_url.as_ref().ok_or_else(|| {
                         ProviderError::RequestFailed(format!(
-                            "Google message at index {msg_index} role '{role}' image part at \
+                            "Google message at index {msg_index} image part at \
                              index {part_index} missing 'image_url'"
                         ))
                     })?;
                     converted.push(json!({"inlineData": image}));
                 }
-                other => {
+                _ => {
                     return Err(ProviderError::RequestFailed(format!(
-                        "Unsupported Google content part type '{other}' at message index \
-                         {msg_index}, part index {part_index}"
+                        "Unsupported Google content part type at message index {msg_index}, \
+                         part index {part_index}"
                     )));
                 }
             }
@@ -173,11 +1452,93 @@ impl GoogleAdapter {
 
         if converted.is_empty() {
             return Err(ProviderError::RequestFailed(format!(
-                "Google message at index {msg_index} role '{role}' has no content parts"
+                "Google message at index {msg_index} has no content parts"
             )));
         }
 
         Ok(converted)
+    }
+
+    fn transform_request_draft(request: &ChatCompletionRequest) -> Result<Value, ProviderError> {
+        let (contents, history) = Self::convert_messages(&request.model, &request.messages)?;
+        let mut body = json!({
+            "contents": contents,
+            GEMINI_HISTORY_KEY: history,
+        });
+
+        if let Some(system) = Self::extract_system(&request.messages) {
+            body["systemInstruction"] = system;
+        }
+
+        let mut generation_config = json!({});
+        if let Some(temperature) = request.temperature {
+            generation_config["temperature"] = json!(temperature);
+        }
+        if let Some(max_tokens) = request.max_tokens {
+            generation_config["maxOutputTokens"] = json!(max_tokens);
+        }
+        if generation_config != json!({}) {
+            body["generationConfig"] = generation_config;
+        }
+
+        if let Some(tools) = &request.tools {
+            body["tools"] = convert_tools_to_gemini(tools)?;
+        }
+        Ok(body)
+    }
+
+    pub(crate) fn transform_request_draft_with_thinking(
+        request: &ChatCompletionRequest,
+        thinking: Option<&ThinkingConfig>,
+    ) -> Result<Value, ProviderError> {
+        let mut body = Self::transform_request_draft(request)?;
+        if let Some(thinking) = thinking.filter(|thinking| thinking.enabled) {
+            let profile = super::resolve_model("google", &request.model)
+                .capabilities()
+                .reasoning_profile;
+            if profile == super::ReasoningProfile::GeminiThinking {
+                let budget = thinking.effective_budget(8192).min(32768);
+                if body.get("generationConfig").is_none() {
+                    body["generationConfig"] = json!({});
+                }
+                body["generationConfig"]["thinkingConfig"] = json!({
+                    "thinkingBudget": budget
+                });
+            } else {
+                tracing::warn!(
+                    model = %request.model,
+                    "thinking requested without current Gemini model-capability evidence; omitting thinkingConfig",
+                );
+            }
+        }
+        Ok(body)
+    }
+
+    pub(crate) fn finalize_request(request: &mut Value) -> Result<(), ProviderError> {
+        let history = request
+            .as_object_mut()
+            .ok_or_else(|| provider_error("Gemini request must be an object"))?
+            .remove(GEMINI_HISTORY_KEY);
+        let Some(history) = history else {
+            return Ok(());
+        };
+        let history = history
+            .as_array()
+            .ok_or_else(|| provider_error("Gemini portable history binding must be an array"))?;
+        let has_unbound_tool_history = history.iter().any(|entry| {
+            entry.get("role").and_then(Value::as_str) == Some("tool")
+                || entry
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| !calls.is_empty())
+        });
+        if has_unbound_tool_history {
+            return Err(ProviderError::Unsupported(
+                "Gemini tool history requires its provider-native state; exact call ids and thought signatures are unavailable"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Extract system instruction.
@@ -234,34 +1595,36 @@ impl ProviderAdapter for GoogleAdapter {
         "google"
     }
 
+    fn state_contract(
+        &self,
+        protocol: crate::runtime::ProviderWireProtocol,
+    ) -> Result<&'static crate::runtime::ProviderStateContract, ProviderError> {
+        match protocol {
+            crate::runtime::ProviderWireProtocol::GeminiGenerateContent => {
+                Ok(&super::GEMINI_GENERATE_CONTENT_STATE_CONTRACT)
+            }
+            crate::runtime::ProviderWireProtocol::GeminiInteractions => {
+                Ok(&super::GEMINI_INTERACTIONS_STATE_CONTRACT)
+            }
+            other => Err(super::unsupported_state_protocol(self.name(), other)),
+        }
+    }
+
+    fn apply_provider_native_state(
+        &self,
+        request: &mut Value,
+        state: &ProviderNativeState,
+    ) -> Result<(), ProviderError> {
+        match state.protocol() {
+            ProviderWireProtocol::GeminiGenerateContent => apply_gemini_state(request, state),
+            other => Err(super::unsupported_state_protocol(self.name(), other)),
+        }
+    }
+
     fn transform_request(&self, request: &ChatCompletionRequest) -> Result<Value, ProviderError> {
-        let mut body = json!({
-            "contents": Self::convert_messages(&request.messages)?
-        });
-
-        // Add system instruction if present
-        if let Some(system) = Self::extract_system(&request.messages) {
-            body["systemInstruction"] = system;
-        }
-
-        // Add generation config
-        let mut gen_config = json!({});
-        if let Some(temp) = request.temperature {
-            gen_config["temperature"] = json!(temp);
-        }
-        if let Some(max_tokens) = request.max_tokens {
-            gen_config["maxOutputTokens"] = json!(max_tokens);
-        }
-        if gen_config != json!({}) {
-            body["generationConfig"] = gen_config;
-        }
-
-        // Convert tools
-        if let Some(tools) = &request.tools {
-            body["tools"] = convert_tools_to_gemini(tools)?;
-        }
-
-        debug!(body = %body, "Transformed request for Google");
+        let mut body = Self::transform_request_draft_with_thinking(request, None)?;
+        Self::finalize_request(&mut body)?;
+        debug!("Transformed request for Google");
         Ok(body)
     }
 
@@ -270,29 +1633,8 @@ impl ProviderAdapter for GoogleAdapter {
         request: &ChatCompletionRequest,
         thinking: &ThinkingConfig,
     ) -> Result<Value, ProviderError> {
-        let mut body = self.transform_request(request)?;
-
-        // Add Google Gemini thinking config if enabled
-        // See: https://ai.google.dev/gemini-api/docs/thinking
-        if thinking.enabled {
-            // Crosslink #599: route through effective_budget so the
-            // adaptive medium/high preset applies when only
-            // `reasoning_effort` is set. Gemini caps at 32768; the
-            // adaptive ceiling of 16000 is well under that, and an
-            // explicit budget over 32768 is clamped here.
-            let budget = thinking.effective_budget(8192).min(32768);
-
-            // Ensure generationConfig exists
-            if body.get("generationConfig").is_none() {
-                body["generationConfig"] = json!({});
-            }
-
-            body["generationConfig"]["thinkingConfig"] = json!({
-                "thinkingBudget": budget
-            });
-            debug!("Added Google thinking params: budget={}", budget);
-        }
-
+        let mut body = Self::transform_request_draft_with_thinking(request, Some(thinking))?;
+        Self::finalize_request(&mut body)?;
         Ok(body)
     }
 
@@ -304,16 +1646,17 @@ impl ProviderAdapter for GoogleAdapter {
                 .and_then(Value::as_str)
                 .filter(|message| !message.is_empty())
                 .ok_or_else(|| {
-                    ProviderError::InvalidResponse(format!(
-                        "Gemini API error missing non-empty string 'message': {error}"
-                    ))
+                    ProviderError::InvalidResponse(
+                        "Gemini API error missing non-empty string 'message'".to_string(),
+                    )
                 })?;
             let code = error
                 .get("code")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0);
+            let _ = message;
             return Err(ProviderError::InvalidResponse(format!(
-                "Gemini API error ({code}): {message}"
+                "Gemini API returned error code {code}"
             )));
         }
 
@@ -325,26 +1668,31 @@ impl ProviderAdapter for GoogleAdapter {
                 ProviderError::InvalidResponse("No candidates in response".to_string())
             })?;
 
-        let parts = candidate
-            .get("content")
-            .and_then(|c| c.get("parts"))
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                ProviderError::InvalidResponse(format!(
-                    "Gemini candidate missing content.parts array: {candidate}"
-                ))
-            })?;
-        let content = extract_gemini_text_content(parts)?;
-
-        let tool_calls = extract_gemini_tool_calls(parts)?;
+        let output = GeminiGenerateContentTurnOutput::new(&response)?;
+        let content = output.text()?;
+        let portable_calls = output.tool_calls(0)?;
 
         let mut message = json!({
             "role": "assistant",
             "content": content
         });
 
-        if let Some(calls) = tool_calls {
-            message["tool_calls"] = json!(calls);
+        if !portable_calls.is_empty() {
+            message["tool_calls"] = Value::Array(
+                portable_calls
+                    .iter()
+                    .map(|call| {
+                        json!({
+                            "id": call.id,
+                            "type": call.call_type,
+                            "function": {
+                                "name": call.function.name,
+                                "arguments": call.function.arguments,
+                            }
+                        })
+                    })
+                    .collect(),
+            );
         }
 
         let finish_reason = candidate
@@ -389,11 +1737,26 @@ impl ProviderAdapter for GoogleAdapter {
         ))
     }
 
-    fn get_headers(&self, api_key: &super::ApiKey) -> Vec<(String, String)> {
-        vec![
-            ("x-goog-api-key".to_string(), api_key.as_str().to_string()),
-            ("content-type".to_string(), "application/json".to_string()),
-        ]
+    fn get_headers(&self, api_key: &super::ApiKey) -> crate::secrets::SensitiveHeaders {
+        let mut headers = crate::secrets::SensitiveHeaders::new();
+        headers.insert_header_secret(
+            reqwest::header::HeaderName::from_static("x-goog-api-key"),
+            api_key.secret(),
+        );
+        headers.insert_static_literal(reqwest::header::CONTENT_TYPE, "application/json");
+        headers
+    }
+
+    fn supports_model_listing(&self) -> bool {
+        true
+    }
+
+    fn model_catalog_format(&self) -> Option<super::ModelCatalogFormat> {
+        Some(super::ModelCatalogFormat::Gemini)
+    }
+
+    fn models_endpoint(&self) -> &'static str {
+        "/v1beta/models?pageSize=1000"
     }
 
     /// Gemini native shape: `candidates[0].content.parts[].text`. Text
@@ -443,74 +1806,6 @@ impl ProviderAdapter for GoogleAdapter {
     }
 }
 
-fn extract_gemini_tool_calls(parts: &[Value]) -> Result<Option<Vec<Value>>, ProviderError> {
-    let mut calls = Vec::new();
-
-    for part in parts {
-        let Some(func_call) = part.get("functionCall") else {
-            continue;
-        };
-
-        if !func_call.is_object() {
-            return Err(ProviderError::InvalidResponse(format!(
-                "Gemini functionCall must be an object: {func_call}"
-            )));
-        }
-
-        let name = func_call
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|name| !name.is_empty())
-            .ok_or_else(|| {
-                ProviderError::InvalidResponse(format!(
-                    "Gemini functionCall missing non-empty string 'name': {func_call}"
-                ))
-            })?;
-
-        let args = func_call.get("args").ok_or_else(|| {
-            ProviderError::InvalidResponse(format!(
-                "Gemini functionCall missing object 'args': {func_call}"
-            ))
-        })?;
-
-        if !args.is_object() {
-            return Err(ProviderError::InvalidResponse(format!(
-                "Gemini functionCall has non-object 'args': expected JSON object, got {}",
-                args_type_name(args)
-            )));
-        }
-
-        let args = serde_json::to_string(args).map_err(|e| {
-            ProviderError::InvalidResponse(format!(
-                "Gemini functionCall has unserializable 'args': {e}; functionCall: {func_call}"
-            ))
-        })?;
-
-        let ordinal = calls.len();
-        calls.push(json!({
-            "id": gemini_tool_call_id(ordinal, name),
-            "type": "function",
-            "function": {
-                "name": name,
-                "arguments": args,
-            }
-        }));
-    }
-
-    Ok((!calls.is_empty()).then_some(calls))
-}
-
-const fn args_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
-}
-
 /// Extract and concatenate text from Gemini `content.parts`.
 ///
 /// Text parts must contain string `text`; native `functionCall` parts are
@@ -525,10 +1820,16 @@ pub fn extract_gemini_text_content(parts: &[Value]) -> Result<String, ProviderEr
     let mut content = String::new();
 
     for (index, part) in parts.iter().enumerate() {
+        // Gemini marks raw thought text explicitly. It remains eligible for
+        // provider-native compatibility redaction, but is never projected as
+        // visible assistant content or a user-facing reasoning summary.
+        if part.get("thought").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
         if let Some(text_value) = part.get("text") {
             let text = text_value.as_str().ok_or_else(|| {
                 ProviderError::InvalidResponse(format!(
-                    "Gemini content part at index {index} has non-string 'text': {part}"
+                    "Gemini content part at index {index} has non-string 'text'"
                 ))
             })?;
             content.push_str(text);
@@ -540,8 +1841,7 @@ pub fn extract_gemini_text_content(parts: &[Value]) -> Result<String, ProviderEr
         }
 
         return Err(ProviderError::InvalidResponse(format!(
-            "Gemini content part at index {index} has no supported text or functionCall field: \
-             {part}"
+            "Gemini content part at index {index} has no supported text or functionCall field"
         )));
     }
 
@@ -573,6 +1873,72 @@ mod tests {
         }
     }
 
+    fn google_request_with_messages(messages: Vec<ChatMessage>) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "gemini-3.5-pro".to_string(),
+            messages,
+            max_tokens: Some(64),
+            temperature: None,
+            tools: None,
+            stream: None,
+            tool_choice: None,
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
+    fn text_message(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.to_string(),
+            content: MessageContent::Text(content.to_string()),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
+    fn assistant_message(content: &str, calls: &[ToolCall]) -> ChatMessage {
+        let tool_calls = calls
+            .iter()
+            .map(|call| {
+                json!({
+                    "id": call.id,
+                    "type": call.call_type,
+                    "function": {
+                        "name": call.function.name,
+                        "arguments": call.function.arguments,
+                    }
+                })
+            })
+            .collect();
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: MessageContent::Text(content.to_string()),
+            name: None,
+            tool_calls: Some(tool_calls),
+            tool_call_id: None,
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
+    fn tool_message(call: &ToolCall, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: "tool".to_string(),
+            content: MessageContent::Text(content.to_string()),
+            name: Some(call.function.name.clone()),
+            tool_calls: None,
+            tool_call_id: Some(call.id.clone()),
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
+    fn gemini_output(content: &Value) -> GeminiGenerateContentTurnOutput {
+        GeminiGenerateContentTurnOutput::new(&json!({
+            "candidates": [{"content": content, "finishReason": "STOP"}]
+        }))
+        .expect("recorded Gemini output must be valid")
+    }
+
     #[test]
     fn convert_tools_to_gemini_functions_accepts_valid_tool() {
         let tools = vec![json!({
@@ -590,12 +1956,64 @@ mod tests {
         assert_eq!(functions.len(), 1);
         assert_eq!(functions[0]["name"], "bash");
         assert_eq!(functions[0]["description"], "run shell");
-        assert_eq!(functions[0]["parameters"]["type"], "object");
+        assert_eq!(functions[0]["parametersJsonSchema"]["type"], "object");
+        assert!(functions[0].get("parameters").is_none());
+    }
+
+    #[test]
+    fn convert_tools_to_gemini_rewrites_nested_const_constraints() {
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "tool_search",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "catalog_generation": {
+                            "type": "string",
+                            "const": "sha256:bound"
+                        },
+                        "policy": {
+                            "oneOf": [
+                                {"const": "private"},
+                                {"const": "team"}
+                            ]
+                        },
+                        "const": {"type": "string"}
+                    }
+                }
+            }
+        })];
+
+        let functions =
+            convert_tools_to_gemini_functions(&tools).expect("valid tool should convert");
+        let schema = &functions[0]["parametersJsonSchema"];
+
+        assert_eq!(
+            schema["properties"]["catalog_generation"]["enum"],
+            json!(["sha256:bound"])
+        );
+        assert_eq!(
+            schema["properties"]["policy"]["oneOf"][0]["enum"],
+            json!(["private"])
+        );
+        assert_eq!(schema["properties"]["const"]["type"], "string");
+        assert!(
+            schema
+                .pointer("/properties/catalog_generation/const")
+                .is_none(),
+            "Gemini schema must not retain unsupported const"
+        );
+        assert_eq!(schema["additionalProperties"], false);
     }
 
     #[test]
     fn transform_request_errors_on_tool_missing_function_object() {
-        let request = google_request_with_tools(vec![json!({"type": "function"})]);
+        let request = google_request_with_tools(vec![json!({
+            "type": "function",
+            "credential": "google-tool-secret-sentinel"
+        })]);
         let err = GoogleAdapter::new()
             .transform_request(&request)
             .expect_err("missing function object must fail");
@@ -604,6 +2022,7 @@ mod tests {
             ProviderError::RequestFailed(msg) => {
                 assert!(msg.contains("'function' object"), "{msg}");
                 assert!(msg.contains("index 0"), "{msg}");
+                assert!(!msg.contains("google-tool-secret-sentinel"), "{msg}");
             }
             other => panic!("expected RequestFailed, got {other:?}"),
         }
@@ -778,8 +2197,9 @@ mod tests {
             .map(|c| c["id"].as_str().unwrap())
             .collect();
         assert_eq!(ids_a, ids_b, "#785: re-parse must yield identical ids");
-        // The shape is `call_<ordinal>_<name>`.
-        assert_eq!(ids_a, vec!["call_0_bash", "call_1_read"]);
+        // The assistant ordinal and in-turn position prevent collisions when
+        // older Gemini models omit provider call ids across multiple rounds.
+        assert_eq!(ids_a, vec!["call_gemini_0_0", "call_gemini_0_1"]);
     }
 
     /// #785: two consecutive calls to the same function in a single turn
@@ -803,8 +2223,8 @@ mod tests {
             .as_array()
             .unwrap();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0]["id"], "call_0_bash");
-        assert_eq!(calls[1]["id"], "call_1_bash");
+        assert_eq!(calls[0]["id"], "call_gemini_0_0");
+        assert_eq!(calls[1]["id"], "call_gemini_0_1");
         assert_ne!(calls[0]["id"], calls[1]["id"]);
     }
 
@@ -929,6 +2349,110 @@ mod tests {
     }
 
     #[test]
+    fn supported_typed_tool_image_becomes_native_function_response_part() {
+        let bytes = b"typed-google-image".to_vec();
+        let expected = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let attachment = crate::tools::register_transient_attachment(
+            "image/png",
+            bytes,
+            crate::tools::ToolSensitivity::Workspace,
+        )
+        .expect("register image attachment");
+        let call = crate::tools::ToolCall {
+            id: "google-image-call".to_string(),
+            call_type: "function".to_string(),
+            function: crate::tools::FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let mut result = tool_message(&call, "typed image metadata");
+        result.extra.insert(
+            crate::tools::TOOL_ATTACHMENTS_MESSAGE_KEY.to_string(),
+            serde_json::to_value([attachment]).expect("serialize attachment metadata"),
+        );
+        let request = google_request_with_messages(vec![assistant_message("", &[call]), result]);
+        let body = GoogleAdapter::transform_request_draft(&request)
+            .expect("transform typed function response draft");
+        let native = &body["contents"][1]["parts"][0]["functionResponse"]["parts"][0]["inlineData"];
+        assert_eq!(native["mimeType"], "image/png");
+        assert_eq!(native["data"], expected);
+        assert_eq!(
+            serde_json::to_string(&body)
+                .expect("serialize Google body")
+                .matches(&expected)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unsupported_google_function_response_media_is_a_diagnostic_not_invalid_wire_data() {
+        let attachment = crate::tools::register_transient_attachment(
+            "application/octet-stream",
+            b"typed-google-binary".to_vec(),
+            crate::tools::ToolSensitivity::Workspace,
+        )
+        .expect("register binary attachment");
+        let call = crate::tools::ToolCall {
+            id: "google-binary-call".to_string(),
+            call_type: "function".to_string(),
+            function: crate::tools::FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let mut result = tool_message(&call, "typed binary metadata");
+        result.extra.insert(
+            crate::tools::TOOL_ATTACHMENTS_MESSAGE_KEY.to_string(),
+            serde_json::to_value([attachment]).expect("serialize attachment metadata"),
+        );
+        let request = google_request_with_messages(vec![assistant_message("", &[call]), result]);
+
+        let body = GoogleAdapter::transform_request_draft(&request)
+            .expect("unsupported media must remain a valid Google request");
+        let response = &body["contents"][1]["parts"][0]["functionResponse"];
+        assert!(response.get("parts").is_none());
+        assert!(response["response"]["attachment_diagnostics"][0]
+            .as_str()
+            .is_some_and(|diagnostic| diagnostic.contains("application/octet-stream")));
+    }
+
+    #[test]
+    fn pre_gemini_three_model_gets_an_explicit_attachment_diagnostic() {
+        let attachment = crate::tools::register_transient_attachment(
+            "image/png",
+            b"typed-google-image".to_vec(),
+            crate::tools::ToolSensitivity::Workspace,
+        )
+        .expect("register image attachment");
+        let call = crate::tools::ToolCall {
+            id: "google-image-call".to_string(),
+            call_type: "function".to_string(),
+            function: crate::tools::FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let mut result = tool_message(&call, "typed image metadata");
+        result.extra.insert(
+            crate::tools::TOOL_ATTACHMENTS_MESSAGE_KEY.to_string(),
+            serde_json::to_value([attachment]).expect("serialize attachment metadata"),
+        );
+        let mut request =
+            google_request_with_messages(vec![assistant_message("", &[call]), result]);
+        request.model = "gemini-2.5-pro".to_string();
+
+        let body = GoogleAdapter::transform_request_draft(&request)
+            .expect("unsupported model must remain a valid Google request");
+        let response = &body["contents"][1]["parts"][0]["functionResponse"];
+        assert!(response.get("parts").is_none());
+        assert!(response["response"]["attachment_diagnostics"][0]
+            .as_str()
+            .is_some_and(|diagnostic| diagnostic.contains("gemini-2.5-pro")));
+    }
+
+    #[test]
     fn transform_request_errors_on_unknown_content_part_type() {
         let msg = ChatMessage {
             role: "user".to_string(),
@@ -966,7 +2490,10 @@ mod tests {
             .expect_err("unknown Google content part must fail request conversion");
 
         match err {
-            ProviderError::RequestFailed(msg) => assert!(msg.contains("video_url"), "{msg}"),
+            ProviderError::RequestFailed(msg) => {
+                assert!(msg.contains("content part type"), "{msg}");
+                assert!(!msg.contains("video_url"), "{msg}");
+            }
             other => panic!("expected RequestFailed, got {other:?}"),
         }
     }
@@ -1107,5 +2634,213 @@ mod tests {
                 "{name}: every wired provider must report supports_streaming=true"
             );
         }
+    }
+
+    #[test]
+    fn native_state_replays_two_parallel_tool_rounds_exactly() {
+        let first_content = json!({
+            "role": "model",
+            "parts": [
+                {"text": "checking"},
+                {
+                    "functionCall": {
+                        "id": "native-a",
+                        "name": "bash",
+                        "args": {"command": "pwd"}
+                    },
+                    "thoughtSignature": "opaque-signature-a"
+                },
+                {
+                    "functionCall": {
+                        "id": "native-b",
+                        "name": "read",
+                        "args": {"path": "Cargo.toml"}
+                    }
+                }
+            ],
+            "providerMetadata": {"must_survive": true}
+        });
+        let first = gemini_output(&first_content);
+        let first_calls = first.tool_calls(1).expect("first calls project");
+        let state =
+            advance_gemini_generate_content_state("google", "gemini-3.5-pro", None, 1, &first)
+                .expect("first native turn advances");
+
+        let second_content = json!({
+            "role": "model",
+            "parts": [{
+                "functionCall": {
+                    "id": "native-c",
+                    "name": "bash",
+                    "args": {"command": "cargo metadata --no-deps"}
+                },
+                "thoughtSignature": "opaque-signature-b"
+            }]
+        });
+        let second = gemini_output(&second_content);
+        let second_calls = second.tool_calls(4).expect("second calls project");
+        let state = advance_gemini_generate_content_state(
+            "google",
+            "gemini-3.5-pro",
+            Some(&state),
+            4,
+            &second,
+        )
+        .expect("second native turn advances");
+
+        let request = google_request_with_messages(vec![
+            text_message("user", "inspect the repository"),
+            assistant_message("checking", &first_calls),
+            tool_message(&first_calls[0], r#"{"cwd":"/workspace"}"#),
+            tool_message(&first_calls[1], r#"{"text":"manifest"}"#),
+            assistant_message("", &second_calls),
+            tool_message(&second_calls[0], r#"{"packages":1}"#),
+        ]);
+        let adapter = GoogleAdapter::new();
+        let mut body =
+            GoogleAdapter::transform_request_draft(&request).expect("portable history converts");
+        adapter
+            .apply_provider_native_state(&mut body, &state)
+            .expect("native state applies");
+        GoogleAdapter::finalize_request(&mut body).expect("request finalizes");
+
+        assert!(body.get(GEMINI_HISTORY_KEY).is_none());
+        let contents = body["contents"].as_array().expect("Gemini contents");
+        assert_eq!(contents[1], first_content);
+        assert_eq!(contents[3], second_content);
+        let first_results = contents[2]["parts"]
+            .as_array()
+            .expect("parallel results are one ordered batch");
+        assert_eq!(first_results.len(), 2);
+        assert_eq!(first_results[0]["functionResponse"]["id"], "native-a");
+        assert_eq!(first_results[1]["functionResponse"]["id"], "native-b");
+        assert_eq!(
+            contents[4]["parts"][0]["functionResponse"]["id"],
+            "native-c"
+        );
+    }
+
+    #[test]
+    fn native_state_omits_synthetic_ids_for_older_gemini_rounds() {
+        let exact_content = json!({
+            "role": "model",
+            "parts": [{
+                "functionCall": {"name": "bash", "args": {"command": "pwd"}},
+                "thoughtSignature": "older-model-signature"
+            }]
+        });
+        let output = gemini_output(&exact_content);
+        let calls = output.tool_calls(1).expect("portable call projects");
+        assert_eq!(calls[0].id, "call_gemini_1_0");
+        let state =
+            advance_gemini_generate_content_state("google", "gemini-2.5-pro", None, 1, &output)
+                .expect("native turn advances");
+        let request = google_request_with_messages(vec![
+            text_message("user", "where am I"),
+            assistant_message("", &calls),
+            tool_message(&calls[0], r#"{"cwd":"/workspace"}"#),
+        ]);
+        let adapter = GoogleAdapter::new();
+        let mut body =
+            GoogleAdapter::transform_request_draft(&request).expect("portable history converts");
+        adapter
+            .apply_provider_native_state(&mut body, &state)
+            .expect("native state applies");
+        GoogleAdapter::finalize_request(&mut body).expect("request finalizes");
+
+        assert_eq!(body["contents"][1], exact_content);
+        assert!(body["contents"][2]["parts"][0]["functionResponse"]
+            .get("id")
+            .is_none());
+    }
+
+    #[test]
+    fn native_history_rejects_missing_duplicate_reordered_and_mismatched_calls() {
+        let output = gemini_output(&json!({
+            "role": "model",
+            "parts": [
+                {"functionCall": {"id": "dup", "name": "bash", "args": {"command": "pwd"}}},
+                {"functionCall": {"id": "dup", "name": "read", "args": {"path": "Cargo.toml"}}}
+            ]
+        }));
+        let error = output
+            .tool_calls(1)
+            .expect_err("duplicate provider call ids must fail");
+        assert!(error.to_string().contains("repeated function call id"));
+
+        let output = gemini_output(&json!({
+            "role": "model",
+            "parts": [
+                {"functionCall": {"id": "call-a", "name": "bash", "args": {"command": "pwd"}}},
+                {"functionCall": {"id": "call-b", "name": "read", "args": {"path": "Cargo.toml"}}}
+            ]
+        }));
+        let calls = output.tool_calls(1).expect("calls project");
+        let missing = google_request_with_messages(vec![
+            text_message("user", "inspect"),
+            assistant_message("", &calls),
+            tool_message(&calls[0], "first"),
+        ]);
+        let error =
+            GoogleAdapter::transform_request_draft(&missing).expect_err("missing result must fail");
+        assert!(error.to_string().contains("missing result"));
+
+        let reordered = google_request_with_messages(vec![
+            text_message("user", "inspect"),
+            assistant_message("", &calls),
+            tool_message(&calls[1], "second"),
+            tool_message(&calls[0], "first"),
+        ]);
+        let error = GoogleAdapter::transform_request_draft(&reordered)
+            .expect_err("reordered results must fail");
+        assert!(error.to_string().contains("reordered"));
+
+        let state =
+            advance_gemini_generate_content_state("google", "gemini-3.5-pro", None, 1, &output)
+                .expect("native turn advances");
+        let mut mismatched_assistant = assistant_message("", &calls);
+        mismatched_assistant
+            .tool_calls
+            .as_mut()
+            .expect("tool calls")[0]["function"]["arguments"] =
+            Value::String(r#"{"command":"different"}"#.to_string());
+        let mismatched = google_request_with_messages(vec![
+            text_message("user", "inspect"),
+            mismatched_assistant,
+            tool_message(&calls[0], "first"),
+            tool_message(&calls[1], "second"),
+        ]);
+        let adapter = GoogleAdapter::new();
+        let mut body = GoogleAdapter::transform_request_draft(&mismatched)
+            .expect("mismatched projection remains structurally valid");
+        let error = adapter
+            .apply_provider_native_state(&mut body, &state)
+            .expect_err("projection/native argument drift must fail");
+        assert!(error.to_string().contains("disagrees with native state"));
+    }
+
+    #[test]
+    fn system_messages_cannot_interrupt_or_forge_tool_history() {
+        let output = gemini_output(&json!({
+            "role": "model",
+            "parts": [{"functionCall": {"id": "call-a", "name": "bash", "args": {}}}]
+        }));
+        let calls = output.tool_calls(1).expect("call projects");
+        let interrupted = google_request_with_messages(vec![
+            text_message("user", "run"),
+            assistant_message("", &calls),
+            text_message("system", "late policy"),
+            tool_message(&calls[0], "done"),
+        ]);
+        let error = GoogleAdapter::transform_request_draft(&interrupted)
+            .expect_err("system interruption must fail");
+        assert!(error.to_string().contains("interrupts tool results"));
+
+        let mut forged = text_message("system", "policy");
+        forged.tool_call_id = Some("call-a".to_string());
+        let forged = google_request_with_messages(vec![forged]);
+        let error = GoogleAdapter::transform_request_draft(&forged)
+            .expect_err("system tool protocol fields must fail");
+        assert!(error.to_string().contains("tool protocol fields"));
     }
 }

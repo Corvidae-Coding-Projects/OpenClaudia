@@ -33,6 +33,10 @@ use thiserror::Error;
 
 use crate::config::ThinkingConfig;
 use crate::proxy::ChatCompletionRequest;
+use crate::runtime::{
+    ProviderNativeState, ProviderStateContract, ProviderStateSupport, ProviderWireProtocol,
+};
+use crate::secrets::SensitiveHeaders;
 use crate::session::TokenUsage;
 
 // Re-export all adapter types and public functions
@@ -45,18 +49,23 @@ pub use anthropic::{
 pub use api_key::{ApiKey, ApiKeyError, MAX_API_KEY_LEN, REDACTED_PLACEHOLDER};
 pub use deepseek::DeepSeekAdapter;
 pub use google::{
-    convert_tools_to_gemini, convert_tools_to_gemini_functions, extract_gemini_text_content,
-    GoogleAdapter,
+    advance_gemini_generate_content_state, convert_tools_to_gemini,
+    convert_tools_to_gemini_functions, extract_gemini_text_content,
+    GeminiGenerateContentTurnOutput, GoogleAdapter,
 };
 pub use kimi::KimiAdapter;
 pub use minimax::MiniMaxAdapter;
 pub use model_catalog::{
-    canonical_static_catalog_provider, static_models_for_provider, ANTHROPIC_MODELS,
-    DEEPSEEK_MODELS, GOOGLE_MODELS, KIMI_MODELS, MINIMAX_MODELS, OPENAI_MODELS, QWEN_MODELS,
-    STATIC_MODEL_CATALOG_PROVIDERS, ZAI_MODELS,
+    cached_model_catalog, canonical_static_catalog_provider, emergency_fallback_catalog,
+    known_model_context_window, resolve_model, static_models_for_provider, ModelAccessState,
+    ModelCapabilities, ModelCatalogEntry, ModelCatalogFormat, ModelCatalogProvenance,
+    ModelCatalogSnapshot, ModelEvidenceSource, ModelLifecycle, ModelPricingState, ModelSupport,
+    ReasoningProfile, ResolvedModel, ANTHROPIC_MODELS, DEEPSEEK_MODELS, GOOGLE_MODELS, KIMI_MODELS,
+    MINIMAX_MODELS, OPENAI_MODELS, QWEN_MODELS, STATIC_MODEL_CATALOG_PROVIDERS, ZAI_MODELS,
 };
-pub use ollama::OllamaAdapter;
-pub use openai::OpenAIAdapter;
+pub use ollama::{advance_ollama_chat_state, OllamaAdapter, OllamaChatTurnOutput};
+pub(crate) use openai::finalize_responses_request;
+pub use openai::{advance_openai_responses_state, OpenAIAdapter, OpenAiResponsesTurnOutput};
 pub use qwen::QwenAdapter;
 pub use zai::ZaiAdapter;
 
@@ -106,6 +115,48 @@ pub struct ModelInfo {
 pub trait ProviderAdapter: Send + Sync {
     /// Get the provider name
     fn name(&self) -> &str;
+
+    /// Declare lossless native-state behavior for one concrete wire protocol.
+    ///
+    /// Implementations must reject protocols they do not speak.  There is no
+    /// default declaration because silently inheriting a generic chat fallback
+    /// is precisely what native continuation state must prevent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Unsupported`] for a protocol the adapter does
+    /// not implement.
+    fn state_contract(
+        &self,
+        protocol: ProviderWireProtocol,
+    ) -> Result<&'static ProviderStateContract, ProviderError>;
+
+    /// Apply validated provider-native state to an already transformed request.
+    ///
+    /// The default is intentionally fail-closed: evidence-only items require no
+    /// request mutation, while any continuation item requires an adapter
+    /// override. Provider-specific continuation slices must add the override at
+    /// the same time they declare a facet round-trippable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported facets or unapplied continuation state.
+    fn apply_provider_native_state(
+        &self,
+        _request: &mut Value,
+        state: &ProviderNativeState,
+    ) -> Result<(), ProviderError> {
+        self.state_contract(state.protocol())?
+            .validate_state(state)
+            .map_err(|error| ProviderError::Unsupported(error.to_string()))?;
+        if state.has_continuation_items() {
+            return Err(ProviderError::Unsupported(format!(
+                "{} declares native continuation items but has no lossless request applicator",
+                self.name()
+            )));
+        }
+        Ok(())
+    }
 
     /// Transform an OpenAI-compatible request to provider format.
     ///
@@ -174,15 +225,20 @@ pub trait ProviderAdapter: Send + Sync {
 
     /// Get required headers for this provider.
     ///
-    /// The key is passed as an [`ApiKey`] rather than `&str` so that the
-    /// only way to reach the raw secret is an explicit `.as_str()` call
-    /// at the HTTP-header construction site — `Debug`/`Display` of an
-    /// `ApiKey` always redact. See crosslink #256.
-    fn get_headers(&self, api_key: &ApiKey) -> Vec<(String, String)>;
+    /// Raw key bytes stay inside [`SensitiveHeaders`] and are materialized
+    /// only when that collection is applied to a request at the transport
+    /// boundary.
+    fn get_headers(&self, api_key: &ApiKey) -> SensitiveHeaders;
 
     /// Check if this provider supports model listing
     fn supports_model_listing(&self) -> bool {
         false
+    }
+
+    /// Response schema used by the provider's model-list endpoint.
+    fn model_catalog_format(&self) -> Option<ModelCatalogFormat> {
+        self.supports_model_listing()
+            .then_some(ModelCatalogFormat::OpenAi)
     }
 
     /// Get the models endpoint path (for providers that support it)
@@ -270,6 +326,95 @@ pub trait ProviderAdapter: Send + Sync {
                 .unwrap_or(0),
         })
     }
+}
+
+const NATIVE_MESSAGES_PENDING: ProviderStateSupport =
+    ProviderStateSupport::Unsupported("native message replay is not wired yet");
+const TOOL_CALLS_PENDING: ProviderStateSupport =
+    ProviderStateSupport::Unsupported("native tool-call replay is not wired yet");
+const PARALLEL_TOOLS_PENDING: ProviderStateSupport =
+    ProviderStateSupport::Unsupported("native parallel tool-call ordering is not wired yet");
+const REASONING_PENDING: ProviderStateSupport =
+    ProviderStateSupport::Unsupported("native reasoning continuation is not wired yet");
+const COMPACTION_PENDING: ProviderStateSupport =
+    ProviderStateSupport::Unsupported("native compaction state is not wired yet");
+const SERVER_CONTINUATION_PENDING: ProviderStateSupport =
+    ProviderStateSupport::Unsupported("server continuation identifiers are not wired yet");
+
+const fn retained_evidence_contract(protocol: ProviderWireProtocol) -> ProviderStateContract {
+    ProviderStateContract {
+        protocol,
+        native_message: NATIVE_MESSAGES_PENDING,
+        tool_calls: TOOL_CALLS_PENDING,
+        parallel_tool_calls: PARALLEL_TOOLS_PENDING,
+        reasoning: REASONING_PENDING,
+        refusal: ProviderStateSupport::EvidenceOnly,
+        usage: ProviderStateSupport::EvidenceOnly,
+        cache_metadata: ProviderStateSupport::EvidenceOnly,
+        compaction: COMPACTION_PENDING,
+        server_continuation: SERVER_CONTINUATION_PENDING,
+        terminal_state: ProviderStateSupport::EvidenceOnly,
+    }
+}
+
+static ANTHROPIC_STATE_CONTRACT: ProviderStateContract =
+    retained_evidence_contract(ProviderWireProtocol::AnthropicMessages);
+static OPENAI_CHAT_STATE_CONTRACT: ProviderStateContract =
+    retained_evidence_contract(ProviderWireProtocol::OpenAiChatCompletions);
+static OPENAI_RESPONSES_STATE_CONTRACT: ProviderStateContract = ProviderStateContract {
+    protocol: ProviderWireProtocol::OpenAiResponses,
+    native_message: ProviderStateSupport::RoundTrip,
+    tool_calls: ProviderStateSupport::RoundTrip,
+    parallel_tool_calls: ProviderStateSupport::RoundTrip,
+    reasoning: ProviderStateSupport::RoundTrip,
+    refusal: ProviderStateSupport::EvidenceOnly,
+    usage: ProviderStateSupport::EvidenceOnly,
+    cache_metadata: ProviderStateSupport::EvidenceOnly,
+    compaction: ProviderStateSupport::RoundTrip,
+    // The Responses transport is deliberately stateless (`store:false`).
+    // Response IDs are retained for evidence and trace correlation, but are
+    // not sent back as `previous_response_id`; exact output items carry the
+    // continuation instead.
+    server_continuation: ProviderStateSupport::EvidenceOnly,
+    terminal_state: ProviderStateSupport::EvidenceOnly,
+};
+static GEMINI_GENERATE_CONTENT_STATE_CONTRACT: ProviderStateContract = ProviderStateContract {
+    protocol: ProviderWireProtocol::GeminiGenerateContent,
+    native_message: ProviderStateSupport::RoundTrip,
+    tool_calls: ProviderStateSupport::RoundTrip,
+    parallel_tool_calls: ProviderStateSupport::RoundTrip,
+    // Thought signatures remain opaque inside their exact native content
+    // parts. They are replayed but never projected into portable messages.
+    reasoning: ProviderStateSupport::RoundTrip,
+    refusal: ProviderStateSupport::EvidenceOnly,
+    usage: ProviderStateSupport::EvidenceOnly,
+    cache_metadata: ProviderStateSupport::EvidenceOnly,
+    compaction: COMPACTION_PENDING,
+    server_continuation: SERVER_CONTINUATION_PENDING,
+    terminal_state: ProviderStateSupport::EvidenceOnly,
+};
+static GEMINI_INTERACTIONS_STATE_CONTRACT: ProviderStateContract =
+    retained_evidence_contract(ProviderWireProtocol::GeminiInteractions);
+static OLLAMA_STATE_CONTRACT: ProviderStateContract = ProviderStateContract {
+    protocol: ProviderWireProtocol::OllamaChat,
+    native_message: ProviderStateSupport::RoundTrip,
+    tool_calls: ProviderStateSupport::RoundTrip,
+    parallel_tool_calls: ProviderStateSupport::RoundTrip,
+    // Ollama's `thinking` field is retained only in the exact native message;
+    // S-049 owns its eventual display/privacy projection.
+    reasoning: ProviderStateSupport::RoundTrip,
+    refusal: ProviderStateSupport::EvidenceOnly,
+    usage: ProviderStateSupport::EvidenceOnly,
+    cache_metadata: ProviderStateSupport::EvidenceOnly,
+    compaction: COMPACTION_PENDING,
+    server_continuation: SERVER_CONTINUATION_PENDING,
+    terminal_state: ProviderStateSupport::EvidenceOnly,
+};
+
+fn unsupported_state_protocol(adapter: &str, protocol: ProviderWireProtocol) -> ProviderError {
+    ProviderError::Unsupported(format!(
+        "provider adapter {adapter} does not implement wire protocol {protocol}"
+    ))
 }
 
 /// Typed enum of every provider this proxy knows how to route to.
@@ -418,8 +563,9 @@ pub const SUPPORTED_PROVIDERS: &[&str] = &[
 /// freshly-started session.
 pub const DEFAULT_MODELS_BY_TARGET: &[(&str, &str)] = &[
     ("anthropic", "claude-opus-4-8"),
-    ("google", "gemini-3.5-flash"),
-    ("gemini", "gemini-3.5-flash"),
+    ("openai", "gpt-5.6-sol"),
+    ("google", "gemini-3.7-flash"),
+    ("gemini", "gemini-3.7-flash"),
     ("zai", "glm-5.2"),
     ("glm", "glm-5.2"),
     ("zhipu", "glm-5.2"),
@@ -434,18 +580,16 @@ pub const DEFAULT_MODELS_BY_TARGET: &[(&str, &str)] = &[
     ("opencode-go", "kimi-k2.7-code"),
 ];
 
-/// Fallback model for targets not listed in [`DEFAULT_MODELS_BY_TARGET`].
-/// Currently every non-table target is treated as OpenAI-compatible.
-pub const DEFAULT_MODEL_FALLBACK: &str = "gpt-5.5";
-
-/// Look up the canonical default model for a target, or [`DEFAULT_MODEL_FALLBACK`].
+/// Look up the canonical default model for a provider with a maintained default.
+///
+/// Local and custom OpenAI-compatible targets intentionally return `None`:
+/// their installed model inventory is runtime state, not an `OpenAI` default.
 #[must_use]
-pub fn default_model_for_target(target: &str) -> &'static str {
+pub fn default_model_for_target(target: &str) -> Option<&'static str> {
     let target = target.trim();
     DEFAULT_MODELS_BY_TARGET
         .iter()
         .find_map(|(t, m)| t.eq_ignore_ascii_case(target).then_some(*m))
-        .unwrap_or(DEFAULT_MODEL_FALLBACK)
 }
 
 /// Environment variable users should set for a provider API key.
@@ -547,52 +691,25 @@ pub fn get_adapter(provider: &str) -> Result<&'static dyn ProviderAdapter, Provi
     Ok(adapter)
 }
 
+#[cfg(test)]
 fn parse_models_response(body: &Value) -> Result<Vec<ModelInfo>, ProviderError> {
-    // Parse OpenAI-style response: { "data": [...], "object": "list" }
-    let data = body.get("data").and_then(Value::as_array).ok_or_else(|| {
-        ProviderError::InvalidResponse("Expected 'data' array in response".to_string())
-    })?;
-
-    let mut models = Vec::with_capacity(data.len());
-    for (index, model) in data.iter().enumerate() {
-        let id = model
-            .get("id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| {
-                ProviderError::InvalidResponse(format!(
-                    "Model entry at index {index} missing non-empty string 'id': {model}"
-                ))
-            })?
-            .to_string();
-
-        let owned_by = match model.get("owned_by") {
-            None | Some(Value::Null) => None,
-            Some(value) => Some(value.as_str().ok_or_else(|| {
-                ProviderError::InvalidResponse(format!(
-                    "Model entry at index {index} has non-string 'owned_by': {model}"
-                ))
-            })?),
-        }
-        .map(str::to_string);
-
-        let created = match model.get("created") {
-            None | Some(Value::Null) => None,
-            Some(value) => Some(value.as_i64().ok_or_else(|| {
-                ProviderError::InvalidResponse(format!(
-                    "Model entry at index {index} has non-integer 'created': {model}"
-                ))
-            })?),
-        };
-
-        models.push(ModelInfo {
-            id,
-            owned_by,
-            created,
-        });
-    }
-
-    Ok(models)
+    let snapshot = model_catalog::parse_discovered_catalog(
+        "openai",
+        "https://example.invalid/v1/models",
+        ModelCatalogFormat::OpenAi,
+        body,
+        chrono::Utc::now().timestamp(),
+    )
+    .map_err(ProviderError::InvalidResponse)?;
+    Ok(snapshot
+        .models
+        .into_iter()
+        .map(|model| ModelInfo {
+            id: model.canonical_id,
+            owned_by: model.owned_by,
+            created: model.created,
+        })
+        .collect())
 }
 
 /// Fetch available models from a provider's `/v1/models` endpoint.
@@ -606,7 +723,14 @@ pub async fn fetch_models(
     api_key: Option<&ApiKey>,
     adapter: &dyn ProviderAdapter,
 ) -> Result<Vec<ModelInfo>, ProviderError> {
-    fetch_models_with_headers(base_url, api_key, &[], adapter).await
+    fetch_models_for_provider_with_headers(
+        adapter.name(),
+        base_url,
+        api_key,
+        &SensitiveHeaders::new(),
+        adapter,
+    )
+    .await
 }
 
 /// Fetch available models with optional operator-supplied headers.
@@ -620,17 +744,126 @@ pub async fn fetch_models(
 pub async fn fetch_models_with_headers(
     base_url: &str,
     api_key: Option<&ApiKey>,
-    extra_headers: &[(String, String)],
+    extra_headers: &SensitiveHeaders,
     adapter: &dyn ProviderAdapter,
 ) -> Result<Vec<ModelInfo>, ProviderError> {
+    fetch_models_for_provider_with_headers(
+        adapter.name(),
+        base_url,
+        api_key,
+        extra_headers,
+        adapter,
+    )
+    .await
+}
+
+/// Fetch available models while retaining the configured provider identity.
+///
+/// OpenAI-compatible local targets share the `openai` adapter, but their
+/// configured names carry the security policy that permits loopback/LAN model
+/// servers. Product call sites should use this function when that identity is
+/// available; the compatibility helpers above remain suitable for canonical
+/// remote providers.
+///
+/// # Errors
+///
+/// Returns a [`ProviderError`] if the endpoint is disallowed, listing is
+/// unsupported, the request fails, or the response is malformed.
+pub async fn fetch_models_for_provider_with_headers(
+    provider_name: &str,
+    base_url: &str,
+    api_key: Option<&ApiKey>,
+    extra_headers: &SensitiveHeaders,
+    adapter: &dyn ProviderAdapter,
+) -> Result<Vec<ModelInfo>, ProviderError> {
+    let snapshot = discover_model_catalog_for_provider_with_headers(
+        provider_name,
+        base_url,
+        api_key,
+        extra_headers,
+        adapter,
+    )
+    .await?;
+    Ok(snapshot
+        .models
+        .into_iter()
+        .map(|model| ModelInfo {
+            id: model.canonical_id,
+            owned_by: model.owned_by,
+            created: model.created,
+        })
+        .collect())
+}
+
+/// Discover and cache the account-scoped model catalogue exposed by a provider.
+///
+/// # Errors
+///
+/// Returns a `ProviderError` when listing is unsupported, the endpoint fails,
+/// or the provider returns a malformed response.
+pub async fn discover_model_catalog_with_headers(
+    base_url: &str,
+    api_key: Option<&ApiKey>,
+    extra_headers: &SensitiveHeaders,
+    adapter: &dyn ProviderAdapter,
+) -> Result<ModelCatalogSnapshot, ProviderError> {
+    discover_model_catalog_for_provider_with_headers(
+        adapter.name(),
+        base_url,
+        api_key,
+        extra_headers,
+        adapter,
+    )
+    .await
+}
+
+/// Discover models using the configured provider name for endpoint policy.
+///
+/// # Errors
+///
+/// Returns a [`ProviderError`] if the endpoint is disallowed, listing is
+/// unsupported, the request fails, or the response is malformed.
+pub async fn discover_model_catalog_for_provider_with_headers(
+    provider_name: &str,
+    base_url: &str,
+    api_key: Option<&ApiKey>,
+    extra_headers: &SensitiveHeaders,
+    adapter: &dyn ProviderAdapter,
+) -> Result<ModelCatalogSnapshot, ProviderError> {
+    discover_model_catalog_impl(
+        provider_name,
+        base_url,
+        api_key,
+        extra_headers,
+        adapter,
+        true,
+    )
+    .await
+}
+
+async fn discover_model_catalog_impl(
+    provider_name: &str,
+    base_url: &str,
+    api_key: Option<&ApiKey>,
+    extra_headers: &SensitiveHeaders,
+    adapter: &dyn ProviderAdapter,
+    validate_endpoint: bool,
+) -> Result<ModelCatalogSnapshot, ProviderError> {
     if !adapter.supports_model_listing() {
         return Err(ProviderError::Unsupported(format!(
             "Provider '{}' does not support model listing",
             adapter.name()
         )));
     }
+    let format = adapter.model_catalog_format().ok_or_else(|| {
+        ProviderError::Unsupported(format!(
+            "Provider '{}' does not declare a model catalogue format",
+            adapter.name()
+        ))
+    })?;
 
-    let client = reqwest::Client::new();
+    let client = crate::provider_transport::shared_client()
+        .map_err(|error| ProviderError::RequestFailed(error.to_string()))?;
 
     // Single source of truth for base-URL normalisation (crosslink #493 —
     // this used to be a hand-inlined three-line trim that drifted from
@@ -638,22 +871,28 @@ pub async fn fetch_models_with_headers(
     // `/v1beta` for Gemini, now only needs to land in one place).
     let normalized_base = crate::proxy::normalize_base_url(base_url);
     let url = format!("{}{}", normalized_base, adapter.models_endpoint());
+    if validate_endpoint {
+        crate::provider_transport::validate_endpoint(provider_name, &url)
+            .map_err(|error| ProviderError::RequestFailed(error.to_string()))?;
+    }
+    let now_unix = chrono::Utc::now().timestamp();
+    if let Some(snapshot) = cached_model_catalog(adapter.name(), &url, now_unix) {
+        return Ok(snapshot);
+    }
 
-    let mut request = client.get(&url);
+    let mut headers = SensitiveHeaders::new();
 
     // Use the adapter's auth contract rather than assuming every provider
     // authenticates model-list requests with a Bearer token.
     if let Some(key) = api_key {
-        for (header, value) in adapter.get_headers(key) {
-            request = request.header(header, value);
-        }
+        headers.extend(&adapter.get_headers(key));
     }
-    for (key, value) in extra_headers {
-        request = request.header(key.as_str(), value.as_str());
-    }
+    headers.extend(extra_headers);
+    let request = headers
+        .apply(client.get(&url))
+        .map_err(|error| ProviderError::RequestFailed(error.to_string()))?;
 
-    let response = request
-        .send()
+    let response = crate::provider_transport::send(request)
         .await
         .map_err(|e| ProviderError::RequestFailed(format!("Failed to fetch models: {e}")))?;
 
@@ -664,17 +903,55 @@ pub async fn fetch_models_with_headers(
         )));
     }
 
-    let body: Value = response.json().await.map_err(|e| {
-        ProviderError::InvalidResponse(format!("Failed to parse models response: {e}"))
-    })?;
+    let body: Value = crate::provider_transport::read_json_capped(
+        response,
+        crate::provider_transport::MAX_JSON_RESPONSE_BYTES,
+    )
+    .await
+    .map_err(|e| ProviderError::InvalidResponse(format!("Failed to parse models response: {e}")))?;
 
-    parse_models_response(&body)
+    let snapshot =
+        model_catalog::parse_discovered_catalog(adapter.name(), &url, format, &body, now_unix)
+            .map_err(ProviderError::InvalidResponse)?;
+    model_catalog::cache_discovered_catalog(&url, snapshot.clone());
+    Ok(snapshot)
+}
+
+#[cfg(test)]
+async fn fetch_models_with_headers_for_test(
+    base_url: &str,
+    api_key: Option<&ApiKey>,
+    extra_headers: &SensitiveHeaders,
+    adapter: &dyn ProviderAdapter,
+) -> Result<Vec<ModelInfo>, ProviderError> {
+    let snapshot = discover_model_catalog_impl(
+        adapter.name(),
+        base_url,
+        api_key,
+        extra_headers,
+        adapter,
+        false,
+    )
+    .await?;
+    Ok(snapshot
+        .models
+        .into_iter()
+        .map(|model| ModelInfo {
+            id: model.canonical_id,
+            owned_by: model.owned_by,
+            created: model.created,
+        })
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::proxy::{ChatCompletionRequest, ChatMessage, MessageContent};
+    use crate::runtime::{
+        ContinuationGeneration, ProviderNativeItem, ProviderNativeItemPurpose, ProviderNativeState,
+        ProviderStateFacet,
+    };
     use serde_json::json;
 
     struct ApiKeyHeaderModelAdapter;
@@ -682,6 +959,16 @@ mod tests {
     impl ProviderAdapter for ApiKeyHeaderModelAdapter {
         fn name(&self) -> &'static str {
             "api-key-header-test"
+        }
+
+        fn state_contract(
+            &self,
+            protocol: ProviderWireProtocol,
+        ) -> Result<&'static ProviderStateContract, ProviderError> {
+            match protocol {
+                ProviderWireProtocol::OpenAiChatCompletions => Ok(&OPENAI_CHAT_STATE_CONTRACT),
+                other => Err(unsupported_state_protocol(self.name(), other)),
+            }
         }
 
         fn transform_request(
@@ -704,13 +991,230 @@ mod tests {
             "/v1/chat/completions".to_string()
         }
 
-        fn get_headers(&self, api_key: &ApiKey) -> Vec<(String, String)> {
-            vec![("x-api-key".to_string(), api_key.as_str().to_string())]
+        fn get_headers(&self, api_key: &ApiKey) -> SensitiveHeaders {
+            let mut headers = SensitiveHeaders::new();
+            headers.insert_header_secret(
+                reqwest::header::HeaderName::from_static("x-api-key"),
+                api_key.secret(),
+            );
+            headers
         }
 
         fn supports_model_listing(&self) -> bool {
             true
         }
+    }
+
+    fn native_state(
+        facet: ProviderStateFacet,
+        purpose: ProviderNativeItemPurpose,
+    ) -> ProviderNativeState {
+        ProviderNativeState::new(
+            "openai",
+            "gpt-test",
+            ProviderWireProtocol::OpenAiChatCompletions,
+            ContinuationGeneration::new(1).expect("non-zero generation"),
+            vec![
+                ProviderNativeItem::new(facet, purpose, json!({"native": true}))
+                    .expect("valid native item"),
+            ],
+        )
+        .expect("valid native state")
+    }
+
+    fn native_state_for(
+        provider: &str,
+        protocol: ProviderWireProtocol,
+        facet: ProviderStateFacet,
+        purpose: ProviderNativeItemPurpose,
+    ) -> ProviderNativeState {
+        ProviderNativeState::new(
+            provider,
+            "model-test",
+            protocol,
+            ContinuationGeneration::new(1).expect("non-zero generation"),
+            vec![
+                ProviderNativeItem::new(facet, purpose, json!({"provider_item": provider}))
+                    .expect("valid native item"),
+            ],
+        )
+        .expect("valid native state")
+    }
+
+    #[test]
+    fn every_registered_adapter_declares_its_native_protocol() {
+        for provider in SUPPORTED_PROVIDERS {
+            let adapter = get_adapter(provider).expect("registered adapter");
+            let protocol = match *provider {
+                "anthropic" => ProviderWireProtocol::AnthropicMessages,
+                "google" | "gemini" => ProviderWireProtocol::GeminiGenerateContent,
+                "ollama" => ProviderWireProtocol::OllamaChat,
+                _ => ProviderWireProtocol::OpenAiChatCompletions,
+            };
+            let contract = adapter
+                .state_contract(protocol)
+                .unwrap_or_else(|error| panic!("{provider} lacks {protocol}: {error}"));
+            assert_eq!(contract.protocol, protocol, "provider {provider}");
+
+            for facet in [
+                ProviderStateFacet::Refusal,
+                ProviderStateFacet::Usage,
+                ProviderStateFacet::CacheMetadata,
+                ProviderStateFacet::TerminalState,
+            ] {
+                contract
+                    .validate_state(&native_state_for(
+                        provider,
+                        protocol,
+                        facet,
+                        ProviderNativeItemPurpose::Evidence,
+                    ))
+                    .unwrap_or_else(|error| {
+                        panic!("{provider} must retain {facet:?} evidence: {error}")
+                    });
+            }
+            for facet in [
+                ProviderStateFacet::NativeMessage,
+                ProviderStateFacet::ToolCalls,
+                ProviderStateFacet::ParallelToolCalls,
+                ProviderStateFacet::Reasoning,
+                ProviderStateFacet::Compaction,
+                ProviderStateFacet::ServerContinuation,
+            ] {
+                let state = native_state_for(
+                    provider,
+                    protocol,
+                    facet,
+                    ProviderNativeItemPurpose::Continuation,
+                );
+                let support = contract.support(facet);
+                let should_round_trip = matches!(*provider, "google" | "gemini" | "ollama")
+                    && matches!(
+                        facet,
+                        ProviderStateFacet::NativeMessage
+                            | ProviderStateFacet::ToolCalls
+                            | ProviderStateFacet::ParallelToolCalls
+                            | ProviderStateFacet::Reasoning
+                    );
+                assert_eq!(
+                    matches!(support, ProviderStateSupport::RoundTrip),
+                    should_round_trip,
+                    "provider {provider}, facet {facet:?} has the wrong continuation contract"
+                );
+                match support {
+                    ProviderStateSupport::RoundTrip => {
+                        contract.validate_state(&state).unwrap_or_else(|error| {
+                            panic!("provider {provider} must round-trip {facet:?}: {error}")
+                        });
+                    }
+                    ProviderStateSupport::EvidenceOnly => {
+                        let error = contract
+                            .validate_state(&state)
+                            .expect_err("evidence-only facets cannot be continuation input");
+                        assert!(
+                            matches!(
+                                error,
+                                crate::runtime::ProviderStateContractError::EvidenceOnlyContinuation { .. }
+                            ),
+                            "provider {provider}, facet {facet:?}: {error}"
+                        );
+                    }
+                    ProviderStateSupport::Unsupported(_) => {
+                        let error = contract
+                            .validate_state(&state)
+                            .expect_err("unwired continuation facet must be explicit");
+                        assert!(
+                            matches!(
+                                error,
+                                crate::runtime::ProviderStateContractError::UnsupportedFacet { .. }
+                            ),
+                            "provider {provider}, facet {facet:?}: {error}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            get_adapter("openai")
+                .expect("OpenAI adapter")
+                .state_contract(ProviderWireProtocol::OpenAiResponses)
+                .expect("Responses contract")
+                .protocol,
+            ProviderWireProtocol::OpenAiResponses
+        );
+    }
+
+    #[test]
+    fn openai_responses_native_contract_is_stateless_and_round_trip() {
+        let responses = get_adapter("openai")
+            .expect("OpenAI adapter")
+            .state_contract(ProviderWireProtocol::OpenAiResponses)
+            .expect("Responses contract");
+        for facet in [
+            ProviderStateFacet::NativeMessage,
+            ProviderStateFacet::ToolCalls,
+            ProviderStateFacet::ParallelToolCalls,
+            ProviderStateFacet::Reasoning,
+            ProviderStateFacet::Compaction,
+        ] {
+            responses
+                .validate_state(&native_state_for(
+                    "openai",
+                    ProviderWireProtocol::OpenAiResponses,
+                    facet,
+                    ProviderNativeItemPurpose::Continuation,
+                ))
+                .unwrap_or_else(|error| panic!("Responses must round-trip {facet:?}: {error}"));
+        }
+        let response_id_evidence = native_state_for(
+            "openai",
+            ProviderWireProtocol::OpenAiResponses,
+            ProviderStateFacet::ServerContinuation,
+            ProviderNativeItemPurpose::Evidence,
+        );
+        responses
+            .validate_state(&response_id_evidence)
+            .expect("stateless Responses retains response ids as evidence");
+        let error = responses
+            .validate_state(&native_state_for(
+                "openai",
+                ProviderWireProtocol::OpenAiResponses,
+                ProviderStateFacet::ServerContinuation,
+                ProviderNativeItemPurpose::Continuation,
+            ))
+            .expect_err("store:false must not claim previous_response_id replay");
+        assert!(matches!(
+            error,
+            crate::runtime::ProviderStateContractError::EvidenceOnlyContinuation { .. }
+        ));
+    }
+
+    #[test]
+    fn adapter_native_state_application_is_fail_closed() {
+        let adapter = get_adapter("openai").expect("OpenAI adapter");
+        let mut body = json!({"model": "gpt-test", "messages": []});
+        let original = body.clone();
+        adapter
+            .apply_provider_native_state(
+                &mut body,
+                &native_state(
+                    ProviderStateFacet::Usage,
+                    ProviderNativeItemPurpose::Evidence,
+                ),
+            )
+            .expect("retained evidence does not become provider input");
+        assert_eq!(body, original);
+
+        let error = adapter
+            .apply_provider_native_state(
+                &mut body,
+                &native_state(
+                    ProviderStateFacet::ServerContinuation,
+                    ProviderNativeItemPurpose::Continuation,
+                ),
+            )
+            .expect_err("unwired continuation must not be ignored");
+        assert!(error.to_string().contains("not wired yet"));
     }
 
     fn create_test_request() -> ChatCompletionRequest {
@@ -1006,7 +1510,7 @@ mod tests {
 
         match err {
             ProviderError::InvalidResponse(msg) => {
-                assert!(msg.contains("index 1"), "{msg}");
+                assert!(msg.contains("entry 1"), "{msg}");
                 assert!(msg.contains("'id'"), "{msg}");
             }
             other => panic!("expected InvalidResponse, got {other:?}"),
@@ -1020,7 +1524,7 @@ mod tests {
 
         match err {
             ProviderError::InvalidResponse(msg) => {
-                assert!(msg.contains("index 0"), "{msg}");
+                assert!(msg.contains("entry 0"), "{msg}");
                 assert!(msg.contains("'id'"), "{msg}");
             }
             other => panic!("expected InvalidResponse, got {other:?}"),
@@ -1077,7 +1581,8 @@ mod tests {
                 "request missing custom header:\n{request}"
             );
 
-            let body = r#"{"object":"list","data":[{"id":"openrouter/test-model"}]}"#;
+            let body =
+                r#"{"object":"list","has_more":true,"data":[{"id":"openrouter/test-model"}]}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 body.len(),
@@ -1089,8 +1594,11 @@ mod tests {
         });
 
         let key = ApiKey::try_from_string("sk-test-model-key".to_string()).expect("valid key");
-        let headers = vec![("X-Custom-Route".to_string(), "test-value".to_string())];
-        let models = fetch_models_with_headers(
+        let mut headers = SensitiveHeaders::new();
+        headers
+            .insert_literal("X-Custom-Route", "test-value".to_string())
+            .expect("valid custom header");
+        let models = fetch_models_with_headers_for_test(
             &format!("http://{addr}/api/v1"),
             Some(&key),
             &headers,
@@ -1141,9 +1649,10 @@ mod tests {
         });
 
         let key = ApiKey::try_from_string("model-list-key".to_string()).expect("valid key");
-        let models = fetch_models(
+        let models = fetch_models_with_headers_for_test(
             &format!("http://{addr}"),
             Some(&key),
+            &SensitiveHeaders::new(),
             &ApiKeyHeaderModelAdapter,
         )
         .await
@@ -1151,6 +1660,111 @@ mod tests {
 
         server.join().expect("server thread must finish");
         assert_eq!(models[0].id, "test-model");
+    }
+
+    #[tokio::test]
+    async fn native_google_catalog_discovery_uses_gemini_shape_and_auth() {
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1beta/models"))
+            .and(query_param("pageSize", "1000"))
+            .and(header("x-goog-api-key", "google-model-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{
+                    "name": "models/gemini-live",
+                    "inputTokenLimit": 1_048_576,
+                    "outputTokenLimit": 65536,
+                    "supportedGenerationMethods": ["generateContent"]
+                }],
+                "nextPageToken": "more"
+            })))
+            .mount(&server)
+            .await;
+
+        let key = ApiKey::try_from_string("google-model-key".to_string()).expect("valid key");
+        let snapshot = discover_model_catalog_impl(
+            "google",
+            &server.uri(),
+            Some(&key),
+            &SensitiveHeaders::new(),
+            &GOOGLE,
+            false,
+        )
+        .await
+        .expect("Gemini model discovery");
+        assert_eq!(snapshot.models[0].canonical_id, "gemini-live");
+        assert_eq!(
+            snapshot.models[0].capabilities.input_context_tokens,
+            Some(1_048_576)
+        );
+        assert!(!snapshot.complete);
+    }
+
+    #[tokio::test]
+    async fn native_anthropic_catalog_discovery_uses_models_shape() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(query_param("limit", "1000"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "id": "claude-live",
+                    "display_name": "Claude Live",
+                    "created_at": "2026-08-22T00:00:00Z",
+                    "max_input_tokens": 1_000_000,
+                    "max_tokens": 128_000
+                }],
+                "has_more": true
+            })))
+            .mount(&server)
+            .await;
+
+        let key = ApiKey::try_from_string("anthropic-model-key".to_string()).expect("valid key");
+        let snapshot = discover_model_catalog_impl(
+            "anthropic",
+            &server.uri(),
+            Some(&key),
+            &SensitiveHeaders::new(),
+            &ANTHROPIC,
+            false,
+        )
+        .await
+        .expect("Anthropic model discovery");
+        assert_eq!(snapshot.models[0].canonical_id, "claude-live");
+        assert_eq!(snapshot.models[0].access, ModelAccessState::Available);
+        assert!(!snapshot.complete);
+    }
+
+    #[tokio::test]
+    async fn native_ollama_catalog_discovery_uses_installed_tags() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"name": "local-model:latest"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let snapshot = discover_model_catalog_with_headers(
+            &server.uri(),
+            None,
+            &SensitiveHeaders::new(),
+            &OLLAMA,
+        )
+        .await
+        .expect("Ollama model discovery");
+        assert_eq!(snapshot.models[0].canonical_id, "local-model:latest");
+        assert_eq!(snapshot.models[0].access, ModelAccessState::Available);
     }
 
     #[test]

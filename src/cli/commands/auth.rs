@@ -1,4 +1,6 @@
+use openclaudia::oauth::{parse_auth_code, OAuthClient, OAuthStore, PkceParams};
 use openclaudia::tools::safe_truncate;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,14 +37,6 @@ fn native_oauth_session_store_path() -> Option<PathBuf> {
     dirs::data_local_dir().map(|d| d.join("openclaudia").join("oauth_sessions.json"))
 }
 
-fn native_oauth_session_store_path_exists(path: &Path) -> Result<bool, String> {
-    match path.symlink_metadata() {
-        Ok(_) => Ok(true),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(format!("failed to inspect {}: {err}", path.display())),
-    }
-}
-
 fn native_oauth_session_store_status() -> NativeOAuthSessionStoreStatus {
     let Some(path) = native_oauth_session_store_path() else {
         return NativeOAuthSessionStoreStatus::Missing;
@@ -55,7 +49,7 @@ fn native_oauth_session_store_status() -> NativeOAuthSessionStoreStatus {
     };
 
     let content = match std::io::read_to_string(file) {
-        Ok(content) => content,
+        Ok(content) => zeroize::Zeroizing::new(content),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return NativeOAuthSessionStoreStatus::Missing;
         }
@@ -67,8 +61,35 @@ fn native_oauth_session_store_status() -> NativeOAuthSessionStoreStatus {
         }
     };
 
-    match serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(&content) {
-        Ok(sessions) => NativeOAuthSessionStoreStatus::SessionCount(sessions.len()),
+    match serde_json::from_str::<serde_json::Value>(&content) {
+        Ok(serde_json::Value::Object(document)) => {
+            if let Some(version) = document.get("schema_version") {
+                if version.as_u64()
+                    != Some(u64::from(openclaudia::oauth::OAUTH_STORE_SCHEMA_VERSION))
+                {
+                    return NativeOAuthSessionStoreStatus::Unreadable(format!(
+                        "failed to parse {}: unsupported OAuth store schema",
+                        path.display()
+                    ));
+                }
+                let Some(sessions) = document
+                    .get("sessions")
+                    .and_then(serde_json::Value::as_object)
+                else {
+                    return NativeOAuthSessionStoreStatus::Unreadable(format!(
+                        "failed to parse {}: versioned store has no sessions object",
+                        path.display()
+                    ));
+                };
+                NativeOAuthSessionStoreStatus::SessionCount(sessions.len())
+            } else {
+                NativeOAuthSessionStoreStatus::SessionCount(document.len())
+            }
+        }
+        Ok(_) => NativeOAuthSessionStoreStatus::Unreadable(format!(
+            "failed to parse {}: expected an object",
+            path.display()
+        )),
         Err(err) => NativeOAuthSessionStoreStatus::Unreadable(format!(
             "failed to parse {}: {err}",
             path.display()
@@ -113,14 +134,17 @@ fn open_native_oauth_session_file(path: &Path) -> Result<Option<std::fs::File>, 
 }
 
 #[allow(clippy::too_many_lines)]
-/// Authenticate with Claude Max subscription via OAuth
+/// Manage Claude Code authentication, or the explicitly enabled experimental flow.
 pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
-    use openclaudia::oauth::{parse_auth_code, OAuthClient, OAuthStore, PkceParams};
-    use std::io::{self, IsTerminal, Write};
-
     if status && logout {
         anyhow::bail!("auth --status and --logout cannot be used together");
     }
+
+    if !openclaudia::claude_credentials::experimental_direct_subscription_enabled() {
+        return run_supported_claude_auth(status, logout).await;
+    }
+
+    eprintln!("⚠ Running the explicitly acknowledged experimental direct Claude subscription flow");
 
     let store = OAuthStore::new();
 
@@ -148,9 +172,11 @@ pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
                     }
                 );
                 if status.expired {
-                    println!("  status       : expired (auto-refreshes on next use)");
+                    println!("  status       : expired; run 'claude auth login' to refresh");
                 } else if status.expires_soon {
-                    println!("  status       : valid, expiring soon (auto-refreshes on next use)");
+                    println!(
+                        "  status       : valid, expiring soon; refresh with 'claude auth login'"
+                    );
                 } else {
                     println!(
                         "  status       : valid (~{}h{}m remaining)",
@@ -161,7 +187,7 @@ pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
             }
             Ok(None) => {
                 println!("No Claude credentials at {credentials_path}.");
-                println!("Run 'openclaudia auth', or log in with Claude Code / openclaude.");
+                println!("Run 'claude auth login' to log in with Claude Code.");
             }
             Err(e) => {
                 eprintln!("Could not read {credentials_path}: {e}");
@@ -188,21 +214,29 @@ pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
 
     // Handle --logout flag
     if logout {
-        let persist_path = native_oauth_session_store_path();
-
-        if let Some(path) = persist_path {
-            if native_oauth_session_store_path_exists(&path)
-                .map_err(|e| anyhow::anyhow!("could not inspect native OAuth session store: {e}"))?
-            {
-                std::fs::remove_file(&path).map_err(|e| {
+        match native_oauth_session_store_status() {
+            NativeOAuthSessionStoreStatus::Missing
+            | NativeOAuthSessionStoreStatus::SessionCount(0) => {
+                println!("No native OAuth sessions to clear.");
+            }
+            NativeOAuthSessionStoreStatus::SessionCount(_) => {
+                let revoked = store
+                    .revoke_all()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("could not revoke native OAuth sessions: {e}"))?;
+                println!("Native OAuth sessions cleared (revoked: {revoked}).");
+            }
+            NativeOAuthSessionStoreStatus::Unreadable(_) => {
+                let path = native_oauth_session_store_path().ok_or_else(|| {
+                    anyhow::anyhow!("could not resolve native OAuth session store")
+                })?;
+                std::fs::remove_file(&path).map_err(|error| {
                     anyhow::anyhow!(
-                        "could not remove native OAuth session store {}: {e}",
+                        "could not remove unreadable native OAuth session store {}: {error}",
                         path.display()
                     )
                 })?;
-                println!("Native OAuth sessions cleared.");
-            } else {
-                println!("No native OAuth sessions to clear.");
+                println!("Native OAuth sessions cleared (unreadable store removed).");
             }
         }
         println!("Shared Claude credentials were not deleted.");
@@ -242,17 +276,21 @@ pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
     let (code, parsed_state) = parse_auth_code(code_input);
 
     let expected_state = &pkce.state;
-    if let Some(ref state) = parsed_state {
-        if state != expected_state {
-            eprintln!("State mismatch! This could be a CSRF attack. Authentication cancelled.");
-            anyhow::bail!("authentication cancelled: OAuth state mismatch");
-        }
+    let state = parsed_state
+        .as_deref()
+        .filter(|state| !state.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("authentication cancelled: authorization code omitted OAuth state")
+        })?;
+    if !expected_state.matches(state) {
+        eprintln!("State mismatch! This could be a CSRF attack. Authentication cancelled.");
+        anyhow::bail!("authentication cancelled: OAuth state mismatch");
     }
 
     println!("\nExchanging code for tokens...");
 
     let client = OAuthClient::new()?;
-    let token_response = client.exchange_code(&code, &pkce).await?;
+    let token_response = client.exchange_code(code, &pkce).await?;
 
     let mut session = openclaudia::oauth::OAuthSession::from_token_response(token_response);
 
@@ -277,32 +315,6 @@ pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
         println!("  Granted scopes: {}", session.granted_scopes.join(", "));
     }
 
-    if session
-        .granted_scopes
-        .iter()
-        .any(|scope| scope == "user:inference")
-    {
-        match openclaudia::claude_credentials::store_credentials(
-            &session.credentials.access_token,
-            session.credentials.refresh_token.as_deref(),
-            session.credentials.expires_at.timestamp_millis(),
-            session.granted_scopes.clone(),
-            None,
-            None,
-        ) {
-            Ok(()) => {
-                let path = openclaudia::claude_credentials::credentials_path().map_or_else(
-                    || "~/.claude/.credentials.json".into(),
-                    |p| p.display().to_string(),
-                );
-                println!("Saved Claude credentials to {path}");
-            }
-            Err(e) => eprintln!("Warning: could not write Claude credentials: {e}"),
-        }
-    } else {
-        eprintln!("Note: granted scopes lack 'user:inference'; skipped writing Claude credentials");
-    }
-
     let session_id = session.id.clone();
     let auth_mode = session.auth_mode.clone();
     store
@@ -310,6 +322,8 @@ pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to save native OAuth session: {e:#}"))?;
 
     println!("\nAuthentication successful!");
+    println!("  Session stored in OpenClaudia's native OAuth store.");
+    println!("  Claude Code's shared credential file was not changed.");
     println!("  Session ID: {}", safe_truncate(&session_id, 8));
     match auth_mode {
         openclaudia::oauth::AuthMode::ApiKey => {
@@ -322,9 +336,35 @@ pub async fn cmd_auth(status: bool, logout: bool) -> anyhow::Result<()> {
             println!("  Auth mode: Proxy (via anthropic-proxy)");
         }
     }
-    println!("\nYour session has been saved. OpenClaudia will now use your");
-    println!("Claude Max subscription automatically when target is 'anthropic'.");
+    println!("\nYour native OAuth session has been saved.");
+    println!("Claude Code login compatibility continues to use Claude Code's own store.");
 
+    Ok(())
+}
+
+async fn run_supported_claude_auth(status: bool, logout: bool) -> anyhow::Result<()> {
+    let sdk =
+        openclaudia::claude_agent_sdk::ClaudeAgentSdk::discover().map_err(anyhow::Error::new)?;
+    let action = if status {
+        "status"
+    } else if logout {
+        "logout"
+    } else {
+        "login"
+    };
+    let result = tokio::process::Command::new(sdk.binary())
+        .args(["auth", action])
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .await
+        .map_err(|error| anyhow::anyhow!("could not run `claude auth {action}`: {error}"))?;
+    if !result.success() {
+        anyhow::bail!("`claude auth {action}` exited with {result}");
+    }
     Ok(())
 }
 
@@ -375,7 +415,7 @@ mod tests {
             .find(".try_store_session(session)")
             .expect("auth must use the fallible OAuth session persist path");
         let success_message = production
-            .find("Your session has been saved")
+            .find("Your native OAuth session has been saved")
             .expect("auth success message must be present");
 
         assert!(
@@ -385,6 +425,24 @@ mod tests {
         assert!(
             !production.contains("store.store_session(session);"),
             "auth must not use the best-effort OAuth session persist wrapper"
+        );
+    }
+
+    #[test]
+    fn auth_keeps_claude_codes_credential_store_read_only() {
+        let source = include_str!("auth.rs");
+        let cfg_test = source
+            .find("#[cfg(test)]")
+            .expect("test marker must be present");
+        let production = &source[..cfg_test];
+
+        assert!(
+            !production.contains("store_credentials"),
+            "native auth must not write Claude Code's foreign credential store"
+        );
+        assert!(
+            production.contains("Claude Code's shared credential file was not changed"),
+            "successful native auth must describe the foreign-store boundary"
         );
     }
 }

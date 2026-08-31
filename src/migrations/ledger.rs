@@ -1,7 +1,11 @@
-//! Completion ledger for once-only migrations.
+//! Legacy standalone completion ledger.
 //!
 //! Stored as a small JSON file at `~/.local/share/openclaudia/migrations.json`
 //! with the shape `{"applied": ["migration-id-1", "migration-id-2"]}`.
+//! The fail-closed startup runner does not use this ledger: startup rejects
+//! once-only registrations because a separate mark cannot be atomic with the
+//! migrated store. The type remains available for compatibility with callers
+//! that manage an independent ledger lifecycle.
 //!
 //! # Failure semantics
 //!
@@ -35,8 +39,7 @@ struct LedgerFile {
     applied: BTreeSet<String>,
 }
 
-/// In-memory completion ledger. Cheap to construct — load once per
-/// startup, mutate during migration run, save once at the end.
+/// In-memory legacy completion ledger for caller-managed workflows.
 #[derive(Debug, Default)]
 pub struct CompletionLedger {
     applied: BTreeSet<String>,

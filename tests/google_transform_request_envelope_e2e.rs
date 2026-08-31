@@ -177,9 +177,10 @@ fn google_transform_keeps_user_role_as_user() {
 
 #[test]
 fn google_transform_unknown_role_defaults_to_user() {
-    // PINS DOC: any non-assistant role maps to "user".
+    // PINS DOC: an unknown non-protocol role maps to "user". The recognized
+    // "tool" role is validated separately as correlated tool history.
     let adapter = get_adapter("google").unwrap();
-    let request = req("m", vec![msg("tool", "result")]);
+    let request = req("m", vec![msg("observer", "result")]);
     let body = adapter.transform_request(&request).expect("ok");
     let contents = body["contents"].as_array().expect("array");
     assert_eq!(contents[0]["role"], "user");
@@ -250,7 +251,7 @@ fn google_transform_parts_with_unsupported_type_rejects_instead_of_skipping() {
             role: "user".to_string(),
             content: MessageContent::Parts(vec![
                 ContentPart {
-                    content_type: "video".to_string(),
+                    content_type: "google-content-type-secret-sentinel".to_string(),
                     text: None,
                     image_url: None,
                 },
@@ -272,8 +273,9 @@ fn google_transform_parts_with_unsupported_type_rejects_instead_of_skipping() {
     let err = err.to_string();
     assert_eq!(
         err,
-        "Request failed: Unsupported Google content part type 'video' at message index 0, part index 0"
+        "Request failed: Unsupported Google content part type at message index 0, part index 0"
     );
+    assert!(!err.contains("google-content-type-secret-sentinel"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────

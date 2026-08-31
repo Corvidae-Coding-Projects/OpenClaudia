@@ -19,16 +19,38 @@ use openclaudia::providers::{
 };
 use serde_json::json;
 
+fn typed_blocks(prefix: &str, suffix: &str) -> SystemPromptBlocks {
+    let mut items = Vec::new();
+    if !prefix.is_empty() {
+        items.push(openclaudia::context::ContextItem::host_instruction(
+            "test.stable",
+            openclaudia::context::HostInstructionSource::CorePolicy,
+            "compiled:test",
+            prefix,
+            openclaudia::context::ContextFreshness::Static,
+            1,
+        ));
+    }
+    if !suffix.is_empty() {
+        items.push(openclaudia::context::ContextItem::host_instruction(
+            "test.dynamic",
+            openclaudia::context::HostInstructionSource::RuntimePolicy,
+            "host:test",
+            suffix,
+            openclaudia::context::ContextFreshness::Turn,
+            2,
+        ));
+    }
+    SystemPromptBlocks::from_items(items, openclaudia::context::ContextBudget::default())
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Section A — build_system_blocks (SystemPromptBlocks → Anthropic array)
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn build_blocks_with_only_stable_prefix_returns_single_block_with_cache_control() {
-    let blocks = SystemPromptBlocks {
-        stable_prefix: "Stable identity + tools".to_string(),
-        dynamic_suffix: String::new(),
-    };
+    let blocks = typed_blocks("Stable identity + tools", "");
     let result = build_system_blocks(&blocks);
     let arr = result.as_array().expect("array");
     assert_eq!(arr.len(), 1);
@@ -40,10 +62,7 @@ fn build_blocks_with_only_stable_prefix_returns_single_block_with_cache_control(
 
 #[test]
 fn build_blocks_with_dynamic_suffix_returns_two_blocks() {
-    let blocks = SystemPromptBlocks {
-        stable_prefix: "stable".to_string(),
-        dynamic_suffix: "dynamic".to_string(),
-    };
+    let blocks = typed_blocks("stable", "dynamic");
     let result = build_system_blocks(&blocks);
     let arr = result.as_array().expect("array");
     assert_eq!(arr.len(), 2);
@@ -54,10 +73,7 @@ fn build_blocks_with_dynamic_suffix_returns_two_blocks() {
 #[test]
 fn build_blocks_dynamic_suffix_has_no_cache_control() {
     // PINS DOC: dynamic suffix changes per-turn → NOT cached.
-    let blocks = SystemPromptBlocks {
-        stable_prefix: "s".to_string(),
-        dynamic_suffix: "d".to_string(),
-    };
+    let blocks = typed_blocks("s", "d");
     let result = build_system_blocks(&blocks);
     let arr = result.as_array().expect("array");
     assert!(
@@ -67,15 +83,13 @@ fn build_blocks_dynamic_suffix_has_no_cache_control() {
 }
 
 #[test]
-fn build_blocks_with_empty_stable_prefix_still_emits_block() {
-    let blocks = SystemPromptBlocks {
-        stable_prefix: String::new(),
-        dynamic_suffix: "only-dynamic".to_string(),
-    };
+fn build_blocks_with_only_dynamic_context_emits_one_uncached_block() {
+    let blocks = typed_blocks("", "only-dynamic");
     let result = build_system_blocks(&blocks);
     let arr = result.as_array().expect("array");
-    assert_eq!(arr.len(), 2);
-    assert_eq!(arr[0]["text"], "");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["text"], "only-dynamic");
+    assert!(arr[0].get("cache_control").is_none());
 }
 
 // ───────────────────────────────────────────────────────────────────────────

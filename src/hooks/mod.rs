@@ -12,6 +12,7 @@
 //! - 2: Block the action
 
 pub mod claude_compat;
+pub mod compat_import;
 pub mod merge;
 
 // Re-export everything public from submodules
@@ -19,22 +20,39 @@ pub use claude_compat::{
     load_claude_code_hooks, load_claude_code_hooks_layered, load_claude_settings, ClaudeCodeHook,
     ClaudeCodeHookEntry, ClaudeCodeSettings, LayeredSettings,
 };
+pub use compat_import::{
+    approve_repository_hook_import, approve_repository_hook_import_at,
+    hook_import_approval_store_path, inspect_repository_hook_imports,
+    inspect_repository_hook_imports_at, load_approved_repository_hooks_at,
+    revoke_repository_hook_import, revoke_repository_hook_import_at, HookImportBoundFile,
+    HookImportCapability, HookImportDiagnostic, HookImportError, HookImportExecutable,
+    HookImportKind, HookImportOutputAuthority, HookImportOutputField, HookImportOwner,
+    HookImportProposal, HookImportReport, HookImportSourceScope, HookImportState,
+};
 pub use merge::merge_hooks_config;
 
+/// Compose explicitly approved compatibility hooks below native host hooks.
+///
+/// Repository sources never activate merely because the files exist. Native
+/// hooks supplied by the host configuration are the final merge layer, so an
+/// imported matcher or policy cannot override them.
+#[must_use]
+pub fn load_effective_hooks(host_hooks: HooksConfig) -> HooksConfig {
+    merge::merge_host_hooks(load_claude_code_hooks(), host_hooks)
+}
+
 use crate::config::{Hook, HookEntry, HookMatcherTarget, HookPolicy, HooksConfig, SandboxMode};
-use crate::tools::is_sensitive_env;
+use futures::stream::{FuturesUnordered, StreamExt as _};
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::process::{Child, Command};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
@@ -59,6 +77,10 @@ static TRUST_UNSANDBOXED_HOOKS: LazyLock<Result<bool, String>> = LazyLock::new(|
     })
 });
 const MAX_HOOK_OUTPUT_BYTES_PER_STREAM: usize = 1024 * 1024;
+const MAX_HOOKS_PER_BATCH: usize = 64;
+const MAX_HOOK_BATCH_INPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_HOOK_BATCH_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MODEL_HOOK_OUTPUT_BYTES: usize = 16 * 1024;
 const HOOK_OUTPUT_TRUNCATED_MARKER: &[u8] = b"\n[hook output truncated at 1 MiB]\n";
 
 /// All hook event types supported by `OpenClaudia`
@@ -99,7 +121,180 @@ pub enum HookEvent {
     VddConverged,
 }
 
+/// Whether an event is allowed to affect the causal action it surrounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookFailureMode {
+    /// A deny, approval request, invalid output, timeout, cancellation, or
+    /// execution failure prevents the guarded action from starting.
+    Block,
+    /// The action has already happened (or the event is informational), so
+    /// failures are retained as observations without rewriting its outcome.
+    Observe,
+}
+
+/// Typed decision composed from every matching hook in configuration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookDecision {
+    Allow,
+    Ask,
+    Deny,
+}
+
+/// Terminal status of one event batch, independent of its decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookBatchStatus {
+    Complete,
+    PartiallyFailed,
+    Failed,
+    /// The complete batch was rejected during admission; no hook started.
+    Skipped,
+    Cancelled,
+}
+
+/// Canonical semantics attached to an event variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookEventContract {
+    pub failure_mode: HookFailureMode,
+    pub accepts_decision: bool,
+    pub accepts_prompt_suggestion: bool,
+}
+
+/// Typed receipt produced for every hook event, including an empty batch.
+///
+/// `sequence` is monotonic within the exact run generation. Outputs remain in
+/// configuration order, and errors identify a partial/failed batch instead of
+/// disappearing behind a frontend-specific log message.
+#[derive(Debug, Clone)]
+pub struct HookReceipt {
+    pub run_id: crate::runtime::RunId,
+    pub sequence: u64,
+    pub event: HookEvent,
+    pub contract: HookEventContract,
+    pub decision: HookDecision,
+    pub status: HookBatchStatus,
+    pub outputs: Vec<HookOutput>,
+    pub errors: Vec<HookError>,
+}
+
+struct HookExecution {
+    outputs: Vec<HookOutput>,
+    errors: Vec<HookError>,
+    decision: HookDecision,
+    cancelled: bool,
+    skipped: bool,
+}
+
+struct AdmittedHook<'a> {
+    index: usize,
+    timeout: Duration,
+    kind: AdmittedHookKind<'a>,
+}
+
+enum AdmittedHookKind<'a> {
+    Command {
+        command: Command,
+        sandbox_mode: SandboxMode,
+    },
+    Prompt(&'a str),
+    Model {
+        prompt: &'a str,
+        model: &'a str,
+        provider: Option<&'a str>,
+    },
+}
+
+struct HookBatchAdmission<'a> {
+    hooks: Vec<AdmittedHook<'a>>,
+    reservation: crate::runtime::BudgetReservation,
+    cancellation: crate::runtime::CancellationHandle,
+    deadline: tokio::time::Instant,
+    command_output_bytes_per_stream: usize,
+}
+
+impl HookReceipt {
+    /// Whether the guarded action may proceed without another approval step.
+    #[must_use]
+    pub const fn allowed(&self) -> bool {
+        match self.contract.failure_mode {
+            HookFailureMode::Observe => true,
+            HookFailureMode::Block => {
+                matches!(self.decision, HookDecision::Allow) && self.errors.is_empty()
+            }
+        }
+    }
+
+    /// Compatibility projection for callers not yet rendering the receipt.
+    #[must_use]
+    pub fn into_result(self) -> HookResult {
+        let allowed = self.allowed();
+        HookResult {
+            allowed,
+            outputs: self.outputs,
+            errors: self.errors,
+        }
+    }
+
+    /// Stable human-readable explanation for a blocked lifecycle action.
+    #[must_use]
+    pub fn blocking_reason(&self) -> Option<String> {
+        if self.allowed() {
+            return None;
+        }
+        let reasons = self
+            .outputs
+            .iter()
+            .filter_map(|output| output.reason.as_deref())
+            .collect::<Vec<_>>();
+        if !reasons.is_empty() {
+            return Some(reasons.join("; "));
+        }
+        if let Some(error) = self.errors.first() {
+            return Some(error.to_string());
+        }
+        Some(match self.decision {
+            HookDecision::Ask => "Hook requested explicit approval".to_string(),
+            HookDecision::Deny => "Action denied by hook".to_string(),
+            HookDecision::Allow => "Blocking hook lifecycle failed".to_string(),
+        })
+    }
+}
+
 impl HookEvent {
+    /// Canonical decision, output, and failure policy for this event.
+    #[must_use]
+    pub const fn contract(self) -> HookEventContract {
+        match self {
+            Self::SessionStart
+            | Self::PreToolUse
+            | Self::UserPromptSubmit
+            | Self::Stop
+            | Self::SubagentStart
+            | Self::PreCompact
+            | Self::PermissionRequest => HookEventContract {
+                failure_mode: HookFailureMode::Block,
+                accepts_decision: true,
+                accepts_prompt_suggestion: matches!(self, Self::UserPromptSubmit),
+            },
+            Self::SessionEnd
+            | Self::PostToolUse
+            | Self::PostToolUseFailure
+            | Self::SubagentStop
+            | Self::Notification
+            | Self::PreAdversaryReview
+            | Self::PostAdversaryReview
+            | Self::VddConflict
+            | Self::VddConverged => HookEventContract {
+                failure_mode: HookFailureMode::Observe,
+                accepts_decision: false,
+                accepts_prompt_suggestion: false,
+            },
+        }
+    }
+
     /// Get the config field name for this event
     #[must_use]
     pub const fn config_key(&self) -> &'static str {
@@ -228,6 +423,10 @@ impl HooksConfig {
 /// Input provided to hooks via stdin
 #[derive(Debug, Clone, Serialize)]
 pub struct HookInput {
+    /// Host capability for command hooks. It is deliberately omitted from the
+    /// serialized hook payload; only the trusted harness may use it.
+    #[serde(skip)]
+    run_context: Arc<crate::tools::ToolRunContext>,
     /// The event type that triggered this hook
     pub event: HookEvent,
     /// Current working directory
@@ -250,13 +449,13 @@ pub struct HookInput {
 }
 
 impl HookInput {
+    /// Construct hook input bound to one exact immutable run capability.
     #[must_use]
-    pub fn new(event: HookEvent) -> Self {
+    pub fn for_run(run: &Arc<crate::tools::ToolRunContext>, event: HookEvent) -> Self {
         Self {
+            run_context: Arc::clone(run),
             event,
-            cwd: crate::tools::security::current_context()
-                .map(|context| context.working_directory().to_string_lossy().to_string())
-                .unwrap_or_default(),
+            cwd: run.working_directory().to_string_lossy().to_string(),
             session_id: None,
             tool_name: None,
             tool_input: None,
@@ -318,13 +517,25 @@ impl HookInput {
     }
 }
 
-fn notification_input(notification_type: &str, data: Value) -> HookInput {
-    HookInput::new(HookEvent::Notification)
+fn notification_input(
+    run: &std::sync::Arc<crate::tools::ToolRunContext>,
+    notification_type: &str,
+    data: Value,
+) -> HookInput {
+    HookInput::for_run(run, HookEvent::Notification)
         .with_extra(
             "notification_type",
             Value::String(notification_type.to_string()),
         )
         .with_extra("data", data)
+}
+
+fn lock_lifecycle_sequences(
+    sequences: &Mutex<HashMap<crate::runtime::RunId, Arc<tokio::sync::Mutex<u64>>>>,
+) -> MutexGuard<'_, HashMap<crate::runtime::RunId, Arc<tokio::sync::Mutex<u64>>>> {
+    sequences
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Output from a hook execution
@@ -335,12 +546,15 @@ pub struct HookOutput {
     pub decision: Option<String>,
     /// Reason for the decision
     pub reason: Option<String>,
-    /// System message to inject
+    /// Legacy hook field name. The runtime treats this as reference data;
+    /// hooks cannot create system instructions.
     #[serde(rename = "systemMessage")]
     pub system_message: Option<String>,
-    /// Modified prompt (for `UserPromptSubmit`)
+    /// Legacy prompt suggestion (for `UserPromptSubmit`). The runtime keeps
+    /// the user's original prompt and attaches this as reference data.
     pub prompt: Option<String>,
-    /// Additional context from hook (plain text output or hookSpecificOutput.additionalContext)
+    /// Reference context from hook (plain text output or
+    /// hookSpecificOutput.additionalContext).
     #[serde(rename = "additionalContext")]
     pub additional_context: Option<String>,
     /// Additional data from the hook
@@ -380,26 +594,14 @@ impl HookResult {
             errors: vec![],
         }
     }
-
-    /// Get all system messages from hook outputs
-    #[must_use]
-    pub fn system_messages(&self) -> Vec<&str> {
-        self.outputs
-            .iter()
-            .filter_map(|o| o.system_message.as_deref())
-            .collect()
-    }
-
-    /// Get modified prompt if any hook provided one
-    #[must_use]
-    pub fn modified_prompt(&self) -> Option<&str> {
-        self.outputs.iter().find_map(|o| o.prompt.as_deref())
-    }
 }
 
 /// Errors that can occur during hook execution
 #[derive(Error, Debug, Clone)]
 pub enum HookError {
+    #[error(transparent)]
+    Capability(#[from] crate::tools::ToolCapabilityError),
+
     #[error("Hook timed out after {0} seconds")]
     Timeout(u64),
 
@@ -415,9 +617,71 @@ pub enum HookError {
     #[error("Invalid matcher regex: {0}")]
     InvalidMatcher(String),
 
+    #[error("Hook input event {input:?} does not match dispatched event {dispatched:?}")]
+    EventMismatch {
+        input: HookEvent,
+        dispatched: HookEvent,
+    },
+
+    #[error("Invalid hook decision {0:?}; expected allow, deny, block, or ask")]
+    InvalidDecision(String),
+
+    #[error("Hook output field {field} is unsupported for {event:?}")]
+    UnsupportedOutput {
+        event: HookEvent,
+        field: &'static str,
+    },
+
+    #[error("Hook event was cancelled before all configured hooks ran")]
+    Cancelled,
+
+    #[error("Hook batch was skipped during admission: {0}")]
+    AdmissionDenied(String),
+
+    #[error("Hook batch was skipped by the canonical run budget: {0}")]
+    Budget(#[from] crate::runtime::BudgetError),
+
+    #[error("Hook output exceeded the admitted {max_bytes}-byte limit")]
+    OutputLimitExceeded { max_bytes: usize },
+
     /// Allowlist enforcement rejected the command's executable.
     #[error("Hook command denied by allowlist: binary '{binary}' is not in allowed_commands")]
     Denied { binary: String },
+}
+
+/// Maximum matcher source bytes accepted by the production hook engine.
+pub const MAX_HOOK_MATCHER_BYTES: usize = 1024;
+
+/// Compile and evaluate one hook matcher without executing a hook or consulting
+/// ambient hook configuration.
+///
+/// This is the pure matcher boundary shared by normal hook admission and the
+/// hermetic fuzz harness. Event-specific fail-open/fail-closed policy remains
+/// in [`HookEngine`]; callers receive the typed compile/limit error here.
+///
+/// # Errors
+///
+/// Returns [`HookError::InvalidMatcher`] for empty, oversized, or invalid regex
+/// patterns.
+pub fn validate_hook_matcher(pattern: &str, context: &str) -> Result<bool, HookError> {
+    const MAX_REGEX_SIZE: usize = 10 * 1024;
+
+    if pattern.is_empty() {
+        return Err(HookError::InvalidMatcher("Empty pattern".to_string()));
+    }
+    if pattern.len() > MAX_HOOK_MATCHER_BYTES {
+        return Err(HookError::InvalidMatcher(format!(
+            "Pattern too long ({} bytes, max {})",
+            pattern.len(),
+            MAX_HOOK_MATCHER_BYTES
+        )));
+    }
+
+    RegexBuilder::new(pattern)
+        .size_limit(MAX_REGEX_SIZE)
+        .build()
+        .map(|regex| regex.is_match(context))
+        .map_err(|error| HookError::InvalidMatcher(error.to_string()))
 }
 
 /// Callback for executing model hooks via a provider adapter.
@@ -440,6 +704,13 @@ pub struct HookEngine {
     /// Optional callback for executing model hooks.
     /// Takes (prompt, model, provider) and returns the model's response text.
     model_hook_callback: Option<Arc<ModelHookCallback>>,
+    /// Full-sandbox command hooks publish transactional workspace generations.
+    /// Serialize those publications within one engine so hooks from the same
+    /// event observe and preserve the effects of earlier configured hooks.
+    command_projection_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Per-run event serialization supplies one causal ordering regardless of
+    /// which frontend initiated the event.
+    lifecycle_sequences: Arc<Mutex<HashMap<crate::runtime::RunId, Arc<tokio::sync::Mutex<u64>>>>>,
 }
 
 impl HookEngine {
@@ -448,6 +719,8 @@ impl HookEngine {
         Self {
             config,
             model_hook_callback: None,
+            command_projection_lock: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle_sequences: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -458,6 +731,21 @@ impl HookEngine {
         self
     }
 
+    /// Derive a one-turn engine with a lower-authority hook layer.
+    ///
+    /// The existing engine is host-owned and takes precedence for matching
+    /// entries and policy. Runtime resources are shared, while the derived
+    /// configuration is dropped when the turn ends.
+    #[must_use]
+    pub fn with_scoped_hooks(&self, hooks: HooksConfig) -> Self {
+        Self {
+            config: merge::merge_host_hooks(hooks, self.config.clone()),
+            model_hook_callback: self.model_hook_callback.clone(),
+            command_projection_lock: Arc::clone(&self.command_projection_lock),
+            lifecycle_sequences: Arc::clone(&self.lifecycle_sequences),
+        }
+    }
+
     /// Fire a `PostToolUse` hook (success) or `PostToolUseFailure`
     /// (error), depending on `success`. Convenience wrapper around
     /// [`HookEngine::run`] so every tool-execution call site can emit
@@ -465,6 +753,7 @@ impl HookEngine {
     /// missing session IDs (tests / one-shot invocations).
     pub async fn fire_post_tool(
         &self,
+        run: &Arc<crate::tools::ToolRunContext>,
         success: bool,
         tool_name: &str,
         tool_input: serde_json::Value,
@@ -476,7 +765,7 @@ impl HookEngine {
         } else {
             HookEvent::PostToolUseFailure
         };
-        let mut input = HookInput::new(event).with_tool(tool_name, tool_input);
+        let mut input = HookInput::for_run(run, event).with_tool(tool_name, tool_input);
         if let Some(sid) = session_id {
             input = input.with_session_id(sid);
         }
@@ -501,61 +790,84 @@ impl HookEngine {
         }
     }
 
-    /// Run all matching hooks for an event
-    pub async fn run(&self, event: HookEvent, input: &HookInput) -> HookResult {
-        let entries = self.get_entries_for_event(event);
+    /// Run one event through the canonical lifecycle and retain its typed
+    /// receipt. Events for the same run are serialized for the full batch, so
+    /// configured hooks and their receipts have one causal order even when a
+    /// frontend initiates work concurrently.
+    pub async fn run_lifecycle(&self, event: HookEvent, input: &HookInput) -> HookReceipt {
+        let run_id = input.run_context.run_id();
+        let sequence = self.lifecycle_sequence(run_id);
+        let mut sequence_guard = sequence.lock().await;
+        let current_sequence = *sequence_guard;
+        *sequence_guard = (*sequence_guard).saturating_add(1);
+        let contract = event.contract();
 
-        if entries.is_empty() {
-            return HookResult::allowed();
-        }
-
-        // Resolve matcher context strictly from the *event variant*.
-        //
-        // Crosslink #350: previously the context was inferred at runtime from
-        // "whichever input field happens to be populated", which let a
-        // `PreToolUse` matcher like `"rm"` accidentally match a user-prompt
-        // string of `"I want to rm a file"`. Now each event has a fixed
-        // [`HookMatcherTarget`] (see [`HookEvent::default_matcher_target`])
-        // which selects exactly one typed accessor — `match_tool`,
-        // `match_prompt`, or `match_event` — and there is no cross-target
-        // fallback.
-        //
-        // Crosslink #758: `event` is still threaded through to `matches_entry`
-        // so a matcher-regex *failure* on a deny-intent event
-        // (PreToolUse / PermissionRequest) fails CLOSED — the hook still
-        // runs and can block.
-        let target = event.default_matcher_target();
-        let matcher_context = Self::resolve_matcher_context(input, target);
-        let matching_entries: Vec<&HookEntry> = entries
-            .iter()
-            .filter(|entry| Self::matches_entry(entry, &matcher_context, event))
-            .collect();
-
-        if matching_entries.is_empty() {
-            return HookResult::allowed();
-        }
-
-        info!(
-            event = ?event,
-            count = matching_entries.len(),
-            "Running hooks"
+        let receipt = if input.event == event {
+            self.run_ordered(event, input, current_sequence).await
+        } else {
+            HookReceipt {
+                run_id,
+                sequence: current_sequence,
+                event,
+                contract,
+                decision: HookDecision::Allow,
+                status: HookBatchStatus::Failed,
+                outputs: Vec::new(),
+                errors: vec![HookError::EventMismatch {
+                    input: input.event,
+                    dispatched: event,
+                }],
+            }
+        };
+        tracing::info!(
+            target: "openclaudia::hooks",
+            run_id = %receipt.run_id,
+            hook_sequence = receipt.sequence,
+            event = ?receipt.event,
+            decision = ?receipt.decision,
+            status = ?receipt.status,
+            output_count = receipt.outputs.len(),
+            error_count = receipt.errors.len(),
+            "Canonical hook lifecycle receipt"
         );
-
-        // Collect all hooks to run
-        let mut hooks_to_run: Vec<(&Hook, u64)> = Vec::new();
-        for entry in &matching_entries {
-            for hook in &entry.hooks {
-                let timeout_secs = match hook {
-                    Hook::Command { timeout, .. }
-                    | Hook::Prompt { timeout, .. }
-                    | Hook::Model { timeout, .. } => *timeout,
-                };
-                hooks_to_run.push((hook, timeout_secs));
+        drop(sequence_guard);
+        if event == HookEvent::SessionEnd {
+            let mut sequences = lock_lifecycle_sequences(&self.lifecycle_sequences);
+            if sequences.get(&run_id).is_some_and(|stored| {
+                Arc::ptr_eq(stored, &sequence) && Arc::strong_count(stored) == 2
+            }) {
+                sequences.remove(&run_id);
             }
         }
+        receipt
+    }
 
-        // Run hooks in parallel.
-        //
+    /// Compatibility projection of [`Self::run_lifecycle`]. All callers,
+    /// including frontends that still consume [`HookResult`], therefore share
+    /// the same ordering, decision, timeout, and partial-failure semantics.
+    pub async fn run(&self, event: HookEvent, input: &HookInput) -> HookResult {
+        self.run_lifecycle(event, input).await.into_result()
+    }
+
+    async fn run_ordered(&self, event: HookEvent, input: &HookInput, sequence: u64) -> HookReceipt {
+        let run_id = input.run_context.run_id();
+        let contract = event.contract();
+        let hooks_to_run = self.matching_hooks(event, input);
+        if hooks_to_run.is_empty() {
+            return HookReceipt {
+                run_id,
+                sequence,
+                event,
+                contract,
+                decision: HookDecision::Allow,
+                status: HookBatchStatus::Complete,
+                outputs: Vec::new(),
+                errors: Vec::new(),
+            };
+        }
+
+        info!(event = ?event, count = hooks_to_run.len(), "Running hooks");
+
         // Crosslink #835: a serialization failure here previously fell
         // through to String::default() and sent empty stdin to every
         // hook — silently neutralising the entire hook batch. Surface
@@ -572,61 +884,517 @@ impl HookEngine {
                     "failed to serialize HookInput; aborting hook batch \
                      (see crosslink #835)"
                 );
-                let mut failed = HookResult::allowed();
-                if event.is_deny_intent() {
-                    failed.allowed = false;
-                }
-                failed.errors.push(HookError::ParseError(format!(
-                    "hook input serialize failed: {e}"
-                )));
-                return failed;
+                return HookReceipt {
+                    run_id,
+                    sequence,
+                    event,
+                    contract,
+                    decision: HookDecision::Allow,
+                    status: HookBatchStatus::Failed,
+                    outputs: Vec::new(),
+                    errors: vec![HookError::ParseError(format!(
+                        "hook input serialize failed: {e}"
+                    ))],
+                };
             }
         };
-        let futures: Vec<_> = hooks_to_run
-            .iter()
-            .map(|(hook, timeout_secs)| self.run_hook(hook, &input_json, *timeout_secs))
-            .collect();
+        let execution = self
+            .execute_hooks(event, contract, input, &input_json, hooks_to_run)
+            .await;
+        let HookExecution {
+            outputs,
+            errors,
+            decision,
+            cancelled,
+            skipped,
+        } = execution;
 
-        let results = futures::future::join_all(futures).await;
+        let status = if cancelled {
+            HookBatchStatus::Cancelled
+        } else if skipped {
+            HookBatchStatus::Skipped
+        } else if errors.is_empty() {
+            HookBatchStatus::Complete
+        } else if outputs.is_empty() {
+            HookBatchStatus::Failed
+        } else {
+            HookBatchStatus::PartiallyFailed
+        };
+        if matches!(contract.failure_mode, HookFailureMode::Block) && !errors.is_empty() {
+            warn!(
+                event = ?event,
+                error_count = errors.len(),
+                "Blocking hook event failed; admitted sibling work was cancelled and joined"
+            );
+        }
 
-        // Combine results
-        let mut hook_result = HookResult::allowed();
-        for result in results {
+        HookReceipt {
+            run_id,
+            sequence,
+            event,
+            contract,
+            decision,
+            status,
+            outputs,
+            errors,
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // Admission, cancellation, ordered composition, and settlement are one batch lifecycle.
+    async fn execute_hooks(
+        &self,
+        event: HookEvent,
+        contract: HookEventContract,
+        input: &HookInput,
+        input_json: &str,
+        hooks_to_run: Vec<(&Hook, u64)>,
+    ) -> HookExecution {
+        if input.run_context.runtime().cancellation().is_cancelled() {
+            return HookExecution {
+                outputs: Vec::new(),
+                errors: vec![HookError::Cancelled],
+                decision: HookDecision::Allow,
+                cancelled: true,
+                skipped: false,
+            };
+        }
+
+        let admission = match self.admit_hook_batch(input, input_json, hooks_to_run) {
+            Ok(admission) => admission,
+            Err(error) => {
+                let cancelled = matches!(
+                    &error,
+                    HookError::Cancelled
+                        | HookError::Budget(crate::runtime::BudgetError::Cancelled { .. })
+                );
+                return HookExecution {
+                    outputs: Vec::new(),
+                    errors: vec![error],
+                    decision: HookDecision::Allow,
+                    cancelled,
+                    skipped: !cancelled,
+                };
+            }
+        };
+        let HookBatchAdmission {
+            hooks,
+            reservation,
+            cancellation,
+            deadline,
+            command_output_bytes_per_stream,
+        } = admission;
+        let hook_count = hooks.len();
+        let mut completed = std::iter::repeat_with(|| None)
+            .take(hook_count)
+            .collect::<Vec<_>>();
+        let mut pending = FuturesUnordered::new();
+        for hook in hooks {
+            let hook_cancellation = cancellation.clone();
+            pending.push(async move {
+                let index = hook.index;
+                let result = self
+                    .run_admitted_hook(
+                        &input.run_context,
+                        hook,
+                        input_json,
+                        command_output_bytes_per_stream,
+                        hook_cancellation,
+                    )
+                    .await;
+                (index, result)
+            });
+        }
+
+        let mut cancellation_requested = false;
+        let mut deadline_elapsed = false;
+        while !pending.is_empty() {
+            let completed_hook = tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(deadline), if !deadline_elapsed => {
+                    let _receipt = cancellation.cancel(crate::runtime::CancellationReason::Deadline);
+                    cancellation_requested = true;
+                    deadline_elapsed = true;
+                    continue;
+                }
+                result = pending.next() => result,
+            };
+            let Some((index, result)) = completed_hook else {
+                break;
+            };
+            let blocks = Self::hook_result_blocks(event, contract, &result);
+            completed[index] = Some(result);
+            if blocks && !pending.is_empty() && !cancellation_requested {
+                let _receipt =
+                    cancellation.cancel(crate::runtime::CancellationReason::ParentTerminated);
+                cancellation_requested = true;
+            }
+        }
+
+        let mut execution = HookExecution {
+            outputs: Vec::new(),
+            errors: Vec::new(),
+            decision: HookDecision::Allow,
+            cancelled: false,
+            skipped: false,
+        };
+        for result in completed.into_iter().flatten() {
             match result {
                 Ok((output, exit_code)) => {
-                    // Exit code 2 means block
                     if exit_code == 2 {
-                        hook_result.allowed = false;
+                        execution.decision =
+                            Self::compose_decision(execution.decision, HookDecision::Deny);
                         let reason = output
                             .reason
                             .clone()
                             .unwrap_or_else(|| "Hook blocked action".to_string());
                         warn!(reason = %reason, "Hook blocked action");
                     }
-                    // Check decision field
-                    if let Some(decision) = &output.decision {
-                        if decision == "deny" || decision == "block" {
-                            hook_result.allowed = false;
+
+                    match Self::validate_output(event, &output) {
+                        Ok(output_decision) => {
+                            execution.decision =
+                                Self::compose_decision(execution.decision, output_decision);
+                        }
+                        Err(mut output_errors) => {
+                            execution.errors.append(&mut output_errors);
                         }
                     }
-                    hook_result.outputs.push(output);
+                    execution.outputs.push(output);
                 }
                 Err(e) => {
                     error!(error = %e, "Hook execution failed");
-                    hook_result.errors.push(e);
+                    execution.cancelled |= matches!(&e, HookError::Cancelled);
+                    execution.errors.push(e);
                 }
             }
         }
-        if event.is_deny_intent() && !hook_result.errors.is_empty() {
-            warn!(
-                event = ?event,
-                error_count = hook_result.errors.len(),
-                "Deny-intent hook execution failed; failing closed"
-            );
-            hook_result.allowed = false;
+        if let Err(error) = reservation.finish_unknown() {
+            execution.errors.push(HookError::Budget(error));
+        }
+        execution
+    }
+
+    #[allow(clippy::too_many_lines)] // Every aggregate limit must be checked before any admitted hook can launch.
+    fn admit_hook_batch<'a>(
+        &self,
+        input: &HookInput,
+        input_json: &str,
+        hooks_to_run: Vec<(&'a Hook, u64)>,
+    ) -> Result<HookBatchAdmission<'a>, HookError> {
+        if hooks_to_run.len() > MAX_HOOKS_PER_BATCH {
+            return Err(HookError::AdmissionDenied(format!(
+                "{} matching hooks exceed the per-event limit of {MAX_HOOKS_PER_BATCH}",
+                hooks_to_run.len()
+            )));
         }
 
-        hook_result
+        let mut command_calls = 0_u64;
+        let mut model_calls = 0_u64;
+        let mut model_input_tokens = 0_u64;
+        let mut prompt_output_bytes = 0_usize;
+        for (hook, _) in &hooks_to_run {
+            match hook {
+                Hook::Command { .. } => {
+                    command_calls = command_calls.checked_add(1).ok_or_else(|| {
+                        HookError::AdmissionDenied("hook process count overflow".to_string())
+                    })?;
+                }
+                Hook::Prompt { prompt, .. } => {
+                    prompt_output_bytes = prompt_output_bytes
+                        .checked_add(prompt.len())
+                        .ok_or_else(|| {
+                            HookError::AdmissionDenied(
+                                "hook prompt output budget overflow".to_string(),
+                            )
+                        })?;
+                }
+                Hook::Model { prompt, .. } => {
+                    model_calls = model_calls.checked_add(1).ok_or_else(|| {
+                        HookError::AdmissionDenied("hook model-call count overflow".to_string())
+                    })?;
+                    model_input_tokens = model_input_tokens
+                        .checked_add(u64::try_from(prompt.len()).map_err(|_| {
+                            HookError::AdmissionDenied(
+                                "hook model input budget overflow".to_string(),
+                            )
+                        })?)
+                        .ok_or_else(|| {
+                            HookError::AdmissionDenied(
+                                "hook model input budget overflow".to_string(),
+                            )
+                        })?;
+                }
+            }
+        }
+
+        if command_calls > 0 {
+            input
+                .run_context
+                .require(crate::tools::ToolResource::Process)?;
+            let sandbox_mode = self
+                .config
+                .policy
+                .as_ref()
+                .map_or(SandboxMode::FullSandbox, |policy| policy.sandbox.clone());
+            if sandbox_mode != SandboxMode::FullSandbox {
+                let trusted = TRUST_UNSANDBOXED_HOOKS
+                    .as_ref()
+                    .copied()
+                    .map_err(Clone::clone)
+                    .map_err(HookError::AdmissionDenied)?;
+                if !trusted {
+                    return Err(HookError::AdmissionDenied(format!(
+                        "hook sandbox mode '{sandbox_mode:?}' requests host execution, which is blocked. A host operator must explicitly start OpenClaudia with {TRUST_UNSANDBOXED_HOOKS_ENV}=true"
+                    )));
+                }
+            }
+        }
+        if model_calls > 0 {
+            input
+                .run_context
+                .require(crate::tools::ToolResource::Network)?;
+            input
+                .run_context
+                .require(crate::tools::ToolResource::Secrets)?;
+        }
+
+        let command_calls_usize = usize::try_from(command_calls).map_err(|_| {
+            HookError::AdmissionDenied("hook process count does not fit this platform".to_string())
+        })?;
+        let command_input_bytes = input_json
+            .len()
+            .checked_mul(command_calls_usize)
+            .ok_or_else(|| HookError::AdmissionDenied("hook input budget overflow".to_string()))?;
+        let model_input_bytes = usize::try_from(model_input_tokens).map_err(|_| {
+            HookError::AdmissionDenied("hook model input does not fit this platform".to_string())
+        })?;
+        let aggregate_input_bytes = command_input_bytes
+            .checked_add(model_input_bytes)
+            .ok_or_else(|| HookError::AdmissionDenied("hook input budget overflow".to_string()))?;
+        if aggregate_input_bytes > MAX_HOOK_BATCH_INPUT_BYTES {
+            return Err(HookError::AdmissionDenied(format!(
+                "hook batch requires {aggregate_input_bytes} input bytes; limit is {MAX_HOOK_BATCH_INPUT_BYTES}"
+            )));
+        }
+
+        let model_calls_usize = usize::try_from(model_calls).map_err(|_| {
+            HookError::AdmissionDenied("hook model count does not fit this platform".to_string())
+        })?;
+        let model_output_bytes = model_calls_usize
+            .checked_mul(MAX_MODEL_HOOK_OUTPUT_BYTES)
+            .ok_or_else(|| HookError::AdmissionDenied("hook output budget overflow".to_string()))?;
+        let fixed_output_bytes = prompt_output_bytes
+            .checked_add(model_output_bytes)
+            .ok_or_else(|| HookError::AdmissionDenied("hook output budget overflow".to_string()))?;
+        if fixed_output_bytes > MAX_HOOK_BATCH_OUTPUT_BYTES {
+            return Err(HookError::AdmissionDenied(format!(
+                "hook batch requires at least {fixed_output_bytes} output bytes; limit is {MAX_HOOK_BATCH_OUTPUT_BYTES}"
+            )));
+        }
+        let command_streams = command_calls_usize.checked_mul(2).ok_or_else(|| {
+            HookError::AdmissionDenied("hook output stream count overflow".to_string())
+        })?;
+        let available = MAX_HOOK_BATCH_OUTPUT_BYTES - fixed_output_bytes;
+        let command_output_bytes_per_stream = match available.checked_div(command_streams) {
+            None => 0,
+            Some(per_stream) => {
+                let per_stream = per_stream.min(MAX_HOOK_OUTPUT_BYTES_PER_STREAM);
+                if per_stream == 0 {
+                    return Err(HookError::AdmissionDenied(
+                        "hook batch has no output capacity for command streams".to_string(),
+                    ));
+                }
+                per_stream
+            }
+        };
+
+        let remaining_time = input.run_context.budget().remaining_time()?;
+        let policy = self.config.policy.as_ref();
+        let mut hooks = Vec::with_capacity(hooks_to_run.len());
+        for (index, (hook, timeout_secs)) in hooks_to_run.into_iter().enumerate() {
+            let hook_timeout = Duration::from_secs(timeout_secs).min(remaining_time);
+            if hook_timeout.is_zero() {
+                return Err(HookError::AdmissionDenied(
+                    "canonical run deadline leaves no time for hook execution".to_string(),
+                ));
+            }
+            let kind = match hook {
+                Hook::Command { command, shell, .. } => {
+                    let mut command = if *shell {
+                        Self::build_shell_command(&input.run_context, command, policy)?
+                    } else {
+                        Self::build_direct_command(&input.run_context, command, policy)?
+                    };
+                    Self::apply_hook_env(
+                        &mut command,
+                        &input.run_context,
+                        input.run_context.working_directory(),
+                    );
+                    AdmittedHookKind::Command {
+                        command,
+                        sandbox_mode: policy.map_or(SandboxMode::FullSandbox, |hook_policy| {
+                            hook_policy.sandbox.clone()
+                        }),
+                    }
+                }
+                Hook::Prompt { prompt, .. } => AdmittedHookKind::Prompt(prompt),
+                Hook::Model {
+                    prompt,
+                    model,
+                    provider,
+                    ..
+                } => AdmittedHookKind::Model {
+                    prompt,
+                    model,
+                    provider: provider.as_deref(),
+                },
+            };
+            hooks.push(AdmittedHook {
+                index,
+                timeout: hook_timeout,
+                kind,
+            });
+        }
+
+        let output_tokens = model_calls
+            .checked_mul(u64::from(crate::DEFAULT_MAX_TOKENS))
+            .ok_or_else(|| HookError::AdmissionDenied("hook token budget overflow".to_string()))?;
+        let cost_microusd = if model_calls == 0 {
+            0
+        } else {
+            crate::session::conservative_budget_cost_microusd(&crate::session::TokenUsage {
+                input_tokens: model_input_tokens,
+                output_tokens,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            })
+            .map_err(|error| {
+                HookError::AdmissionDenied(format!("hook cost budget overflow: {error}"))
+            })?
+            .microusd
+        };
+        let concurrent_calls = command_calls.checked_add(model_calls).ok_or_else(|| {
+            HookError::AdmissionDenied("hook concurrency budget overflow".to_string())
+        })?;
+        let reservation = input
+            .run_context
+            .budget()
+            .reserve(crate::runtime::BudgetAmounts {
+                input_tokens: model_input_tokens,
+                output_tokens,
+                turns: model_calls,
+                provider_calls: model_calls,
+                tool_calls: command_calls,
+                concurrent_calls,
+                cost_microusd,
+                ..crate::runtime::BudgetAmounts::default()
+            })?;
+        Ok(HookBatchAdmission {
+            hooks,
+            reservation,
+            cancellation: input.run_context.runtime().cancellation().child(),
+            deadline: tokio::time::Instant::now() + remaining_time,
+            command_output_bytes_per_stream,
+        })
+    }
+
+    fn hook_result_blocks(
+        event: HookEvent,
+        contract: HookEventContract,
+        result: &Result<(HookOutput, i32), HookError>,
+    ) -> bool {
+        if !matches!(contract.failure_mode, HookFailureMode::Block) {
+            return false;
+        }
+        match result {
+            Err(_) | Ok((_, 2)) => true,
+            Ok((output, _)) => Self::validate_output(event, output)
+                .map_or(true, |decision| !matches!(decision, HookDecision::Allow)),
+        }
+    }
+
+    fn matching_hooks<'a>(&'a self, event: HookEvent, input: &HookInput) -> Vec<(&'a Hook, u64)> {
+        // Matcher context is selected by the event variant, never whichever
+        // optional input field happens to be populated. Invalid deny-intent
+        // regexes still fail closed through `matches_entry`.
+        let matcher_context = Self::resolve_matcher_context(input, event.default_matcher_target());
+        self.get_entries_for_event(event)
+            .iter()
+            .filter(|entry| Self::matches_entry(entry, &matcher_context, event))
+            .flat_map(|entry| {
+                entry.hooks.iter().map(|hook| {
+                    let timeout = match hook {
+                        Hook::Command { timeout, .. }
+                        | Hook::Prompt { timeout, .. }
+                        | Hook::Model { timeout, .. } => *timeout,
+                    };
+                    (hook, timeout)
+                })
+            })
+            .collect()
+    }
+
+    fn lifecycle_sequence(&self, run_id: crate::runtime::RunId) -> Arc<tokio::sync::Mutex<u64>> {
+        let mut sequences = lock_lifecycle_sequences(&self.lifecycle_sequences);
+        Arc::clone(
+            sequences
+                .entry(run_id)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(0))),
+        )
+    }
+
+    const fn compose_decision(current: HookDecision, next: HookDecision) -> HookDecision {
+        match (current, next) {
+            (HookDecision::Deny, _) | (_, HookDecision::Deny) => HookDecision::Deny,
+            (HookDecision::Ask, _) | (_, HookDecision::Ask) => HookDecision::Ask,
+            (HookDecision::Allow, HookDecision::Allow) => HookDecision::Allow,
+        }
+    }
+
+    fn validate_output(
+        event: HookEvent,
+        output: &HookOutput,
+    ) -> Result<HookDecision, Vec<HookError>> {
+        let contract = event.contract();
+        let mut errors = Vec::new();
+        let decision = output
+            .decision
+            .as_deref()
+            .map_or(HookDecision::Allow, |value| {
+                match value.trim().to_ascii_lowercase().as_str() {
+                    "allow" => HookDecision::Allow,
+                    "deny" | "block" => HookDecision::Deny,
+                    "ask" => HookDecision::Ask,
+                    _ => {
+                        errors.push(HookError::InvalidDecision(value.to_string()));
+                        HookDecision::Allow
+                    }
+                }
+            });
+        if output.decision.is_some() && !contract.accepts_decision {
+            errors.push(HookError::UnsupportedOutput {
+                event,
+                field: "decision",
+            });
+        }
+        if output.prompt.is_some() && !contract.accepts_prompt_suggestion {
+            errors.push(HookError::UnsupportedOutput {
+                event,
+                field: "prompt",
+            });
+        }
+        if !output.extra.is_empty() {
+            errors.push(HookError::UnsupportedOutput {
+                event,
+                field: "extra",
+            });
+        }
+
+        if errors.is_empty() {
+            Ok(decision)
+        } else {
+            Err(errors)
+        }
     }
 
     /// Get hook entries for a specific event. `PostToolUseFailure` falls
@@ -709,7 +1477,7 @@ impl HookEngine {
         match Self::validate_and_match(pattern, context) {
             Ok(matched) => matched,
             Err(e) => {
-                let fail_closed = event.is_deny_intent();
+                let fail_closed = matches!(event.contract().failure_mode, HookFailureMode::Block);
                 warn!(
                     event = ?event,
                     pattern = %pattern,
@@ -723,37 +1491,14 @@ impl HookEngine {
         }
     }
 
-    /// Validate regex pattern and check for match
-    /// Maximum pattern length to prevent `ReDoS` via complex expressions.
-    const MAX_PATTERN_LEN: usize = 1024;
-    /// Maximum compiled regex size (bytes) to limit pathological backtracking.
-    const MAX_REGEX_SIZE: usize = 10 * 1024; // 10KB
-
     fn validate_and_match(pattern: &str, context: &str) -> Result<bool, HookError> {
-        if pattern.is_empty() {
-            return Err(HookError::InvalidMatcher("Empty pattern".to_string()));
-        }
-        if pattern.len() > Self::MAX_PATTERN_LEN {
-            return Err(HookError::InvalidMatcher(format!(
-                "Pattern too long ({} chars, max {})",
-                pattern.len(),
-                Self::MAX_PATTERN_LEN
-            )));
-        }
-
-        match RegexBuilder::new(pattern)
-            .size_limit(Self::MAX_REGEX_SIZE)
-            .build()
-        {
-            Ok(re) => Ok(re.is_match(context)),
-            Err(e) => Err(HookError::InvalidMatcher(e.to_string())),
-        }
+        validate_hook_matcher(pattern, context)
     }
 
     /// Parse hook output — matches Claude Code behavior:
     /// - Empty output → default
     /// - Starts with '{' → try JSON parse, fall back to plain text on failure
-    /// - Anything else → treat as plain text (`additionalContext` / system-reminder)
+    /// - Anything else → treat as plain-text reference context
     fn parse_hook_output(stdout: &str) -> HookOutput {
         let trimmed = stdout.trim();
         if trimmed.is_empty() {
@@ -762,13 +1507,26 @@ impl HookEngine {
 
         // Only try JSON parse if it looks like JSON (starts with '{')
         if trimmed.starts_with('{') {
-            match serde_json::from_str(trimmed) {
-                Ok(output) => return output,
-                Err(_) => {
-                    // Invalid JSON that starts with { — treat as plain text
-                    debug!("Hook output starts with '{{' but is not valid JSON, treating as plain text");
+            if let Ok(mut value) = serde_json::from_str::<Value>(trimmed) {
+                let compatibility_context = value
+                    .as_object_mut()
+                    .and_then(|object| object.remove("hookSpecificOutput"))
+                    .and_then(|specific| {
+                        specific
+                            .get("additionalContext")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    });
+                if let Ok(mut output) = serde_json::from_value::<HookOutput>(value) {
+                    if output.additional_context.is_none() {
+                        output.additional_context = compatibility_context;
+                    }
+                    return output;
                 }
             }
+            // Invalid or non-object JSON is retained as inert reference text;
+            // it never acquires decision authority through parse recovery.
+            debug!("Hook output starts with '{{' but is not a valid hook object, treating as plain text");
         }
 
         // Plain text output — wrap as additionalContext (like Claude Code does)
@@ -802,8 +1560,13 @@ impl HookEngine {
     }
 
     /// Fire a notification event with type and data.
-    pub async fn fire_notification(&self, notification_type: &str, data: Value) -> Vec<HookResult> {
-        let input = notification_input(notification_type, data);
+    pub async fn fire_notification(
+        &self,
+        run: &std::sync::Arc<crate::tools::ToolRunContext>,
+        notification_type: &str,
+        data: Value,
+    ) -> Vec<HookResult> {
+        let input = notification_input(run, notification_type, data);
 
         debug!(
             notification_type = %notification_type,
@@ -813,41 +1576,46 @@ impl HookEngine {
         vec![self.run(HookEvent::Notification, &input).await]
     }
 
-    /// Run a single hook
-    async fn run_hook(
+    async fn run_admitted_hook(
         &self,
-        hook: &Hook,
+        run: &crate::tools::ToolRunContext,
+        hook: AdmittedHook<'_>,
         input_json: &str,
-        timeout_secs: u64,
+        command_output_bytes_per_stream: usize,
+        cancellation: crate::runtime::CancellationHandle,
     ) -> Result<(HookOutput, i32), HookError> {
-        match hook {
-            Hook::Command { command, shell, .. } => {
-                self.run_command_hook(
+        if cancellation.is_cancelled() {
+            return Err(HookError::Cancelled);
+        }
+        match hook.kind {
+            AdmittedHookKind::Command {
+                command,
+                sandbox_mode,
+            } => {
+                self.run_admitted_command_hook(
+                    run,
                     command,
-                    *shell,
-                    self.config.policy.as_ref(),
+                    sandbox_mode,
                     input_json,
-                    timeout_secs,
+                    hook.timeout,
+                    command_output_bytes_per_stream,
+                    cancellation,
                 )
                 .await
             }
-            Hook::Prompt { prompt, .. } => {
-                // Prompt hooks just return the prompt as system message
-                Ok((
-                    HookOutput {
-                        system_message: Some(prompt.clone()),
-                        ..Default::default()
-                    },
-                    0,
-                ))
-            }
-            Hook::Model {
+            AdmittedHookKind::Prompt(prompt) => Ok((
+                HookOutput {
+                    additional_context: Some(prompt.to_string()),
+                    ..Default::default()
+                },
+                0,
+            )),
+            AdmittedHookKind::Model {
                 prompt,
                 model,
                 provider,
-                ..
             } => {
-                self.run_model_hook(prompt, model, provider.as_deref(), timeout_secs)
+                self.run_model_hook(run, prompt, model, provider, hook.timeout, cancellation)
                     .await
             }
         }
@@ -859,13 +1627,14 @@ impl HookEngine {
     /// the ready-to-spawn `Command`. Returns `Err` on tokenisation failure or
     /// allowlist denial.
     fn build_direct_command(
+        run: &crate::tools::ToolRunContext,
         command: &str,
         policy: Option<&HookPolicy>,
     ) -> Result<Command, HookError> {
         let tokens = shlex::split(command).ok_or_else(|| {
-            HookError::CommandFailed(format!(
-                "Failed to tokenise hook command (unterminated quote?): {command}"
-            ))
+            HookError::CommandFailed(
+                "Failed to tokenise hook command because its quoting is incomplete".to_string(),
+            )
         })?;
 
         if tokens.is_empty() {
@@ -875,284 +1644,217 @@ impl HookEngine {
         }
 
         let binary_path = &tokens[0];
-        // Strip to basename so "/usr/bin/python3" matches allowlist entry "python3".
-        let binary_name = Path::new(binary_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(binary_path.as_str());
-
-        match policy {
-            Some(p) => {
-                if let Some(allowed) = &p.allowed_commands {
-                    if !allowed.contains(binary_name) {
-                        return Err(HookError::Denied {
-                            binary: binary_name.to_string(),
-                        });
-                    }
-                }
-            }
-            None => {
-                if !ALLOW_ALL_DEPRECATION_WARNED.swap(true, Ordering::Relaxed) {
-                    warn!(
-                        "HooksConfig has no `policy` field — allowing every hook \
-                         executable name inside the full OS sandbox. Add \
-                         `policy: {{allowed_commands: [...]}}` to restrict which \
-                         binaries hooks may execute."
-                    );
-                }
-            }
-        }
-
-        let mut cmd = Command::new(binary_path);
+        let resolved = Self::resolve_hook_executable(run, binary_path)?;
+        Self::authorize_hook_executable(run, binary_path, &resolved, policy)?;
+        let mut cmd = Command::new(resolved);
         if tokens.len() > 1 {
             cmd.args(&tokens[1..]);
         }
         Ok(cmd)
     }
 
-    /// Scrub credential env vars and inject `CLAUDE_PROJECT_DIR` into `cmd`.
-    fn apply_hook_env(cmd: &mut Command, project_dir: &std::path::Path) {
-        let sensitive: Vec<String> = std::env::vars()
-            .map(|(k, _)| k)
-            .filter(|k| is_sensitive_env(k))
-            .collect();
-        for key in &sensitive {
-            cmd.env_remove(key);
-        }
-        cmd.env("CLAUDE_PROJECT_DIR", project_dir);
+    fn build_shell_command(
+        run: &crate::tools::ToolRunContext,
+        command: &str,
+        policy: Option<&HookPolicy>,
+    ) -> Result<Command, HookError> {
+        let (resolved, shell_arg) = Self::resolved_hook_shell(run)?;
+        let shell = if cfg!(windows) { "cmd" } else { "sh" };
+        Self::authorize_hook_executable(run, shell, &resolved, policy)?;
+        warn!(
+            executable = %resolved.display(),
+            "Hook is running in explicitly configured shell compatibility mode"
+        );
+        let mut cmd = Command::new(resolved);
+        cmd.arg(shell_arg).arg(command);
+        Ok(cmd)
     }
 
-    fn resolved_hook_shell() -> Result<(PathBuf, &'static str), HookError> {
+    fn resolved_hook_shell(
+        run: &crate::tools::ToolRunContext,
+    ) -> Result<(PathBuf, &'static str), HookError> {
         let (shell, shell_arg) = if cfg!(windows) {
             ("cmd", "/C")
         } else {
             ("sh", "-c")
         };
-        let shell_path = which::which(shell).map_err(|e| {
-            HookError::CommandFailed(format!("{shell} binary not found on PATH: {e}"))
-        })?;
-        Ok((shell_path, shell_arg))
+        Self::resolve_hook_executable(run, shell).map(|path| (path, shell_arg))
     }
 
+    fn resolve_hook_executable(
+        run: &crate::tools::ToolRunContext,
+        executable: &str,
+    ) -> Result<PathBuf, HookError> {
+        let resolved = run
+            .resolve_executable(executable)
+            .map_err(|error| HookError::CommandFailed(error.to_string()))?
+            .canonicalize()
+            .map_err(|error| {
+                HookError::CommandFailed(format!(
+                    "Failed to canonicalize the resolved hook executable: {error}"
+                ))
+            })?;
+        let metadata = std::fs::metadata(&resolved).map_err(|error| {
+            HookError::CommandFailed(format!(
+                "Failed to inspect the resolved hook executable: {error}"
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(HookError::CommandFailed(
+                "Resolved hook executable is not a regular file".to_string(),
+            ));
+        }
+        Ok(resolved)
+    }
+
+    fn authorize_hook_executable(
+        run: &crate::tools::ToolRunContext,
+        requested: &str,
+        resolved: &Path,
+        policy: Option<&HookPolicy>,
+    ) -> Result<(), HookError> {
+        let Some(policy) = policy else {
+            if !ALLOW_ALL_DEPRECATION_WARNED.swap(true, Ordering::Relaxed) {
+                warn!(
+                    "HooksConfig has no `policy` field — allowing canonical hook executable identities under the default full sandbox"
+                );
+            }
+            return Ok(());
+        };
+        let Some(allowed) = policy.allowed_commands.as_ref() else {
+            return Ok(());
+        };
+        let mut allowed_executables = allowed.iter().collect::<Vec<_>>();
+        allowed_executables.sort_unstable();
+        for allowed_executable in allowed_executables {
+            match Self::resolve_hook_executable(run, allowed_executable) {
+                Ok(allowed_identity) if allowed_identity == resolved => return Ok(()),
+                Ok(_) => {}
+                Err(error) => {
+                    debug!(
+                        allowed_executable,
+                        %error,
+                        "Ignoring unavailable hook allowlist entry while checking canonical executable identities"
+                    );
+                }
+            }
+        }
+        let binary = Path::new(requested)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("<non-unicode>")
+            .to_string();
+        Err(HookError::Denied { binary })
+    }
+
+    /// Replace ambient process state with this run's exact environment grants
+    /// and the one harness-owned project-directory value documented for hooks.
+    fn apply_hook_env(
+        cmd: &mut Command,
+        run: &crate::tools::ToolRunContext,
+        project_dir: &std::path::Path,
+    ) {
+        cmd.env_clear();
+        for name in run.environment_grants().keys() {
+            if !crate::tools::is_sensitive_env(name) {
+                let _applied = run.environment_grants().with_value(name, |value| {
+                    cmd.env(name, value);
+                });
+            }
+        }
+        cmd.env("HOME", run.private_temp_root())
+            .env("TMPDIR", run.private_temp_root())
+            .env("TMP", run.private_temp_root())
+            .env("TEMP", run.private_temp_root())
+            .env("PATH", run.executable_search_path())
+            .env("CLAUDE_PROJECT_DIR", project_dir);
+    }
+
+    #[cfg(test)]
     async fn write_hook_stdin<W>(stdin: &mut W, input_json: &str) -> Result<(), HookError>
     where
-        W: AsyncWrite + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
     {
-        stdin.write_all(input_json.as_bytes()).await.map_err(|e| {
-            HookError::CommandFailed(format!("failed to write hook input to stdin: {e}"))
-        })?;
-        stdin
-            .shutdown()
+        tokio::io::AsyncWriteExt::write_all(stdin, input_json.as_bytes())
+            .await
+            .map_err(|e| {
+                HookError::CommandFailed(format!("failed to write hook input to stdin: {e}"))
+            })?;
+        tokio::io::AsyncWriteExt::shutdown(stdin)
             .await
             .map_err(|e| HookError::CommandFailed(format!("failed to close hook input stdin: {e}")))
     }
 
-    async fn terminate_child_after_stdin_failure(child: &mut Child) {
-        if let Some(pid) = child.id() {
-            let _ = tokio::task::spawn_blocking(move || {
-                crate::tools::terminate_process_tree(pid);
-            })
-            .await;
-        }
-        if let Err(e) = child.start_kill() {
-            debug!(error = %e, "Failed to kill hook process after stdin failure");
-        }
-        if let Err(e) = child.wait().await {
-            debug!(error = %e, "Failed to reap hook process after stdin failure");
-        }
-    }
-
-    async fn read_bounded_hook_stream<R>(mut stream: R) -> Result<Vec<u8>, std::io::Error>
-    where
-        R: AsyncRead + Unpin,
-    {
-        let mut retained = Vec::new();
-        let mut chunk = [0u8; 8192];
-        let mut truncated = false;
-        loop {
-            let count = stream.read(&mut chunk).await?;
-            if count == 0 {
-                break;
-            }
-            let remaining = MAX_HOOK_OUTPUT_BYTES_PER_STREAM.saturating_sub(retained.len());
-            let keep = remaining.min(count);
-            retained.extend_from_slice(&chunk[..keep]);
-            truncated |= keep < count;
-        }
-        if truncated {
-            retained.extend_from_slice(HOOK_OUTPUT_TRUNCATED_MARKER);
-        }
-        Ok(retained)
-    }
-
-    async fn wait_for_hook_output(
-        mut child: Child,
-        timeout_secs: u64,
-    ) -> Result<std::process::Output, HookError> {
-        let pid = child.id();
-        let stdout = child.stdout.take().ok_or_else(|| {
-            HookError::CommandFailed("hook stdout unavailable after spawn".to_string())
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            HookError::CommandFailed("hook stderr unavailable after spawn".to_string())
-        })?;
-        let stdout_reader = tokio::spawn(Self::read_bounded_hook_stream(stdout));
-        let stderr_reader = tokio::spawn(Self::read_bounded_hook_stream(stderr));
-        let status = match timeout(Duration::from_secs(timeout_secs), child.wait()).await {
-            Ok(Ok(status)) => status,
-            Ok(Err(error)) => {
-                if let Some(pid) = pid {
-                    let _ = tokio::task::spawn_blocking(move || {
-                        crate::tools::terminate_process_tree(pid);
-                    })
-                    .await;
-                }
-                return Err(HookError::CommandFailed(error.to_string()));
-            }
-            Err(_) => {
-                if let Some(pid) = pid {
-                    let _ = tokio::task::spawn_blocking(move || {
-                        crate::tools::terminate_process_tree(pid);
-                    })
-                    .await;
-                }
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                let _ = stdout_reader.await;
-                let _ = stderr_reader.await;
-                return Err(HookError::Timeout(timeout_secs));
-            }
-        };
-        let stdout = stdout_reader
-            .await
-            .map_err(|error| HookError::CommandFailed(error.to_string()))?
-            .map_err(|error| HookError::CommandFailed(error.to_string()))?;
-        let stderr = stderr_reader
-            .await
-            .map_err(|error| HookError::CommandFailed(error.to_string()))?
-            .map_err(|error| HookError::CommandFailed(error.to_string()))?;
-        Ok(std::process::Output {
-            status,
-            stdout,
-            stderr,
-        })
-    }
-
-    #[cfg(unix)]
-    fn isolate_hook_process_group(command: &mut Command) {
-        use std::os::unix::process::CommandExt as _;
-        command.as_std_mut().process_group(0);
-    }
-
-    #[cfg(not(unix))]
-    fn isolate_hook_process_group(_command: &mut Command) {
-        // The enforced Windows backend uses a Job object when available.
-    }
-
     /// Execute a command hook.
     ///
-    /// Two execution paths:
-    /// - `use_shell = false` (default): tokenise with `shlex`, exec directly —
-    ///   shell metacharacters are inert literal arguments.
-    /// - `use_shell = true` (opt-in): pass to `sh -c`, warn loudly on every call.
-    ///
-    /// Credentials are scrubbed in both paths. See [`Self::build_direct_command`].
-    async fn run_command_hook(
+    /// The executable and argv were resolved during aggregate admission. This
+    /// method owns only sandbox preparation and the cancellable process
+    /// lifecycle, so policy denial cannot race a sibling launch.
+    #[allow(clippy::too_many_arguments)] // Carries one immutable admission record into one supervised process lifecycle.
+    async fn run_admitted_command_hook(
         &self,
-        command: &str,
-        use_shell: bool,
-        policy: Option<&HookPolicy>,
+        run: &crate::tools::ToolRunContext,
+        child_cmd: Command,
+        sandbox_mode: SandboxMode,
         input_json: &str,
-        timeout_secs: u64,
+        hook_timeout: Duration,
+        output_bytes_per_stream: usize,
+        cancellation: crate::runtime::CancellationHandle,
     ) -> Result<(HookOutput, i32), HookError> {
-        debug!(command = %command, shell = use_shell, "Running command hook");
-
-        // Resolve cwd eagerly — missing cwd is a hard error, not a silent "".
-        let security =
-            crate::tools::security::current_context().map_err(HookError::CommandFailed)?;
-        let project_dir = security.working_directory().to_path_buf();
-
-        let mut child_cmd = if use_shell {
-            warn!(
-                command = %command,
-                "Hook is running with shell:true — shell injection risk. \
-                 Consider converting to a direct-spawn hook."
-            );
-            let (shell_path, shell_arg) = Self::resolved_hook_shell()?;
-            let mut cmd = Command::new(shell_path);
-            cmd.arg(shell_arg).arg(command);
-            cmd
+        let project_dir = run.working_directory().to_path_buf();
+        let _projection_guard = if sandbox_mode == SandboxMode::FullSandbox {
+            Some(tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(HookError::Cancelled),
+                guard = self.command_projection_lock.lock() => guard,
+            })
         } else {
-            Self::build_direct_command(command, policy)?
+            None
         };
-
-        Self::apply_hook_env(&mut child_cmd, &project_dir);
-        let sandbox_mode = policy.map_or(SandboxMode::FullSandbox, |hook_policy| {
-            hook_policy.sandbox.clone()
-        });
-        if sandbox_mode == SandboxMode::FullSandbox {
-            let sandboxed = crate::tools::sandboxed_hook_command(child_cmd.as_std(), &project_dir)
-                .map_err(|error| {
+        if cancellation.is_cancelled() {
+            return Err(HookError::Cancelled);
+        }
+        let prepared_command = if sandbox_mode == SandboxMode::FullSandbox {
+            crate::tools::sandboxed_hook_command(run, &child_cmd, &project_dir).map_err(
+                |error| {
                     HookError::CommandFailed(format!("failed to create full hook sandbox: {error}"))
-                })?;
-            child_cmd = Command::from(sandboxed);
+                },
+            )?
         } else {
-            let trusted = TRUST_UNSANDBOXED_HOOKS
-                .as_ref()
-                .map_err(Clone::clone)
-                .map_err(HookError::CommandFailed)?;
-            if !trusted {
-                return Err(HookError::CommandFailed(format!(
-                    "hook sandbox mode '{sandbox_mode:?}' requests host execution, which is blocked. \
-                     A host operator must explicitly start OpenClaudia with \
-                     {TRUST_UNSANDBOXED_HOOKS_ENV}=true to trust unsandboxed hooks"
-                )));
-            }
             warn!(
                 mode = ?sandbox_mode,
                 env = TRUST_UNSANDBOXED_HOOKS_ENV,
                 "Hook OS sandbox explicitly disabled by the host operator"
             );
-        }
-
-        Self::isolate_hook_process_group(&mut child_cmd);
-        let mut child = child_cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| HookError::CommandFailed(e.to_string()))?;
-        let _process_registration = (sandbox_mode == SandboxMode::FullSandbox).then(|| {
-            child
-                .id()
-                .map(crate::tools::command::ActiveSandboxProcess::register)
-        });
-
-        let Some(mut stdin) = child.stdin.take() else {
-            Self::terminate_child_after_stdin_failure(&mut child).await;
-            return Err(HookError::CommandFailed(
-                "hook stdin unavailable".to_string(),
-            ));
+            crate::tools::command::PreparedProcessCommand::host(child_cmd)
         };
-        let stdin_result = Self::write_hook_stdin(&mut stdin, input_json).await;
-        drop(stdin);
-        if let Err(e) = stdin_result {
-            Self::terminate_child_after_stdin_failure(&mut child).await;
-            return Err(e);
-        }
 
-        match Self::wait_for_hook_output(child, timeout_secs).await {
+        let limits = crate::tools::command::ProcessLimits::new(hook_timeout)
+            .with_output_limit(output_bytes_per_stream, HOOK_OUTPUT_TRUNCATED_MARKER)
+            .with_stdin_early_close_allowed();
+        match crate::tools::command::run_prepared_run_owned_with_cancellation(
+            run,
+            prepared_command,
+            "hook",
+            limits,
+            Some(input_json.as_bytes().to_vec()),
+            cancellation,
+        )
+        .await
+        {
             Ok(output) => {
+                let output = output.into_std_output();
                 let exit_code = output.status.code().unwrap_or(-1);
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 if !stderr.is_empty() {
-                    debug!(stderr = %stderr, "Hook stderr");
+                    debug!(stderr_bytes = stderr.len(), "Hook wrote bounded stderr");
                 }
                 if exit_code != 0 && exit_code != 2 {
                     const MAX_HOOK_ERROR_BYTES: usize = 4096;
+                    let sanitized = run.sanitize_diagnostic(stderr.trim());
                     let diagnostic =
-                        crate::tools::safe_truncate(stderr.trim(), MAX_HOOK_ERROR_BYTES);
+                        crate::tools::safe_truncate(sanitized.as_str(), MAX_HOOK_ERROR_BYTES);
                     let suffix = if diagnostic.is_empty() {
                         String::new()
                     } else {
@@ -1164,23 +1866,25 @@ impl HookEngine {
                 }
                 Ok((Self::parse_hook_output(&stdout), exit_code))
             }
-            Err(e) => Err(e),
+            Err(crate::tools::command::CommandError::TimedOut { .. }) => {
+                Err(HookError::Timeout(hook_timeout.as_secs().max(1)))
+            }
+            Err(crate::tools::command::CommandError::Cancelled { .. }) => Err(HookError::Cancelled),
+            Err(error) => Err(HookError::CommandFailed(error.to_string())),
         }
     }
 
     /// Execute a model hook by sending a prompt to a specified model/provider
     async fn run_model_hook(
         &self,
+        run: &crate::tools::ToolRunContext,
         prompt: &str,
         model: &str,
         provider: Option<&str>,
-        timeout_secs: u64,
+        hook_timeout: Duration,
+        cancellation: crate::runtime::CancellationHandle,
     ) -> Result<(HookOutput, i32), HookError> {
-        debug!(
-            model = %model,
-            provider = ?provider,
-            "Running model hook"
-        );
+        debug!("Running admitted model hook");
 
         let callback = self.model_hook_callback.as_ref().ok_or_else(|| {
             HookError::CommandFailed(
@@ -1195,16 +1899,26 @@ impl HookEngine {
             provider.map(String::from),
         );
 
-        match timeout(Duration::from_secs(timeout_secs), future).await {
-            Ok(Ok(response)) => Ok((
-                HookOutput {
-                    system_message: Some(response),
-                    ..Default::default()
-                },
-                0,
-            )),
-            Ok(Err(e)) => Err(HookError::CommandFailed(format!("Model hook error: {e}"))),
-            Err(_) => Err(HookError::Timeout(timeout_secs)),
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(HookError::Cancelled),
+            result = timeout(hook_timeout, future) => match result {
+                Ok(Ok(response)) if response.len() <= MAX_MODEL_HOOK_OUTPUT_BYTES => Ok((
+                    HookOutput {
+                        additional_context: Some(response),
+                        ..Default::default()
+                    },
+                    0,
+                )),
+                Ok(Ok(_)) => Err(HookError::OutputLimitExceeded {
+                    max_bytes: MAX_MODEL_HOOK_OUTPUT_BYTES,
+                }),
+                Ok(Err(error)) => Err(HookError::CommandFailed(format!(
+                    "Model hook failed: {}",
+                    run.sanitize_diagnostic(&error)
+                ))),
+                Err(_) => Err(HookError::Timeout(hook_timeout.as_secs().max(1))),
+            }
         }
     }
 }
@@ -1217,6 +1931,48 @@ mod tests {
     use std::io;
     use std::pin::Pin;
     use std::task::{Context, Poll};
+
+    fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
+        static RUN: std::sync::OnceLock<std::sync::Arc<crate::tools::ToolRunContext>> =
+            std::sync::OnceLock::new();
+        RUN.get_or_init(|| {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target/test-workspaces")
+                .join(format!("hook-unit-{}", std::process::id()));
+            std::fs::create_dir_all(&root).expect("isolated hook fixture root");
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), &root)
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(std::collections::HashMap::new())
+                .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+                .process(true)
+                .network(false)
+                .secrets(false)
+                .provider("hook-unit-test")
+                .build()
+                .expect("hook unit-test run")
+        })
+    }
+
+    fn test_run_with_environment(
+        grants: std::collections::HashMap<String, String>,
+    ) -> std::sync::Arc<crate::tools::ToolRunContext> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-workspaces")
+            .join(format!("hook-env-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("isolated hook environment root");
+        crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), &root)
+            .read_only_roots(Vec::new())
+            .read_write_roots(Vec::new())
+            .environment_grants(grants)
+            .workspace_access(crate::tools::WorkspaceAccess::ReadWrite)
+            .process(true)
+            .network(false)
+            .secrets(false)
+            .provider("hook-environment-test")
+            .build()
+            .expect("explicit hook test run")
+    }
 
     struct FailingAsyncWrite;
 
@@ -1253,7 +2009,7 @@ mod tests {
 
     #[test]
     fn test_hook_input_builder() {
-        let input = HookInput::new(HookEvent::PreToolUse)
+        let input = HookInput::for_run(test_run(), HookEvent::PreToolUse)
             .with_session_id("test-session")
             .with_tool("Write", serde_json::json!({"path": "/tmp/test"}));
 
@@ -1264,7 +2020,7 @@ mod tests {
 
     #[test]
     fn notification_input_sets_expected_extra_fields() {
-        let input = notification_input("status", serde_json::json!({"ok": true}));
+        let input = notification_input(test_run(), "status", serde_json::json!({"ok": true}));
 
         assert_eq!(input.event, HookEvent::Notification);
         assert_eq!(
@@ -1278,7 +2034,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hook_result_system_messages() {
+    fn test_hook_output_system_message_becomes_typed_reference() {
         let result = HookResult {
             allowed: true,
             outputs: vec![
@@ -1294,20 +2050,164 @@ mod tests {
             errors: vec![],
         };
 
-        let messages = result.system_messages();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0], "Message 1");
-        assert_eq!(messages[1], "Message 2");
+        let items = crate::context::hook_result_reference_items(&result, "fixture", 10);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|item| {
+            item.source()
+                == crate::context::ContextSource::Reference(crate::context::ReferenceSource::Hook)
+                && item.authority() == crate::context::ContextAuthority::Reference
+        }));
+        assert_eq!(items[0].content(), "Message 1");
+        assert_eq!(items[1].content(), "Message 2");
     }
 
     #[tokio::test]
     async fn test_empty_hooks_config() {
         let engine = HookEngine::new(HooksConfig::default());
-        let input = HookInput::new(HookEvent::SessionStart);
+        let input = HookInput::for_run(test_run(), HookEvent::SessionStart);
         let result = engine.run(HookEvent::SessionStart, &input).await;
 
         assert!(result.allowed);
         assert!(result.outputs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn canonical_lifecycle_sequence_is_shared_and_retired_at_session_end() {
+        let run = test_run_with_environment(std::collections::HashMap::new());
+        let engine = HookEngine::new(HooksConfig::default());
+        let scoped = engine.clone().with_scoped_hooks(HooksConfig::default());
+
+        let start = engine
+            .run_lifecycle(
+                HookEvent::SessionStart,
+                &HookInput::for_run(&run, HookEvent::SessionStart),
+            )
+            .await;
+        let prompt = scoped
+            .run_lifecycle(
+                HookEvent::UserPromptSubmit,
+                &HookInput::for_run(&run, HookEvent::UserPromptSubmit).with_prompt("continue"),
+            )
+            .await;
+        let end = engine
+            .run_lifecycle(
+                HookEvent::SessionEnd,
+                &HookInput::for_run(&run, HookEvent::SessionEnd),
+            )
+            .await;
+
+        assert_eq!((start.sequence, prompt.sequence, end.sequence), (0, 1, 2));
+        assert_eq!(start.status, HookBatchStatus::Complete);
+        assert_eq!(prompt.decision, HookDecision::Allow);
+        assert!(lock_lifecycle_sequences(&engine.lifecycle_sequences).is_empty());
+    }
+
+    #[test]
+    fn scoped_hook_policy_cannot_disable_existing_host_hook_commands() {
+        let host = HooksConfig {
+            pre_tool_use: vec![HookEntry {
+                matcher: Some("host".to_string()),
+                hooks: vec![Hook::Command {
+                    command: "echo host".to_string(),
+                    shell: false,
+                    timeout: 5,
+                }],
+            }],
+            ..HooksConfig::default()
+        };
+        let lower = HooksConfig {
+            policy: Some(HookPolicy {
+                allowed_commands: Some(std::collections::HashSet::from(["true".to_string()])),
+                sandbox: SandboxMode::FullSandbox,
+            }),
+            pre_tool_use: vec![HookEntry {
+                matcher: Some("skill".to_string()),
+                hooks: vec![Hook::Command {
+                    command: "true".to_string(),
+                    shell: false,
+                    timeout: 5,
+                }],
+            }],
+            ..HooksConfig::default()
+        };
+
+        let scoped = HookEngine::new(host).with_scoped_hooks(lower);
+        let allowed = scoped
+            .config
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.allowed_commands.as_ref())
+            .expect("scoped command allowlist");
+        assert!(allowed.contains("true"));
+        assert!(allowed.contains("echo"));
+        assert_eq!(scoped.config.pre_tool_use.len(), 2);
+    }
+
+    #[test]
+    fn unavailable_allowlist_entry_does_not_mask_a_later_canonical_match() {
+        let executable = if cfg!(windows) { "cmd" } else { "sh" };
+        let resolved =
+            HookEngine::resolve_hook_executable(test_run(), executable).expect("test shell");
+        let policy = HookPolicy {
+            allowed_commands: Some(std::collections::HashSet::from([
+                "__openclaudia_missing_allowlist_entry__".to_string(),
+                executable.to_string(),
+            ])),
+            sandbox: SandboxMode::FullSandbox,
+        };
+
+        HookEngine::authorize_hook_executable(test_run(), executable, &resolved, Some(&policy))
+            .expect("a missing unrelated entry must not mask the canonical match");
+    }
+
+    #[tokio::test]
+    async fn model_hook_requires_secrets_before_invoking_provider_callback() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let run =
+            crate::tools::ToolRunContext::builder(crate::state::SessionId::new(), root.path())
+                .read_only_roots(Vec::new())
+                .read_write_roots(Vec::new())
+                .environment_grants(std::collections::HashMap::new())
+                .workspace_access(crate::tools::WorkspaceAccess::ReadOnly)
+                .process(false)
+                .network(true)
+                .secrets(false)
+                .provider("model-hook-secret-denial-test")
+                .build()
+                .expect("network-only hook test run");
+        let callback_invoked = std::sync::Arc::new(AtomicBool::new(false));
+        let callback_probe = std::sync::Arc::clone(&callback_invoked);
+        let engine = HookEngine::new(HooksConfig {
+            session_start: vec![HookEntry {
+                matcher: None,
+                hooks: vec![Hook::Model {
+                    prompt: "review this".to_string(),
+                    model: "test-model".to_string(),
+                    provider: Some("test-provider".to_string()),
+                    timeout: 1,
+                }],
+            }],
+            ..HooksConfig::default()
+        })
+        .with_model_callback(Box::new(move |_, _, _| {
+            callback_probe.store(true, Ordering::SeqCst);
+            Box::pin(async { Ok("unexpected provider response".to_string()) })
+        }));
+        let input = HookInput::for_run(&run, HookEvent::SessionStart);
+
+        let result = engine.run(HookEvent::SessionStart, &input).await;
+
+        assert!(result.errors.iter().any(|error| matches!(
+            error,
+            HookError::Capability(crate::tools::ToolCapabilityError::Unavailable {
+                resource: crate::tools::ToolResource::Secrets,
+                ..
+            })
+        )));
+        assert!(
+            !callback_invoked.load(Ordering::SeqCst),
+            "provider callback must not run before every required capability is authorized"
+        );
     }
 
     #[tokio::test]
@@ -1324,6 +2224,39 @@ mod tests {
             }
             other => panic!("expected CommandFailed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn command_hook_deadline_covers_blocked_stdin_delivery() {
+        let engine = HookEngine::new(HooksConfig {
+            post_tool_use: vec![HookEntry {
+                matcher: None,
+                hooks: vec![Hook::Command {
+                    command: "sleep 60".to_string(),
+                    shell: false,
+                    timeout: 1,
+                }],
+            }],
+            ..HooksConfig::default()
+        });
+        let input = HookInput::for_run(test_run(), HookEvent::PostToolUse)
+            .with_extra("padding", serde_json::Value::String("x".repeat(512 * 1024)));
+        let started = std::time::Instant::now();
+
+        let result = engine.run(HookEvent::PostToolUse, &input).await;
+
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| matches!(error, HookError::Timeout(1))),
+            "{result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "one-second hook deadline did not return promptly"
+        );
     }
 
     // ========================================================================
@@ -1520,8 +2453,8 @@ mod tests {
 
     #[test]
     fn test_hook_input_with_prompt() {
-        let input =
-            HookInput::new(HookEvent::UserPromptSubmit).with_prompt("How do I fix this bug?");
+        let input = HookInput::for_run(test_run(), HookEvent::UserPromptSubmit)
+            .with_prompt("How do I fix this bug?");
 
         assert_eq!(input.event, HookEvent::UserPromptSubmit);
         assert_eq!(input.prompt, Some("How do I fix this bug?".to_string()));
@@ -1529,7 +2462,7 @@ mod tests {
 
     #[test]
     fn test_hook_input_with_extra() {
-        let input = HookInput::new(HookEvent::PreCompact)
+        let input = HookInput::for_run(test_run(), HookEvent::PreCompact)
             .with_extra("current_tokens", serde_json::json!(50_000))
             .with_extra("max_tokens", serde_json::json!(100_000));
 
@@ -1544,16 +2477,18 @@ mod tests {
     }
 
     #[test]
-    fn test_hook_input_cwd_populated() {
-        let input = HookInput::new(HookEvent::SessionStart);
-
-        // CWD should be populated from env
-        assert!(!input.cwd.is_empty());
+    fn test_hook_input_cwd_comes_from_explicit_run() {
+        let bound = HookInput::for_run(test_run(), HookEvent::SessionStart);
+        assert_eq!(
+            bound.cwd,
+            test_run().working_directory().to_string_lossy(),
+            "bound hook input must expose only its exact run working directory"
+        );
     }
 
     #[test]
     fn test_hook_input_serialization() {
-        let input = HookInput::new(HookEvent::PreToolUse)
+        let input = HookInput::for_run(test_run(), HookEvent::PreToolUse)
             .with_session_id("session-123")
             .with_tool("bash", serde_json::json!({"command": "ls"}));
 
@@ -1582,7 +2517,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hook_result_modified_prompt() {
+    fn test_hook_prompt_suggestion_becomes_typed_reference() {
         let result = HookResult {
             allowed: true,
             outputs: vec![HookOutput {
@@ -1592,17 +2527,23 @@ mod tests {
             errors: vec![],
         };
 
-        assert_eq!(result.modified_prompt(), Some("Modified user prompt"));
+        let items = crate::context::hook_result_reference_items(&result, "fixture", 10);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].content(), "Modified user prompt");
+        assert_eq!(
+            items[0].authority(),
+            crate::context::ContextAuthority::Reference
+        );
     }
 
     #[test]
-    fn test_hook_result_no_modified_prompt() {
+    fn test_hook_result_without_context_has_no_reference_items() {
         let result = HookResult::allowed();
-        assert_eq!(result.modified_prompt(), None);
+        assert!(crate::context::hook_result_reference_items(&result, "fixture", 10).is_empty());
     }
 
     #[test]
-    fn test_hook_result_multiple_system_messages() {
+    fn test_hook_result_multiple_legacy_system_fields_keep_order_as_references() {
         let result = HookResult {
             allowed: true,
             outputs: vec![
@@ -1619,10 +2560,10 @@ mod tests {
             errors: vec![],
         };
 
-        let messages = result.system_messages();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0], "Security warning");
-        assert_eq!(messages[1], "Style guide reminder");
+        let items = crate::context::hook_result_reference_items(&result, "fixture", 10);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].content(), "Security warning");
+        assert_eq!(items[1].content(), "Style guide reminder");
     }
 
     // ========================================================================
@@ -1888,7 +2829,7 @@ mod tests {
         });
 
         let engine = HookEngine::new(config);
-        let input = HookInput::new(HookEvent::PreToolUse)
+        let input = HookInput::for_run(test_run(), HookEvent::PreToolUse)
             .with_tool("Write", serde_json::json!({"path": "/tmp/test"}));
 
         let result = engine.run(HookEvent::PreToolUse, &input).await;
@@ -1896,9 +2837,10 @@ mod tests {
         assert!(result.allowed);
         assert_eq!(result.outputs.len(), 1);
         assert_eq!(
-            result.outputs[0].system_message,
+            result.outputs[0].additional_context,
             Some("Remember to backup".to_string())
         );
+        assert!(result.outputs[0].system_message.is_none());
     }
 
     #[tokio::test]
@@ -1913,7 +2855,7 @@ mod tests {
         });
 
         let engine = HookEngine::new(config);
-        let input = HookInput::new(HookEvent::PreToolUse)
+        let input = HookInput::for_run(test_run(), HookEvent::PreToolUse)
             .with_tool("Read", serde_json::json!({"path": "/tmp/test"})); // Different tool
 
         let result = engine.run(HookEvent::PreToolUse, &input).await;
@@ -1940,7 +2882,8 @@ mod tests {
         });
 
         let engine = HookEngine::new(config);
-        let input = HookInput::new(HookEvent::PreToolUse).with_tool("bash", serde_json::json!({}));
+        let input = HookInput::for_run(test_run(), HookEvent::PreToolUse)
+            .with_tool("bash", serde_json::json!({}));
 
         let result = engine.run(HookEvent::PreToolUse, &input).await;
 
@@ -1965,7 +2908,7 @@ mod tests {
             ..Default::default()
         };
         let engine = HookEngine::new(config);
-        let input = HookInput::new(HookEvent::PostToolUseFailure)
+        let input = HookInput::for_run(test_run(), HookEvent::PostToolUseFailure)
             .with_tool("bash", serde_json::json!({}))
             .with_extra("tool_output", serde_json::json!("boom"));
 
@@ -2002,8 +2945,8 @@ mod tests {
             ..Default::default()
         };
         let engine = HookEngine::new(config);
-        let input =
-            HookInput::new(HookEvent::PostToolUseFailure).with_tool("bash", serde_json::json!({}));
+        let input = HookInput::for_run(test_run(), HookEvent::PostToolUseFailure)
+            .with_tool("bash", serde_json::json!({}));
 
         let result = engine.run(HookEvent::PostToolUseFailure, &input).await;
         assert_eq!(
@@ -2037,6 +2980,42 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_sandbox_hook_publishes_success_and_discards_failure() {
+        let root = tempfile::tempdir_in(".").expect("hook workspace root");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        let policy = Some(HookPolicy {
+            allowed_commands: None,
+            sandbox: SandboxMode::FullSandbox,
+        });
+
+        let engine = HookEngine::new(make_command_config(
+            "printf committed > hook-success",
+            true,
+            policy.clone(),
+        ));
+        let input = HookInput::for_run(&run, HookEvent::PostToolUse)
+            .with_tool("bash", serde_json::json!({}));
+        let result = engine.run(HookEvent::PostToolUse, &input).await;
+        assert!(result.errors.is_empty(), "hook failed: {:?}", result.errors);
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("hook-success"))
+                .expect("published hook output"),
+            "committed"
+        );
+
+        let engine = HookEngine::new(make_command_config(
+            "printf uncommitted > hook-failure; exit 7",
+            true,
+            policy,
+        ));
+        let input = HookInput::for_run(&run, HookEvent::PostToolUse)
+            .with_tool("bash", serde_json::json!({}));
+        let result = engine.run(HookEvent::PostToolUse, &input).await;
+        assert_eq!(result.errors.len(), 1);
+        assert!(!root.path().join("hook-failure").exists());
+    }
+
     /// Allowlist with a single entry permits a matching binary.
     #[tokio::test]
     async fn allowlist_permits_listed_binary() {
@@ -2046,7 +3025,8 @@ mod tests {
             sandbox: SandboxMode::FullSandbox,
         };
         let engine = HookEngine::new(make_command_config("true", false, Some(policy)));
-        let input = HookInput::new(HookEvent::PostToolUse).with_tool("bash", serde_json::json!({}));
+        let input = HookInput::for_run(test_run(), HookEvent::PostToolUse)
+            .with_tool("bash", serde_json::json!({}));
         let result = engine.run(HookEvent::PostToolUse, &input).await;
         // `true` succeeds with exit code 0 → hook allowed.
         assert!(result.allowed, "allowlisted binary must be permitted");
@@ -2064,7 +3044,8 @@ mod tests {
         };
         // Attempt to run `true` which is NOT in the allowlist.
         let engine = HookEngine::new(make_command_config("true", false, Some(policy)));
-        let input = HookInput::new(HookEvent::PostToolUse).with_tool("bash", serde_json::json!({}));
+        let input = HookInput::for_run(test_run(), HookEvent::PostToolUse)
+            .with_tool("bash", serde_json::json!({}));
         let result = engine.run(HookEvent::PostToolUse, &input).await;
         assert_eq!(
             result.errors.len(),
@@ -2099,7 +3080,8 @@ mod tests {
             false,
             Some(policy),
         ));
-        let input = HookInput::new(HookEvent::PostToolUse).with_tool("bash", serde_json::json!({}));
+        let input = HookInput::for_run(test_run(), HookEvent::PostToolUse)
+            .with_tool("bash", serde_json::json!({}));
         let result = engine.run(HookEvent::PostToolUse, &input).await;
         // Should succeed: echo exits 0, allowlist check passes.
         assert!(
@@ -2120,7 +3102,8 @@ mod tests {
             true, // explicit shell: true
             None, // no policy
         ));
-        let input = HookInput::new(HookEvent::PostToolUse).with_tool("bash", serde_json::json!({}));
+        let input = HookInput::for_run(test_run(), HookEvent::PostToolUse)
+            .with_tool("bash", serde_json::json!({}));
         let result = engine.run(HookEvent::PostToolUse, &input).await;
         assert!(result.errors.is_empty(), "shell pipeline must succeed");
         assert!(result.allowed);
@@ -2128,66 +3111,71 @@ mod tests {
 
     #[test]
     fn shell_mode_resolves_platform_shell_binary() {
-        let (shell_path, shell_arg) = HookEngine::resolved_hook_shell().expect("platform shell");
+        let (shell_path, shell_arg) =
+            HookEngine::resolved_hook_shell(test_run()).expect("platform shell");
         assert!(
             shell_path.is_absolute(),
             "hook shell must resolve to an absolute path, got {}",
             shell_path.display()
         );
         assert_eq!(shell_arg, if cfg!(windows) { "/C" } else { "-c" });
+        let command = HookEngine::build_shell_command(test_run(), "true", None)
+            .expect("resolved shell command");
+        assert_eq!(Path::new(command.get_program()), shell_path);
+    }
 
-        let source = include_str!("mod.rs");
-        let cfg_test = source
-            .find("#[cfg(test)]")
-            .expect("test marker must be present");
-        let production = &source[..cfg_test];
-        assert!(
-            !production.contains("Command::new(shell)"),
-            "hook shell mode must not spawn an unresolved shell binary"
-        );
-        assert!(
-            production.contains("which::which(shell)"),
-            "hook shell mode must resolve the platform shell through which"
+    /// Environment replacement must remove both ambient inheritance and
+    /// values explicitly attached before the run grants are applied.
+    #[test]
+    fn hook_environment_replacement_clears_prior_values() {
+        let mut command = Command::new("unused-hook-binary");
+        command.env("ANTHROPIC_API_KEY", "must-not-survive");
+
+        HookEngine::apply_hook_env(&mut command, test_run(), test_run().project_root());
+
+        let configured = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        assert!(!configured.contains_key("ANTHROPIC_API_KEY"));
+        assert_eq!(
+            configured.get("CLAUDE_PROJECT_DIR"),
+            Some(&Some(
+                test_run().project_root().to_string_lossy().into_owned()
+            ))
         );
     }
 
-    /// Env scrub: sensitive vars must not be present in the child's environment.
-    /// We run `printenv ANTHROPIC_API_KEY` and expect an empty/missing output.
     #[tokio::test]
-    async fn env_scrub_removes_sensitive_vars() {
-        // Set a fake key in the current process env so there's something to scrub.
-        // Safety: single-threaded test context; no other thread reads this var.
-        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "sk-fake-key-for-test") };
-
-        let policy = HookPolicy {
-            allowed_commands: Some(std::collections::HashSet::from([
-                "printenv".to_string(),
-                "sh".to_string(),
-            ])),
-            sandbox: SandboxMode::FullSandbox,
-        };
+    async fn hook_process_receives_only_exact_run_environment_grants() {
+        let run = test_run_with_environment(std::collections::HashMap::from([(
+            "S019_HOOK_ENV".to_string(),
+            "exact".to_string(),
+        )]));
         let engine = HookEngine::new(make_command_config(
-            "printenv ANTHROPIC_API_KEY",
-            false,
-            Some(policy),
+            "[ \"$S019_HOOK_ENV\" = exact ] && [ -z \"${S019_UNGRANTED_ENV+x}\" ]",
+            true,
+            Some(HookPolicy {
+                allowed_commands: None,
+                sandbox: SandboxMode::FullSandbox,
+            }),
         ));
-        let input = HookInput::new(HookEvent::PostToolUse).with_tool("bash", serde_json::json!({}));
+        let input = HookInput::for_run(&run, HookEvent::PostToolUse)
+            .with_tool("bash", serde_json::json!({}));
+
         let result = engine.run(HookEvent::PostToolUse, &input).await;
 
-        // printenv exits 1 when the variable is unset — that's expected.
-        // Crucially, there should be no output containing the fake key.
-        // We inspect hook outputs (stdout) for the key string.
-        for out in &result.outputs {
-            if let Some(ctx) = &out.additional_context {
-                assert!(
-                    !ctx.contains("sk-fake-key-for-test"),
-                    "sensitive var must not appear in hook stdout"
-                );
-            }
-        }
-
-        // Restore env to not leak into other tests.
-        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
+        assert!(result.allowed);
+        assert!(
+            result.errors.is_empty(),
+            "exact environment hook failed: {:?}",
+            result.errors
+        );
     }
 
     /// Backwards-compatible mode (no policy): hook runs without error even
@@ -2196,7 +3184,8 @@ mod tests {
     async fn no_policy_allow_all_backwards_compat() {
         // No policy → allow-all mode.
         let engine = HookEngine::new(make_command_config("true", false, None));
-        let input = HookInput::new(HookEvent::PostToolUse).with_tool("bash", serde_json::json!({}));
+        let input = HookInput::for_run(test_run(), HookEvent::PostToolUse)
+            .with_tool("bash", serde_json::json!({}));
         let result = engine.run(HookEvent::PostToolUse, &input).await;
         assert!(
             result.errors.is_empty(),
@@ -2292,7 +3281,7 @@ mod tests {
             ..Default::default()
         };
         let engine = HookEngine::new(config);
-        let input = HookInput::new(HookEvent::PreToolUse)
+        let input = HookInput::for_run(test_run(), HookEvent::PreToolUse)
             .with_tool("bash", serde_json::json!({"command": "cargo test"}));
 
         let result = engine.run(HookEvent::PreToolUse, &input).await;
@@ -2325,7 +3314,8 @@ mod tests {
             ..Default::default()
         };
         let engine = HookEngine::new(config);
-        let input = HookInput::new(HookEvent::PostToolUse).with_tool("bash", serde_json::json!({}));
+        let input = HookInput::for_run(test_run(), HookEvent::PostToolUse)
+            .with_tool("bash", serde_json::json!({}));
 
         let result = engine.run(HookEvent::PostToolUse, &input).await;
 
@@ -2363,6 +3353,10 @@ mod tests {
             HookEngine::matches_entry(&entry, "Write", HookEvent::PermissionRequest),
             "PermissionRequest with malformed matcher MUST fail-closed"
         );
+        assert!(
+            HookEngine::matches_entry(&entry, "Write", HookEvent::UserPromptSubmit),
+            "UserPromptSubmit with malformed matcher MUST fail-closed"
+        );
     }
 
     /// Crosslink #758: observe-intent events (e.g. `PostToolUse`) with a
@@ -2386,10 +3380,6 @@ mod tests {
         assert!(
             !HookEngine::matches_entry(&entry, "Write", HookEvent::Notification),
             "Notification with malformed matcher MUST fail-open"
-        );
-        assert!(
-            !HookEngine::matches_entry(&entry, "Write", HookEvent::UserPromptSubmit),
-            "UserPromptSubmit with malformed matcher MUST fail-open"
         );
     }
 
@@ -2515,6 +3505,7 @@ mod tests {
         let guard = subscriber::set_default(subscriber);
         engine
             .fire_post_tool(
+                test_run(),
                 true,
                 "bash",
                 serde_json::json!({"command": "ls"}),
@@ -2581,6 +3572,7 @@ mod tests {
         let guard = subscriber::set_default(subscriber);
         engine
             .fire_post_tool(
+                test_run(),
                 true,
                 "bash",
                 serde_json::json!({"command": "true"}),
@@ -2619,10 +3611,24 @@ mod tests {
         let engine = HookEngine::new(config);
 
         engine
-            .fire_post_tool(true, "bash", serde_json::json!({}), "ok", Some("s1"))
+            .fire_post_tool(
+                test_run(),
+                true,
+                "bash",
+                serde_json::json!({}),
+                "ok",
+                Some("s1"),
+            )
             .await;
         engine
-            .fire_post_tool(false, "bash", serde_json::json!({}), "fail", Some("s1"))
+            .fire_post_tool(
+                test_run(),
+                false,
+                "bash",
+                serde_json::json!({}),
+                "fail",
+                Some("s1"),
+            )
             .await;
         // Success assertion: neither call panicked or returned an error
         // that bubbled up — the fire_post_tool helper swallows hook
@@ -2678,19 +3684,19 @@ mod tests {
     fn typed_accessors_return_correct_slot() {
         // match_tool / match_prompt / match_event each look at exactly one
         // slot of HookInput and do not cross-pollinate.
-        let with_tool = HookInput::new(HookEvent::PreToolUse)
+        let with_tool = HookInput::for_run(test_run(), HookEvent::PreToolUse)
             .with_tool("rm", serde_json::json!({"path": "/etc"}));
         assert_eq!(with_tool.match_tool(), Some("rm"));
         assert_eq!(with_tool.match_prompt(), None);
         assert_eq!(with_tool.match_event(), Some("pre_tool_use"));
 
-        let with_prompt =
-            HookInput::new(HookEvent::UserPromptSubmit).with_prompt("I want to rm a file");
+        let with_prompt = HookInput::for_run(test_run(), HookEvent::UserPromptSubmit)
+            .with_prompt("I want to rm a file");
         assert_eq!(with_prompt.match_tool(), None);
         assert_eq!(with_prompt.match_prompt(), Some("I want to rm a file"));
         assert_eq!(with_prompt.match_event(), Some("user_prompt_submit"));
 
-        let bare = HookInput::new(HookEvent::SessionStart);
+        let bare = HookInput::for_run(test_run(), HookEvent::SessionStart);
         assert_eq!(bare.match_tool(), None);
         assert_eq!(bare.match_prompt(), None);
         assert_eq!(bare.match_event(), Some("session_start"));
@@ -2718,7 +3724,7 @@ mod tests {
 
         // A PreToolUse event for a *different* tool, with a prompt that
         // happens to contain the regex pattern.
-        let input = HookInput::new(HookEvent::PreToolUse)
+        let input = HookInput::for_run(test_run(), HookEvent::PreToolUse)
             .with_tool("Write", serde_json::json!({"path": "/tmp/x"}))
             .with_prompt("I want to rm a file");
 
@@ -2748,13 +3754,14 @@ mod tests {
         let engine = HookEngine::new(config);
 
         // Case A: prompt contains "rm" ⇒ blocks.
-        let hit = HookInput::new(HookEvent::UserPromptSubmit).with_prompt("please rm -rf /tmp/foo");
+        let hit = HookInput::for_run(test_run(), HookEvent::UserPromptSubmit)
+            .with_prompt("please rm -rf /tmp/foo");
         let result_a = engine.run(HookEvent::UserPromptSubmit, &hit).await;
         assert!(!result_a.allowed, "matcher must hit the prompt slot");
 
         // Case B: prompt is benign, but tool_name happens to be "rm"
         // (would have falsely matched under the old heuristic).
-        let miss = HookInput::new(HookEvent::UserPromptSubmit)
+        let miss = HookInput::for_run(test_run(), HookEvent::UserPromptSubmit)
             .with_tool("rm", serde_json::json!({}))
             .with_prompt("hello world");
         let result_b = engine.run(HookEvent::UserPromptSubmit, &miss).await;
@@ -2791,7 +3798,7 @@ mod tests {
             ..Default::default()
         };
         let engine = HookEngine::new(config);
-        let input = HookInput::new(HookEvent::SessionStart);
+        let input = HookInput::for_run(test_run(), HookEvent::SessionStart);
 
         // Hooks run in parallel and one of them blocks ⇒ allowed = false.
         // We can't distinguish *which* matched from HookResult alone, but we

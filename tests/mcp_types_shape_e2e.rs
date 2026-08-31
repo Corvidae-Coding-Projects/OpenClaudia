@@ -16,6 +16,7 @@ use openclaudia::mcp::{
     McpCapabilities, McpResource, McpServerInfo, McpTool, McpTransportKind, ToolsCapability,
 };
 use serde_json::json;
+use std::collections::BTreeMap;
 
 // ───────────────────────────────────────────────────────────────────────────
 // Section A — McpTool serde shape
@@ -25,8 +26,13 @@ use serde_json::json;
 fn mcp_tool_required_name_field_round_trips() {
     let tool = McpTool {
         name: "bash".to_string(),
+        title: None,
         description: None,
         input_schema: None,
+        output_schema: None,
+        annotations: None,
+        icons: Vec::new(),
+        meta: BTreeMap::new(),
     };
     let json_str = serde_json::to_string(&tool).expect("ser");
     let back: McpTool = serde_json::from_str(&json_str).expect("de");
@@ -39,12 +45,17 @@ fn mcp_tool_required_name_field_round_trips() {
 fn mcp_tool_with_description_and_input_schema_round_trips() {
     let tool = McpTool {
         name: "read".to_string(),
+        title: Some("Read".to_string()),
         description: Some("Read a file".to_string()),
         input_schema: Some(json!({
             "type": "object",
             "properties": {"path": {"type": "string"}},
             "required": ["path"]
         })),
+        output_schema: Some(json!({"type": "object"})),
+        annotations: Some(json!({"readOnlyHint": true})),
+        icons: Vec::new(),
+        meta: BTreeMap::new(),
     };
     let json_str = serde_json::to_string(&tool).expect("ser");
     let back: McpTool = serde_json::from_str(&json_str).expect("de");
@@ -57,8 +68,13 @@ fn mcp_tool_with_description_and_input_schema_round_trips() {
 fn mcp_tool_input_schema_wire_field_is_camel_case() {
     let tool = McpTool {
         name: "x".to_string(),
+        title: None,
         description: None,
         input_schema: Some(json!({"type": "object"})),
+        output_schema: None,
+        annotations: None,
+        icons: Vec::new(),
+        meta: BTreeMap::new(),
     };
     let json_str = serde_json::to_string(&tool).expect("ser");
     // PINS WIRE: input_schema ↔ inputSchema rename.
@@ -93,13 +109,20 @@ fn mcp_tool_deserializes_with_only_name() {
 fn mcp_tool_clone_preserves_all_fields() {
     let original = McpTool {
         name: "x".to_string(),
+        title: Some("X".to_string()),
         description: Some("d".to_string()),
         input_schema: Some(json!({"k": "v"})),
+        output_schema: Some(json!({"type": "boolean"})),
+        annotations: Some(json!({"readOnlyHint": true})),
+        icons: Vec::new(),
+        meta: BTreeMap::from([("vendor.example/tag".to_string(), json!("typed"))]),
     };
     let cloned = original.clone();
     assert_eq!(cloned.name, original.name);
     assert_eq!(cloned.description, original.description);
     assert_eq!(cloned.input_schema, original.input_schema);
+    assert_eq!(cloned.output_schema, original.output_schema);
+    assert_eq!(cloned.meta, original.meta);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -111,8 +134,13 @@ fn mcp_resource_required_fields_round_trip() {
     let r = McpResource {
         uri: "file:///x".to_string(),
         name: "file-x".to_string(),
+        title: None,
         description: None,
         mime_type: None,
+        size: None,
+        annotations: None,
+        icons: Vec::new(),
+        meta: BTreeMap::new(),
     };
     let json_str = serde_json::to_string(&r).expect("ser");
     let back: McpResource = serde_json::from_str(&json_str).expect("de");
@@ -125,13 +153,20 @@ fn mcp_resource_full_shape_round_trips() {
     let r = McpResource {
         uri: "file:///doc.txt".to_string(),
         name: "Documentation".to_string(),
+        title: Some("Project documentation".to_string()),
         description: Some("Project documentation".to_string()),
         mime_type: Some("text/plain".to_string()),
+        size: Some(128),
+        annotations: None,
+        icons: Vec::new(),
+        meta: BTreeMap::new(),
     };
     let json_str = serde_json::to_string(&r).expect("ser");
     let back: McpResource = serde_json::from_str(&json_str).expect("de");
     assert_eq!(back.description, r.description);
     assert_eq!(back.mime_type, r.mime_type);
+    assert_eq!(back.title, r.title);
+    assert_eq!(back.size, r.size);
 }
 
 #[test]
@@ -139,8 +174,13 @@ fn mcp_resource_mime_type_wire_field_is_camel_case() {
     let r = McpResource {
         uri: "x".to_string(),
         name: "n".to_string(),
+        title: None,
         description: None,
         mime_type: Some("text/plain".to_string()),
+        size: None,
+        annotations: None,
+        icons: Vec::new(),
+        meta: BTreeMap::new(),
     };
     let json_str = serde_json::to_string(&r).expect("ser");
     // PINS WIRE: mime_type ↔ mimeType rename.
@@ -198,6 +238,24 @@ fn mcp_capabilities_with_resources_and_prompts_preserves_arbitrary_value() {
     let caps: McpCapabilities = serde_json::from_str(json).expect("de");
     assert!(caps.resources.is_some());
     assert!(caps.prompts.is_some());
+}
+
+#[test]
+fn mcp_capabilities_preserve_unknown_vendor_capability_keys() {
+    let capabilities: McpCapabilities = serde_json::from_value(json!({
+        "tools": {},
+        "com.example/vendor-capability": {"mode": "typed"}
+    }))
+    .expect("open current capability set");
+    assert_eq!(
+        capabilities.additional["com.example/vendor-capability"],
+        json!({"mode": "typed"})
+    );
+    let wire = serde_json::to_value(capabilities).expect("capability round trip");
+    assert_eq!(
+        wire["com.example/vendor-capability"],
+        json!({"mode": "typed"})
+    );
 }
 
 #[test]
@@ -263,10 +321,16 @@ fn mcp_server_info_clone_preserves_fields() {
     let original = McpServerInfo {
         name: "srv".to_string(),
         version: Some("1.0".to_string()),
+        title: Some("Server".to_string()),
+        description: Some("Current MCP server".to_string()),
+        website_url: Some("https://example.invalid".to_string()),
+        icons: Vec::new(),
     };
     let cloned = original.clone();
     assert_eq!(cloned.name, original.name);
     assert_eq!(cloned.version, original.version);
+    assert_eq!(cloned.title, original.title);
+    assert_eq!(cloned.website_url, original.website_url);
 }
 
 // ───────────────────────────────────────────────────────────────────────────

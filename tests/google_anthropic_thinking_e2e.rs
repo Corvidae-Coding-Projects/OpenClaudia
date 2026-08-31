@@ -60,7 +60,7 @@ const fn enabled_budget(budget: u32) -> ThinkingConfig {
 #[test]
 fn google_thinking_enabled_writes_thinking_config_with_budget() {
     let adapter = get_adapter("google").expect("google adapter");
-    let req = minimal_request("gemini-2.5-pro");
+    let req = minimal_request("gemini-3.7-flash");
     let thinking = enabled_budget(8192);
     let body = adapter
         .transform_request_with_thinking(&req, &thinking)
@@ -78,7 +78,7 @@ fn google_thinking_enabled_writes_thinking_config_with_budget() {
 #[test]
 fn google_thinking_disabled_does_not_write_thinking_config() {
     let adapter = get_adapter("google").expect("google adapter");
-    let req = minimal_request("gemini-2.5-pro");
+    let req = minimal_request("gemini-3.7-flash");
     let thinking = ThinkingConfig {
         enabled: false,
         ..ThinkingConfig::default()
@@ -99,7 +99,7 @@ fn google_thinking_budget_clamps_at_32768_ceiling() {
     // PINS GOOGLE CAP: Gemini caps at 32768; an over-budget
     // request MUST be clamped (not error, not pass-through).
     let adapter = get_adapter("google").expect("google adapter");
-    let req = minimal_request("gemini-2.5-pro");
+    let req = minimal_request("gemini-3.7-flash");
     let thinking = enabled_budget(99_999);
     let body = adapter
         .transform_request_with_thinking(&req, &thinking)
@@ -118,7 +118,7 @@ fn google_thinking_with_adaptive_high_effort_derives_budget_from_step_function()
     // PINS ADAPTIVE: when budget_tokens is None and
     // reasoning_effort=high, adaptive_budget_for derives 16000.
     let adapter = get_adapter("google").expect("google adapter");
-    let req = minimal_request("gemini-2.5-pro");
+    let req = minimal_request("gemini-3.7-flash");
     let thinking = ThinkingConfig {
         enabled: true,
         budget_tokens: None,
@@ -139,7 +139,7 @@ fn google_thinking_with_adaptive_high_effort_derives_budget_from_step_function()
 #[test]
 fn google_thinking_with_adaptive_low_effort_derives_1024_budget() {
     let adapter = get_adapter("google").expect("google adapter");
-    let req = minimal_request("gemini-2.5-pro");
+    let req = minimal_request("gemini-3.7-flash");
     let thinking = ThinkingConfig {
         enabled: true,
         budget_tokens: None,
@@ -159,7 +159,7 @@ fn google_thinking_with_adaptive_low_effort_derives_1024_budget() {
 #[test]
 fn google_thinking_with_no_effort_no_explicit_budget_falls_back_to_default() {
     let adapter = get_adapter("google").expect("google adapter");
-    let req = minimal_request("gemini-2.5-pro");
+    let req = minimal_request("gemini-3.7-flash");
     let thinking = ThinkingConfig {
         enabled: true,
         budget_tokens: None,
@@ -185,7 +185,7 @@ fn google_thinking_with_no_effort_no_explicit_budget_falls_back_to_default() {
 fn anthropic_thinking_budget_floors_at_1024() {
     // PINS ANTHROPIC FLOOR: budget below 1024 MUST be raised.
     let adapter = get_adapter("anthropic").expect("anthropic adapter");
-    let req = minimal_request("claude-sonnet-4-5");
+    let req = minimal_request("claude-sonnet-4-6");
     let thinking = enabled_budget(500); // below floor
     let body = adapter
         .transform_request_with_thinking(&req, &thinking)
@@ -200,7 +200,7 @@ fn anthropic_thinking_budget_floors_at_1024() {
 #[test]
 fn anthropic_thinking_explicit_high_budget_preserved_above_floor() {
     let adapter = get_adapter("anthropic").expect("anthropic adapter");
-    let req = minimal_request("claude-sonnet-4-5");
+    let req = minimal_request("claude-sonnet-4-6");
     let thinking = enabled_budget(20_000);
     let body = adapter
         .transform_request_with_thinking(&req, &thinking)
@@ -211,7 +211,7 @@ fn anthropic_thinking_explicit_high_budget_preserved_above_floor() {
 #[test]
 fn anthropic_thinking_object_has_type_enabled_marker() {
     let adapter = get_adapter("anthropic").expect("anthropic adapter");
-    let req = minimal_request("claude-sonnet-4-5");
+    let req = minimal_request("claude-sonnet-4-6");
     let thinking = enabled_budget(8000);
     let body = adapter
         .transform_request_with_thinking(&req, &thinking)
@@ -243,7 +243,7 @@ fn anthropic_opus_4_8_uses_adaptive_thinking_not_manual_budget() {
 }
 
 #[test]
-fn anthropic_opus_4_7_uses_adaptive_thinking_not_manual_budget() {
+fn stale_anthropic_opus_4_7_name_does_not_enable_thinking_controls() {
     let adapter = get_adapter("anthropic").expect("anthropic adapter");
     let req = minimal_request("claude-opus-4-7");
     let thinking = ThinkingConfig {
@@ -256,12 +256,8 @@ fn anthropic_opus_4_7_uses_adaptive_thinking_not_manual_budget() {
     let body = adapter
         .transform_request_with_thinking(&req, &thinking)
         .expect("transform");
-    assert_eq!(body["thinking"]["type"], "adaptive");
-    assert!(
-        body["thinking"].get("budget_tokens").is_none(),
-        "Opus 4.7 rejects manual thinking budgets; got {body}"
-    );
-    assert_eq!(body["output_config"]["effort"], "max");
+    assert!(body.get("thinking").is_none());
+    assert!(body.get("output_config").is_none());
 }
 
 #[test]
@@ -288,7 +284,7 @@ fn anthropic_fable_5_omits_explicit_thinking_because_adaptive_is_implicit() {
 #[test]
 fn anthropic_thinking_disabled_does_not_inject_thinking_field() {
     let adapter = get_adapter("anthropic").expect("anthropic adapter");
-    let req = minimal_request("claude-sonnet-4-5");
+    let req = minimal_request("claude-sonnet-4-6");
     let thinking = ThinkingConfig {
         enabled: false,
         ..ThinkingConfig::default()
@@ -305,7 +301,7 @@ fn anthropic_thinking_disabled_does_not_inject_thinking_field() {
 #[test]
 fn anthropic_thinking_with_adaptive_high_effort_derives_16000() {
     let adapter = get_adapter("anthropic").expect("anthropic adapter");
-    let req = minimal_request("claude-sonnet-4-5");
+    let req = minimal_request("claude-sonnet-4-6");
     let thinking = ThinkingConfig {
         enabled: true,
         budget_tokens: None,
@@ -326,7 +322,7 @@ fn anthropic_thinking_with_adaptive_high_effort_derives_16000() {
 #[test]
 fn google_thinking_does_not_use_anthropic_field_name() {
     let adapter = get_adapter("google").expect("google adapter");
-    let req = minimal_request("gemini-2.5-pro");
+    let req = minimal_request("gemini-3.7-flash");
     let body = adapter
         .transform_request_with_thinking(&req, &enabled_budget(8000))
         .expect("transform");
@@ -338,7 +334,7 @@ fn google_thinking_does_not_use_anthropic_field_name() {
 #[test]
 fn anthropic_thinking_does_not_use_google_path() {
     let adapter = get_adapter("anthropic").expect("anthropic adapter");
-    let req = minimal_request("claude-sonnet-4-5");
+    let req = minimal_request("claude-sonnet-4-6");
     let body = adapter
         .transform_request_with_thinking(&req, &enabled_budget(8000))
         .expect("transform");
@@ -356,12 +352,15 @@ fn each_provider_writes_thinking_into_a_documented_distinct_location() {
     // contract via JSON-pointer reach.
     let google_body = get_adapter("google")
         .unwrap()
-        .transform_request_with_thinking(&minimal_request("gemini-2.5-pro"), &enabled_budget(5000))
+        .transform_request_with_thinking(
+            &minimal_request("gemini-3.7-flash"),
+            &enabled_budget(5000),
+        )
         .unwrap();
     let anthropic_body = get_adapter("anthropic")
         .unwrap()
         .transform_request_with_thinking(
-            &minimal_request("claude-sonnet-4-5"),
+            &minimal_request("claude-sonnet-4-6"),
             &enabled_budget(5000),
         )
         .unwrap();
@@ -382,9 +381,9 @@ fn disabled_thinking_passes_request_through_unchanged_for_both_providers() {
     for provider in &["google", "anthropic"] {
         let adapter = get_adapter(provider).expect("adapter");
         let model = if *provider == "google" {
-            "gemini-2.5-pro"
+            "gemini-3.7-flash"
         } else {
-            "claude-sonnet-4-5"
+            "claude-sonnet-4-6"
         };
         let req = minimal_request(model);
         let baseline = adapter.transform_request(&req).expect("transform");

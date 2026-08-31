@@ -29,6 +29,7 @@ use std::collections::HashMap;
 
 /// Plugin author information
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PluginAuthor {
     /// Display name of the plugin author or organization
     pub name: String,
@@ -253,6 +254,7 @@ pub struct HooksDefinition {
 
 /// A single hook entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HookEntry {
     /// Matcher pattern (tool name regex for PreToolUse/PostToolUse)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -292,6 +294,7 @@ pub enum McpServersSpecEntry {
 
 /// MCP server configuration (matches Claude Code format)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
     /// Command to execute
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -300,8 +303,11 @@ pub struct McpServerConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
     /// Environment variables
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub env: HashMap<String, String>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::secrets::EnvironmentGrants::is_empty"
+    )]
+    pub env: crate::secrets::EnvironmentGrants,
     /// Transport type (stdio or http)
     #[serde(
         default = "default_transport",
@@ -313,8 +319,11 @@ pub struct McpServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     /// Static HTTP headers for remote MCP transports.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub headers: HashMap<String, String>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::secrets::SensitiveHeaders::is_empty"
+    )]
+    pub headers: crate::secrets::SensitiveHeaders,
     /// Dynamic header helper command. Parsed so the connection layer can
     /// explicitly reject unsupported dynamic auth instead of silently
     /// dropping it.
@@ -324,6 +333,10 @@ pub struct McpServerConfig {
         rename = "headersHelper"
     )]
     pub headers_helper: Option<String>,
+    /// Standards-based OAuth settings for an HTTP MCP server. Existing static
+    /// headers remain supported; OAuth is opt-in per server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<crate::mcp_oauth::McpOAuthClientConfig>,
     /// Per-server tool execution timeout in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
@@ -362,18 +375,21 @@ where
 /// plugin author owns); on enable the host registers it with the LSP
 /// pool so the standard `lsp` tool dispatches against it transparently.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LspServerConfig {
     /// Executable to spawn.
     pub command: String,
     /// Arguments passed to the executable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
-    /// Extra environment variables injected into the spawned process.
-    /// The standard LSP env-scrub allowlist (see `tools::lsp`) still
-    /// applies — credentials that fail the allowlist are dropped with a
-    /// `warn!` log.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub env: HashMap<String, String>,
+    /// Environment values required by the server. Every name/value must be an
+    /// exact member of the owning run's explicit environment grants; a plugin
+    /// declaration cannot grant additional authority.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::secrets::EnvironmentGrants::is_empty"
+    )]
+    pub env: crate::secrets::EnvironmentGrants,
     /// File extensions the server claims (e.g. `["rs"]`). Empty means
     /// the server is invocation-only — it does not auto-register against
     /// any extension.
@@ -403,6 +419,7 @@ pub enum SkillsSpec {
 
 /// Claude Code-compatible plugin manifest (.claude-plugin/plugin.json)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginManifest {
     /// Plugin name (kebab-case, unique identifier)
     pub name: String,
@@ -452,7 +469,7 @@ pub struct PluginManifest {
     /// Each entry maps a language identifier (e.g. `"rust"`) to an
     /// [`LspServerConfig`] describing how to spawn the server binary.
     /// On plugin load the host wires every entry into the LSP pool so
-    /// `is_lsp_connected("rust")` returns true once the plugin is enabled.
+    /// `is_lsp_connected(run, "rust")` returns true once the plugin is enabled.
     /// `None` ⇒ plugin contributes no LSP servers (overwhelmingly common).
     #[serde(
         default,
@@ -460,13 +477,12 @@ pub struct PluginManifest {
         skip_serializing_if = "Option::is_none"
     )]
     pub lsp_servers: Option<HashMap<String, LspServerConfig>>,
-    /// Optional detached ed25519 signature over the manifest bytes.
+    /// Legacy inline signature retained for manifest compatibility.
     ///
-    /// When present, the signature is verified by
-    /// [`crate::plugins::validate::verify_signature`] during install if the
-    /// active [`crate::plugins::policy::PluginPolicy`] includes a
-    /// `RequireSignature` action. The field is skipped during serialization
-    /// when absent so existing manifests are unaffected.
+    /// Inline metadata cannot authenticate the package containing it and is
+    /// never an activation authority. Install/update verification uses the
+    /// detached `.claude-plugin/artifact.json` statement, which binds the
+    /// canonical package tree before a generation can be published.
     ///
     /// On-disk shape: serialized as a base64 string via the `Serialize` /
     /// `Deserialize` impls on `PluginSignature` itself.

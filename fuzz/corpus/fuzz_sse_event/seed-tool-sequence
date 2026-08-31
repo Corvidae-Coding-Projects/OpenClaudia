@@ -1,0 +1,1 @@
+[{"type":"content_block_start","content_block":{"type":"tool_use","id":"call-1","name":"read_file"}},{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"path\":\"README.md\"}"}},{"type":"message_delta","delta":{"stop_reason":"tool_use"}}]

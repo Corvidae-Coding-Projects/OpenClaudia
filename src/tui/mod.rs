@@ -12,6 +12,8 @@ pub mod components;
 pub mod events;
 pub mod input;
 pub mod messages;
+pub mod safety;
+mod supervision;
 
 use crossterm::{
     cursor,
@@ -29,13 +31,130 @@ use ratatui::{
 };
 use std::io::{self, stdout, Write};
 use std::path::PathBuf;
-use syntect::easy::HighlightLines;
-use syntect::highlighting::ThemeSet;
-use syntect::parsing::SyntaxSet;
 
-static SYNTAX_SET: std::sync::LazyLock<SyntaxSet> =
-    std::sync::LazyLock::new(SyntaxSet::load_defaults_newlines);
-static THEME_SET: std::sync::LazyLock<ThemeSet> = std::sync::LazyLock::new(ThemeSet::load_defaults);
+use self::safety::{
+    append_raw_bounded, sanitize_terminal_label, sanitize_terminal_text, EVENT_TEXT_LIMITS,
+    MARKDOWN_TEXT_LIMITS, RENDER_TRUNCATION_MARKER,
+};
+
+/// Maximum accumulated fenced-code source reparsed for contextual highlighting.
+///
+/// Arborium parses a complete source unit rather than carrying lexical state one
+/// line at a time. Keeping a byte- and line-bounded prefix preserves multiline
+/// constructs for ordinary code blocks without allowing streaming output to
+/// create unbounded quadratic parse work. Content beyond either bound is still
+/// rendered through the existing flat-color fallback; it is never dropped.
+const MAX_HIGHLIGHT_SOURCE_BYTES: usize = 64 * 1024;
+const MAX_HIGHLIGHT_SOURCE_LINES: usize = 1024;
+
+/// Per-code-block syntax highlighter backed by maintained tree-sitter grammars.
+///
+/// Unsupported language tags are represented by `None` at the call site and
+/// retain the existing flat-color fallback instead of failing rendering.
+struct CodeHighlighter {
+    language: String,
+    engine: arborium::AnsiHighlighter,
+    source: String,
+    line_count: usize,
+    disabled: bool,
+}
+
+impl CodeHighlighter {
+    fn new(language: &str) -> Option<Self> {
+        if language.is_empty() {
+            return None;
+        }
+        let mut engine =
+            arborium::AnsiHighlighter::new(arborium::theme::builtin::catppuccin_mocha());
+        engine.store().get(language)?;
+        // The surrounding renderer owns terminal wrapping and indentation.
+        // Arborium's terminal-width auto-detection would otherwise wrap a line
+        // a second time and make output depend on whether stdout is a TTY.
+        engine.options_mut().width = None;
+        engine.options_mut().pad_to_width = false;
+        Some(Self {
+            language: language.to_string(),
+            engine,
+            source: String::new(),
+            line_count: 0,
+            disabled: false,
+        })
+    }
+
+    fn highlight_line(&mut self, line: &str) -> Option<String> {
+        if self.disabled {
+            return None;
+        }
+        if self.line_count >= MAX_HIGHLIGHT_SOURCE_LINES {
+            self.source.clear();
+            self.disabled = true;
+            return None;
+        }
+        let line = sanitize_terminal_text(line, safety::TextLimits::new(4096, 6144, 1, 4096));
+        if line.was_truncated() {
+            self.source.clear();
+            self.disabled = true;
+            return None;
+        }
+        let line = line.as_str();
+        let separator_bytes = usize::from(!self.source.is_empty());
+        let next_size = self
+            .source
+            .len()
+            .checked_add(separator_bytes)?
+            .checked_add(line.len())?;
+        if next_size > MAX_HIGHLIGHT_SOURCE_BYTES {
+            self.source.clear();
+            self.disabled = true;
+            return None;
+        }
+        if separator_bytes == 1 {
+            self.source.push('\n');
+        }
+        self.source.push_str(line);
+        self.line_count += 1;
+        let highlighted = self.engine.highlight(&self.language, &self.source).ok()?;
+        Some(last_ansi_line(&highlighted))
+    }
+}
+
+/// Extract the final rendered line while preserving any SGR style that began
+/// before its newline (for example a multiline comment or string span).
+fn last_ansi_line(rendered: &str) -> String {
+    let Some(newline) = rendered.rfind('\n') else {
+        return rendered.to_string();
+    };
+    let prefix = &rendered[..newline];
+    let tail = &rendered[newline + 1..];
+    let Some(active_style) = active_ansi_style(prefix) else {
+        return tail.to_string();
+    };
+    let mut line = String::with_capacity(active_style.len() + tail.len());
+    line.push_str(active_style);
+    line.push_str(tail);
+    line
+}
+
+fn active_ansi_style(rendered: &str) -> Option<&str> {
+    let mut active = None;
+    let mut offset = 0;
+    while let Some(relative_start) = rendered[offset..].find("\u{1b}[") {
+        let start = offset + relative_start;
+        let sequence = &rendered[start..];
+        let Some(relative_end) = sequence.find('m') else {
+            break;
+        };
+        let end = start + relative_end + 1;
+        let escape = &rendered[start..end];
+        if escape == "\u{1b}[0m" || escape == "\u{1b}[m" {
+            active = None;
+        } else {
+            active = Some(escape);
+        }
+        offset = end;
+    }
+    active
+}
 
 // ─── Brand palette ──────────────────────────────────────────────────────────
 //
@@ -62,7 +181,7 @@ pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", 
 // ─── Theme support ──────────────────────────────────────────────────────────
 
 /// A color theme for the terminal UI
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Theme {
     /// Theme identifier
     pub name: String,
@@ -237,12 +356,13 @@ pub fn render_markdown(text: &str) {
 
 /// Render markdown with a specific theme
 pub fn render_markdown_themed(text: &str, theme: &Theme) {
+    let text = sanitize_terminal_text(text, MARKDOWN_TEXT_LIMITS);
     let mut stdout = io::stdout();
     let mut in_code_block = false;
     let mut code_lang = String::new();
-    let mut highlighter: Option<HighlightLines> = None;
+    let mut highlighter: Option<CodeHighlighter> = None;
 
-    for line in text.lines() {
+    for line in text.as_str().lines() {
         if line.starts_with("```") {
             if in_code_block {
                 // End code block
@@ -256,18 +376,7 @@ pub fn render_markdown_themed(text: &str, theme: &Theme) {
                 in_code_block = true;
                 code_lang = line.trim_start_matches('`').trim().to_string();
 
-                // Set up syntax highlighter for the detected language
-                let syntax = if code_lang.is_empty() {
-                    SYNTAX_SET.find_syntax_plain_text()
-                } else {
-                    SYNTAX_SET
-                        .find_syntax_by_token(&code_lang)
-                        .unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text())
-                };
-                let theme_name = "base16-ocean.dark";
-                if let Some(syn_theme) = THEME_SET.themes.get(theme_name) {
-                    highlighter = Some(HighlightLines::new(syntax, syn_theme));
-                }
+                highlighter = CodeHighlighter::new(&code_lang);
 
                 if !code_lang.is_empty() {
                     let _ = stdout.execute(SetForegroundColor(CtColor::DarkGrey));
@@ -330,6 +439,7 @@ pub fn render_markdown_themed(text: &str, theme: &Theme) {
         // Horizontal rule
         if line.trim() == "---" || line.trim() == "***" || line.trim() == "___" {
             let (cols, _) = terminal::size().unwrap_or((80, 24));
+            let cols = cols.clamp(1, MAX_STREAMING_MARKDOWN_COLUMNS);
             let _ = stdout.execute(SetForegroundColor(CtColor::DarkGrey));
             println!("{}", "\u{2500}".repeat(cols as usize));
             let _ = stdout.execute(ResetColor);
@@ -344,26 +454,18 @@ pub fn render_markdown_themed(text: &str, theme: &Theme) {
     stdout.flush().ok();
 }
 
-/// Render a single code line with syntect syntax highlighting.
+/// Render a single code line with tree-sitter syntax highlighting.
 ///
 /// Falls back to the theme's `code_color` if highlighting fails.
 fn render_highlighted_code_line(
     stdout: &mut io::Stdout,
     line: &str,
-    highlighter: &mut HighlightLines,
+    highlighter: &mut CodeHighlighter,
     fallback_color: CtColor,
 ) {
-    if let Ok(ranges) = highlighter.highlight_line(line, &SYNTAX_SET) {
+    if let Some(highlighted) = highlighter.highlight_line(line) {
         let _ = stdout.execute(Print("    "));
-        for (style, text) in ranges {
-            let color = CtColor::Rgb {
-                r: style.foreground.r,
-                g: style.foreground.g,
-                b: style.foreground.b,
-            };
-            let _ = stdout.execute(SetForegroundColor(color));
-            let _ = stdout.execute(Print(text));
-        }
+        let _ = stdout.execute(Print(highlighted));
         let _ = stdout.execute(ResetColor);
         let _ = stdout.execute(Print("\n"));
     } else {
@@ -395,18 +497,29 @@ fn render_heading(stdout: &mut io::Stdout, line: &str, theme: &Theme) {
 
 /// Render inline formatting: bold, italic, inline code, links
 fn render_inline(stdout: &mut io::Stdout, text: &str, theme: &Theme) {
+    let _ = render_inline_to(stdout, text, theme);
+}
+
+fn render_inline_to<W: io::Write>(writer: &mut W, text: &str, theme: &Theme) -> io::Result<()> {
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
     let mut i = 0;
+    let mut scan_budget = InlineScanBudget::new(len.saturating_mul(4).max(1));
 
     while i < len {
+        if scan_budget.exhausted() {
+            for character in &chars[i..] {
+                write!(writer, "{character}")?;
+            }
+            break;
+        }
         // Bold: **text**
         if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*' {
-            if let Some(end) = find_closing(&chars, i + 2, "**") {
-                let _ = stdout.execute(SetAttribute(Attribute::Bold));
+            if let Some(end) = find_closing_bounded(&chars, i + 2, "**", &mut scan_budget) {
+                writer.execute(SetAttribute(Attribute::Bold))?;
                 let inner: String = chars[i + 2..end].iter().collect();
-                print!("{inner}");
-                let _ = stdout.execute(SetAttribute(Attribute::NoBold));
+                write!(writer, "{inner}")?;
+                writer.execute(SetAttribute(Attribute::NoBold))?;
                 i = end + 2;
                 continue;
             }
@@ -414,11 +527,11 @@ fn render_inline(stdout: &mut io::Stdout, text: &str, theme: &Theme) {
 
         // Italic: *text* (but not **)
         if chars[i] == '*' && (i + 1 >= len || chars[i + 1] != '*') {
-            if let Some(end) = find_closing_char(&chars, i + 1, '*') {
-                let _ = stdout.execute(SetAttribute(Attribute::Italic));
+            if let Some(end) = find_closing_char_bounded(&chars, i + 1, '*', &mut scan_budget) {
+                writer.execute(SetAttribute(Attribute::Italic))?;
                 let inner: String = chars[i + 1..end].iter().collect();
-                print!("{inner}");
-                let _ = stdout.execute(SetAttribute(Attribute::NoItalic));
+                write!(writer, "{inner}")?;
+                writer.execute(SetAttribute(Attribute::NoItalic))?;
                 i = end + 1;
                 continue;
             }
@@ -426,11 +539,11 @@ fn render_inline(stdout: &mut io::Stdout, text: &str, theme: &Theme) {
 
         // Inline code: `text`
         if chars[i] == '`' {
-            if let Some(end) = find_closing_char(&chars, i + 1, '`') {
-                let _ = stdout.execute(SetForegroundColor(theme.code_color));
+            if let Some(end) = find_closing_char_bounded(&chars, i + 1, '`', &mut scan_budget) {
+                writer.execute(SetForegroundColor(theme.code_color))?;
                 let inner: String = chars[i + 1..end].iter().collect();
-                print!("{inner}");
-                let _ = stdout.execute(ResetColor);
+                write!(writer, "{inner}")?;
+                writer.execute(ResetColor)?;
                 i = end + 1;
                 continue;
             }
@@ -438,25 +551,103 @@ fn render_inline(stdout: &mut io::Stdout, text: &str, theme: &Theme) {
 
         // Link: [text](url)
         if chars[i] == '[' {
-            if let Some((link_text, url, end_pos)) = parse_link(&chars, i) {
-                let _ = stdout.execute(SetAttribute(Attribute::Underlined));
-                print!("{link_text}");
-                let _ = stdout.execute(SetAttribute(Attribute::NoUnderline));
-                let _ = stdout.execute(SetForegroundColor(CtColor::DarkGrey));
-                print!(" ({url})");
-                let _ = stdout.execute(ResetColor);
+            if let Some((link_text, url, end_pos)) = parse_link_bounded(&chars, i, &mut scan_budget)
+            {
+                writer.execute(SetAttribute(Attribute::Underlined))?;
+                write!(writer, "{link_text}")?;
+                writer.execute(SetAttribute(Attribute::NoUnderline))?;
+                writer.execute(SetForegroundColor(CtColor::DarkGrey))?;
+                write!(writer, " ({url})")?;
+                writer.execute(ResetColor)?;
                 i = end_pos;
                 continue;
             }
         }
 
         // Regular character
-        print!("{}", chars[i]);
+        write!(writer, "{}", chars[i])?;
         i += 1;
+    }
+    Ok(())
+}
+
+struct InlineScanBudget {
+    remaining: usize,
+}
+
+impl InlineScanBudget {
+    const fn new(remaining: usize) -> Self {
+        Self { remaining }
+    }
+
+    const fn exhausted(&self) -> bool {
+        self.remaining == 0
+    }
+
+    const fn observe(&mut self) -> bool {
+        if self.remaining == 0 {
+            return false;
+        }
+        self.remaining -= 1;
+        true
     }
 }
 
+fn find_closing_bounded(
+    chars: &[char],
+    start: usize,
+    delim: &str,
+    budget: &mut InlineScanBudget,
+) -> Option<usize> {
+    let delim_chars: Vec<char> = delim.chars().collect();
+    let dlen = delim_chars.len();
+    if dlen == 0 {
+        return None;
+    }
+    let mut i = start;
+    while i + dlen <= chars.len() && budget.observe() {
+        if chars[i..i + dlen] == delim_chars[..] {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+const fn find_closing_char_bounded(
+    chars: &[char],
+    start: usize,
+    delim: char,
+    budget: &mut InlineScanBudget,
+) -> Option<usize> {
+    let mut i = start;
+    while i < chars.len() && budget.observe() {
+        if chars[i] == delim {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_link_bounded(
+    chars: &[char],
+    start: usize,
+    budget: &mut InlineScanBudget,
+) -> Option<(String, String, usize)> {
+    let text_end = find_closing_char_bounded(chars, start + 1, ']', budget)?;
+    let paren_start = text_end + 1;
+    if paren_start >= chars.len() || chars[paren_start] != '(' {
+        return None;
+    }
+    let url_end = find_closing_char_bounded(chars, paren_start + 1, ')', budget)?;
+    let link_text = chars[start + 1..text_end].iter().collect();
+    let url = chars[paren_start + 1..url_end].iter().collect();
+    Some((link_text, url, url_end + 1))
+}
+
 /// Find closing delimiter in char slice (e.g., "**")
+#[cfg(test)]
 fn find_closing(chars: &[char], start: usize, delim: &str) -> Option<usize> {
     let delim_chars: Vec<char> = delim.chars().collect();
     let dlen = delim_chars.len();
@@ -474,11 +665,13 @@ fn find_closing(chars: &[char], start: usize, delim: &str) -> Option<usize> {
 }
 
 /// Find closing single character delimiter
+#[cfg(test)]
 fn find_closing_char(chars: &[char], start: usize, delim: char) -> Option<usize> {
     (start..chars.len()).find(|&i| chars[i] == delim)
 }
 
 /// Parse a markdown link [text](url) starting at position i ('[')
+#[cfg(test)]
 fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
     // Find closing ']'
     let text_end = find_closing_char(chars, start + 1, ']')?;
@@ -531,6 +724,9 @@ fn strip_ordered_list_prefix(s: &str) -> Option<&str> {
 /// Uses `·` separator matching Claude Code's byline style.
 pub fn draw_status_bar(model: &str, tokens: usize, cost: Option<f64>, mode: &str, duration: &str) {
     let mut stdout = io::stdout();
+    let model = sanitize_terminal_label(model);
+    let mode = sanitize_terminal_label(mode);
+    let duration = sanitize_terminal_label(duration);
 
     let cost_str = match cost {
         Some(c) if c >= 0.01 => format!("${c:.2}"),
@@ -549,13 +745,13 @@ pub fn draw_status_bar(model: &str, tokens: usize, cost: Option<f64>, mode: &str
 
     // Build parts with · separator (Claude Code style)
     let sep = " \u{00B7} ";
-    let mut parts = vec![model.to_string()];
+    let mut parts = vec![model.into_string()];
     if !cost_str.is_empty() {
         parts.push(cost_str);
     }
     parts.push(format!("In: {token_str}"));
-    parts.push(mode.to_string());
-    parts.push(duration.to_string());
+    parts.push(mode.into_string());
+    parts.push(duration.into_string());
 
     let status = parts.join(sep);
 
@@ -581,22 +777,29 @@ pub struct StreamingMarkdownRenderer {
     /// Language for the current code block (for syntax highlighting)
     code_lang: String,
     /// Syntax highlighter for the current code block
-    highlighter: Option<HighlightLines<'static>>,
+    highlighter: Option<CodeHighlighter>,
+    /// The current physical line exceeded its pre-parse byte ceiling; bytes
+    /// are discarded until the next newline.
+    line_truncated: bool,
     /// The theme to use for rendering
     theme: Theme,
 }
 
-/// The `Send`-able subset of [`StreamingMarkdownRenderer`] state that can be
-/// carried across `.await` boundaries.
+/// Hard upper bound for horizontal-rule expansion in deterministic and
+/// terminal streaming renderers.
+pub const MAX_STREAMING_MARKDOWN_COLUMNS: u16 = 512;
+
+/// The dependency-independent subset of [`StreamingMarkdownRenderer`] state.
 ///
-/// `StreamingMarkdownRenderer` holds a `HighlightLines` (from syntect/onig) that
-/// contains raw pointers and is therefore `!Send`. When the streaming loop needs
-/// to yield at `stream.next().await`, it first extracts this state, drops the
-/// renderer, awaits, then reconstructs the renderer from the state.
+/// The parser cache is intentionally disposable: callers can persist or move
+/// this state without binding session state to a third-party grammar engine,
+/// then reconstruct highlighting from the fenced language tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownRenderState {
     line_buffer: String,
     in_code_block: bool,
     code_lang: String,
+    line_truncated: bool,
     theme: Theme,
 }
 
@@ -604,19 +807,29 @@ impl StreamingMarkdownRenderer {
     /// Create a new streaming renderer with the loaded theme
     #[must_use]
     pub fn new() -> Self {
+        Self::with_theme(Theme::load())
+    }
+
+    /// Create a streaming renderer with an explicit theme.
+    ///
+    /// Unlike [`Self::new`], this constructor performs no user-configuration
+    /// lookup and is suitable for deterministic or hermetic execution.
+    #[must_use]
+    pub const fn with_theme(theme: Theme) -> Self {
         Self {
             line_buffer: String::new(),
             in_code_block: false,
             code_lang: String::new(),
             highlighter: None,
-            theme: Theme::load(),
+            line_truncated: false,
+            theme,
         }
     }
 
     /// Extract the `Send`-able render state, consuming `self`.
     ///
-    /// The `HighlightLines` (which is `!Send`) is discarded; it will be
-    /// reconstructed from `code_lang` when the renderer is restored via
+    /// The parser cache is discarded; it will be reconstructed from `code_lang`
+    /// when the renderer is restored via
     /// [`StreamingMarkdownRenderer::from_state`].
     #[must_use]
     pub fn into_state(self) -> MarkdownRenderState {
@@ -624,24 +837,19 @@ impl StreamingMarkdownRenderer {
             line_buffer: self.line_buffer,
             in_code_block: self.in_code_block,
             code_lang: self.code_lang,
+            line_truncated: self.line_truncated,
             theme: self.theme,
         }
     }
 
     /// Reconstruct a renderer from previously saved state.
     ///
-    /// If the state records an active code block, the `HighlightLines` is
+    /// If the state records an active code block, the syntax highlighter is
     /// rebuilt from the language token so highlighting resumes correctly.
     #[must_use]
     pub fn from_state(state: MarkdownRenderState) -> Self {
-        let highlighter = if state.in_code_block && !state.code_lang.is_empty() {
-            let syntax = SYNTAX_SET
-                .find_syntax_by_token(&state.code_lang)
-                .unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text());
-            THEME_SET
-                .themes
-                .get("base16-ocean.dark")
-                .map(|t| HighlightLines::new(syntax, t))
+        let highlighter = if state.in_code_block {
+            CodeHighlighter::new(&state.code_lang)
         } else {
             None
         };
@@ -650,6 +858,7 @@ impl StreamingMarkdownRenderer {
             in_code_block: state.in_code_block,
             code_lang: state.code_lang,
             highlighter,
+            line_truncated: state.line_truncated,
             theme: state.theme,
         }
     }
@@ -657,59 +866,103 @@ impl StreamingMarkdownRenderer {
     /// Feed a text chunk into the renderer. Complete lines are rendered
     /// immediately; the trailing incomplete line stays buffered.
     pub fn push(&mut self, text: &str) {
-        self.line_buffer.push_str(text);
+        let mut stdout = io::stdout();
+        let columns = terminal::size().map_or(80, |(columns, _)| columns);
+        let _ = self.push_to(text, &mut stdout, columns);
+    }
 
-        // Render all complete lines
-        while let Some(newline_pos) = self.line_buffer.find('\n') {
-            let line = self.line_buffer[..newline_pos].to_string();
-            self.line_buffer = self.line_buffer[newline_pos + 1..].to_string();
-            self.render_line(&line);
-            println!();
+    /// Feed a text chunk into an explicit output sink.
+    ///
+    /// This is the deterministic streaming boundary used by tests and fuzzing:
+    /// it neither reads the terminal nor writes to process stdout. Horizontal
+    /// rule expansion is capped even if the caller supplies an extreme width.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first write or flush error reported by `writer`.
+    pub fn push_to<W: io::Write>(
+        &mut self,
+        text: &str,
+        writer: &mut W,
+        terminal_columns: u16,
+    ) -> io::Result<()> {
+        const MAX_STREAMING_LINE_BYTES: usize = 4096;
+        let admitted = sanitize_terminal_text(text, EVENT_TEXT_LIMITS);
+        for segment in admitted.as_str().split_inclusive('\n') {
+            let complete = segment.ends_with('\n');
+            let fragment = segment.strip_suffix('\n').unwrap_or(segment);
+            if !self.line_truncated {
+                let content_limit =
+                    MAX_STREAMING_LINE_BYTES.saturating_sub(RENDER_TRUNCATION_MARKER.len());
+                if append_raw_bounded(&mut self.line_buffer, fragment, content_limit) {
+                    self.line_buffer.push_str(RENDER_TRUNCATION_MARKER);
+                    self.line_truncated = true;
+                }
+            }
+            if complete {
+                let line = std::mem::take(&mut self.line_buffer);
+                self.line_truncated = false;
+                self.render_line_to(&line, writer, terminal_columns)?;
+                writeln!(writer)?;
+            }
         }
 
         // Flush stdout after each push so partial output appears immediately
-        io::stdout().flush().ok();
+        writer.flush()
     }
 
     /// Flush any remaining buffered text at stream end
     pub fn flush(&mut self) {
+        let mut stdout = io::stdout();
+        let columns = terminal::size().map_or(80, |(columns, _)| columns);
+        let _ = self.flush_to(&mut stdout, columns);
+    }
+
+    /// Flush buffered text into an explicit output sink.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first write or flush error reported by `writer`.
+    pub fn flush_to<W: io::Write>(
+        &mut self,
+        writer: &mut W,
+        terminal_columns: u16,
+    ) -> io::Result<()> {
         if !self.line_buffer.is_empty() {
             let line = std::mem::take(&mut self.line_buffer);
-            self.render_line(&line);
-            io::stdout().flush().ok();
+            self.render_line_to(&line, writer, terminal_columns)?;
         }
+        writer.flush()
     }
 
-    /// Render a single complete line with markdown formatting
     /// Render one line of code-block content, applying syntax highlighting when available.
-    fn render_code_block_line(&mut self, line: &str) {
-        let mut stdout = io::stdout();
+    fn render_code_block_line_to<W: io::Write>(
+        &mut self,
+        line: &str,
+        writer: &mut W,
+    ) -> io::Result<()> {
         if let Some(ref mut hl) = self.highlighter {
-            if let Ok(ranges) = hl.highlight_line(line, &SYNTAX_SET) {
-                let _ = stdout.execute(Print("    "));
-                for (style, text) in ranges {
-                    let color = CtColor::Rgb {
-                        r: style.foreground.r,
-                        g: style.foreground.g,
-                        b: style.foreground.b,
-                    };
-                    let _ = stdout.execute(SetForegroundColor(color));
-                    let _ = stdout.execute(Print(text));
-                }
+            if let Some(highlighted) = hl.highlight_line(line) {
+                writer.execute(Print("    "))?;
+                writer.execute(Print(highlighted))?;
             } else {
-                let _ = stdout.execute(SetForegroundColor(self.theme.code_color));
-                print!("    {line}");
+                writer.execute(SetForegroundColor(self.theme.code_color))?;
+                write!(writer, "    {line}")?;
             }
         } else {
-            let _ = stdout.execute(SetForegroundColor(self.theme.code_color));
-            print!("    {line}");
+            writer.execute(SetForegroundColor(self.theme.code_color))?;
+            write!(writer, "    {line}")?;
         }
-        let _ = stdout.execute(ResetColor);
+        writer.execute(ResetColor)?;
+        Ok(())
     }
 
-    fn render_line(&mut self, line: &str) {
-        let mut stdout = io::stdout();
-
+    fn render_line_to<W: io::Write>(
+        &mut self,
+        line: &str,
+        writer: &mut W,
+        terminal_columns: u16,
+    ) -> io::Result<()> {
         // Code fence toggle
         if line.starts_with("```") {
             if self.in_code_block {
@@ -717,65 +970,54 @@ impl StreamingMarkdownRenderer {
                 self.in_code_block = false;
                 self.code_lang.clear();
                 self.highlighter = None;
-                let _ = stdout.execute(ResetColor);
+                writer.execute(ResetColor)?;
             } else {
                 // Start code block
                 self.in_code_block = true;
                 self.code_lang = line.trim_start_matches('`').trim().to_string();
 
-                let syntax = if self.code_lang.is_empty() {
-                    SYNTAX_SET.find_syntax_plain_text()
-                } else {
-                    SYNTAX_SET
-                        .find_syntax_by_token(&self.code_lang)
-                        .unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text())
-                };
-                let theme_name = "base16-ocean.dark";
-                if let Some(syn_theme) = THEME_SET.themes.get(theme_name) {
-                    self.highlighter = Some(HighlightLines::new(syntax, syn_theme));
-                }
+                self.highlighter = CodeHighlighter::new(&self.code_lang);
 
                 if !self.code_lang.is_empty() {
-                    let _ = stdout.execute(SetForegroundColor(CtColor::DarkGrey));
-                    print!("  --- {} ---", self.code_lang);
-                    let _ = stdout.execute(ResetColor);
+                    writer.execute(SetForegroundColor(CtColor::DarkGrey))?;
+                    write!(writer, "  --- {} ---", self.code_lang)?;
+                    writer.execute(ResetColor)?;
                 }
             }
-            return;
+            return Ok(());
         }
 
         // Inside code block: syntax highlight
         if self.in_code_block {
-            self.render_code_block_line(line);
-            return;
+            return self.render_code_block_line_to(line, writer);
         }
 
         // Heading
         if line.starts_with('#') {
             let level = line.chars().take_while(|c| *c == '#').count();
             let text = line[level..].trim_start();
-            let _ = stdout.execute(SetAttribute(Attribute::Bold));
+            writer.execute(SetAttribute(Attribute::Bold))?;
             if level <= 2 {
-                let _ = stdout.execute(SetForegroundColor(self.theme.heading_color));
+                writer.execute(SetForegroundColor(self.theme.heading_color))?;
             }
             match level {
-                1 => print!("{}", text.to_uppercase()),
-                _ => print!("{text}"),
+                1 => write!(writer, "{}", text.to_uppercase())?,
+                _ => write!(writer, "{text}")?,
             }
-            let _ = stdout.execute(SetAttribute(Attribute::Reset));
-            let _ = stdout.execute(ResetColor);
-            return;
+            writer.execute(SetAttribute(Attribute::Reset))?;
+            writer.execute(ResetColor)?;
+            return Ok(());
         }
 
         // Blockquote
         if line.starts_with("> ") || line == ">" {
             let content = line.strip_prefix("> ").unwrap_or("");
-            let _ = stdout.execute(SetForegroundColor(CtColor::DarkGrey));
-            print!("  | ");
-            let _ = stdout.execute(SetForegroundColor(CtColor::White));
-            render_inline(&mut stdout, content, &self.theme);
-            let _ = stdout.execute(ResetColor);
-            return;
+            writer.execute(SetForegroundColor(CtColor::DarkGrey))?;
+            write!(writer, "  | ")?;
+            writer.execute(SetForegroundColor(CtColor::White))?;
+            render_inline_to(writer, content, &self.theme)?;
+            writer.execute(ResetColor)?;
+            return Ok(());
         }
 
         // List items
@@ -783,29 +1025,29 @@ impl StreamingMarkdownRenderer {
         if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
             let indent = line.len() - trimmed.len();
             let content = &trimmed[2..];
-            print!("{}  \u{2022} ", " ".repeat(indent));
-            render_inline(&mut stdout, content, &self.theme);
-            return;
+            write!(writer, "{}  \u{2022} ", " ".repeat(indent))?;
+            render_inline_to(writer, content, &self.theme)?;
+            return Ok(());
         }
         if let Some(rest) = strip_ordered_list_prefix(trimmed) {
             let indent = line.len() - trimmed.len();
             let num_part = &trimmed[..trimmed.len() - rest.len()];
-            print!("{}  {}", " ".repeat(indent), num_part);
-            render_inline(&mut stdout, rest, &self.theme);
-            return;
+            write!(writer, "{}  {}", " ".repeat(indent), num_part)?;
+            render_inline_to(writer, rest, &self.theme)?;
+            return Ok(());
         }
 
         // Horizontal rule
         if line.trim() == "---" || line.trim() == "***" || line.trim() == "___" {
-            let (cols, _) = terminal::size().unwrap_or((80, 24));
-            let _ = stdout.execute(SetForegroundColor(CtColor::DarkGrey));
-            print!("{}", "\u{2500}".repeat(cols as usize));
-            let _ = stdout.execute(ResetColor);
-            return;
+            let columns = terminal_columns.clamp(1, MAX_STREAMING_MARKDOWN_COLUMNS);
+            writer.execute(SetForegroundColor(CtColor::DarkGrey))?;
+            write!(writer, "{}", "\u{2500}".repeat(usize::from(columns)))?;
+            writer.execute(ResetColor)?;
+            return Ok(());
         }
 
         // Regular line with inline formatting
-        render_inline(&mut stdout, line, &self.theme);
+        render_inline_to(writer, line, &self.theme)
     }
 }
 
@@ -819,11 +1061,12 @@ impl Default for StreamingMarkdownRenderer {
 
 /// Print a thinking/reasoning chunk in dim styling (indented under the header)
 pub fn print_thinking_chunk(text: &str) {
+    let text = sanitize_terminal_text(text, EVENT_TEXT_LIMITS);
     let mut stdout = io::stdout();
     let _ = stdout.execute(SetAttribute(Attribute::Dim));
     let _ = stdout.execute(SetAttribute(Attribute::Italic));
     let _ = stdout.execute(SetForegroundColor(CtColor::DarkGrey));
-    print!("{text}");
+    print!("{}", text.as_str());
     let _ = stdout.execute(SetAttribute(Attribute::Reset));
     let _ = stdout.execute(ResetColor);
     stdout.flush().ok();
@@ -956,12 +1199,21 @@ impl WelcomeScreen {
         let area = Rect::new(x_offset, 0, box_width, box_height);
 
         // Version in the box title (purple branding)
+        let version = sanitize_terminal_label(&self.version);
+        let provider = sanitize_terminal_label(&self.provider);
+        let model = sanitize_terminal_label(&self.model);
+        let working_dir = sanitize_terminal_label(&self.working_dir);
+        let username = self
+            .username
+            .as_deref()
+            .map(sanitize_terminal_label)
+            .map(safety::SanitizedText::into_string);
         let title = Line::from(vec![
             Span::styled(
                 "OpenClaudia",
                 Style::default().fg(PURPLE).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!(" v{}", self.version), Style::default().fg(GOLD)),
+            Span::styled(format!(" v{}", version.as_str()), Style::default().fg(GOLD)),
         ]);
 
         let block = Block::default()
@@ -980,7 +1232,7 @@ impl WelcomeScreen {
         frame.render_widget(block, area);
 
         // Left column content
-        let greeting = self.username.as_ref().map_or_else(
+        let greeting = username.as_ref().map_or_else(
             || "Welcome to OpenClaudia!".to_string(),
             |name| format!("Welcome back, {name}!"),
         );
@@ -994,14 +1246,17 @@ impl WelcomeScreen {
             )),
             Line::from(""),
             Line::from(Span::styled(
-                format!("Provider: {}", capitalize_first(&self.provider)),
+                format!("Provider: {}", capitalize_first(provider.as_str())),
                 Style::default().fg(PURPLE),
             )),
             Line::from(Span::styled(
-                format!("Model: {}", self.model),
+                format!("Model: {}", model.as_str()),
                 Style::default().fg(GOLD),
             )),
-            Line::from(Span::styled(&self.working_dir, Style::default().fg(DIM))),
+            Line::from(Span::styled(
+                working_dir.into_string(),
+                Style::default().fg(DIM),
+            )),
         ];
         let left_para = Paragraph::new(left_text).wrap(Wrap { trim: true });
         frame.render_widget(left_para, chunks[0]);
@@ -1072,6 +1327,7 @@ pub fn teardown_pinned_bar() -> io::Result<()> {
 ///
 /// Returns an error if terminal operations fail.
 pub fn redraw_pinned_bar(effort: &str) -> io::Result<()> {
+    let effort = sanitize_terminal_label(effort);
     let (cols, rows) = terminal::size().unwrap_or((80, 24));
     let bar_row = rows.saturating_sub(PINNED_ROWS) + 1;
     if bar_row < 3 {
@@ -1098,7 +1354,7 @@ pub fn redraw_pinned_bar(effort: &str) -> io::Result<()> {
     let status_row = bar_row + 1;
     write!(stdout, "\x1b[{status_row};1H")?;
     let left = "? for shortcuts";
-    let right = format!("\u{25CF} {effort} \u{00B7} /effort");
+    let right = format!("\u{25CF} {} \u{00B7} /effort", effort.as_str());
     let total = left.len() + right.len();
     let pad = if cols as usize > total {
         " ".repeat(cols as usize - total)
@@ -1220,10 +1476,11 @@ pub fn print_role_header(role: &str) {
             },
         ),
     };
+    let role = sanitize_terminal_label(role);
     let mut out = stdout();
     let _ = out.execute(SetForegroundColor(color));
     let _ = out.execute(SetAttribute(Attribute::Bold));
-    let _ = out.execute(Print(format!("{icon} {role}")));
+    let _ = out.execute(Print(format!("{icon} {}", role.as_str())));
     let _ = out.execute(SetAttribute(Attribute::Reset));
     let _ = out.execute(ResetColor);
     let _ = out.execute(Print("\n"));
@@ -1231,14 +1488,16 @@ pub fn print_role_header(role: &str) {
 
 /// Print a tool execution start indicator (matches Claude Code's ● symbol).
 pub fn print_tool_start(tool_name: &str, description: &str) {
+    let tool_name = sanitize_terminal_label(tool_name);
+    let description = sanitize_terminal_text(description, EVENT_TEXT_LIMITS);
     let mut out = stdout();
     let _ = out.execute(SetForegroundColor(CtColor::Cyan));
     let _ = out.execute(SetAttribute(Attribute::Bold));
-    let _ = out.execute(Print(format!("\n  \u{25CF} {tool_name}")));
+    let _ = out.execute(Print(format!("\n  \u{25CF} {}", tool_name.as_str())));
     let _ = out.execute(SetAttribute(Attribute::Reset));
-    if !description.is_empty() {
+    if !description.as_str().is_empty() {
         let _ = out.execute(SetForegroundColor(CtColor::DarkGrey));
-        let _ = out.execute(Print(format!(" ({description})")));
+        let _ = out.execute(Print(format!(" ({})", description.as_str())));
     }
     let _ = out.execute(ResetColor);
     let _ = out.execute(Print("\n"));
@@ -1246,14 +1505,15 @@ pub fn print_tool_start(tool_name: &str, description: &str) {
 
 /// Print tool completion status with duration.
 pub fn print_tool_done(tool_name: &str, success: bool, duration_ms: u64) {
+    let tool_name = sanitize_terminal_label(tool_name);
     let mut out = stdout();
     let _ = out.execute(Print("  "));
     if success {
         let _ = out.execute(SetForegroundColor(CtColor::Green));
-        let _ = out.execute(Print(format!("\u{2713} {tool_name}")));
+        let _ = out.execute(Print(format!("\u{2713} {}", tool_name.as_str())));
     } else {
         let _ = out.execute(SetForegroundColor(CtColor::Red));
-        let _ = out.execute(Print(format!("\u{2717} {tool_name}")));
+        let _ = out.execute(Print(format!("\u{2717} {}", tool_name.as_str())));
     }
     if duration_ms > 0 {
         let _ = out.execute(SetForegroundColor(CtColor::DarkGrey));
@@ -1301,6 +1561,10 @@ pub fn print_context_usage(used_tokens: usize, max_tokens: usize) {
 
 /// Print a clean welcome banner (inline fallback, no ratatui).
 pub fn print_welcome_banner(version: &str, provider: &str, model: &str, auth_method: &str) {
+    let version = sanitize_terminal_label(version);
+    let provider = sanitize_terminal_label(provider);
+    let model = sanitize_terminal_label(model);
+    let auth_method = sanitize_terminal_label(auth_method);
     let mut out = stdout();
     // Purple branding header
     let _ = out.execute(SetForegroundColor(CtColor::Rgb {
@@ -1309,14 +1573,17 @@ pub fn print_welcome_banner(version: &str, provider: &str, model: &str, auth_met
         b: 219,
     }));
     let _ = out.execute(SetAttribute(Attribute::Bold));
-    let _ = out.execute(Print(format!("  OpenClaudia v{version}")));
+    let _ = out.execute(Print(format!("  OpenClaudia v{}", version.as_str())));
     let _ = out.execute(SetAttribute(Attribute::Reset));
     let _ = out.execute(ResetColor);
     let _ = out.execute(Print("\n"));
     // Provider and model on next line
     let _ = out.execute(SetForegroundColor(CtColor::DarkGrey));
     let _ = out.execute(Print(format!(
-        "  {provider} \u{00B7} {model} \u{00B7} {auth_method}\n\n"
+        "  {} \u{00B7} {} \u{00B7} {}\n\n",
+        provider.as_str(),
+        model.as_str(),
+        auth_method.as_str()
     )));
     let _ = out.execute(ResetColor);
 }
@@ -1384,6 +1651,70 @@ mod tests {
     fn test_theme_default() {
         let theme = Theme::default();
         assert_eq!(theme.name, "default");
+    }
+
+    #[test]
+    fn maintained_syntax_highlighter_colors_supported_language() {
+        let mut highlighter =
+            CodeHighlighter::new("rust").expect("the explicit Rust grammar must be registered");
+        let rendered = highlighter
+            .highlight_line("fn main() { println!(\"hello\"); }")
+            .expect("valid Rust source must highlight");
+        assert!(
+            rendered.contains("\u{1b}["),
+            "highlighted terminal source must contain ANSI styling"
+        );
+        assert!(rendered.contains("main"));
+    }
+
+    #[test]
+    fn unsupported_syntax_tag_uses_existing_flat_color_fallback() {
+        assert!(CodeHighlighter::new("definitely-not-a-language").is_none());
+    }
+
+    #[test]
+    fn maintained_syntax_highlighter_preserves_multiline_context() {
+        let mut contextual =
+            CodeHighlighter::new("rust").expect("the explicit Rust grammar must be registered");
+        contextual
+            .highlight_line("/* opening comment")
+            .expect("first comment line must highlight");
+        let continued = contextual
+            .highlight_line("still inside */ let value = 1;")
+            .expect("continued comment line must highlight");
+
+        let mut isolated =
+            CodeHighlighter::new("rust").expect("the explicit Rust grammar must be registered");
+        let without_context = isolated
+            .highlight_line("still inside */ let value = 1;")
+            .expect("isolated source must remain renderable");
+        assert_ne!(
+            continued, without_context,
+            "multiline parsing must affect the continued line's styling"
+        );
+        assert!(continued.contains("\u{1b}["));
+        assert!(continued.contains("still inside */"));
+    }
+
+    #[test]
+    fn maintained_syntax_highlighter_falls_back_after_bounded_source() {
+        let mut highlighter =
+            CodeHighlighter::new("rust").expect("the explicit Rust grammar must be registered");
+        let oversized = "x".repeat(MAX_HIGHLIGHT_SOURCE_BYTES + 1);
+        assert!(highlighter.highlight_line(&oversized).is_none());
+        assert!(highlighter
+            .highlight_line("let still_visible = true;")
+            .is_none());
+    }
+
+    #[test]
+    fn maintained_syntax_highlighter_bounds_reparse_line_count() {
+        let mut highlighter =
+            CodeHighlighter::new("rust").expect("the explicit Rust grammar must be registered");
+        for _ in 0..MAX_HIGHLIGHT_SOURCE_LINES {
+            assert!(highlighter.highlight_line("// bounded").is_some());
+        }
+        assert!(highlighter.highlight_line("let fallback = true;").is_none());
     }
 
     #[test]

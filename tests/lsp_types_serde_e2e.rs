@@ -138,6 +138,7 @@ fn lsp_action_is_copy_and_eq() {
 #[test]
 fn lsp_location_required_fields_round_trip() {
     let original = LspLocation {
+        resource_id: "src/lib.rs".to_string(),
         uri: "file:///src/lib.rs".to_string(),
         line: 42,
         character: 12,
@@ -155,6 +156,7 @@ fn lsp_location_required_fields_round_trip() {
 #[test]
 fn lsp_location_with_range_end_fields_round_trip() {
     let original = LspLocation {
+        resource_id: "src/main.rs".to_string(),
         uri: "file:///src/main.rs".to_string(),
         line: 10,
         character: 0,
@@ -172,6 +174,7 @@ fn lsp_location_with_range_end_fields_round_trip() {
 #[test]
 fn lsp_location_clone_preserves_all_fields() {
     let original = LspLocation {
+        resource_id: "x".to_string(),
         uri: "file:///x".to_string(),
         line: 1,
         character: 2,
@@ -195,8 +198,13 @@ fn lsp_symbol_with_no_children_round_trips() {
     let original = LspSymbol {
         name: "Foo".to_string(),
         kind: "struct".to_string(),
+        uri: None,
+        resource_id: None,
+        container_name: None,
         line: 10,
+        character: None,
         end_line: Some(30),
+        end_character: None,
         children: Vec::new(),
     };
     let json = serde_json::to_string(&original).expect("ser");
@@ -212,15 +220,25 @@ fn lsp_symbol_with_nested_children_round_trips() {
     let child_method = LspSymbol {
         name: "method_a".to_string(),
         kind: "method".to_string(),
+        uri: None,
+        resource_id: None,
+        container_name: None,
         line: 12,
+        character: None,
         end_line: Some(14),
+        end_character: None,
         children: Vec::new(),
     };
     let parent_struct = LspSymbol {
         name: "Foo".to_string(),
         kind: "struct".to_string(),
+        uri: None,
+        resource_id: None,
+        container_name: None,
         line: 10,
+        character: None,
         end_line: Some(40),
+        end_character: None,
         children: vec![child_method],
     };
     let json = serde_json::to_string(&parent_struct).expect("ser");
@@ -236,13 +254,23 @@ fn lsp_symbol_clone_preserves_recursive_tree() {
     let symbol = LspSymbol {
         name: "X".to_string(),
         kind: "class".to_string(),
+        uri: None,
+        resource_id: None,
+        container_name: None,
         line: 1,
+        character: None,
         end_line: Some(10),
+        end_character: None,
         children: vec![LspSymbol {
             name: "y".to_string(),
             kind: "method".to_string(),
+            uri: None,
+            resource_id: None,
+            container_name: None,
             line: 5,
+            character: None,
             end_line: None,
+            end_character: None,
             children: Vec::new(),
         }],
     };
@@ -261,6 +289,7 @@ fn lsp_result_full_shape_round_trips() {
         action: "goToDefinition".to_string(),
         file_path: "/src/lib.rs".to_string(),
         results: vec![LspLocation {
+            resource_id: "src/lib.rs".to_string(),
             uri: "file:///src/lib.rs".to_string(),
             line: 100,
             character: 5,
@@ -270,6 +299,11 @@ fn lsp_result_full_shape_round_trips() {
         }],
         hover_text: None,
         symbols: Vec::new(),
+        provenance: None,
+        call_hierarchy_items: Vec::new(),
+        diagnostics: Vec::new(),
+        partial_reasons: Vec::new(),
+        content_authority: "untrusted_language_server_output".to_string(),
     };
     let json = serde_json::to_string(&original).expect("ser");
     let back: LspResult = serde_json::from_str(&json).expect("de");
@@ -287,6 +321,11 @@ fn lsp_result_hover_action_carries_hover_text_field() {
         results: Vec::new(),
         hover_text: Some("fn name() -> Result<()>".to_string()),
         symbols: Vec::new(),
+        provenance: None,
+        call_hierarchy_items: Vec::new(),
+        diagnostics: Vec::new(),
+        partial_reasons: Vec::new(),
+        content_authority: "untrusted_language_server_output".to_string(),
     };
     let json = serde_json::to_string(&original).expect("ser");
     let back: LspResult = serde_json::from_str(&json).expect("de");
@@ -303,10 +342,20 @@ fn lsp_result_document_symbols_action_carries_symbols_field() {
         symbols: vec![LspSymbol {
             name: "Top".to_string(),
             kind: "struct".to_string(),
+            uri: None,
+            resource_id: None,
+            container_name: None,
             line: 0,
+            character: None,
             end_line: Some(10),
+            end_character: None,
             children: Vec::new(),
         }],
+        provenance: None,
+        call_hierarchy_items: Vec::new(),
+        diagnostics: Vec::new(),
+        partial_reasons: Vec::new(),
+        content_authority: "untrusted_language_server_output".to_string(),
     };
     let json = serde_json::to_string(&original).expect("ser");
     let back: LspResult = serde_json::from_str(&json).expect("de");
@@ -322,6 +371,11 @@ fn lsp_result_clone_preserves_all_fields() {
         results: Vec::new(),
         hover_text: Some("text".to_string()),
         symbols: Vec::new(),
+        provenance: None,
+        call_hierarchy_items: Vec::new(),
+        diagnostics: Vec::new(),
+        partial_reasons: Vec::new(),
+        content_authority: "untrusted_language_server_output".to_string(),
     };
     let cloned = original.clone();
     assert_eq!(cloned.action, original.action);
@@ -329,19 +383,54 @@ fn lsp_result_clone_preserves_all_fields() {
 }
 
 #[test]
-fn lsp_result_serialized_field_count_matches_documented_5() {
+fn lsp_result_serialized_shape_marks_untrusted_server_content() {
     let result = LspResult {
         action: "x".to_string(),
         file_path: "x".to_string(),
         results: Vec::new(),
         hover_text: None,
         symbols: Vec::new(),
+        provenance: None,
+        call_hierarchy_items: Vec::new(),
+        diagnostics: Vec::new(),
+        partial_reasons: Vec::new(),
+        content_authority: "untrusted_language_server_output".to_string(),
     };
     let json: serde_json::Value = serde_json::to_value(&result).expect("ser");
     let obj = json.as_object().expect("obj");
-    // PINS SHAPE: 5 documented fields.
-    assert_eq!(obj.len(), 5);
-    for field in &["action", "file_path", "results", "hover_text", "symbols"] {
+    // PINS SHAPE: stable result fields plus explicit server-content authority.
+    assert_eq!(obj.len(), 6);
+    for field in &[
+        "action",
+        "file_path",
+        "results",
+        "hover_text",
+        "symbols",
+        "content_authority",
+    ] {
         assert!(obj.contains_key(*field), "MUST contain field {field:?}");
     }
+}
+
+#[test]
+fn pre_s069_result_shape_deserializes_with_safe_metadata_defaults() {
+    let result: LspResult = serde_json::from_value(serde_json::json!({
+        "action": "goToDefinition",
+        "file_path": "src/lib.rs",
+        "results": [{
+            "uri": "file:///src/lib.rs",
+            "line": 1,
+            "character": 1,
+            "end_line": null,
+            "end_character": null,
+            "preview": null
+        }],
+        "hover_text": null,
+        "symbols": []
+    }))
+    .expect("legacy serialized result remains readable");
+    assert_eq!(result.content_authority, "untrusted_language_server_output");
+    assert!(result.results[0].resource_id.is_empty());
+    assert!(result.diagnostics.is_empty());
+    assert!(result.partial_reasons.is_empty());
 }

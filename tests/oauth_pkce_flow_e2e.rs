@@ -17,7 +17,16 @@ use openclaudia::oauth::{
     parse_auth_code, AuthMode, OAuthCredentials, PkceParams, ANTHROPIC_CLIENT_ID,
     ANTHROPIC_REDIRECT_URI, OAUTH_AUTHORIZE_URL,
 };
+use openclaudia::secrets::OAuthToken;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+fn authorization_state(pkce: &PkceParams) -> String {
+    url::Url::parse(&pkce.build_auth_url())
+        .expect("authorization URL")
+        .query_pairs()
+        .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+        .expect("state query parameter")
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // Section A — oauth constants
@@ -47,7 +56,7 @@ fn oauth_authorize_url_points_to_claude_ai() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn pkce_generate_yields_high_entropy_verifier() {
+fn pkce_generate_yields_high_entropy_redacted_verifier() {
     let p = PkceParams::generate();
     // base64url(64 random bytes) → ~86 chars.
     assert!(
@@ -55,24 +64,24 @@ fn pkce_generate_yields_high_entropy_verifier() {
         "verifier MUST have substantial length; got {} chars",
         p.verifier.len()
     );
-    // base64url alphabet only.
-    assert!(
-        p.verifier
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
-        "verifier MUST be base64url; got {:?}",
-        p.verifier
-    );
+    let rendered = format!("{:?}", p.verifier);
+    assert_eq!(rendered, "SecretString([REDACTED])");
 }
 
 #[test]
 fn pkce_generate_yields_high_entropy_state() {
     let p = PkceParams::generate();
-    assert!(p.state.len() >= 80);
-    assert!(p
-        .state
+    let state = authorization_state(&p);
+    assert!(state.len() >= 80);
+    assert!(state
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    let rendered = format!("{p:?}");
+    assert!(
+        !rendered.contains(&state),
+        "PKCE Debug leaked state: {rendered}"
+    );
+    assert!(rendered.contains("SecretString([REDACTED])"));
 }
 
 #[test]
@@ -132,7 +141,7 @@ fn build_auth_url_carries_verifier_challenge_not_verifier_directly() {
     // stays secret until token exchange).
     assert!(url.contains(&p.challenge));
     assert!(
-        !url.contains(&p.verifier),
+        !p.verifier.appears_in(&url),
         "verifier MUST NOT appear in authorize URL; got {url:?}"
     );
 }
@@ -183,7 +192,7 @@ fn parse_auth_code_handles_only_hash_as_empty_code_empty_state() {
 #[test]
 fn oauth_credentials_future_expiry_is_not_expired() {
     let cred = OAuthCredentials {
-        access_token: "tok".to_string(),
+        access_token: OAuthToken::try_from_string("tok".to_string()).expect("token"),
         refresh_token: None,
         expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
     };
@@ -193,7 +202,7 @@ fn oauth_credentials_future_expiry_is_not_expired() {
 #[test]
 fn oauth_credentials_past_expiry_is_expired() {
     let cred = OAuthCredentials {
-        access_token: "tok".to_string(),
+        access_token: OAuthToken::try_from_string("tok".to_string()).expect("token"),
         refresh_token: None,
         expires_at: chrono::Utc::now() - chrono::Duration::hours(1),
     };
@@ -234,7 +243,7 @@ fn now_epoch() -> u64 {
 #[test]
 fn token_bundle_with_long_lifetime_is_not_expired() {
     let bundle = TokenBundle {
-        access_token: "at".to_string(),
+        access_token: OAuthToken::try_from_string("at".to_string()).expect("token"),
         refresh_token: None,
         expires_in_secs: 3600,
         obtained_at: now_epoch(),
@@ -247,7 +256,7 @@ fn token_bundle_with_long_lifetime_is_not_expired() {
 #[test]
 fn token_bundle_with_past_obtained_at_plus_short_lifetime_is_expired() {
     let bundle = TokenBundle {
-        access_token: "at".to_string(),
+        access_token: OAuthToken::try_from_string("at".to_string()).expect("token"),
         refresh_token: None,
         expires_in_secs: 1,
         // Obtained 1 hour ago, lifetime 1 second → expired.
@@ -263,7 +272,7 @@ fn token_bundle_needs_refresh_within_safety_window() {
     // Token expires 30 seconds from now; safety window 60s
     // → needs refresh.
     let bundle = TokenBundle {
-        access_token: "at".to_string(),
+        access_token: OAuthToken::try_from_string("at".to_string()).expect("token"),
         refresh_token: None,
         expires_in_secs: 30,
         obtained_at: now_epoch(),
@@ -276,7 +285,7 @@ fn token_bundle_needs_refresh_within_safety_window() {
 #[test]
 fn token_bundle_does_not_need_refresh_far_outside_safety_window() {
     let bundle = TokenBundle {
-        access_token: "at".to_string(),
+        access_token: OAuthToken::try_from_string("at".to_string()).expect("token"),
         refresh_token: None,
         expires_in_secs: 3600,
         obtained_at: now_epoch(),
@@ -287,24 +296,25 @@ fn token_bundle_does_not_need_refresh_far_outside_safety_window() {
 }
 
 #[test]
-fn token_bundle_serde_round_trips() {
+fn token_bundle_serde_redacts_and_rejects_lossy_round_trip() {
     let bundle = TokenBundle {
-        access_token: "at".to_string(),
-        refresh_token: Some("rt".to_string()),
+        access_token: OAuthToken::try_from_string("at".to_string()).expect("token"),
+        refresh_token: Some(OAuthToken::try_from_string("rt".to_string()).expect("token")),
         expires_in_secs: 3600,
         obtained_at: 1_700_000_000,
         token_type: "Bearer".to_string(),
         scope: "read write".to_string(),
     };
     let json = serde_json::to_string(&bundle).expect("ser");
-    let back: TokenBundle = serde_json::from_str(&json).expect("de");
-    assert_eq!(back, bundle);
+    assert!(!json.contains("\"at\""));
+    assert!(!json.contains("\"rt\""));
+    assert!(serde_json::from_str::<TokenBundle>(&json).is_err());
 }
 
 #[test]
-fn token_bundle_with_absent_refresh_token_serde_round_trips() {
+fn token_bundle_with_absent_refresh_token_omits_field_but_remains_non_reloadable() {
     let bundle = TokenBundle {
-        access_token: "at".to_string(),
+        access_token: OAuthToken::try_from_string("at".to_string()).expect("token"),
         refresh_token: None,
         expires_in_secs: 1000,
         obtained_at: 1_700_000_000,
@@ -312,8 +322,9 @@ fn token_bundle_with_absent_refresh_token_serde_round_trips() {
         scope: String::new(),
     };
     let json = serde_json::to_string(&bundle).expect("ser");
-    let back: TokenBundle = serde_json::from_str(&json).expect("de");
-    assert_eq!(back.refresh_token, None);
+    let encoded: serde_json::Value = serde_json::from_str(&json).expect("encoded JSON");
+    assert!(encoded.get("refresh_token").is_none());
+    assert!(serde_json::from_str::<TokenBundle>(&json).is_err());
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -333,7 +344,8 @@ fn fresh_config() -> OAuthConfig {
 
 fn fresh_pkce() -> PkcePair {
     PkcePair {
-        code_verifier: "verifier".to_string(),
+        code_verifier: openclaudia::secrets::SecretString::try_from_string("verifier".to_string())
+            .expect("verifier"),
         code_challenge: "challenge".to_string(),
         method: "S256",
     }
@@ -359,7 +371,7 @@ fn start_authorization_from_authorized_is_invalid_transition() {
     let flow = OAuthFlow::Authorized {
         config: fresh_config(),
         token: TokenBundle {
-            access_token: "at".to_string(),
+            access_token: OAuthToken::try_from_string("at".to_string()).expect("token"),
             refresh_token: None,
             expires_in_secs: 100,
             obtained_at: now_epoch(),
@@ -391,15 +403,14 @@ fn accept_redirect_with_mismatched_state_errors_state_mismatch() {
         .start_authorization("expected-state".to_string(), fresh_pkce())
         .expect("transition");
     let outcome = awaiting.accept_redirect("ATTACKER-STATE", "code".to_string());
-    let matched = matches!(
-        &outcome,
-        Err(OAuthError::StateMismatch { expected, actual })
-            if expected == "expected-state" && actual == "ATTACKER-STATE"
-    );
+    let matched = matches!(&outcome, Err(OAuthError::StateMismatch { .. }));
     assert!(
         matched,
         "MUST refuse state mismatch as CSRF guard; got {outcome:?}"
     );
+    let rendered = format!("{outcome:?}");
+    assert!(!rendered.contains("expected-state"), "{rendered}");
+    assert!(!rendered.contains("ATTACKER-STATE"), "{rendered}");
 }
 
 #[test]
@@ -410,7 +421,7 @@ fn complete_exchange_from_exchanging_transitions_to_authorized() {
         .unwrap();
     let exchanging = awaiting.accept_redirect("s", "code".to_string()).unwrap();
     let token = TokenBundle {
-        access_token: "at".to_string(),
+        access_token: OAuthToken::try_from_string("at".to_string()).expect("token"),
         refresh_token: None,
         expires_in_secs: 100,
         obtained_at: now_epoch(),
@@ -425,7 +436,7 @@ fn complete_exchange_from_exchanging_transitions_to_authorized() {
 fn complete_exchange_from_idle_is_invalid_transition() {
     let flow = OAuthFlow::new(fresh_config());
     let token = TokenBundle {
-        access_token: "at".to_string(),
+        access_token: OAuthToken::try_from_string("at".to_string()).expect("token"),
         refresh_token: None,
         expires_in_secs: 100,
         obtained_at: now_epoch(),
@@ -440,5 +451,7 @@ fn complete_exchange_from_idle_is_invalid_transition() {
 fn fail_transitions_to_failed_terminal_state_from_any_state() {
     let flow = OAuthFlow::new(fresh_config());
     let failed = flow.fail("test failure");
-    assert!(matches!(failed, OAuthFlow::Failed { ref reason } if reason == "test failure"));
+    assert!(
+        matches!(failed, OAuthFlow::Failed { ref reason } if reason.as_str() == "test failure")
+    );
 }

@@ -1,10 +1,10 @@
 //! End-to-end tests for `tools::registry` `ToolHandler` trait
-//! introspection + `PermissionTarget` declarations + registry
+//! introspection + mandatory `ToolEffectSpec` declarations + registry
 //! integrity that sprint 30 left uncovered.
 //!
 //! Sprint 71 of the verification effort. Sprint 30 covered the
 //! schema validation; this file pins the per-handler
-//! `permission_target`, `name`/`definition` self-consistency,
+//! effect metadata, `name`/`definition` self-consistency,
 //! and the registry's dispatch identity (same handler reference
 //! returned across calls).
 
@@ -14,6 +14,7 @@
 
 use std::collections::BTreeSet;
 
+use openclaudia::tools::effect::{ToolEffect, ToolEffectSpec, ToolTarget};
 use openclaudia::tools::registry::registry;
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -161,38 +162,39 @@ fn handler_definition_function_has_parameters_schema() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section B — PermissionTarget declarations
+// Section B — Mandatory effect declarations (S-016)
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn bash_handler_declares_bash_canonical_with_command_arg_key() {
     let r = registry();
-    let handler = r.get("bash").expect("bash registered");
-    let target = handler
-        .permission_target()
-        .expect("bash MUST declare permission target");
-    assert_eq!(target.canonical, "Bash");
-    assert_eq!(target.arg_key, "command");
+    let spec = r.get("bash").expect("bash registered").effect_spec();
+    assert_eq!(spec.canonical, "Bash");
+    assert_eq!(spec.target, ToolTarget::Arg("command"));
+    assert_eq!(spec.effect, ToolEffect::Destructive);
 }
 
 #[test]
 fn write_file_handler_declares_write_canonical_with_path_arg_key() {
     let r = registry();
-    let handler = r.get("write_file").expect("write_file registered");
-    let target = handler
-        .permission_target()
-        .expect("write_file MUST declare permission target");
-    assert_eq!(target.canonical, "Write");
-    assert_eq!(target.arg_key, "path");
+    let spec = r
+        .get("write_file")
+        .expect("write_file registered")
+        .effect_spec();
+    assert_eq!(spec.canonical, "Write");
+    assert_eq!(spec.target, ToolTarget::Arg("path"));
+    assert_eq!(spec.effect, ToolEffect::WorkspaceMutation);
 }
 
 #[test]
 fn edit_file_handler_declares_edit_canonical() {
     let r = registry();
-    let handler = r.get("edit_file").expect("edit_file registered");
-    let target = handler.permission_target().expect("MUST declare target");
-    assert_eq!(target.canonical, "Edit");
-    assert_eq!(target.arg_key, "path");
+    let spec = r
+        .get("edit_file")
+        .expect("edit_file registered")
+        .effect_spec();
+    assert_eq!(spec.canonical, "Edit");
+    assert_eq!(spec.target, ToolTarget::Arg("path"));
 }
 
 #[test]
@@ -215,16 +217,21 @@ fn mutation_tool_descriptions_document_successful_read_gate() {
 #[test]
 fn web_fetch_handler_declares_webfetch_canonical_with_url_arg_key() {
     let r = registry();
-    let handler = r.get("web_fetch").expect("web_fetch registered");
-    let target = handler.permission_target().expect("MUST declare target");
-    assert_eq!(target.canonical, "WebFetch");
-    assert_eq!(target.arg_key, "url");
+    let spec = r
+        .get("web_fetch")
+        .expect("web_fetch registered")
+        .effect_spec();
+    assert_eq!(spec.canonical, "WebFetch");
+    assert_eq!(spec.target, ToolTarget::Arg("url"));
+    assert_eq!(spec.effect, ToolEffect::NetworkRead);
 }
 
 #[test]
-fn read_only_tools_declare_no_permission_target() {
-    // Documented contract: tools with no side effects return
-    // None from permission_target() — the default impl.
+fn read_only_tools_declare_read_only_as_a_positive_claim() {
+    // S-016: read-only is now an assertion the handler makes, not the
+    // absence of an override. The old form of this test ("MUST return None
+    // from permission_target") could not tell a genuine read-only tool from
+    // one that simply forgot to classify itself — which is F-001.
     let r = registry();
     for tool_name in &[
         "read_file",
@@ -233,41 +240,36 @@ fn read_only_tools_declare_no_permission_target() {
         "glob",
         "grep",
     ] {
-        let handler = r.get(tool_name).expect("registered");
-        assert!(
-            handler.permission_target().is_none(),
-            "read-only tool {tool_name:?} MUST return None from permission_target"
+        let spec = r.get(tool_name).expect("registered").effect_spec();
+        assert_eq!(
+            spec.effect,
+            ToolEffect::ReadOnly,
+            "read-only tool {tool_name:?} MUST declare ToolEffect::ReadOnly"
         );
+        assert!(!spec.effect.requires_authorization());
     }
 }
 
 #[test]
-fn every_handler_with_permission_target_uses_non_empty_canonical_and_arg_key() {
+fn every_handler_declares_a_structurally_valid_spec() {
     let r = registry();
     for tool_name in registered_tool_names() {
         let handler = r.get(&tool_name).unwrap();
-        if let Some(target) = handler.permission_target() {
-            assert!(
-                !target.canonical.is_empty(),
-                "tool {tool_name:?} permission_target.canonical MUST be non-empty"
-            );
-            assert!(
-                !target.arg_key.is_empty(),
-                "tool {tool_name:?} permission_target.arg_key MUST be non-empty"
-            );
-        }
+        handler
+            .effect_spec()
+            .validate(&tool_name)
+            .unwrap_or_else(|e| panic!("{tool_name}: {e}"));
     }
 }
 
 #[test]
-fn permission_targets_are_referentially_stable_across_calls() {
+fn effect_specs_are_referentially_stable_across_calls() {
     let r = registry();
     let handler = r.get("bash").unwrap();
-    let t1 = handler.permission_target();
-    let t2 = handler.permission_target();
     assert_eq!(
-        t1, t2,
-        "permission_target MUST be deterministic per handler"
+        handler.effect_spec(),
+        handler.effect_spec(),
+        "effect_spec MUST be deterministic per handler"
     );
 }
 
@@ -307,44 +309,30 @@ fn registry_singleton_is_referentially_stable_across_calls() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Section D — PermissionTarget shape + Eq
+// Section D — ToolEffectSpec shape + Eq
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn permission_target_with_same_canonical_and_arg_key_compares_equal() {
-    use openclaudia::tools::registry::PermissionTarget;
-    let a = PermissionTarget {
-        canonical: "Bash",
-        arg_key: "command",
-    };
-    let b = PermissionTarget {
-        canonical: "Bash",
-        arg_key: "command",
-    };
+fn effect_spec_with_same_fields_compares_equal() {
+    let a = ToolEffectSpec::effectful(ToolEffect::Destructive, "Bash", "command");
+    let b = ToolEffectSpec::effectful(ToolEffect::Destructive, "Bash", "command");
     assert_eq!(a, b);
 }
 
 #[test]
-fn permission_target_different_canonical_compares_not_equal() {
-    use openclaudia::tools::registry::PermissionTarget;
-    let a = PermissionTarget {
-        canonical: "Bash",
-        arg_key: "command",
-    };
-    let b = PermissionTarget {
-        canonical: "Write",
-        arg_key: "command",
-    };
-    assert_ne!(a, b);
+fn effect_spec_different_effect_compares_not_equal() {
+    let a = ToolEffectSpec::effectful(ToolEffect::Destructive, "Bash", "command");
+    let b = ToolEffectSpec::effectful(ToolEffect::ReadOnly, "Bash", "command");
+    assert_ne!(
+        a, b,
+        "two declarations differing only in effect must not compare equal; \
+         collapsing them would let a destructive tool pass as a read"
+    );
 }
 
 #[test]
-fn permission_target_is_copy_clone_for_zero_alloc_dispatch() {
-    use openclaudia::tools::registry::PermissionTarget;
-    let a = PermissionTarget {
-        canonical: "X",
-        arg_key: "y",
-    };
+fn effect_spec_is_copy_clone_for_zero_alloc_dispatch() {
+    let a = ToolEffectSpec::read_only("X");
     // Copy semantics — value passes without clone() call.
     let b = a;
     let c = a; // a still usable (Copy).
@@ -366,7 +354,7 @@ fn every_registered_tool_has_lookup_handler_and_definition() {
         // — MUST not panic and MUST be self-consistent.
         let _ = handler.name();
         let _ = handler.definition();
-        let _ = handler.permission_target();
+        let _ = handler.effect_spec();
     }
 }
 
@@ -477,23 +465,28 @@ fn readme_web_search_docs_explain_browser_feature_boundary() {
     let claude_code_features = include_str!("../CLAUDE_CODE_FEATURES.md");
     let architecture = include_str!("../ARCHITECTURE.md");
     let cargo_toml = include_str!("../Cargo.toml");
+    let registry_source = include_str!("../src/tools/registry.rs");
+    let web_source = include_str!("../src/web.rs");
     let changelog = include_str!("../CHANGELOG.md");
 
     assert!(
-        readme.contains("Free DuckDuckGo/Bing browser scraping"),
-        "README must explain that web search is free and browser-backed"
+        readme.contains("Free DuckDuckGo/Bing browser scraping is available"),
+        "README must explain that opt-in web search is free and browser-backed"
     );
     assert!(
         comparison.contains("free DuckDuckGo/Bing browser scraping"),
         "COMPARISON.md must describe OpenClaudia web search as free and browser-backed"
     );
     assert!(
-        readme.contains("web_search is unavailable"),
-        "README no-default-features build note must explain web_search's browser-feature requirement"
+        readme.contains("`web_search` and `web_browser` are\nunavailable"),
+        "README default build note must explain web_search's browser-feature requirement"
     );
     assert!(
-        prompt_tools.contains("No search API key is required"),
-        "model-facing tool prompt must not tell the model to require a paid search API key"
+        prompt_tools.contains(
+            "tool definitions attached to the current request are the authoritative list"
+        ) && !prompt_tools.contains("web_search")
+            && !prompt_tools.contains("search API key"),
+        "model-facing base policy must stay capability-neutral instead of hard-coding web-search availability"
     );
     assert!(
         claude_code_features.contains("free DuckDuckGo/Bing browser scraping"),
@@ -502,6 +495,18 @@ fn readme_web_search_docs_explain_browser_feature_boundary() {
     assert!(
         architecture.contains("DuckDuckGo") && architecture.contains("/ Bing"),
         "architecture doc must describe the current free search backend"
+    );
+    assert!(
+        readme.contains("--features browser")
+            && readme.contains("operator-installed compatible")
+            && claude_code_features.contains("not part of the default build")
+            && architecture.contains("cannot\ndownload Chromium at runtime")
+            && cargo_toml.contains("default = []")
+            && cargo_toml.contains("features = [\"offline\"]")
+            && !cargo_toml.contains("features = [\"fetch\"]")
+            && !registry_source.contains("default `browser` feature")
+            && !web_source.contains("default `browser` feature"),
+        "browser availability must be explicit, opt-in, offline-built, and documented consistently"
     );
     for doc in [
         readme,

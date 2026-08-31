@@ -16,7 +16,7 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::compaction::{CompactionConfig, ContextCompactor};
+use openclaudia::compaction::{CompactionConfig, ContextCompactor, RequestTokenMeasurement};
 use openclaudia::proxy::{ChatCompletionRequest, ChatMessage, MessageContent};
 use openclaudia::services::{AutoCompactPolicy, AutoCompactor};
 
@@ -63,6 +63,10 @@ fn compactor_with_cap(max_tokens: usize) -> ContextCompactor {
     ContextCompactor::new(config)
 }
 
+fn measured(request: &ChatCompletionRequest, tokens: usize) -> RequestTokenMeasurement {
+    RequestTokenMeasurement::for_request(request, tokens)
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Section A — AutoCompactor::auto + ::new
 // ───────────────────────────────────────────────────────────────────────────
@@ -88,7 +92,7 @@ fn compactor_accessor_returns_underlying_compactor() {
     // The accessor returns a reference — same max_context_tokens.
     let analysis = auto
         .compactor()
-        .analyze_with_hint(&make_request(1, 10), None);
+        .analyze_with_measurement(&make_request(1, 10), None);
     assert_eq!(analysis.max_tokens, 50_000);
 }
 
@@ -116,13 +120,13 @@ fn auto_policy_compacts_when_actual_tokens_exceed_threshold() {
     let req = make_request(1, 10);
     // Pass actual = 5000 (> 4404) → MUST trigger.
     assert!(
-        auto.should_compact(&req, Some(5000)),
+        auto.should_compact(&req, Some(measured(&req, 5000))),
         "actual=5000 > effective_threshold=4404 MUST trigger"
     );
     // Pass actual = 4404 (exactly at threshold) → MUST NOT
     // trigger (strict > comparison).
     assert!(
-        !auto.should_compact(&req, Some(4404)),
+        !auto.should_compact(&req, Some(measured(&req, 4404))),
         "actual=4404 == effective_threshold MUST NOT trigger (strict >)"
     );
 }
@@ -153,16 +157,16 @@ fn always_over_budget_triggers_at_or_above_max_context() {
     // Under AlwaysOverBudget, only actual >= max triggers.
     // 9999 → NO trigger.
     assert!(
-        !auto.should_compact(&req, Some(9999)),
+        !auto.should_compact(&req, Some(measured(&req, 9999))),
         "actual=9999 < max=10000 MUST NOT trigger under AlwaysOverBudget"
     );
     // 10000 → trigger (>= cap).
     assert!(
-        auto.should_compact(&req, Some(10_000)),
+        auto.should_compact(&req, Some(measured(&req, 10_000))),
         "actual==max MUST trigger under AlwaysOverBudget"
     );
     // 15000 → trigger.
-    assert!(auto.should_compact(&req, Some(15_000)));
+    assert!(auto.should_compact(&req, Some(measured(&req, 15_000))));
 }
 
 #[test]
@@ -177,10 +181,10 @@ fn always_over_budget_does_not_trigger_below_max_even_above_auto_threshold() {
     let req = make_request(1, 10);
 
     // Auto: trigger at 7000.
-    assert!(auto.should_compact(&req, Some(7000)));
+    assert!(auto.should_compact(&req, Some(measured(&req, 7000))));
     // AlwaysOverBudget: do NOT trigger at 7000.
     assert!(
-        !always.should_compact(&req, Some(7000)),
+        !always.should_compact(&req, Some(measured(&req, 7000))),
         "AlwaysOverBudget MUST be STRICTER than Auto — 7000 is above Auto's effective threshold \
          but below AlwaysOverBudget's cap"
     );
@@ -243,8 +247,8 @@ fn actual_hint_zero_treated_as_zero_tokens() {
     let auto = AutoCompactor::new(compactor.clone(), AutoCompactPolicy::Auto);
     let always = AutoCompactor::new(compactor, AutoCompactPolicy::AlwaysOverBudget);
     let req = make_request(1, 10);
-    assert!(!auto.should_compact(&req, Some(0)));
-    assert!(!always.should_compact(&req, Some(0)));
+    assert!(!auto.should_compact(&req, Some(measured(&req, 0))));
+    assert!(!always.should_compact(&req, Some(measured(&req, 0))));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -263,7 +267,7 @@ fn actual_hint_overrides_estimator_when_provided() {
     assert!(!auto.should_compact(&small_req, None));
     // With hint above threshold: MUST compact.
     assert!(
-        auto.should_compact(&small_req, Some(9000)),
+        auto.should_compact(&small_req, Some(measured(&small_req, 9000))),
         "actual hint MUST override estimator"
     );
 }

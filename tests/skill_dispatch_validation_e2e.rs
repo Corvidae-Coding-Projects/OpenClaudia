@@ -1,7 +1,6 @@
 //! End-to-end tests for the `skill` tool dispatched
 //! through the registry — name validation arms +
-//! envelope-shape contract on a real skill loaded from
-//! tempdir.
+//! typed-result and trust contract on a real skill loaded from a tempdir.
 //!
 //! Sprint 154 of the verification effort. Sprint 128
 //! covered direct `execute_skill` calls; this file pins
@@ -12,38 +11,30 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use openclaudia::tools::registry::{registry, ToolContext};
+use openclaudia::tools::registry::registry;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard, OnceLock};
 use tempfile::TempDir;
 
-fn cwd_lock() -> MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn run_in_tempdir<R>(f: impl FnOnce() -> R) -> R {
-    let prev = std::env::current_dir().expect("cwd");
-    let tmp = TempDir::new().expect("tempdir");
-    std::env::set_current_dir(tmp.path()).expect("set cwd");
-    let outcome = f();
-    std::env::set_current_dir(&prev).expect("restore cwd");
-    outcome
-}
+mod support;
 
 fn dispatch_skill(args: &HashMap<String, Value>) -> (String, bool) {
-    let mut ctx = ToolContext {
-        security: openclaudia::tools::security::current_context(),
-        memory_db: None,
-        app_config: None,
-        task_mgr: None,
-    };
-    registry()
-        .dispatch("skill", args, &mut ctx)
-        .expect("skill must be registered")
+    support::dispatch_tool("skill", args)
+}
+
+fn dispatch_skill_in(
+    root: &std::path::Path,
+    args: &HashMap<String, Value>,
+) -> openclaudia::tools::ToolResult {
+    let policy = openclaudia::skills::SkillCapabilityPolicy::project(
+        vec!["Bash(git status *)".to_string()],
+        true,
+        true,
+        true,
+    )
+    .expect("bounded registry skill policy");
+    let run = support::trusted_project_skill_run_context(root, policy);
+    support::dispatch_tool_result_for_run(&run, "skill", args)
 }
 
 fn args_with(entries: &[(&str, Value)]) -> HashMap<String, Value> {
@@ -63,7 +54,7 @@ fn missing_name_arg_returns_documented_error() {
     let (msg, is_err) = dispatch_skill(&HashMap::new());
     assert!(is_err);
     assert!(
-        msg.contains("missing required argument") && msg.contains("name"),
+        msg.contains("Host safety") && msg.contains("Missing 'name' argument"),
         "MUST surface documented missing-name; got {msg:?}"
     );
 }
@@ -74,7 +65,9 @@ fn name_arg_as_number_returns_validation_error() {
     let (msg, is_err) = dispatch_skill(&args);
     assert!(is_err);
     assert!(
-        msg.contains("Invalid 'name' argument: expected string"),
+        msg.contains("Host safety")
+            && msg.contains("malformed arguments")
+            && msg.contains("'name'"),
         "wrong-type name MUST be rejected clearly; got {msg:?}"
     );
 }
@@ -84,7 +77,9 @@ fn name_arg_as_array_returns_validation_error() {
     let args = args_with(&[("name", json!(["x"]))]);
     let (msg, is_err) = dispatch_skill(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'name' argument: expected string"));
+    assert!(msg.contains("Host safety"));
+    assert!(msg.contains("malformed arguments"));
+    assert!(msg.contains("'name'"));
 }
 
 #[test]
@@ -92,7 +87,8 @@ fn name_arg_as_null_returns_validation_error() {
     let args = args_with(&[("name", Value::Null)]);
     let (msg, is_err) = dispatch_skill(&args);
     assert!(is_err);
-    assert!(msg.contains("Invalid 'name' argument: expected string"));
+    assert!(msg.contains("Host safety"));
+    assert!(msg.contains("Missing 'name' argument"));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -131,8 +127,8 @@ fn unknown_skill_returns_documented_error_with_offending_name() {
     let (msg, is_err) = dispatch_skill(&args);
     assert!(is_err);
     assert!(
-        msg.contains("unknown skill"),
-        "MUST surface 'unknown skill'; got {msg:?}"
+        msg.contains("unknown or unavailable skill"),
+        "MUST surface unavailable skill; got {msg:?}"
     );
     assert!(
         msg.contains("definitely-no-such-skill-marker-154"),
@@ -175,12 +171,12 @@ fn name_with_leading_whitespace_trimmed_before_lookup() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn skill_installed_in_project_dir_loads_and_returns_envelope() {
-    let _l = cwd_lock();
-    run_in_tempdir(|| {
+fn trusted_project_skill_dispatch_returns_typed_provenance() {
+    let tmp = TempDir::new().expect("tempdir");
+    {
         // Write a skill at .openclaudia/skills/<name>/SKILL.md.
-        let skills_dir = std::path::Path::new(".openclaudia/skills/round_trip_154");
-        std::fs::create_dir_all(skills_dir).expect("mkdir skills");
+        let skills_dir = tmp.path().join(".openclaudia/skills/round_trip_154");
+        std::fs::create_dir_all(&skills_dir).expect("mkdir skills");
         std::fs::write(
             skills_dir.join("SKILL.md"),
             "---\nname: round_trip_154\ndescription: test\n---\nBody marker: HELLO_FROM_154\n",
@@ -188,52 +184,49 @@ fn skill_installed_in_project_dir_loads_and_returns_envelope() {
         .expect("write SKILL.md");
 
         let args = args_with(&[("name", json!("round_trip_154"))]);
-        let (text, is_err) = dispatch_skill(&args);
-        assert!(!is_err, "installed skill MUST load; got error {text:?}");
-
-        // PINS ENVELOPE: opens with <skill name="...">, ends with </skill>.
-        assert!(
-            text.starts_with("<skill name=\""),
-            "envelope MUST open with <skill name=; got {text:?}"
-        );
-        assert!(
-            text.contains("name=\"round_trip_154\""),
-            "envelope MUST embed skill name attribute; got {text:?}"
-        );
-        assert!(
-            text.ends_with("</skill>"),
-            "envelope MUST close with </skill>; got {text:?}"
-        );
-        // Body content MUST appear between the tags.
+        let result = dispatch_skill_in(tmp.path(), &args);
+        assert!(!result.is_error(), "installed skill MUST load: {result:?}");
+        let text = result.content();
         assert!(
             text.contains("HELLO_FROM_154"),
             "body MUST be present; got {text:?}"
         );
-    });
+        assert!(!text.contains("<skill"));
+        let structured = result.structured().expect("typed skill selection");
+        assert_eq!(structured["schema"], "openclaudia.skill_selection.v1");
+        assert_eq!(structured["name"], "round_trip_154");
+        assert_eq!(structured["trigger"], "model_selection");
+        assert_eq!(structured["provenance"]["source"], "project");
+    }
 }
 
 #[test]
-fn skill_envelope_normalises_trailing_newline_before_close_tag() {
-    let _l = cwd_lock();
-    run_in_tempdir(|| {
-        let skills_dir = std::path::Path::new(".openclaudia/skills/trailing_newline_154");
-        std::fs::create_dir_all(skills_dir).expect("mkdir");
-        // Body ends WITHOUT trailing newline.
+fn registry_model_selection_does_not_activate_declared_authority() {
+    let tmp = TempDir::new().expect("tempdir");
+    {
+        let skills_dir = tmp.path().join(".openclaudia/skills/trailing_newline_154");
+        std::fs::create_dir_all(&skills_dir).expect("mkdir");
         std::fs::write(
             skills_dir.join("SKILL.md"),
-            "---\nname: trailing_newline_154\ndescription: test\n---\nLast line no NL",
+            "---\nname: trailing_newline_154\ndescription: test\nallowed_tools:\n  - Bash(git status *)\nmodel: gpt-5.6\neffort: high\n---\nLast line no NL",
         )
         .expect("write");
 
         let args = args_with(&[("name", json!("trailing_newline_154"))]);
-        let (text, is_err) = dispatch_skill(&args);
-        assert!(!is_err);
-        // PINS: render_envelope adds a newline so close-tag is on its own line.
-        assert!(
-            text.contains("Last line no NL\n</skill>"),
-            "MUST insert trailing newline before </skill>; got {text:?}"
+        let result = dispatch_skill_in(tmp.path(), &args);
+        assert!(!result.is_error());
+        let structured = result.structured().expect("typed selection");
+        assert_eq!(
+            structured["requested_allowed_tools"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
         );
-    });
+        assert_eq!(structured["effective_allowed_tools"], json!([]));
+        assert!(structured["effective_model"].is_null());
+        assert!(structured["effective_effort"].is_null());
+        assert_eq!(structured["hooks_active"], false);
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────

@@ -261,9 +261,9 @@ fn get_context_window_substring_match_finds_provider_prefix() {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[test]
-fn build_compact_boundary_message_produces_system_role() {
+fn build_compact_boundary_message_produces_assistant_evidence_role() {
     let msg = build_compact_boundary_message(50_000, 25, vec![], None);
-    assert_eq!(msg.role, "system");
+    assert_eq!(msg.role, "assistant");
 }
 
 #[test]

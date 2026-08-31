@@ -1,13 +1,20 @@
 use std::collections::{HashMap, HashSet};
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
-use super::USER_QUESTION_MARKER;
+use super::{
+    ToolFailure, ToolFailureCode, ToolFollowUp, ToolFollowUpState, ToolHandlerResult, ToolQuestion,
+    ToolQuestionOption, ToolRetryability,
+};
 
 /// Claude Code-compatible chip width for the question `header` field.
 /// Matches `ASK_USER_QUESTION_TOOL_CHIP_WIDTH` in
 /// `claude-code/tools/AskUserQuestionTool/prompt.ts`.
 const HEADER_CHIP_WIDTH: usize = 12;
+const MAX_QUESTION_BYTES: usize = 2048;
+const MAX_OPTION_LABEL_BYTES: usize = 512;
+const MAX_OPTION_DESCRIPTION_BYTES: usize = 2048;
+const MAX_OPTION_PREVIEW_BYTES: usize = 4096;
 
 /// Pull the `questions` array out of the raw tool arguments and apply the
 /// outer 1-4 count bound.  Returns the borrowed slice on success.
@@ -50,23 +57,40 @@ fn validate_option(
         || format!("Question {i} option {j} missing 'label'"),
         || format!("Question {i} option {j} 'label' must be a string"),
     )?;
+    if label.len() > MAX_OPTION_LABEL_BYTES {
+        return Err(format!(
+            "Question {i} option {j} label exceeds {MAX_OPTION_LABEL_BYTES} bytes"
+        ));
+    }
     if !seen.insert(label.to_string()) {
         return Err(format!(
             "Question {i} option labels must be unique; '{label}' appears more than once"
         ));
     }
-    let _description = required_string_field(
+    let description = required_string_field(
         opt,
         "description",
         || format!("Question {i} option {j} missing 'description'"),
         || format!("Question {i} option {j} 'description' must be a string"),
     )?;
+    if description.len() > MAX_OPTION_DESCRIPTION_BYTES {
+        return Err(format!(
+            "Question {i} option {j} description exceeds {MAX_OPTION_DESCRIPTION_BYTES} bytes"
+        ));
+    }
     // `preview` is optional (CC parity).  When present it must be a string —
     // fail loudly rather than silently dropping it.
     if let Some(v) = opt.get("preview") {
         if !v.is_string() {
             return Err(format!(
                 "Question {i} option {j} 'preview' must be a string"
+            ));
+        }
+        if v.as_str()
+            .is_some_and(|preview| preview.len() > MAX_OPTION_PREVIEW_BYTES)
+        {
+            return Err(format!(
+                "Question {i} option {j} preview exceeds {MAX_OPTION_PREVIEW_BYTES} bytes"
             ));
         }
     }
@@ -83,6 +107,11 @@ fn validate_question(i: usize, q: &Value) -> Result<&str, String> {
         || format!("Question {i} missing 'question' field"),
         || format!("Question {i} 'question' must be a string"),
     )?;
+    if question_text.len() > MAX_QUESTION_BYTES {
+        return Err(format!(
+            "Question {i} text exceeds {MAX_QUESTION_BYTES} bytes"
+        ));
+    }
 
     let header = required_string_field(
         q,
@@ -146,41 +175,74 @@ fn validate_question_set(questions: &[Value]) -> Result<(), String> {
     Ok(())
 }
 
-/// Rewrite the legacy `multi_select` key to the canonical `multiSelect` so
-/// downstream renderers see one spelling.  Leaves other fields untouched.
-fn normalize_question(q: &Value) -> Value {
-    let mut out = q.clone();
-    if let Some(obj) = out.as_object_mut() {
-        if !obj.contains_key("multiSelect") {
-            if let Some(legacy) = obj.remove("multi_select") {
-                obj.insert("multiSelect".to_string(), legacy);
-            }
-        }
+fn typed_question(value: &Value) -> ToolQuestion {
+    let options = value["options"]
+        .as_array()
+        .expect("validated question options")
+        .iter()
+        .map(|option| ToolQuestionOption {
+            label: option["label"]
+                .as_str()
+                .expect("validated option label")
+                .to_string(),
+            description: option["description"]
+                .as_str()
+                .expect("validated option description")
+                .to_string(),
+            preview: option
+                .get("preview")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        })
+        .collect();
+    ToolQuestion {
+        question: value["question"]
+            .as_str()
+            .expect("validated question text")
+            .to_string(),
+        header: value["header"]
+            .as_str()
+            .expect("validated question header")
+            .to_string(),
+        options,
+        multi_select: value
+            .get("multiSelect")
+            .or_else(|| value.get("multi_select"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     }
-    out
 }
 
-/// Execute the `ask_user_question` tool.
-/// Returns a special JSON result that signals the main loop to collect user input.
-pub fn execute_ask_user_question(args: &HashMap<String, Value>) -> (String, bool) {
+fn invalid_question(message: String) -> ToolHandlerResult {
+    ToolHandlerResult::error(ToolFailure::new(
+        ToolFailureCode::InvalidArguments,
+        message,
+        ToolRetryability::Never,
+    ))
+}
+
+/// Execute the `ask_user_question` tool by returning a trusted typed follow-up.
+pub fn execute_ask_user_question(args: &HashMap<String, Value>) -> ToolHandlerResult {
     let questions = match parse_args(args) {
         Ok(qs) => qs,
-        Err(msg) => return (msg, true),
+        Err(msg) => return invalid_question(msg),
     };
     if let Err(msg) = validate_question_set(questions) {
-        return (msg, true);
+        return invalid_question(msg);
     }
-    let normalized: Vec<Value> = questions.iter().map(normalize_question).collect();
-    let result = json!({
-        "type": USER_QUESTION_MARKER,
-        "questions": normalized,
-    });
-    (result.to_string(), false)
+    let questions = questions.iter().map(typed_question).collect();
+    ToolHandlerResult::success_text("Waiting for user answers".to_string()).with_follow_up(
+        ToolFollowUp::UserQuestion {
+            questions,
+            state: ToolFollowUpState::Pending,
+        },
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn make_args(questions: Value) -> HashMap<String, Value> {
         let mut m = HashMap::new();
@@ -208,7 +270,7 @@ mod tests {
                 ]
             },
         ]));
-        let (msg, is_err) = execute_ask_user_question(&args);
+        let (msg, is_err) = execute_ask_user_question(&args).into_legacy();
         assert!(is_err, "duplicate text should error");
         assert!(msg.contains("unique"));
     }
@@ -223,7 +285,7 @@ mod tests {
                 {"label": "Same", "description": "y"},
             ]
         }]));
-        let (msg, is_err) = execute_ask_user_question(&args);
+        let (msg, is_err) = execute_ask_user_question(&args).into_legacy();
         assert!(is_err);
         assert!(msg.contains("unique"));
     }
@@ -239,13 +301,10 @@ mod tests {
                 {"label": "B", "description": "b"},
             ]
         }]));
-        let (msg, is_err) = execute_ask_user_question(&args);
-        assert!(
-            !is_err,
-            "valid multi_select + preview should succeed: {msg}"
-        );
-        // Canonical output uses `multiSelect`.
-        assert!(msg.contains("\"multiSelect\":true"));
+        let result = execute_ask_user_question(&args);
+        let q = first_typed_question(&result).expect("typed follow-up question");
+        assert!(q.multi_select);
+        assert_eq!(q.options[0].preview.as_deref(), Some("```\nexample\n```"));
     }
 
     #[test]
@@ -259,11 +318,12 @@ mod tests {
                 {"label": "B", "description": "b"},
             ]
         }]));
-        let (msg, is_err) = execute_ask_user_question(&args);
-        assert!(!is_err);
-        // Legacy spelling is rewritten to the canonical one.
-        assert!(msg.contains("\"multiSelect\":true"));
-        assert!(!msg.contains("multi_select"));
+        let result = execute_ask_user_question(&args);
+        let q = first_typed_question(&result).expect("typed follow-up question");
+        assert!(q.multi_select);
+        let widget = q.widget_value();
+        assert_eq!(widget["multiSelect"].as_bool(), Some(true));
+        assert!(widget.get("multi_select").is_none());
     }
 
     /// crosslink #585: emulate the read pattern in
@@ -277,17 +337,11 @@ mod tests {
             .unwrap_or(false)
     }
 
-    /// Pull the first question out of the validator's normalised JSON-string
-    /// output. Returns `None` when the call errored.
-    fn first_normalised_question(msg: &str, is_err: bool) -> Option<Value> {
-        if is_err {
-            return None;
+    fn first_typed_question(result: &ToolHandlerResult) -> Option<&ToolQuestion> {
+        match &result.follow_up {
+            ToolFollowUp::UserQuestion { questions, .. } => questions.first(),
+            _ => None,
         }
-        let parsed: Value = serde_json::from_str(msg).ok()?;
-        parsed
-            .get("questions")
-            .and_then(|q| q.as_array())
-            .and_then(|arr| arr.first().cloned())
     }
 
     #[test]
@@ -304,13 +358,13 @@ mod tests {
                 {"label": "B", "description": "b"},
             ]
         }]));
-        let (msg, is_err) = execute_ask_user_question(&args);
-        let q = first_normalised_question(&msg, is_err)
-            .expect("validator must succeed and emit a question");
+        let result = execute_ask_user_question(&args);
+        let q = first_typed_question(&result).expect("validator must emit typed question");
+        let q = q.widget_value();
         assert_eq!(
             q.get("multiSelect").and_then(Value::as_bool),
             Some(true),
-            "canonical multiSelect must survive validator: {msg}"
+            "canonical multiSelect must survive validator"
         );
         assert!(
             read_multi_select(&q),
@@ -334,9 +388,9 @@ mod tests {
                 {"label": "B", "description": "b"},
             ]
         }]));
-        let (msg, is_err) = execute_ask_user_question(&args);
-        let q = first_normalised_question(&msg, is_err)
-            .expect("validator must succeed and emit a question");
+        let result = execute_ask_user_question(&args);
+        let q = first_typed_question(&result).expect("validator must emit typed question");
+        let q = q.widget_value();
         // The validator's contract: canonical key only, no legacy leftover.
         assert!(
             q.get("multi_select").is_none(),
@@ -363,7 +417,7 @@ mod tests {
                 {"label": "B", "description": "b"},
             ]
         }]));
-        let (_, is_err) = execute_ask_user_question(&args);
+        let (_, is_err) = execute_ask_user_question(&args).into_legacy();
         assert!(is_err);
     }
 }

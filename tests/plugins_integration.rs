@@ -8,9 +8,15 @@
 
 use openclaudia::plugins::policy::PluginPolicy;
 use openclaudia::plugins::{
-    InstalledPlugins, MarketplaceSource, PluginError, PluginInstallEntry, PluginManager,
+    InstalledPlugins, MarketplaceSource, PluginComponentKind, PluginError, PluginInstallEntry,
+    PluginManager,
 };
-use openclaudia::skills::{load_skills, parse_skill_file, SkillDefinition};
+use openclaudia::skills::{
+    load_skills_for_run, parse_skill_file, ResolvedSkill, SkillCapabilityPolicy, SkillRunAccess,
+};
+use openclaudia::state::SessionId;
+use openclaudia::tools::{ToolRunContext, WorkspaceAccess};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -164,6 +170,207 @@ fn b1_installed_entry_skipped_if_name_already_loaded_from_search_path() {
     let errors = manager.discover();
     assert!(errors.is_empty());
     assert_eq!(manager.count(), 1);
+}
+
+#[test]
+fn enabled_plugin_lsp_declarations_refresh_the_exact_run_service() {
+    let root = TempDir::new().unwrap();
+    let plugin_dir = make_cc_plugin(root.path(), "lsp-plugin");
+    fs::write(
+        plugin_dir.join(".claude-plugin/plugin.json"),
+        serde_json::json!({
+            "name": "lsp-plugin",
+            "version": "1.0.0",
+            "description": "Integration-test LSP plugin",
+            "lspServers": {
+                "fixture": {
+                    "command": "/bin/fixture-language-server",
+                    "args": ["--stdio"],
+                    "extensions": ["fixture"]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut manager =
+        PluginManager::with_paths_for_project(vec![root.path().to_path_buf()], root.path());
+    assert!(manager.discover().is_empty());
+    let run = ToolRunContext::builder(SessionId::new(), root.path())
+        .working_directory(root.path())
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(HashMap::new())
+        .workspace_access(WorkspaceAccess::ReadWrite)
+        .process(false)
+        .network(false)
+        .secrets(false)
+        .provider("plugin-lsp-composition-test")
+        .build()
+        .expect("plugin LSP test run");
+
+    manager.configure_lsp_service_for_run(&run);
+    let configured = run.lsp_service().plugin_servers();
+    assert_eq!(configured.len(), 1);
+    assert!(configured[0].owner.starts_with("plugin__"));
+    assert!(configured[0].owner.contains("__lsp__fixture__g"));
+    assert_eq!(configured[0].language, "fixture");
+    assert_eq!(configured[0].config.extensions, ["fixture"]);
+
+    manager.disable("lsp-plugin").expect("disable plugin");
+    manager.configure_lsp_service_for_run(&run);
+    assert!(run.lsp_service().plugin_servers().is_empty());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One fixture proves the atomic six-component lifecycle end to end.
+fn canonical_plugin_generation_invokes_and_revokes_every_component_type() {
+    let root = TempDir::new().unwrap();
+    let plugin_dir = make_cc_plugin(root.path(), "complete-plugin");
+    let command_dir = plugin_dir.join("commands");
+    let hook_dir = plugin_dir.join("hooks");
+    let agent_dir = plugin_dir.join("agents");
+    let skill_dir = plugin_dir.join("skills/reviewer");
+    fs::create_dir_all(&command_dir).unwrap();
+    fs::create_dir_all(&hook_dir).unwrap();
+    fs::create_dir_all(&agent_dir).unwrap();
+    fs::create_dir_all(&skill_dir).unwrap();
+    fs::write(
+        command_dir.join("review.md"),
+        "---\nallowed-tools: [Read]\n---\nReview $ARGUMENTS",
+    )
+    .unwrap();
+    fs::write(
+        hook_dir.join("hooks.json"),
+        serde_json::json!({
+            "PreToolUse": [{"matcher": "read_file", "type": "command", "command": "echo plugin-hook", "timeout": 2}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        agent_dir.join("reviewer.md"),
+        "---\nname: reviewer\nallowed-tools: [Read]\nmodel: sonnet\n---\nInspect the assigned artifact and report concrete findings.",
+    )
+    .unwrap();
+    write_skill(
+        &skill_dir.join("SKILL.md"),
+        "plugin-review",
+        "Review with package context",
+        "Review the supplied arguments: $ARGUMENTS",
+    );
+    fs::write(
+        plugin_dir.join(".mcp.json"),
+        serde_json::json!({
+            "mcpServers": {
+                "fixture": {"transport": "stdio", "command": "node", "args": ["server.js"]}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        plugin_dir.join(".claude-plugin/plugin.json"),
+        serde_json::json!({
+            "name": "complete-plugin",
+            "version": "1.0.0",
+            "description": "Every supported component",
+            "lspServers": {
+                "fixture": {"command": "fixture-ls", "args": ["--stdio"], "extensions": ["fixture"]}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut manager =
+        PluginManager::with_paths_for_project(vec![root.path().to_path_buf()], root.path());
+    assert!(manager.discover().is_empty());
+    let registry = manager.capability_registry();
+    let kinds = registry
+        .all()
+        .map(|registration| registration.metadata().kind)
+        .collect::<Vec<_>>();
+    for kind in [
+        PluginComponentKind::Command,
+        PluginComponentKind::Hook,
+        PluginComponentKind::Skill,
+        PluginComponentKind::Agent,
+        PluginComponentKind::Mcp,
+        PluginComponentKind::Lsp,
+    ] {
+        assert!(
+            kinds.contains(&kind),
+            "missing canonical {kind} registration"
+        );
+    }
+
+    let command = manager
+        .invoke_command("complete-plugin", "review", "src/lib.rs")
+        .expect("command invocation");
+    assert_eq!(command.prompt, "Review src/lib.rs");
+    let skill = manager
+        .invoke_skill("complete-plugin", "plugin-review", "src/lib.rs")
+        .expect("skill invocation");
+    assert!(skill.prompt.contains("src/lib.rs"));
+    let agent = manager
+        .invoke_agent("complete-plugin", "reviewer", "inspect src/lib.rs")
+        .expect("agent invocation");
+    assert_eq!(agent.task, "inspect src/lib.rs");
+    assert!(manager
+        .capability_registry()
+        .all()
+        .all(|registration| registration
+            .metadata()
+            .canonical_name
+            .starts_with("plugin__")));
+    assert!(manager
+        .compose_hook_engine(&openclaudia::hooks::HookEngine::new(
+            openclaudia::config::HooksConfig::default(),
+        ))
+        .is_ok());
+
+    let run = ToolRunContext::builder(SessionId::new(), root.path())
+        .working_directory(root.path())
+        .read_only_roots(Vec::new())
+        .read_write_roots(Vec::new())
+        .environment_grants(HashMap::new())
+        .mcp_environment_grants(HashMap::new())
+        .workspace_access(WorkspaceAccess::ReadWrite)
+        .process(true)
+        .network(false)
+        .secrets(false)
+        .provider("plugin-generation-test")
+        .build()
+        .expect("plugin generation run");
+    assert_eq!(manager.mcp_registrations_for_run(&run).len(), 1);
+    manager.configure_lsp_service_for_run(&run);
+    assert_eq!(run.lsp_service().plugin_servers().len(), 1);
+
+    manager.disable("complete-plugin").expect("disable plugin");
+    assert!(manager.capability_registry().all().next().is_none());
+    manager.configure_lsp_service_for_run(&run);
+    assert!(run.lsp_service().plugin_servers().is_empty());
+    let revocations = manager.take_pending_revocations();
+    assert_eq!(revocations.len(), 1);
+    let retired = &revocations[0];
+    assert_eq!(retired.retired_owners.len(), 1);
+    assert_eq!(retired.removed_registrations.len(), 6);
+    for kind in [
+        PluginComponentKind::Command,
+        PluginComponentKind::Hook,
+        PluginComponentKind::Skill,
+        PluginComponentKind::Agent,
+        PluginComponentKind::Mcp,
+        PluginComponentKind::Lsp,
+    ] {
+        assert!(retired.removed_kinds.contains(&kind));
+    }
+
+    let mut restarted =
+        PluginManager::with_paths_for_project(vec![root.path().to_path_buf()], root.path());
+    assert!(restarted.discover().is_empty());
+    assert!(restarted.capability_registry().all().next().is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -603,54 +810,42 @@ fn b4_full_valid_skill_file() {
 // ---------------------------------------------------------------------------
 // B5 — `load_skills` directory scanning
 //
-// `load_skills()` reads `dirs::home_dir()` (the `HOME` env var on Linux)
-// and a cwd-relative `.openclaudia/skills` path.  Both are process-global,
-// so tests that exercise the full `load_skills` call must be serialised.
-//
-// Strategy:
-//   • Tests that can exercise the *component* behaviour (parse_skill_file,
-//     dedup algorithm) do so directly without touching global state.
-//   • The one test that must call `load_skills` with controlled fixtures
-//     (b5_load_skills_serial) holds an advisory mutex so it does not race
-//     with itself if the suite is accidentally run in parallel via cargo
-//     nextest or similar.
+// Discovery is exercised through an explicit run capability. Tests never
+// mutate HOME or the process current directory.
 // ---------------------------------------------------------------------------
 
-/// Pin the scan-both-dirs, missing-dir, dropped-bad-file, dir-format,
-/// name-fallback, and dedup (B5 + B6) contracts in a single serialised
-/// test that controls HOME and cwd.
-///
-/// All five B5 behaviours and all three B6 behaviours are pinned here to
-/// avoid process-global-state races when the suite runs with multiple
-/// threads.  Each assertion block is clearly labelled.
+/// Pin host-user + trusted-project discovery, invalid-file containment,
+/// package formats, fallback naming, and source precedence without ambient
+/// process state.
 #[test]
-fn b5_b6_load_skills_serial() {
-    use std::sync::Mutex;
-    // Advisory mutex: makes this test body sequential even when cargo
-    // runs tests in a thread pool.  The Mutex is per-process, so any
-    // other test that mutates HOME or cwd should acquire it too.
-    static LOCK: Mutex<()> = Mutex::new(());
-    let _guard = LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-
+fn b5_b6_load_skills_from_explicit_run_grants() {
     let (user_home, project_root) = b5_b6_write_fixtures();
+    let user_skills = user_home.path().join(".openclaudia/skills");
+    let policy = SkillCapabilityPolicy::project(Vec::new(), false, false, false)
+        .expect("text-only project trust");
+    let access = SkillRunAccess::from_host_grants(
+        None,
+        Some(&user_skills),
+        Some((project_root.path(), policy)),
+    )
+    .expect("explicit skill roots");
+    let run = openclaudia::tools::ToolRunContext::builder(
+        openclaudia::state::SessionId::new(),
+        project_root.path(),
+    )
+    .read_only_roots(Vec::new())
+    .read_write_roots(Vec::new())
+    .environment_grants(std::collections::HashMap::new())
+    .skill_access(access)
+    .workspace_access(openclaudia::tools::WorkspaceAccess::ReadWrite)
+    .process(false)
+    .network(false)
+    .secrets(false)
+    .provider("plugin-skill-test")
+    .build()
+    .expect("skill discovery run");
 
-    // ---- swap global state ----
-    let original_home = std::env::var("HOME").ok();
-    let original_cwd = std::env::current_dir().ok();
-    std::env::set_var("HOME", user_home.path());
-    std::env::set_current_dir(project_root.path()).unwrap();
-
-    let skills = load_skills();
-
-    // ---- restore global state before any assertion panics ----
-    if let Some(h) = original_home {
-        std::env::set_var("HOME", h);
-    }
-    if let Some(cwd) = original_cwd {
-        let _ = std::env::set_current_dir(cwd);
-    }
+    let skills = load_skills_for_run(&run);
 
     b5_b6_assert_contracts(&skills);
 }
@@ -741,7 +936,7 @@ fn b5_b6_write_fixtures() -> (TempDir, TempDir) {
 }
 
 /// Assert all B5+B6 behavioural contracts against the loaded skills list.
-fn b5_b6_assert_contracts(skills: &[SkillDefinition]) {
+fn b5_b6_assert_contracts(skills: &[ResolvedSkill]) {
     let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
 
     // B5-a: both dirs scanned
@@ -773,7 +968,7 @@ fn b5_b6_assert_contracts(skills: &[SkillDefinition]) {
     );
 
     // B6-a: project skill shadows user skill with same name
-    let shared_entries: Vec<&SkillDefinition> =
+    let shared_entries: Vec<&ResolvedSkill> =
         skills.iter().filter(|s| s.name == "shared").collect();
     assert_eq!(
         shared_entries.len(),

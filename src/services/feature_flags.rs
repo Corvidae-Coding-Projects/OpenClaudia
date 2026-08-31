@@ -1,10 +1,11 @@
-//! Feature-flag source — boolean gates for opt-in code paths.
+//! Experimental feature-flag source — boolean gates for test/library code.
 //!
 //! Port of Claude Code's `getFeatureValue_CACHED_MAY_BE_STALE` +
 //! GrowthBook-backed flag lookups, stripped down to the local case.
-//! OC doesn't have a remote flag backend; every flag defaults to
-//! `false` unless explicitly turned on via [`StaticFlags::set`] or the
-//! `OPENCLAUDIA_FEATURE_<NAME>` environment variable.
+//! `OpenClaudia` has no declared production flag catalog and no production
+//! consumer of this interface. The implementation is preserved for typed
+//! rollout work, but production configuration rejects arbitrary
+//! `OPENCLAUDIA_FEATURE_<NAME>` variables rather than silently accepting them.
 //!
 //! Flag names are expected to be `snake_case`. The env-var lookup
 //! uppercases the name and prepends `OPENCLAUDIA_FEATURE_`, so
@@ -22,7 +23,8 @@ pub trait FeatureFlagSource: Send + Sync {
     fn is_enabled(&self, name: &str) -> bool;
 }
 
-/// Default implementation backed by a `HashMap<String, bool>` plus an environment-variable fallback.
+/// Experimental implementation backed by a `HashMap<String, bool>` plus an
+/// environment-variable fallback for isolated library/test construction.
 ///
 /// `set` writes are intentionally build-time / startup-time — no lock overhead
 /// on the `is_enabled` hot path at the cost of needing `&mut self` for
