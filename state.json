@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1237,
+  "next_display_id": 1238,
   "next_comment_id": 2035,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -502,6 +502,7 @@
     "6dd808c9-43b5-4d4b-a367-b8476d826c3b": 547,
     "6e06f23f-15f5-48b9-82f3-e0a376e9415e": 631,
     "6e2acc8d-9b4b-43d9-b1f4-73c4bc2da4ad": 516,
+    "6e583b73-88b7-419c-8e3c-13dbf5cdd811": 1237,
     "6e5d4ff2-0f4d-4a53-ba9e-ab6bb418ab3b": 533,
     "6e91ef5d-5676-43a1-94c2-4fd4abd19332": 366,
     "6ea4d98d-679e-4078-b6b1-125fa8b5ab9b": 1145,
@@ -17622,6 +17623,16 @@
       "labels": [
         "claude-code-parity,context"
       ]
+    },
+    "6e583b73-88b7-419c-8e3c-13dbf5cdd811": {
+      "uuid": "6e583b73-88b7-419c-8e3c-13dbf5cdd811",
+      "display_id": 1237,
+      "title": "Accept standard ACP content-block prompts",
+      "status": "open",
+      "priority": "high",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-31T02:02:03.591805308Z",
+      "updated_at": "2026-08-31T02:02:03.591805308Z"
     },
     "6e5d4ff2-0f4d-4a53-ba9e-ab6bb418ab3b": {
       "uuid": "6e5d4ff2-0f4d-4a53-ba9e-ab6bb418ab3b",
@@ -51631,11 +51642,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2592,
       "timestamp": "2026-08-31T02:00:59.643726298Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2593,
+      "timestamp": "2026-08-31T02:02:03.591805308Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T02:00:59.643726298Z",
+    "timestamp": "2026-08-31T02:02:03.591805308Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2592
+    "agent_seq": 2593
   }
 }
