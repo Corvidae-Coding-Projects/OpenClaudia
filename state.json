@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1242,
+  "next_display_id": 1243,
   "next_comment_id": 2049,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -444,6 +444,7 @@
     "61b766a5-4ec1-402f-8cb0-a707a6096bec": 244,
     "61d88ff2-344d-4852-a925-58eacfcfc809": 647,
     "61f6b3e0-6e74-490f-928e-5c9e68d0bd98": 615,
+    "620586c5-b1f1-45cf-a372-f31a15067217": 1242,
     "62403f03-075f-434e-ab12-46788de19975": 539,
     "62651369-fdf3-4a92-81e0-e85f053e21a1": 646,
     "6277adb8-655a-4265-bd38-8709d1b84574": 208,
@@ -15933,6 +15934,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgqj5+UR1olg7w0+zZwuWbsWpzM2FlVsxso1l+rn8dSfAAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAwW/CGoTqI4y+33JbNPaT89K6OKI1gIEB4rq/twRGC0h2RVpNj5ziiIlk3nykFr9MQC2UWj7WXuU1guQ9CR6GBA=="
         }
       }
+    },
+    "620586c5-b1f1-45cf-a372-f31a15067217": {
+      "uuid": "620586c5-b1f1-45cf-a372-f31a15067217",
+      "display_id": 1242,
+      "title": "Use canonical VDD authority in ACP terminal finalization",
+      "description": "Steps to reproduce:\n1. \n\nExpected: \nActual: \n\nSteps to reproduce:\\n1. Enable blocking VDD for an ACP run backed by Claude or Codex account SDK auth.\\n2. Complete a Claudia-tool mutation turn with no configured quality gate.\\n\\nExpected: host-owned alternate-model VDD runs through the canonical verifier harness with the same guardrails, Reality grounding, typed Claudia tools, budgets, and read-only artifact authority; a passing artifact-bound receipt can satisfy terminal promotion.\\nActual: ACP constructs VddEngine without alternate runtime auth, validates Reality claims before VDD, and then uses the legacy text-review path. VDD cannot supply verifier authority to the terminal claim gate and its SDK transport is a no-tools review call rather than the canonical verifier role.\\n\\nDo not enable provider-native tools, weaken the final gate, or add benchmark-specific prompts. Required VDD failures must remain fail-closed and revisions must be revalidated.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-31T02:53:45.500553927Z",
+      "updated_at": "2026-08-31T02:53:45.500553927Z"
     },
     "62403f03-075f-434e-ab12-46788de19975": {
       "uuid": "62403f03-075f-434e-ab12-46788de19975",
@@ -52101,11 +52114,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2640,
       "timestamp": "2026-08-31T02:53:40.856031947Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2641,
+      "timestamp": "2026-08-31T02:53:45.500553927Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T02:53:40.856031947Z",
+    "timestamp": "2026-08-31T02:53:45.500553927Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2640
+    "agent_seq": 2641
   }
 }
