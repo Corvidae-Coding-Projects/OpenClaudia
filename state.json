@@ -1,6 +1,6 @@
 {
   "next_display_id": 1252,
-  "next_comment_id": 2078,
+  "next_comment_id": 2079,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -34250,7 +34250,7 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T01:41:13.039848926Z",
-      "updated_at": "2026-08-31T06:43:25.656397222Z",
+      "updated_at": "2026-08-31T06:47:31.057651810Z",
       "labels": [
         "benchmark",
         "feature"
@@ -34282,6 +34282,15 @@
           "kind": "observation",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAmFkZCmSVnBS1hsAeBRf4VKCZUr4JZ8iQtoUCxo3F1nr1kOYq7HPdamevCkhV68zgIR7cZC6eCLkytUx0r2X2CA=="
+        },
+        "77049623-83a6-421a-b304-dd5afbd89de3": {
+          "display_id": 2078,
+          "author": "6Vw9",
+          "content": "HarnessBench checkpoint after task 050: 49 normal result files exist because task 016 raised a suite-level exception without a normal result. Across those 49 normal results: mean outcome 0.684043, mean combined 0.682757, 33 adapter-ok / 16 adapter-false, 10 perfect outcomes, 6 zero outcomes. Explicit provider-capacity failures are tasks 034, 039, 048, and 049; these are environmental-invalid runs to rerun unchanged after availability stabilizes. Tasks 048 and 049 failed consecutively, but task 050 then completed normally in 193.705s, so the campaign remains active. No benchmark prompts, fixtures, hooks, or scoring were changed.",
+          "created_at": "2026-08-31T06:47:31.054875206Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAFngf3/QLl0FijIdskOPZe18IGV8cUDtJNrEgdjcypCV8ch3L0QxEZ/ToOte2mZz9tXOfpT0vmy30EXmAEB0GDA=="
         },
         "783a280f-08ba-4d78-b958-8039e841cfaa": {
           "display_id": 2034,
@@ -53051,11 +53060,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2739,
       "timestamp": "2026-08-31T06:43:25.656397222Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2740,
+      "timestamp": "2026-08-31T06:47:31.057651810Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T06:43:25.656397222Z",
+    "timestamp": "2026-08-31T06:47:31.057651810Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2739
+    "agent_seq": 2740
   }
 }
