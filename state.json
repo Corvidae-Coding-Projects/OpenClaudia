@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1244,
+  "next_display_id": 1245,
   "next_comment_id": 2058,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -872,6 +872,7 @@
     "bd31b987-7a4a-475a-967e-d606f949f115": 105,
     "bd44e0b5-3af3-4e96-abda-b2a21525d8f0": 114,
     "be4d8977-1279-4a7b-8864-03cc8ec32769": 568,
+    "beb5c7e7-e059-4b32-968c-68fc12a56ad8": 1244,
     "bebac181-5222-452e-b579-c448646625b0": 363,
     "bec00a66-9604-4ca9-8efa-e5938aa1a031": 675,
     "beca54a8-a4da-43de-9f07-0e9be1fa226a": 6,
@@ -29728,6 +29729,18 @@
         }
       }
     },
+    "beb5c7e7-e059-4b32-968c-68fc12a56ad8": {
+      "uuid": "beb5c7e7-e059-4b32-968c-68fc12a56ad8",
+      "display_id": 1244,
+      "title": "Enforce inference-only Agent SDK router boundaries",
+      "description": "Claude and Codex account-backed transports must act only as model inference routers. They may authenticate through their owning executables and return schema-bound assistant text or OpenClaudia host-tool requests, but they must not load or invoke native CLI tools, skills, plugins, MCP, browser/computer, shell/edit, memory, agent, hook, or persistence surfaces. Strengthen fail-closed launch configuration and output-event validation where the installed CLIs expose gaps; preserve OpenClaudia as the sole owner of tool schemas, permissions, guardrails, Reality grounding, budgets, execution, and VDD authority. Acceptance: focused fake-executable tests prove exact constraints and reject unknown/native execution events; real Claude and Codex account smokes request a host file operation, demonstrate that only OpenClaudia executes it, and finish through the canonical tool-result loop; Rust 1.98 gates pass with CARGO_BUILD_JOBS=2.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-31T03:46:07.718243225Z",
+      "updated_at": "2026-08-31T03:46:07.718243225Z"
+    },
     "bebac181-5222-452e-b579-c448646625b0": {
       "uuid": "bebac181-5222-452e-b579-c448646625b0",
       "display_id": 363,
@@ -52400,11 +52413,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2676,
       "timestamp": "2026-08-31T03:44:01.335236919Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2677,
+      "timestamp": "2026-08-31T03:46:07.718243225Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T03:44:01.335236919Z",
+    "timestamp": "2026-08-31T03:46:07.718243225Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2676
+    "agent_seq": 2677
   }
 }
