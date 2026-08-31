@@ -1,6 +1,6 @@
 {
   "next_display_id": 1245,
-  "next_comment_id": 2073,
+  "next_comment_id": 2074,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -34118,7 +34118,7 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T01:41:13.039848926Z",
-      "updated_at": "2026-08-31T05:15:12.959199942Z",
+      "updated_at": "2026-08-31T05:25:26.488868347Z",
       "labels": [
         "benchmark",
         "feature"
@@ -34159,6 +34159,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAzknO6YstkHt+3c6l4wVOj9Xv7o8aDgjihXAGsqhuvOoexxlma6rPyM6nfJ+cEByBEFaTUbRO5cgLX6Ut5OP8DQ=="
+        },
+        "850ba642-bb0f-4a79-a07c-3700bf5e59ae": {
+          "display_id": 2073,
+          "author": "6Vw9",
+          "content": "Early full-run structural findings, without task-specific changes: task 003 completed but scored 0 because web_browser rejected the benchmark's local fixture origin without an exact private-origin grant, while task 006 passed, narrowing this to browser origin authorization rather than all localhost use. Task 007 preserved the same ACP session across two rounds but round 2 failed the canonical final grounding gate (typed final claim envelope), matching ACP/VDD authority debt. Task 008's independent quality rubric executed successfully, but the subject run exhausted its 1,000,000-token host budget after 769,133 used + 265,894 requested, exposing severe repeated-schema/context amplification. Baseline continues unchanged to identify clusters before general fixes.",
+          "created_at": "2026-08-31T05:25:26.484599423Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA2OECASxFCLc7DQYJ+9y+eu3LivomnoajA5hWCK5aTynRdgX3jJ5b7wCK1IJA9nq6OwAauG1O7TnKhDte10/DAQ=="
         },
         "8dfb65e2-0512-4b88-84c9-fac3fb4b48fe": {
           "display_id": 2027,
@@ -52664,11 +52673,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2697,
       "timestamp": "2026-08-31T05:15:12.959199942Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2698,
+      "timestamp": "2026-08-31T05:25:26.488868347Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T05:15:12.959199942Z",
+    "timestamp": "2026-08-31T05:25:26.488868347Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2697
+    "agent_seq": 2698
   }
 }
