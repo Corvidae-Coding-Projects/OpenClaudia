@@ -1,6 +1,6 @@
 {
   "next_display_id": 1240,
-  "next_comment_id": 2042,
+  "next_comment_id": 2043,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -31776,11 +31776,22 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T02:23:19.612408959Z",
-      "updated_at": "2026-08-31T02:23:30.004038819Z",
+      "updated_at": "2026-08-31T02:23:45.486826819Z",
       "labels": [
         "bug",
         "remediation"
-      ]
+      ],
+      "comments": {
+        "65e48801-1468-4f17-9d4e-a79a8b57231c": {
+          "display_id": 2042,
+          "author": "6Vw9",
+          "content": "Repair category: canonical history round-trip root cause. Trace the exact assistant tool-call and tool-result values emitted by ACP into decode_acp_messages, align the generated history with the canonical MessageContent variants, preserve typed tool identity/results and bounds, and add a regression that crosses at least one executed tool into the next provider turn. Do not special-case the smoke prompt or benchmark.",
+          "created_at": "2026-08-31T02:23:45.483952603Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAfVoiFUk1hbt6ORnjcI3rkOv7hgDfkbtl0V3Ot+fx1xOn0YCv1yuNL48wUD1GJecBoSqkgEH3C767I9KaviZoAQ=="
+        }
+      }
     },
     "cd49b48a-bf26-4021-8747-0cf2ad5700ce": {
       "uuid": "cd49b48a-bf26-4021-8747-0cf2ad5700ce",
@@ -51882,11 +51893,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2616,
       "timestamp": "2026-08-31T02:23:40.604420975Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2617,
+      "timestamp": "2026-08-31T02:23:45.486826819Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T02:23:40.604420975Z",
+    "timestamp": "2026-08-31T02:23:45.486826819Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2616
+    "agent_seq": 2617
   }
 }
