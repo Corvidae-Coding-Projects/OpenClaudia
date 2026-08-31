@@ -1,6 +1,6 @@
 {
   "next_display_id": 1252,
-  "next_comment_id": 2082,
+  "next_comment_id": 2083,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -34261,7 +34261,7 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T01:41:13.039848926Z",
-      "updated_at": "2026-08-31T06:47:56.105069612Z",
+      "updated_at": "2026-08-31T07:08:17.723777145Z",
       "labels": [
         "benchmark",
         "feature"
@@ -34383,6 +34383,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAsZ41mt86FkljdSpFFkMna1/PqfGGukDdcpnwshfz6Wsc9WGk0ptJBPUzREfVdlQYeQZ/oSZAovCq/QCn0pOrAg=="
+        },
+        "f1e21e0e-959f-41ca-ab70-8050d36a6ea7": {
+          "display_id": 2082,
+          "author": "6Vw9",
+          "content": "Baseline campaign paused cleanly before task 061 after three consecutive task endings with explicit provider-capacity failures. No task-061 result was produced. Canonical results through task 060 remain durable. Exact baseline binary was preserved at /home/doll/OpenClaudia-benchmarks/state/binaries/openclaudia-98dc4327 with expected SHA-256 48b4392015969100b3922f55168f6c2cfc78818b9144f2840034d5a96c28e1f1. Resume/reruns will use that frozen binary and the same model/configuration.",
+          "created_at": "2026-08-31T07:08:17.721347871Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAxFLTH0XqWF64Pah/GUaO/KSBojvtdC+g0TfNrVfIpMGC58hmqLl8FZZLu/zGstKLXan68cjPK1H4VFHnDSu5BA=="
         },
         "f2333041-dac5-451f-a85b-6d1b973fc1b4": {
           "display_id": 2077,
@@ -53109,11 +53118,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2743,
       "timestamp": "2026-08-31T07:08:12.748983771Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2744,
+      "timestamp": "2026-08-31T07:08:17.723777145Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T07:08:12.748983771Z",
+    "timestamp": "2026-08-31T07:08:17.723777145Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2743
+    "agent_seq": 2744
   }
 }
