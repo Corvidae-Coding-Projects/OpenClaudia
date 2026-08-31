@@ -1,6 +1,6 @@
 {
   "next_display_id": 1238,
-  "next_comment_id": 2037,
+  "next_comment_id": 2038,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -6772,7 +6772,18 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-21T07:18:01.712667919Z",
-      "updated_at": "2026-08-21T07:18:01.712667919Z"
+      "updated_at": "2026-08-31T02:11:40.131329412Z",
+      "comments": {
+        "39bdfdc3-5b8e-4149-a599-5ed39d1e310c": {
+          "display_id": 2037,
+          "author": "6Vw9",
+          "content": "Rust 1.98 parallel ACP lib sweep on branch feature/benchmark-driven-general-harness-hardening produced two workspace-baseline collision failures (headless_gate_allows_matching_default_allow_rule and matcher_match_triggers_deny). Both passed immediately when rerun alone; no prompt-parser code was implicated. This is fresh evidence for the existing parallel test-isolation debt.",
+          "created_at": "2026-08-31T02:11:40.128009469Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA2Qkb2GlF6ytkuSWXQ6D0pyPkDIu/GgD0iPjOy22d7az0CHJ88NsdlVBsOjTf6uqQmc3kAvtsYzeYvZQNbVxJBw=="
+        }
+      }
     },
     "2e8a8e18-b837-4932-bc94-54badfbb0c7b": {
       "uuid": "2e8a8e18-b837-4932-bc94-54badfbb0c7b",
@@ -51694,11 +51705,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2597,
       "timestamp": "2026-08-31T02:10:44.637909722Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2598,
+      "timestamp": "2026-08-31T02:11:40.131329412Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T02:10:44.637909722Z",
+    "timestamp": "2026-08-31T02:11:40.131329412Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2597
+    "agent_seq": 2598
   }
 }
