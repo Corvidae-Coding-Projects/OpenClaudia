@@ -1,6 +1,6 @@
 {
   "next_display_id": 1239,
-  "next_comment_id": 2039,
+  "next_comment_id": 2040,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -17648,7 +17648,7 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T02:02:03.591805308Z",
-      "updated_at": "2026-08-31T02:14:06.721961764Z",
+      "updated_at": "2026-08-31T02:14:38.324710670Z",
       "labels": [
         "remediation"
       ],
@@ -17679,6 +17679,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABATiQKD1d51crT0JYGciP4xH9NArjI8nldsw2TupVaSrdQAQtSVCcYd0Nnmi1sSkjInO/4f1QX5a3Gfm4KK17QAQ=="
+        },
+        "a0e4979a-82cb-4386-a874-80754e465133": {
+          "display_id": 2039,
+          "author": "6Vw9",
+          "content": "Delivered in signed commit 0e8ec88d: standard ACP text content-block prompts are accepted through the real wire path, legacy string prompts remain compatible, malformed and unsupported blocks fail before mutation, and aggregate prompt bytes remain bounded. Rust 1.98 fmt, strict all-target/all-feature Clippy, focused regressions, 116 serialized ACP tests, 15 config tests, and 16 IDE tests passed. Real pinned acpx progressed through this boundary to separately tracked OAuth failure #1238.",
+          "created_at": "2026-08-31T02:14:38.322111525Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAbtyMX/lDaPkQ2w+K3V+xTYgHE697Po+lUlBuTPwa8i+6G3CmHVVejIfyouSTOePG5ZnELb8bcQ0Y31qt9uO5Ag=="
         }
       }
     },
@@ -51776,11 +51785,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2606,
       "timestamp": "2026-08-31T02:14:12.511077843Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2607,
+      "timestamp": "2026-08-31T02:14:38.324710670Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T02:14:12.511077843Z",
+    "timestamp": "2026-08-31T02:14:38.324710670Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2606
+    "agent_seq": 2607
   }
 }
