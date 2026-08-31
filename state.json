@@ -1,6 +1,6 @@
 {
   "next_display_id": 1241,
-  "next_comment_id": 2048,
+  "next_comment_id": 2049,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -11716,12 +11716,21 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T02:30:49.831047103Z",
-      "updated_at": "2026-08-31T02:32:36.459630966Z",
+      "updated_at": "2026-08-31T02:40:27.381943788Z",
       "labels": [
         "bug",
         "remediation"
       ],
       "comments": {
+        "c5722f05-d382-4d41-938f-e0b38100edc1": {
+          "display_id": 2048,
+          "author": "6Vw9",
+          "content": "Correction from the real Claude and Codex ACP traces: both SDK transports already carry the typed final envelope inside their bounded content field and both keep native tools disabled. The identical denial proves parsing reached AgentDecision::Final. The missing authority is host-side: the default run has no trusted verifier receipt, ACP does not persist EveryTurn quality-gate results before the next provider turn, and VDD finalization currently occurs only after the Reality claim gate. Scope is therefore the general ACP verifier handoff; do not add an SDK-native tool or benchmark-specific bypass.",
+          "created_at": "2026-08-31T02:40:27.379391666Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAhNPGXDU++MHH/9qwXoUHVqYceo4hOHWmi0/NKuSGbp6MkQ51voALTYP/rB9QRyKtQp6C2XYm/5BQLRUCy/NDDg=="
+        },
         "e75b89a5-c734-4cab-9c0b-df13d8e63e8a": {
           "display_id": 2047,
           "author": "6Vw9",
@@ -52045,11 +52054,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2634,
       "timestamp": "2026-08-31T02:32:36.459630966Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2635,
+      "timestamp": "2026-08-31T02:40:27.381943788Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T02:32:36.459630966Z",
+    "timestamp": "2026-08-31T02:40:27.381943788Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2634
+    "agent_seq": 2635
   }
 }
