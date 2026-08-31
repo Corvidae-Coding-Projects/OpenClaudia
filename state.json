@@ -1,6 +1,6 @@
 {
   "next_display_id": 1244,
-  "next_comment_id": 2054,
+  "next_comment_id": 2055,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -31362,7 +31362,7 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T02:51:20.188391308Z",
-      "updated_at": "2026-08-31T03:27:01.584615092Z",
+      "updated_at": "2026-08-31T03:27:06.249326015Z",
       "labels": [
         "bug",
         "interoperability"
@@ -31385,6 +31385,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAP5Sbz1wwNMQTuZmisIMe7YjItNHncXt8Vjj6WzB1fHCRpwSgWRawD0F7m7LQFgnhJ1eimt2+006IMHVYOIkvAA=="
+        },
+        "f846a8e8-261a-4ab1-a4df-9227c76be67f": {
+          "display_id": 2054,
+          "author": "6Vw9",
+          "content": "Delivered in signed commit 01116f1c: standard params.update envelopes; standard agent_message_chunk, tool_call/in_progress, and tool_call_update content; invalid nonstandard call_started removed because session/prompt already establishes the turn. Verification remains Rust 1.98 format, 118 ACP lib tests, 31 ACP integration tests, strict all-target/all-feature Clippy, pinned SDK schema parse, and real gated acpx Claude-router smoke.",
+          "created_at": "2026-08-31T03:27:06.246882940Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAwJSh3jrhV2ehgVoSthMYOWK3wJvWR3StdlT5b2KtelKFc3THHOtyGnpWRCQkT1TaZiCWdQjARfvsQ3q7El4FDg=="
         },
         "f9379522-3136-4806-8afe-02e8a84e1e54": {
           "display_id": 2051,
@@ -52299,11 +52308,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2663,
       "timestamp": "2026-08-31T03:27:01.584615092Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2664,
+      "timestamp": "2026-08-31T03:27:06.249326015Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T03:27:01.584615092Z",
+    "timestamp": "2026-08-31T03:27:06.249326015Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2663
+    "agent_seq": 2664
   }
 }
