@@ -1,6 +1,6 @@
 {
   "next_display_id": 1237,
-  "next_comment_id": 2029,
+  "next_comment_id": 2030,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -4252,11 +4252,20 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T01:49:44.011089921Z",
-      "updated_at": "2026-08-31T01:51:18.285615277Z",
+      "updated_at": "2026-08-31T01:56:41.000227415Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "305f9b14-b2fe-4793-a35b-f0c6e621a087": {
+          "display_id": 2029,
+          "author": "6Vw9",
+          "content": "Verified repair ready for commit: ACP now consumes the documented root --dangerously-skip-permissions flag and applies it only to the in-memory effective launch permission config; unsupported subcommands still reject it, while mandatory host-safety and sandbox gates remain active. Evidence: real command exit 0; 3 focused binary tests; 57 CLI lifecycle tests; 15 ACP config tests; 16 ACP IDE-state tests; cargo fmt check; Rust 1.98 strict all-target/all-feature Clippy.",
+          "created_at": "2026-08-31T01:56:40.995575072Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAPJ/shzglI4WajntZtMtbyIpw2q4nDvBBF2KOISYQ3BaWB1Eza9o4niOZz9m44okR4xbmE5lKl4ax+ZLKKlwfAg=="
+        },
         "dc1faaed-768e-41ca-ae41-2d2153f5e8af": {
           "display_id": 2028,
           "author": "6Vw9",
@@ -51500,11 +51509,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2576,
       "timestamp": "2026-08-31T01:51:18.285615277Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2577,
+      "timestamp": "2026-08-31T01:56:41.000227415Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T01:51:18.285615277Z",
+    "timestamp": "2026-08-31T01:56:41.000227415Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2576
+    "agent_seq": 2577
   }
 }
