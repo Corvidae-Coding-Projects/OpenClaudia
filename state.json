@@ -11710,14 +11710,14 @@
     "476d7814-be85-475b-979c-586ec374382a": {
       "uuid": "476d7814-be85-475b-979c-586ec374382a",
       "display_id": 1240,
-      "title": "Make ACP terminal verification reachable to SDK routers",
-      "description": "Real Claude and Codex ACP smokes execute only Claudia-owned tools and both return parseable typed final envelopes, but mutation tasks terminate at the Reality gate because no trusted verifier receipt is available to the router before its final turn. Preserve the inference-only SDK boundary and native-tool disablement. Repair the provider-neutral ACP flow so configured deterministic gates are recorded and exposed before terminal claims, and so enabled alternate-model VDD can participate through host-owned finalization without allowing model/self-authored verification. Acceptance: no native SDK tools; malformed claims remain rejected; configured gate/VDD failures fail closed; real Claude and Codex ACP mutation smokes complete through Claudia tools with current evidence; no benchmark-specific prompt or grounding bypass.",
+      "title": "Persist ACP verifier receipts for SDK router turns",
+      "description": "Real Claude and Codex ACP smokes prove both SDK transports remain inference-only and execute only Claudia-owned tools, but configured EveryTurn quality-gate results were not persisted before the next provider turn. The router therefore could not cite the trusted receipt required for file-change or command-result claims. Record every configured ACP gate result in the run-bound Reality Ledger before re-prompting, retain fail-closed gate behavior, and explicitly teach the no-verifier fallback to report exact file observations plus unresolved correctness. Acceptance: unit evidence proves trusted receipt persistence; real Claude and Codex mutation/readback turns finish without native SDK tools; a real configured-gate turn hydrates and cites the gate receipt; malformed or forged claims remain rejected.",
       "status": "open",
       "priority": "high",
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T02:30:49.831047103Z",
-      "updated_at": "2026-08-31T02:40:49.198634174Z",
+      "updated_at": "2026-08-31T02:53:40.856031947Z",
       "labels": [
         "bug",
         "remediation"
@@ -52096,11 +52096,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2639,
       "timestamp": "2026-08-31T02:51:29.355629520Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2640,
+      "timestamp": "2026-08-31T02:53:40.856031947Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T02:51:29.355629520Z",
+    "timestamp": "2026-08-31T02:53:40.856031947Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2639
+    "agent_seq": 2640
   }
 }
