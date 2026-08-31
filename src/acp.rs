@@ -4375,11 +4375,10 @@ impl AcpServer {
                         })
                         .collect();
 
-                    if let Err(error) = self.push_history_message(json!({
-                        "role": "assistant",
-                        "content": if content.is_empty() { Value::Null } else { Value::String(content) },
-                        "tool_calls": tool_calls_json,
-                    })) {
+                    if let Err(error) = self.push_history_message(acp_assistant_tool_call_message(
+                        &content,
+                        &tool_calls_json,
+                    )) {
                         return self.fail_prompt_with_update(acp_session_id, &error);
                     }
                     if let Some(state) = next_provider_native_state {
@@ -5618,6 +5617,14 @@ fn bounded_acp_tool_message(result: &ToolResult) -> Value {
         "tool_call_id": result.tool_call_id(),
         "content": content,
         "is_error": true,
+    })
+}
+
+fn acp_assistant_tool_call_message(content: &str, tool_calls: &[Value]) -> Value {
+    json!({
+        "role": "assistant",
+        "content": content,
+        "tool_calls": tool_calls,
     })
 }
 
@@ -7170,7 +7177,7 @@ mod acp_ledger_helper_tests {
 
 #[cfg(test)]
 mod message_history_tests {
-    use super::decode_acp_messages;
+    use super::{acp_assistant_tool_call_message, decode_acp_messages};
     use serde_json::json;
 
     #[test]
@@ -7198,6 +7205,24 @@ mod message_history_tests {
 
         assert!(err.contains("index 1"), "{err}");
         assert!(err.contains("content"), "{err}");
+    }
+
+    #[test]
+    fn empty_assistant_tool_call_content_round_trips_as_text() {
+        let tool_calls = vec![json!({
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "list_files", "arguments": "{}"}
+        })];
+        let message = acp_assistant_tool_call_message("", &tool_calls);
+
+        let decoded = decode_acp_messages(&[message]).expect("empty tool-call prose must decode");
+
+        assert!(matches!(
+            &decoded[0].content,
+            crate::proxy::MessageContent::Text(content) if content.is_empty()
+        ));
+        assert_eq!(decoded[0].tool_calls.as_ref().map(Vec::len), Some(1));
     }
 }
 

@@ -125,6 +125,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - TUI: every turn now dual-writes — the existing JSON snapshot at `~/.local/share/openclaudia/chat_sessions/<uuid>.json` stays for backward compat, and new entries also append to the JSONL transcript via `App::persist_transcript_tail`. Watermark tracking skips re-appending on resume
 
 ### Fixed
+- Round-trip ACP tool-result history through provider turns (#1239)
 - Use platform mode_t for transactional init mkdirat (#1224)
 - Await complete background settlement in exit-code regression test (#1209)
 - Rebind technical-memory evidence after background finalization fix (#1208)
