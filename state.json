@@ -1,6 +1,6 @@
 {
   "next_display_id": 1245,
-  "next_comment_id": 2063,
+  "next_comment_id": 2064,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -14209,11 +14209,22 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T01:37:58.499701427Z",
-      "updated_at": "2026-08-31T01:39:12.211086086Z",
+      "updated_at": "2026-08-31T04:26:44.793393617Z",
       "labels": [
         "feature",
         "remediation"
-      ]
+      ],
+      "comments": {
+        "557bc5af-fd49-4ac7-9d4a-d705d581b2af": {
+          "display_id": 2063,
+          "author": "6Vw9",
+          "content": "Keep account-backed provider executables as credential-owning inference transports while OpenClaudia remains the only tool, permission, grounding, budget, execution, and verifier authority; validate broad harness behavior with real account smokes and Rust 1.98 gates before benchmark work.",
+          "created_at": "2026-08-31T04:26:44.789595001Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAHxXcdYnNRodZEAzMnYRuPvn2syRh4WAGinAoKaQgRTqkgbj/LbYGLF/ocVXDpbcNEmjZpIMYx16NKJS7nN6lAw=="
+        }
+      }
     },
     "5ab41d6d-bd5d-407f-b9d2-8a5208b56d68": {
       "uuid": "5ab41d6d-bd5d-407f-b9d2-8a5208b56d68",
@@ -52520,11 +52531,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2687,
       "timestamp": "2026-08-31T04:25:37.622642185Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2688,
+      "timestamp": "2026-08-31T04:26:44.793393617Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T04:25:37.622642185Z",
+    "timestamp": "2026-08-31T04:26:44.793393617Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2687
+    "agent_seq": 2688
   }
 }
