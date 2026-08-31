@@ -26278,8 +26278,9 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T05:27:50.199296504Z",
-      "updated_at": "2026-08-31T05:28:04.892281565Z",
+      "updated_at": "2026-08-31T05:28:09.672669771Z",
       "labels": [
+        "benchmark",
         "browser",
         "bug",
         "security"
@@ -52716,11 +52717,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2702,
       "timestamp": "2026-08-31T05:28:04.892281565Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2703,
+      "timestamp": "2026-08-31T05:28:09.672669771Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T05:28:04.892281565Z",
+    "timestamp": "2026-08-31T05:28:09.672669771Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2702
+    "agent_seq": 2703
   }
 }
