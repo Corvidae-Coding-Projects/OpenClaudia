@@ -1,6 +1,6 @@
 {
   "next_display_id": 1243,
-  "next_comment_id": 2051,
+  "next_comment_id": 2052,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -31345,11 +31345,22 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T02:51:20.188391308Z",
-      "updated_at": "2026-08-31T02:51:29.355629520Z",
+      "updated_at": "2026-08-31T03:25:45.061835849Z",
       "labels": [
         "bug",
         "interoperability"
-      ]
+      ],
+      "comments": {
+        "f9379522-3136-4806-8afe-02e8a84e1e54": {
+          "display_id": 2051,
+          "author": "6Vw9",
+          "content": "Pinned @agentclientprotocol/sdk schema evidence corrects the issue assumption: ACP has no call_started SessionUpdate variant. session/prompt itself establishes the turn. The protocol-correct repair removes that invalid redundant notification, nests all real updates under params.update, carries OpenClaudia call correlation in reserved _meta, uses in_progress, emits tool completion as tool_call_update, and projects display text through standard ToolCallContent.",
+          "created_at": "2026-08-31T03:25:45.056558475Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAkJN3/+cqHa3bkEHtbdjbg78wgiYuTAdYdt0JH7PXRMdJRwSfR49wXa56aaMQw69aIA6GhdddgRPyuNy6XZtGCQ=="
+        }
+      }
     },
     "c8f1326c-6a66-42be-81fc-888614f4ef84": {
       "uuid": "c8f1326c-6a66-42be-81fc-888614f4ef84",
@@ -52203,11 +52214,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2653,
       "timestamp": "2026-08-31T03:02:30.550854486Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2654,
+      "timestamp": "2026-08-31T03:25:45.061835849Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T03:02:30.550854486Z",
+    "timestamp": "2026-08-31T03:25:45.061835849Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2653
+    "agent_seq": 2654
   }
 }
