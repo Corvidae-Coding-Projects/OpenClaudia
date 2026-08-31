@@ -1,6 +1,6 @@
 {
   "next_display_id": 1245,
-  "next_comment_id": 2070,
+  "next_comment_id": 2071,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -34118,7 +34118,7 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T01:41:13.039848926Z",
-      "updated_at": "2026-08-31T05:11:13.242068181Z",
+      "updated_at": "2026-08-31T05:12:47.686774305Z",
       "labels": [
         "benchmark",
         "feature"
@@ -34159,6 +34159,15 @@
           "kind": "note",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAHOQWAxtogExHdFDR8P8zm6GcyAUe40gWMatcirlcDIUnZFh14NyHH9KtyjWzJE4s7jiWG+G/YQEn2HE0o6awAg=="
+        },
+        "ab868509-6813-412b-9373-5478f7b2eaa0": {
+          "display_id": 2070,
+          "author": "6Vw9",
+          "content": "Qualification attempt 2 initialized ACP and ran the account-backed model, but the unchanged oracle scored 0 because every new ACP session correctly began in read-only initializer mode. The response identified the correct answer but could not write. Adapter now deterministically selects OpenClaudia's canonical coding mode before the prompt; no product permission, guardrail, task, fixture, or oracle bypass was added.",
+          "created_at": "2026-08-31T05:12:47.682605884Z",
+          "kind": "observation",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABApNW9wdCYkGkZ+I1Xqf5VdddBrD1isxCs7wymWB+8389tVvZVkdVqAvGBXLo4ho9ZRLsLAiKNexyr7mDsYktDCw=="
         },
         "ce8ada42-e663-4dc7-8a84-d2b7aa7d7e95": {
           "display_id": 2026,
@@ -52622,11 +52631,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2694,
       "timestamp": "2026-08-31T05:11:13.242068181Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2695,
+      "timestamp": "2026-08-31T05:12:47.686774305Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T05:11:13.242068181Z",
+    "timestamp": "2026-08-31T05:12:47.686774305Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2694
+    "agent_seq": 2695
   }
 }
