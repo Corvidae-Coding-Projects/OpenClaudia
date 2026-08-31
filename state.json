@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1236,
+  "next_display_id": 1237,
   "next_comment_id": 2028,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -114,6 +114,7 @@
     "195439e7-8e9c-4ae7-ab36-0baba61f056e": 773,
     "198eff8a-a0b3-494c-8fa6-3ffff1a2b46d": 680,
     "199913f2-8c62-4724-ae0c-becac6208d0a": 872,
+    "19d3507d-347b-4ccc-99d2-f21268fd277b": 1236,
     "19ddbcb6-4e09-488a-8a45-bc58ccbd3130": 937,
     "1a8c1ec2-b880-4e0a-b255-04758c7e4165": 905,
     "1a9a7d50-9654-46c4-b6c4-1c0337445a7b": 222,
@@ -4238,6 +4239,16 @@
       "created_at": "2026-05-18T22:08:54.638463784Z",
       "updated_at": "2026-05-20T13:22:04.598393841Z",
       "closed_at": "2026-05-20T13:22:04.598393841Z"
+    },
+    "19d3507d-347b-4ccc-99d2-f21268fd277b": {
+      "uuid": "19d3507d-347b-4ccc-99d2-f21268fd277b",
+      "display_id": 1236,
+      "title": "Honor --dangerously-skip-permissions in ACP automation",
+      "status": "open",
+      "priority": "high",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-31T01:49:44.011089921Z",
+      "updated_at": "2026-08-31T01:49:44.011089921Z"
     },
     "19ddbcb6-4e09-488a-8a45-bc58ccbd3130": {
       "uuid": "19ddbcb6-4e09-488a-8a45-bc58ccbd3130",
@@ -51451,11 +51462,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2572,
       "timestamp": "2026-08-31T01:44:29.239531834Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2573,
+      "timestamp": "2026-08-31T01:49:44.011089921Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T01:44:29.239531834Z",
+    "timestamp": "2026-08-31T01:49:44.011089921Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2572
+    "agent_seq": 2573
   }
 }
