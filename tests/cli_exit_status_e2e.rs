@@ -1627,6 +1627,35 @@ fn acp_accepts_keyless_local_provider_until_stdin_eof() {
     );
 }
 
+#[test]
+fn acp_accepts_explicit_permission_bypass_until_stdin_eof() {
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    write_local_provider_config(&cwd);
+
+    let output = isolated_command(&cwd, &home)
+        .args(["--dangerously-skip-permissions", "acp"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("openclaudia acp with explicit permission bypass must run");
+
+    assert!(
+        output.status.success(),
+        "ACP should honor the automation permission bypass and exit cleanly on EOF; stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("--dangerously-skip-permissions cannot be used with 'acp'"),
+        "ACP must consume the root automation flag instead of rejecting it; got {combined:?}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn acp_accepts_keyless_anthropic_with_supported_claude_login_until_stdin_eof() {

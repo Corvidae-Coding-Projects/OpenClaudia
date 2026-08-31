@@ -563,6 +563,7 @@ async fn main() -> anyhow::Result<()> {
             Box::pin(cli::commands::acp::cmd_acp(
                 target.or(cli.target),
                 acp_model.or(cli.model),
+                cli.dangerously_skip_permissions,
             ))
             .await
         }
@@ -778,6 +779,7 @@ fn reject_ignored_root_flags_for_subcommand(cli: &Cli) -> anyhow::Result<()> {
         Commands::Start { .. } | Commands::Acp { .. } | Commands::Loop { .. }
     );
     let allows_root_model = matches!(command, Commands::Acp { .. });
+    let allows_permission_bypass = matches!(command, Commands::Acp { .. });
 
     if cli.model.is_some() && !allows_root_model {
         anyhow::bail!("--model cannot be used with '{command_name}'");
@@ -794,7 +796,7 @@ fn reject_ignored_root_flags_for_subcommand(cli: &Cli) -> anyhow::Result<()> {
     if cli.coordinator {
         anyhow::bail!("--coordinator cannot be used with '{command_name}'");
     }
-    if cli.dangerously_skip_permissions {
+    if cli.dangerously_skip_permissions && !allows_permission_bypass {
         anyhow::bail!("--dangerously-skip-permissions cannot be used with '{command_name}'");
     }
     if cli.tui_mode {

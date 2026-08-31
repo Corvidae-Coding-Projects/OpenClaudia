@@ -3,9 +3,10 @@
 //! The Claude Agent SDK does not currently publish a Rust package. Anthropic's
 //! documented integration for other languages is the unmodified `claude -p`
 //! executable. This module constrains that executable to model-transport duty:
-//! safe mode disables filesystem customizations, Claude's tools are disabled,
-//! MCP is empty and strict, and session persistence is off. Tool selections are
-//! returned as typed data for `OpenClaudia`'s own policy and execution loop.
+//! safe and restricted modes disable filesystem customizations and native
+//! execution surfaces, Claude's tools are empty, MCP is empty and strict, and
+//! session persistence is off. Tool selections are returned as typed data for
+//! `OpenClaudia`'s own policy and execution loop.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -270,7 +271,9 @@ impl ClaudeAgentSdk {
             .args(["--model", model])
             .args(["--effort", normalize_effort(effort)])
             .arg("--safe-mode")
+            .arg("--restricted")
             .args(["--tools", ""])
+            .args(["--disallowedTools", "mcp__*"])
             .arg("--disable-slash-commands")
             .arg("--no-chrome")
             .arg("--no-session-persistence")
@@ -1037,7 +1040,9 @@ mod tests {
         for required in [
             "-p",
             "--safe-mode",
+            "--restricted",
             "--tools",
+            "--disallowedTools",
             "--disable-slash-commands",
             "--no-chrome",
             "--no-session-persistence",
@@ -1055,6 +1060,9 @@ mod tests {
         assert!(args.contains("\"const\":\"read_file\""));
         let args = args.lines().collect::<Vec<_>>();
         assert!(args.windows(2).any(|pair| pair == ["--tools", ""]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--disallowedTools", "mcp__*"]));
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--mcp-config", EMPTY_MCP_CONFIG]));

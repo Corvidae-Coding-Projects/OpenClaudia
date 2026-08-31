@@ -3,8 +3,8 @@
   "corpus_id": "openclaudia-technical-memory-tuning-v1",
   "split": "tuning",
   "generator_id": "s105-corpus-builder",
-  "repository_revision_id": "12f5444119df1067351c876bf01f534f55b41ee4",
-  "repository_revision_digest": "sha256:90575780cc78c06e6d81d030ac93016803874f7808985c0bbe029fb94b47bbdd",
+  "repository_revision_id": "01116f1ce8d81ad3a839b8b3a830516ca9d50a57",
+  "repository_revision_digest": "sha256:0262543d20f69218be55ba2807507e9c92d5ffee0363a0c28b37d66970a256fb",
   "evaluation_now_unix_seconds": 100,
   "lessons": [
     {
@@ -87,7 +87,7 @@
         "observation": "A source observation past its retention boundary is not current technical evidence.",
         "guidance": "Report the omission as partial rather than converting expiry into a clean no-hit.",
         "applicability": {"paths": ["src/memory/source.rs"], "components": ["memory-source"], "tags": ["verify"]},
-        "citations": [{"kind": "source_file", "locator": "src/memory/source.rs", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:99245690f24b07589fe2945e5048374a407db6d24a6ddc0c7cb9fd8b4596019c"}],
+        "citations": [{"kind": "source_file", "locator": "src/memory/source.rs", "source_version": "git:01116f1ce8d81ad3a839b8b3a830516ca9d50a57", "digest": "sha256:99245690f24b07589fe2945e5048374a407db6d24a6ddc0c7cb9fd8b4596019c"}],
         "confidence": "verified_by_test",
         "sensitivity": "internal",
         "retention": {"policy": "expire_after", "unix_seconds": 30}
@@ -159,7 +159,7 @@
         "observation": "The audit-era contract predates the current store guard implementation.",
         "guidance": "Revalidate this older contract before using it as technical evidence.",
         "applicability": {"paths": ["src/memory.rs"], "components": ["technical-memory"], "tags": ["testing"]},
-        "citations": [{"kind": "documentation", "locator": "docs/full-codebase-audit-2026-08-16.md", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:67c11719308878460870202b1d8ad6541b9f0cce88ff1a601169f476f27e3a02"}],
+        "citations": [{"kind": "documentation", "locator": "docs/full-codebase-audit-2026-08-16.md", "source_version": "git:01116f1ce8d81ad3a839b8b3a830516ca9d50a57", "digest": "sha256:67c11719308878460870202b1d8ad6541b9f0cce88ff1a601169f476f27e3a02"}],
         "confidence": "observed_once",
         "sensitivity": "internal",
         "retention": {"policy": "review_after", "unix_seconds": 70}

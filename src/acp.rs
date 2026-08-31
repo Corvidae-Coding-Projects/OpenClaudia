@@ -209,6 +209,46 @@ fn validate_optional_bounded_string(
         .map_or(Ok(()), |value| validate_bounded_string(value, field, limit))
 }
 
+fn parse_acp_prompt_value(value: &Value) -> Result<String, String> {
+    match value {
+        Value::String(prompt) => {
+            if prompt.len() > MAX_ACP_PROMPT_BYTES {
+                return Err(format!(
+                    "prompt exceeds the {MAX_ACP_PROMPT_BYTES}-byte ACP limit"
+                ));
+            }
+            Ok(prompt.clone())
+        }
+        Value::Array(blocks) => {
+            let mut prompt = String::new();
+            for (index, block) in blocks.iter().enumerate() {
+                let block = block.as_object().ok_or_else(|| {
+                    format!("Invalid 'prompt[{index}]' content block: expected object")
+                })?;
+                let block_type = block.get("type").and_then(Value::as_str).ok_or_else(|| {
+                    format!("Invalid 'prompt[{index}].type' parameter: expected string")
+                })?;
+                if block_type != "text" {
+                    return Err(format!(
+                        "Unsupported 'prompt[{index}]' content block: only type 'text' is supported"
+                    ));
+                }
+                let text = block.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    format!("Invalid 'prompt[{index}].text' parameter: expected string")
+                })?;
+                if prompt.len().saturating_add(text.len()) > MAX_ACP_PROMPT_BYTES {
+                    return Err(format!(
+                        "prompt exceeds the {MAX_ACP_PROMPT_BYTES}-byte ACP limit"
+                    ));
+                }
+                prompt.push_str(text);
+            }
+            Ok(prompt)
+        }
+        _ => Err("Invalid 'prompt' parameter: expected string or content-block array".to_string()),
+    }
+}
+
 fn required_params_object(params: &Value) -> Result<&serde_json::Map<String, Value>, String> {
     params
         .as_object()
@@ -263,7 +303,7 @@ fn validate_json_rpc_method_schema(message: &JsonRpcMessage) -> Result<(), Strin
             let prompt = params
                 .get("prompt")
                 .ok_or_else(|| "Missing prompt".to_string())?;
-            validate_bounded_string(prompt, "prompt", MAX_ACP_PROMPT_BYTES)?;
+            let _ = parse_acp_prompt_value(prompt)?;
         }
         "session/cancel" => {
             let params = required_params_object(&message.params)?;
@@ -2491,8 +2531,12 @@ impl AcpServer {
         }
     }
 
-    /// Send a session/update notification.
-    fn send_session_update(&self, session_id: &str, update_type: &str, content: &Value) {
+    /// Send a standard ACP `session/update` notification.
+    fn send_session_update(&self, session_id: &str, update: &Value) {
+        let update_type = update
+            .get("sessionUpdate")
+            .and_then(Value::as_str)
+            .unwrap_or("invalid");
         let active_call = self
             .active_call
             .as_ref()
@@ -2508,9 +2552,12 @@ impl AcpServer {
             "session/update",
             Some(json!({
                 "sessionId": session_id,
-                "callId": active_call.call_id,
-                "sessionUpdate": update_type,
-                "content": content,
+                "update": update,
+                "_meta": {
+                    "openclaudia": {
+                        "callId": active_call.call_id,
+                    }
+                },
             })),
         );
     }
@@ -3350,11 +3397,17 @@ impl AcpServer {
         if !text.is_empty() {
             self.send_session_update(
                 acp_session_id,
-                "agent_message_chunk",
                 &json!({
-                    "type": "text",
-                    "text": text,
-                    "provisional": true,
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {
+                        "type": "text",
+                        "text": text,
+                    },
+                    "_meta": {
+                        "openclaudia": {
+                            "provisional": true,
+                        }
+                    },
                 }),
             );
         }
@@ -3375,13 +3428,10 @@ impl AcpServer {
         if session_id.is_empty() {
             return Err("sessionId must not be empty".to_string());
         }
-        let prompt = Self::required_string_param(params, "prompt", "Missing prompt")?;
-        if prompt.len() > MAX_ACP_PROMPT_BYTES {
-            return Err(format!(
-                "prompt exceeds the {MAX_ACP_PROMPT_BYTES}-byte ACP limit"
-            ));
-        }
-        Ok((session_id.to_string(), prompt.to_string()))
+        let prompt = params
+            .get("prompt")
+            .ok_or_else(|| "Missing prompt".to_string())?;
+        Ok((session_id.to_string(), parse_acp_prompt_value(prompt)?))
     }
 
     async fn prepare_prompt_run_context(
@@ -3531,11 +3581,9 @@ impl AcpServer {
             call_id: call.call_id.clone(),
         };
         self.active_call = Some(marker);
-        self.send_session_update(
-            &acp_session_id,
-            "call_started",
-            &json!({"callId": &call.call_id}),
-        );
+        // `session/prompt` already establishes the active turn. ACP has no
+        // `call_started` session-update variant; subsequent standard updates
+        // retain OpenClaudia's call correlation in their reserved `_meta`.
 
         let prompt_input = crate::hooks::HookInput::for_run(
             &run_context,
@@ -4338,11 +4386,10 @@ impl AcpServer {
                         })
                         .collect();
 
-                    if let Err(error) = self.push_history_message(json!({
-                        "role": "assistant",
-                        "content": if content.is_empty() { Value::Null } else { Value::String(content) },
-                        "tool_calls": tool_calls_json,
-                    })) {
+                    if let Err(error) = self.push_history_message(acp_assistant_tool_call_message(
+                        &content,
+                        &tool_calls_json,
+                    )) {
                         return self.fail_prompt_with_update(acp_session_id, &error);
                     }
                     if let Some(state) = next_provider_native_state {
@@ -4357,11 +4404,11 @@ impl AcpServer {
 
                         self.send_session_update(
                             acp_session_id,
-                            "tool_call",
                             &json!({
+                                "sessionUpdate": "tool_call",
                                 "toolCallId": tc.id,
                                 "title": tc.name,
-                                "status": "running",
+                                "status": "in_progress",
                             }),
                         );
 
@@ -4511,7 +4558,6 @@ impl AcpServer {
 
                         self.send_session_update(
                             acp_session_id,
-                            "tool_call",
                             &acp_tool_call_update_payload(&result),
                         );
 
@@ -4530,6 +4576,17 @@ impl AcpServer {
                         &self.model,
                         crate::config::RunAfter::EveryTurn,
                     ) {
+                        if let Err(error) = record_acp_quality_gate_observations(
+                            &run,
+                            oc_session_id,
+                            report.results(),
+                        ) {
+                            tracing::warn!(
+                                session_id = oc_session_id,
+                                %error,
+                                "failed to record ACP quality-gate observations"
+                            );
+                        }
                         if report.prevents_progress() {
                             let detail = report.reason().map_or_else(
                                 || {
@@ -5558,6 +5615,23 @@ fn record_acp_tool_result_observation(
     }
 }
 
+fn record_acp_quality_gate_observations(
+    run: &crate::tools::ToolRunContext,
+    session_id: &str,
+    gates: &[crate::guardrails::QualityCheckResult],
+) -> Result<(), String> {
+    if gates.is_empty() {
+        return Ok(());
+    }
+    let mut ledger = crate::ledger::RealityLedger::open_project_session_for_run(run, session_id)
+        .map_err(|error| format!("opening Reality Ledger failed: {error}"))?;
+    for gate in gates {
+        crate::grounded_loop::append_quality_gate_observations(run, &mut ledger, gate)
+            .map_err(|error| format!("recording quality gate '{}' failed: {error}", gate.name()))?;
+    }
+    Ok(())
+}
+
 fn bounded_acp_tool_message(result: &ToolResult) -> Value {
     let message = result.openai_message();
     if bounded_json_size(&message, MAX_ACP_TOOL_OUTPUT_BYTES).is_ok() {
@@ -5584,6 +5658,14 @@ fn bounded_acp_tool_message(result: &ToolResult) -> Value {
     })
 }
 
+fn acp_assistant_tool_call_message(content: &str, tool_calls: &[Value]) -> Value {
+    json!({
+        "role": "assistant",
+        "content": content,
+        "tool_calls": tool_calls,
+    })
+}
+
 fn acp_tool_call_update_payload(result: &ToolResult) -> Value {
     let status = if matches!(result.outcome(), ToolOutcome::Success { .. }) {
         "completed"
@@ -5593,10 +5675,17 @@ fn acp_tool_call_update_payload(result: &ToolResult) -> Value {
     let rendered = result.render_text();
     let output = crate::tools::safe_truncate(&rendered, MAX_ACP_TOOL_OUTPUT_BYTES / 2);
     let mut payload = json!({
+        "sessionUpdate": "tool_call_update",
         "toolCallId": result.tool_call_id(),
         "title": result.handler(),
         "status": status,
-        "output": output,
+        "content": [{
+            "type": "content",
+            "content": {
+                "type": "text",
+                "text": output,
+            }
+        }],
     });
     let raw_output = result.model_payload();
     if bounded_json_size(&raw_output, MAX_ACP_TOOL_OUTPUT_BYTES / 2).is_ok() {
@@ -6445,6 +6534,17 @@ mod bounded_transport_tests {
     }
 
     #[test]
+    fn json_rpc_decode_accepts_standard_acp_text_prompt_blocks() {
+        let decoded = decode_json_rpc_frame(
+            br#"{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"s","prompt":[{"type":"text","text":"hello"}]}}"#,
+        )
+        .expect("standard ACP text content block");
+
+        assert_eq!(decoded.method, "session/prompt");
+        assert_eq!(decoded.params["prompt"][0]["text"], "hello");
+    }
+
+    #[test]
     fn active_json_rpc_request_ids_cannot_be_reused() {
         let mut registry = AcpCallRegistry::default();
         let id = json!("request-7");
@@ -6983,8 +7083,9 @@ mod search_security_tests {
 #[cfg(test)]
 mod acp_ledger_helper_tests {
     use super::{
-        acp_tool_call, record_acp_background_command_start, record_acp_tool_result_observation,
-        validate_and_render_acp_final_response, ACP_BACKGROUND_COMMAND_PENDING_STDERR,
+        acp_tool_call, record_acp_background_command_start, record_acp_quality_gate_observations,
+        record_acp_tool_result_observation, validate_and_render_acp_final_response,
+        ACP_BACKGROUND_COMMAND_PENDING_STDERR,
     };
 
     fn test_run() -> &'static std::sync::Arc<crate::tools::ToolRunContext> {
@@ -7068,6 +7169,66 @@ mod acp_ledger_helper_tests {
     }
 
     #[test]
+    fn acp_quality_gate_observer_makes_trusted_receipt_available_to_next_turn() {
+        let session_id = "acp-quality-gate-ledger-test";
+        let root = tempfile::TempDir::new().expect("isolated ACP quality-gate workspace");
+        let run = crate::tools::security::test_run_context_for(root.path());
+        let task = {
+            let mut ledger =
+                crate::ledger::RealityLedger::open_project_session_for_run(&run, session_id)
+                    .expect("initialize ACP session ledger before verifier snapshot");
+            ledger
+                .observe_user_task(&run, "create proof.txt", "test-model")
+                .expect("record ACP user task")
+        };
+        let config = crate::config::GuardrailsConfig {
+            quality_gates: Some(crate::config::QualityGatesConfig {
+                enabled: true,
+                checks: vec![crate::config::QualityCheck {
+                    name: "acp-check".to_string(),
+                    command: "sh -c 'exit 0'".to_string(),
+                    required: true,
+                }],
+                ..crate::config::QualityGatesConfig::default()
+            }),
+            ..crate::config::GuardrailsConfig::default()
+        };
+        crate::guardrails::configure(&run, &config).expect("configure ACP quality gate");
+        let gates = crate::guardrails::run_quality_gates(&run, "test-model");
+
+        record_acp_quality_gate_observations(&run, session_id, &gates)
+            .expect("record ACP quality gate");
+
+        let ledger = crate::ledger::RealityLedger::open_project_session_for_run(&run, session_id)
+            .expect("reopen session ledger");
+        let verification = ledger
+            .observations_chronological()
+            .into_iter()
+            .find(|observation| {
+                matches!(
+                    observation.kind,
+                    crate::ledger::ObservationKind::Verification { passed: true, .. }
+                )
+            })
+            .expect("trusted ACP verifier observation");
+        assert_eq!(
+            verification.provenance.trust,
+            crate::ledger::EvidenceTrust::TrustedVerifier
+        );
+        assert!(verification.provenance.is_bound_to(&run));
+        let verification_id = verification.id;
+        let packet = crate::grounded_loop::build_prompt_packet(
+            &ledger,
+            &run,
+            task,
+            crate::grounded_loop::DEFAULT_GROUNDING_INDEX_LIMIT,
+            Vec::new(),
+        )
+        .expect("build next ACP grounding packet");
+        assert!(packet.verifier_results.contains(&verification_id));
+    }
+
+    #[test]
     fn acp_background_bash_records_pending_command_without_verifier_authority() {
         let session_id = "acp-background-command-ledger-test";
         let path = crate::ledger::project_session_ledger_path(session_id)
@@ -7122,7 +7283,7 @@ mod acp_ledger_helper_tests {
 
 #[cfg(test)]
 mod message_history_tests {
-    use super::decode_acp_messages;
+    use super::{acp_assistant_tool_call_message, decode_acp_messages};
     use serde_json::json;
 
     #[test]
@@ -7150,6 +7311,24 @@ mod message_history_tests {
 
         assert!(err.contains("index 1"), "{err}");
         assert!(err.contains("content"), "{err}");
+    }
+
+    #[test]
+    fn empty_assistant_tool_call_content_round_trips_as_text() {
+        let tool_calls = vec![json!({
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "list_files", "arguments": "{}"}
+        })];
+        let message = acp_assistant_tool_call_message("", &tool_calls);
+
+        let decoded = decode_acp_messages(&[message]).expect("empty tool-call prose must decode");
+
+        assert!(matches!(
+            &decoded[0].content,
+            crate::proxy::MessageContent::Text(content) if content.is_empty()
+        ));
+        assert_eq!(decoded[0].tool_calls.as_ref().map(Vec::len), Some(1));
     }
 }
 
@@ -7428,6 +7607,7 @@ mod session_mode_tests {
     use super::{
         build_acp_prompt_context, prepare_acp_session_storage, AcpActiveCallMarker, AcpServer,
         ACP_CONFIG_MODEL_ID, ACP_CONFIG_MODE_ID, INVALID_PARAMS, MAX_ACP_OUTPUT_QUEUE_FRAMES,
+        MAX_ACP_PROMPT_BYTES,
     };
     use crate::config::{AppConfig, Hook, HookEntry, HookPolicy, HooksConfig};
     use crate::hooks::HookEngine;
@@ -7568,8 +7748,24 @@ memory:
         )
         .expect("session update JSON");
         assert_eq!(update["method"], "session/update");
-        assert_eq!(update["params"]["content"]["text"], "hello");
-        assert_eq!(update["params"]["content"]["provisional"], true);
+        assert_eq!(update["params"]["sessionId"], "acp-session");
+        assert_eq!(
+            update["params"]["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
+        assert_eq!(update["params"]["update"]["content"]["type"], "text");
+        assert_eq!(update["params"]["update"]["content"]["text"], "hello");
+        assert_eq!(
+            update["params"]["update"]["_meta"]["openclaudia"]["provisional"],
+            true
+        );
+        assert_eq!(update["params"]["_meta"]["openclaudia"]["callId"], "call-1");
+        assert!(
+            update["params"].get("sessionUpdate").is_none()
+                && update["params"].get("content").is_none()
+                && update["params"].get("callId").is_none(),
+            "ACP update fields must be nested in the standard update envelope"
+        );
         assert_eq!(server.provisional_output, "hello");
     }
 
@@ -8933,9 +9129,15 @@ blast_radius:
         assert_eq!(provider_payload["result"]["outcome"]["status"], "partial");
 
         let ui_payload = super::acp_tool_call_update_payload(&result);
+        assert_eq!(ui_payload["sessionUpdate"], "tool_call_update");
         assert_eq!(ui_payload["toolCallId"], "call-partial-provider");
         assert_eq!(ui_payload["status"], "failed");
-        assert_eq!(ui_payload["output"], result.render_text());
+        assert_eq!(ui_payload["content"][0]["type"], "content");
+        assert_eq!(ui_payload["content"][0]["content"]["type"], "text");
+        assert_eq!(
+            ui_payload["content"][0]["content"]["text"],
+            result.render_text()
+        );
         assert_eq!(ui_payload["rawOutput"], result.model_payload());
         assert_eq!(
             ui_payload["rawOutput"]["result"]["outcome"]["status"],
@@ -9830,7 +10032,7 @@ blast_radius:
     }
 
     #[tokio::test]
-    async fn session_prompt_rejects_invalid_string_fields_before_prompt_loop() {
+    async fn session_prompt_rejects_invalid_fields_before_prompt_loop() {
         for (id, params, expected) in [
             (
                 json!(1),
@@ -9845,7 +10047,17 @@ blast_radius:
             (
                 json!(3),
                 json!({"sessionId": "s", "prompt": ["hello"]}),
-                "Invalid 'prompt' parameter: expected string",
+                "Invalid 'prompt[0]' content block: expected object",
+            ),
+            (
+                json!(4),
+                json!({"sessionId": "s", "prompt": [{"type": "text", "text": 42}]}),
+                "Invalid 'prompt[0].text' parameter: expected string",
+            ),
+            (
+                json!(5),
+                json!({"sessionId": "s", "prompt": [{"type": "image", "data": "opaque"}]}),
+                "Unsupported 'prompt[0]' content block: only type 'text' is supported",
             ),
         ] {
             let (mut server, mut rx, _tmp) = test_server();
@@ -9867,6 +10079,44 @@ blast_radius:
             );
             assert_no_client_request(&mut rx, "invalid session/prompt params");
         }
+    }
+
+    #[test]
+    fn session_prompt_parser_accepts_standard_text_blocks_and_legacy_strings() {
+        let (_, standard) = AcpServer::parse_prompt_params(&json!({
+            "sessionId": "s",
+            "prompt": [
+                {"type": "text", "text": "hello "},
+                {"type": "text", "text": "world"}
+            ]
+        }))
+        .expect("standard ACP text blocks");
+        let (_, legacy) = AcpServer::parse_prompt_params(&json!({
+            "sessionId": "s",
+            "prompt": "hello world"
+        }))
+        .expect("legacy string prompt");
+
+        assert_eq!(standard, "hello world");
+        assert_eq!(legacy, standard);
+    }
+
+    #[test]
+    fn session_prompt_parser_bounds_aggregate_text_block_bytes() {
+        let first = "a".repeat(MAX_ACP_PROMPT_BYTES);
+        let error = AcpServer::parse_prompt_params(&json!({
+            "sessionId": "s",
+            "prompt": [
+                {"type": "text", "text": first},
+                {"type": "text", "text": "b"}
+            ]
+        }))
+        .expect_err("aggregate content-block prompt must remain bounded");
+
+        assert_eq!(
+            error,
+            format!("prompt exceeds the {MAX_ACP_PROMPT_BYTES}-byte ACP limit")
+        );
     }
 
     #[tokio::test]

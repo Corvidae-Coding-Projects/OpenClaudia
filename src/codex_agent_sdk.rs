@@ -36,23 +36,53 @@ const TRANSPORT_INPUT_PREFIX: &str = concat!(
 
 /// Features that could give the owned subprocess an execution surface outside
 /// `OpenClaudia`'s policy, budget, hook, and permission boundaries.
+///
+/// `code_mode_host` is deliberately not disabled. Current Codex requires that
+/// inert compatibility host even while `code_mode` itself is disabled; without
+/// it, the CLI fails before it can return a schema-bound host-tool proposal.
 const DISABLED_NATIVE_FEATURES: &[&str] = &[
-    "shell_tool",
-    "unified_exec",
+    "apply_patch_freeform",
     "apps",
-    "plugins",
-    "multi_agent",
+    "artifact",
+    "auth_elicitation",
     "browser_use",
-    "computer_use",
-    "image_generation",
-    "view_image",
-    "hooks",
-    "skill_search",
-    "skill_mcp_dependency_install",
-    "tool_call_mcp_elicitation",
-    "request_permissions_tool",
+    "browser_use_external",
+    "browser_use_full_cdp_access",
     "code_mode",
-    "code_mode_host",
+    "code_mode_only",
+    "computer_use",
+    "default_mode_request_user_input",
+    "deferred_executor",
+    "executor_capability_discovery",
+    "external_agent_memory_import",
+    "goals",
+    "hooks",
+    "image_generation",
+    "in_app_browser",
+    "in_app_local_automation",
+    "js_repl",
+    "memories",
+    "multi_agent",
+    "multi_agent_v2",
+    "personality",
+    "plugin_sharing",
+    "plugins",
+    "psp",
+    "recommended_plugins",
+    "remote_plugin",
+    "request_permissions_tool",
+    "search_tool",
+    "shell_snapshot",
+    "shell_snapshot_v2",
+    "shell_tool",
+    "skill_mcp_dependency_install",
+    "skill_search",
+    "standalone_web_search",
+    "tool_call_mcp_elicitation",
+    "tool_suggest",
+    "unified_exec",
+    "view_image",
+    "workspace_dependencies",
 ];
 
 /// Pinned capability for the official Codex executable and its owned login.
@@ -260,6 +290,7 @@ impl CodexAgentSdk {
                 "--ephemeral",
                 "--ignore-user-config",
                 "--ignore-rules",
+                "--strict-config",
                 "--skip-git-repo-check",
                 "--sandbox",
                 "read-only",
@@ -595,17 +626,8 @@ fn turn_contract(request: &Value) -> Result<(String, BTreeSet<String>), CodexAge
     Ok((schema, names))
 }
 
-fn native_tool_item(item_type: &str) -> bool {
-    matches!(
-        item_type,
-        "command_execution"
-            | "file_change"
-            | "mcp_tool_call"
-            | "dynamic_tool_call"
-            | "web_search"
-            | "image_generation"
-            | "computer_use"
-    )
+fn inert_provider_item(item_type: &str) -> bool {
+    matches!(item_type, "agent_message" | "reasoning")
 }
 
 #[allow(clippy::too_many_lines)] // Parsing the bounded JSONL transcript as one state machine is easier to audit.
@@ -630,7 +652,10 @@ fn decode_turn(
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if matches!(event_type, "item.started" | "item.completed") {
+        if matches!(
+            event_type,
+            "item.started" | "item.updated" | "item.completed"
+        ) {
             let item = event
                 .get("item")
                 .and_then(Value::as_object)
@@ -638,7 +663,16 @@ fn decode_turn(
                     CodexAgentSdkError::InvalidOutput("item event is missing its item".to_string())
                 })?;
             let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-            if native_tool_item(item_type) {
+            if item_type == "error" {
+                let diagnostic = item
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Codex reported an unspecified item failure");
+                return Err(CodexAgentSdkError::Process(
+                    crate::secrets::SafeDiagnostic::from_untrusted(diagnostic).to_string(),
+                ));
+            }
+            if !inert_provider_item(item_type) {
                 return Err(CodexAgentSdkError::NativeToolUse(item_type.to_string()));
             }
             if event_type == "item.completed" && item_type == "agent_message" {
@@ -917,7 +951,7 @@ mod tests {
     }
 
     #[test]
-    fn decoder_rejects_native_tools_and_unadvertised_host_tools() {
+    fn decoder_rejects_native_unknown_and_unadvertised_host_tools() {
         let native = concat!(
             "{\"type\":\"item.started\",\"item\":{\"type\":\"command_execution\"}}\n",
             "{\"type\":\"turn.completed\",\"usage\":{}}\n",
@@ -925,6 +959,15 @@ mod tests {
         assert!(matches!(
             decode_turn(native.as_bytes(), &BTreeSet::new()),
             Err(CodexAgentSdkError::NativeToolUse(_))
+        ));
+
+        let unknown = concat!(
+            "{\"type\":\"item.updated\",\"item\":{\"type\":\"future_execution_surface\"}}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{}}\n",
+        );
+        assert!(matches!(
+            decode_turn(unknown.as_bytes(), &BTreeSet::new()),
+            Err(CodexAgentSdkError::NativeToolUse(item)) if item == "future_execution_surface"
         ));
 
         let unadvertised = concat!(
@@ -937,6 +980,32 @@ mod tests {
         )
         .expect_err("unadvertised tool must fail closed");
         assert!(error.to_string().contains("was not advertised"));
+    }
+
+    #[test]
+    fn decoder_accepts_only_inert_reasoning_before_the_structured_message() {
+        let transcript = concat!(
+            "{\"type\":\"item.started\",\"item\":{\"type\":\"reasoning\"}}\n",
+            "{\"type\":\"item.updated\",\"item\":{\"type\":\"reasoning\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"reasoning\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"content\\\":\\\"routed\\\",\\\"tool_calls\\\":[]}\"}}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{}}\n",
+        );
+        let turn = decode_turn(transcript.as_bytes(), &BTreeSet::new()).expect("inert turn");
+        assert_eq!(turn.content, "routed");
+        assert!(turn.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn decoder_reports_provider_item_errors_without_misclassifying_them_as_tools() {
+        let transcript = concat!(
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"error\",\"message\":\"provider unavailable\"}}\n",
+            "{\"type\":\"turn.failed\",\"error\":{\"message\":\"provider unavailable\"}}\n",
+        );
+        let error = decode_turn(transcript.as_bytes(), &BTreeSet::new())
+            .expect_err("provider error must fail the turn");
+        assert!(matches!(error, CodexAgentSdkError::Process(_)));
+        assert!(error.to_string().contains("provider unavailable"));
     }
 
     #[tokio::test]
@@ -995,6 +1064,7 @@ mod tests {
             "--ephemeral",
             "--ignore-user-config",
             "--ignore-rules",
+            "--strict-config",
             "--skip-git-repo-check",
             "--sandbox",
             "read-only",
@@ -1009,6 +1079,7 @@ mod tests {
         for feature in DISABLED_NATIVE_FEATURES {
             assert!(args.lines().any(|arg| arg == *feature), "missing {feature}");
         }
+        assert!(!args.lines().any(|arg| arg == "code_mode_host"));
         assert!(args.contains("model_reasoning_effort=\"high\""));
 
         let stdin = std::fs::read_to_string(stdin_path).expect("captured stdin");
