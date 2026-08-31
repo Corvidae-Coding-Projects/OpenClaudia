@@ -1,6 +1,6 @@
 {
   "next_display_id": 1252,
-  "next_comment_id": 2079,
+  "next_comment_id": 2080,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -34250,7 +34250,7 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T01:41:13.039848926Z",
-      "updated_at": "2026-08-31T06:47:31.057651810Z",
+      "updated_at": "2026-08-31T06:47:51.023891187Z",
       "labels": [
         "benchmark",
         "feature"
@@ -34354,6 +34354,15 @@
           "kind": "decision",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA2f9I537SWpHev+uU2CKFrp6ivuRzOZbtYV/A0bLNKlR3s4lL531Pbued26vSNGMgSmmbrxskVNTz8JJIMvvtAA=="
+        },
+        "e61c5b5b-3013-4e26-b68b-aa09c07863ed": {
+          "display_id": 2079,
+          "author": "6Vw9",
+          "content": "Correction to the immediately preceding task-050 checkpoint: its prose aggregate accidentally retained three preserved task-001 adapter/qualification artifacts. Filtering to only canonical result filenames yields 49 normal results, 32 adapter-ok / 17 adapter-false, mean outcome 0.702353, mean combined 0.701067, 12 perfect outcomes, and 4 zero outcomes. The capacity-failure classification and task IDs remain unchanged.",
+          "created_at": "2026-08-31T06:47:51.021052148Z",
+          "kind": "note",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAsZ41mt86FkljdSpFFkMna1/PqfGGukDdcpnwshfz6Wsc9WGk0ptJBPUzREfVdlQYeQZ/oSZAovCq/QCn0pOrAg=="
         },
         "f2333041-dac5-451f-a85b-6d1b973fc1b4": {
           "display_id": 2077,
@@ -53065,11 +53074,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2740,
       "timestamp": "2026-08-31T06:47:31.057651810Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2741,
+      "timestamp": "2026-08-31T06:47:51.023891187Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T06:47:31.057651810Z",
+    "timestamp": "2026-08-31T06:47:51.023891187Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2740
+    "agent_seq": 2741
   }
 }
