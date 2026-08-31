@@ -1,6 +1,6 @@
 {
   "next_display_id": 1237,
-  "next_comment_id": 2032,
+  "next_comment_id": 2033,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -4252,11 +4252,20 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T01:49:44.011089921Z",
-      "updated_at": "2026-08-31T01:58:36.842618566Z",
+      "updated_at": "2026-08-31T01:58:59.905054654Z",
       "labels": [
         "remediation"
       ],
       "comments": {
+        "2ce49a40-d62b-40b2-8162-df1c13d40808": {
+          "display_id": 2032,
+          "author": "6Vw9",
+          "content": "Reclosure appended a duplicate changelog row; restored the exact single entry already committed in 6e583c9a and will close without generating another row.",
+          "created_at": "2026-08-31T01:58:59.901927390Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAUGSnXA4HqAITJfnVmtZNogoCoerPsUDHFRxiouh86qidfcqMw9p1myuhav7t3pMewkVVRhhUK0usMegqSdmMCQ=="
+        },
         "305f9b14-b2fe-4793-a35b-f0c6e621a087": {
           "display_id": 2029,
           "author": "6Vw9",
@@ -51582,11 +51591,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2587,
       "timestamp": "2026-08-31T01:58:42.636018103Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2588,
+      "timestamp": "2026-08-31T01:58:59.905054654Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T01:58:42.636018103Z",
+    "timestamp": "2026-08-31T01:58:59.905054654Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2587
+    "agent_seq": 2588
   }
 }
