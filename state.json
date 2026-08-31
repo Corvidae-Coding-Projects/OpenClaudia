@@ -1,6 +1,6 @@
 {
   "next_display_id": 1245,
-  "next_comment_id": 2061,
+  "next_comment_id": 2062,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -29743,7 +29743,7 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T03:46:07.718243225Z",
-      "updated_at": "2026-08-31T04:00:44.402242864Z",
+      "updated_at": "2026-08-31T04:25:22.734227216Z",
       "labels": [
         "architecture",
         "bug"
@@ -29775,6 +29775,15 @@
           "kind": "plan",
           "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAMAAceW6SLnze+LOC/TZCHDpW7hCKIWUgwfg0sIscTviYP7MtWvq60qQxrg7HotDqdFdxcBONMpfTXynrVi/SDA=="
+        },
+        "f2dd145f-0be7-4d52-8531-88e81a0366b6": {
+          "display_id": 2061,
+          "author": "6Vw9",
+          "content": "Implemented the inference-only Agent SDK boundary using the live-qualified Peritus b4e9730 method: Codex runs ephemeral, read-only, strict-config with native capabilities disabled while retaining only the inert code_mode_host compatibility path; Claude runs safe and restricted with an empty native tool set, all MCP tools explicitly denied, strict empty MCP configuration, and no session persistence. Both decoders fail closed on native execution events or unadvertised host-tool proposals. Real logged-in Codex 0.151.0 and Claude Code 2.1.251 ACP smokes created and reread exact proof files only through OpenClaudia host tools; the Reality gate rejected an inapplicable Claude receipt and accepted the corrected exact receipt without weakening policy. Verification passed on Rust 1.98 with CARGO_BUILD_JOBS=2: fmt, 27 focused SDK tests, all-feature binary build, strict all-target/all-feature Clippy, and the full serialized all-target/all-feature test suite with zero failures. Memory remained stable with roughly 11-12 GiB available.",
+          "created_at": "2026-08-31T04:25:22.720455030Z",
+          "kind": "result",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAKBRBVlTFytARhJhoAjT3WYP69UIrgAHl3O+eH6Zt1PfTkKBaqUSoFVJyFzXvk03h+YaGrnOn97GvNi0vAybQAA=="
         }
       }
     },
@@ -52485,11 +52494,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2683,
       "timestamp": "2026-08-31T04:00:44.402242864Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2684,
+      "timestamp": "2026-08-31T04:25:22.734227216Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T04:00:44.402242864Z",
+    "timestamp": "2026-08-31T04:25:22.734227216Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2683
+    "agent_seq": 2684
   }
 }
