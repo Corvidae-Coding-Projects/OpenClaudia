@@ -4248,11 +4248,12 @@
       "uuid": "19d3507d-347b-4ccc-99d2-f21268fd277b",
       "display_id": 1236,
       "title": "Honor --dangerously-skip-permissions in ACP automation",
-      "status": "open",
+      "status": "closed",
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T01:49:44.011089921Z",
-      "updated_at": "2026-08-31T01:58:59.905054654Z",
+      "updated_at": "2026-08-31T01:59:05.098596252Z",
+      "closed_at": "2026-08-31T01:59:05.098584817Z",
       "labels": [
         "remediation"
       ],
@@ -51596,11 +51597,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2588,
       "timestamp": "2026-08-31T01:58:59.905054654Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2589,
+      "timestamp": "2026-08-31T01:59:05.098596252Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T01:58:59.905054654Z",
+    "timestamp": "2026-08-31T01:59:05.098596252Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2588
+    "agent_seq": 2589
   }
 }
