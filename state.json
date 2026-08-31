@@ -14052,8 +14052,9 @@
       "priority": "high",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T01:37:58.499701427Z",
-      "updated_at": "2026-08-31T01:38:03.170687332Z",
+      "updated_at": "2026-08-31T01:39:12.211086086Z",
       "labels": [
+        "feature",
         "remediation"
       ]
     },
@@ -51344,11 +51345,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2562,
       "timestamp": "2026-08-31T01:38:09.444393412Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2563,
+      "timestamp": "2026-08-31T01:39:12.211086086Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T01:38:09.444393412Z",
+    "timestamp": "2026-08-31T01:39:12.211086086Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2562
+    "agent_seq": 2563
   }
 }
