@@ -1,5 +1,5 @@
 {
-  "next_display_id": 1250,
+  "next_display_id": 1251,
   "next_comment_id": 2076,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
@@ -333,6 +333,7 @@
     "4a36082e-13b8-437f-b66f-7ee7beb6e37d": 103,
     "4a463d5d-ce25-413a-aa00-e82c9f2d4104": 920,
     "4a710789-2818-495a-9ec9-87e3f67e7a4c": 1169,
+    "4a727106-7218-4a21-9136-a1acbd35956b": 1250,
     "4aba17c7-1b3c-411b-b388-591e7001ab3c": 520,
     "4b2f0ddf-e3eb-40a8-a635-7f480533019f": 1140,
     "4b4c1c60-67ab-404b-a810-59728e5b3d54": 1069,
@@ -12404,6 +12405,18 @@
           "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgf6zX/OSipECNC3b+xW4BqMVIVwAW8f+opORGgO7Tn+sAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAy43/k55U9suTcBy+wfr34VAOza4artF8nY0ebmj75WAKo9DLCQhN4SM+kg63DmF5kEE11lwjQ51rCvmu3WHhDQ=="
         }
       }
+    },
+    "4a727106-7218-4a21-9136-a1acbd35956b": {
+      "uuid": "4a727106-7218-4a21-9136-a1acbd35956b",
+      "display_id": 1250,
+      "title": "Propagate exact loopback-origin grants into sandboxed process networking",
+      "description": "Steps to reproduce:\n1. \n\nExpected: \nActual: \n\nSteps to reproduce:\n1. Launch an ACP coding run whose trusted runtime supplies an ephemeral HTTP service on one exact 127.0.0.1 port.\n2. Use a sandboxed shell or typed HTTP client to access that exact origin.\n3. Observe connection attempts fail with Operation not permitted and no requests reach the server.\n\nExpected: an explicit run-bound scheme/host/port grant is projected into sandbox networking and recorded in capability/Reality receipts, while every other loopback/private origin remains denied.\nActual: legitimate local API and browser-test workflows cannot reach their supplied fixture services through sandboxed process tools.\n\nCoordinate with #1245 so browser and process tools consume one host-owned exact-origin authority. Do not disable network isolation, allow private CIDRs broadly, or special-case benchmark ports.",
+      "status": "open",
+      "priority": "high",
+      "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
+      "created_by": "6Vw9",
+      "created_at": "2026-08-31T06:01:26.725480796Z",
+      "updated_at": "2026-08-31T06:01:26.725480796Z"
     },
     "4aba17c7-1b3c-411b-b388-591e7001ab3c": {
       "uuid": "4aba17c7-1b3c-411b-b388-591e7001ab3c",
@@ -52928,11 +52941,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2725,
       "timestamp": "2026-08-31T05:56:51.654374942Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2726,
+      "timestamp": "2026-08-31T06:01:26.725480796Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T05:56:51.654374942Z",
+    "timestamp": "2026-08-31T06:01:26.725480796Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2725
+    "agent_seq": 2726
   }
 }
