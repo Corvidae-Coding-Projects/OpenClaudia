@@ -1,6 +1,6 @@
 {
   "next_display_id": 1236,
-  "next_comment_id": 2026,
+  "next_comment_id": 2027,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -33598,11 +33598,22 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T01:41:13.039848926Z",
-      "updated_at": "2026-08-31T01:41:22.503646654Z",
+      "updated_at": "2026-08-31T01:42:38.353364370Z",
       "labels": [
         "benchmark",
         "feature"
-      ]
+      ],
+      "comments": {
+        "ce8ada42-e663-4dc7-8a84-d2b7aa7d7e95": {
+          "display_id": 2026,
+          "author": "6Vw9",
+          "content": "Benchmark integrity protocol: preserve upstream tasks, prompts, budgets, adapters, graders, and oracle code unchanged; add only neutral OpenClaudia integration plumbing; record exact upstream commits and model/provider settings; use small smoke and diagnostic subsets for development; reserve untouched held-out tasks for validation; never detect benchmark identity, task IDs, grader artifacts, or expected outputs inside the harness; accept trap failures only as evidence for general architectural corrections validated outside the triggering task.",
+          "created_at": "2026-08-31T01:42:38.350572817Z",
+          "kind": "decision",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA2f9I537SWpHev+uU2CKFrp6ivuRzOZbtYV/A0bLNKlR3s4lL531Pbued26vSNGMgSmmbrxskVNTz8JJIMvvtAA=="
+        }
+      }
     },
     "e1ea7878-fc34-40da-8a20-64769ede56e8": {
       "uuid": "e1ea7878-fc34-40da-8a20-64769ede56e8",
@@ -51421,11 +51432,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2570,
       "timestamp": "2026-08-31T01:41:46.353148880Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2571,
+      "timestamp": "2026-08-31T01:42:38.353364370Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T01:41:46.353148880Z",
+    "timestamp": "2026-08-31T01:42:38.353364370Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2570
+    "agent_seq": 2571
   }
 }
