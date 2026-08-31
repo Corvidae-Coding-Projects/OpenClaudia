@@ -1,6 +1,6 @@
 {
   "next_display_id": 1239,
-  "next_comment_id": 2040,
+  "next_comment_id": 2041,
   "display_id_map": {
     "003a29eb-1abc-4c93-b4d8-ac2000f8a74d": 397,
     "00648987-e445-4213-abbf-6faeef2a5244": 471,
@@ -25558,11 +25558,22 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T02:13:09.833070001Z",
-      "updated_at": "2026-08-31T02:13:18.893707647Z",
+      "updated_at": "2026-08-31T02:15:37.329245672Z",
       "labels": [
         "bug",
         "remediation"
-      ]
+      ],
+      "comments": {
+        "e066b251-c68b-4172-8e66-0728121704c7": {
+          "display_id": 2040,
+          "author": "6Vw9",
+          "content": "Repair category: supported authentication lifecycle root cause. Reproduce and trace the exact Claude Agent SDK credential discovery/refresh path used by ACP, compare it with the repository's existing Claude Code login support, and make the smallest general correction that restores existing-login automation without exposing tokens, bypassing authentication, switching transports, or adding benchmark-specific behavior. Prove via focused Rust 1.98 tests and the same pinned acpx file-writing smoke.",
+          "created_at": "2026-08-31T02:15:37.326182314Z",
+          "kind": "plan",
+          "signed_by": "SHA256:j+T69HS/M0AwPawKX5c+EFy9FaQnZPkMoDhPY7douB4",
+          "signature": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg3hUp0i9PNKQQMq2guEzD3AVit1zRcPhExHUTd0ybTloAAAARY3Jvc3NsaW5rLWNvbW1lbnQAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAz8CBLO32LSnbOeykBtaRehHA4ARtbgymcWWB60N2Dj3OSpKYHWTQ9C3vH7mqviT7Lae8xigI/2935VojK5ALAA=="
+        }
+      }
     },
     "a2f32f84-b156-4cef-86c3-0547eec38dc7": {
       "uuid": "a2f32f84-b156-4cef-86c3-0547eec38dc7",
@@ -51806,11 +51817,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2610,
       "timestamp": "2026-08-31T02:15:32.047297378Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2611,
+      "timestamp": "2026-08-31T02:15:37.329245672Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T02:15:32.047297378Z",
+    "timestamp": "2026-08-31T02:15:37.329245672Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2610
+    "agent_seq": 2611
   }
 }
