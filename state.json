@@ -11709,14 +11709,14 @@
     "476d7814-be85-475b-979c-586ec374382a": {
       "uuid": "476d7814-be85-475b-979c-586ec374382a",
       "display_id": 1240,
-      "title": "Carry typed terminal claims through SDK router transports",
-      "description": "Steps to reproduce:\n1. \n\nExpected: \nActual: \n\nReal Claude and Codex ACP smokes now execute Claudia-owned tools across multiple provider turns, then both fail terminal success with: supported runtime claims require a trusted verification claim. The constrained SDK schemas currently return only content plus tool_calls, so the inference-only router has no typed channel for Claudia's final-claim/verification contract. Extend the provider-neutral router response and ACP finalization path so native SDK tools remain disabled while terminal claims can be validated against Claudia's Reality Ledger and VDD policy. Do not weaken or bypass the grounding gate.",
+      "title": "Make ACP terminal verification reachable to SDK routers",
+      "description": "Real Claude and Codex ACP smokes execute only Claudia-owned tools and both return parseable typed final envelopes, but mutation tasks terminate at the Reality gate because no trusted verifier receipt is available to the router before its final turn. Preserve the inference-only SDK boundary and native-tool disablement. Repair the provider-neutral ACP flow so configured deterministic gates are recorded and exposed before terminal claims, and so enabled alternate-model VDD can participate through host-owned finalization without allowing model/self-authored verification. Acceptance: no native SDK tools; malformed claims remain rejected; configured gate/VDD failures fail closed; real Claude and Codex ACP mutation smokes complete through Claudia tools with current evidence; no benchmark-specific prompt or grounding bypass.",
       "status": "open",
       "priority": "high",
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T02:30:49.831047103Z",
-      "updated_at": "2026-08-31T02:40:27.381943788Z",
+      "updated_at": "2026-08-31T02:40:49.198634174Z",
       "labels": [
         "bug",
         "remediation"
@@ -52059,11 +52059,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2635,
       "timestamp": "2026-08-31T02:40:27.381943788Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2636,
+      "timestamp": "2026-08-31T02:40:49.198634174Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T02:40:27.381943788Z",
+    "timestamp": "2026-08-31T02:40:49.198634174Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2635
+    "agent_seq": 2636
   }
 }
