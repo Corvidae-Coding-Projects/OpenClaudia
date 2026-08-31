@@ -25288,10 +25288,11 @@
       "parent_uuid": "5a94ce53-84ed-4cc4-86d6-7ea057841060",
       "created_by": "6Vw9",
       "created_at": "2026-08-31T06:15:14.794986482Z",
-      "updated_at": "2026-08-31T06:15:24.782629319Z",
+      "updated_at": "2026-08-31T06:15:29.520250958Z",
       "labels": [
         "bug",
-        "provider"
+        "provider",
+        "reliability"
       ]
     },
     "9e3a1d39-c6e7-455c-aebc-fa014ca6123d": {
@@ -53024,11 +53025,16 @@
       "agent_id": "6Vw9",
       "agent_seq": 2735,
       "timestamp": "2026-08-31T06:15:24.782629319Z"
+    },
+    {
+      "agent_id": "6Vw9",
+      "agent_seq": 2736,
+      "timestamp": "2026-08-31T06:15:29.520250958Z"
     }
   ],
   "watermark": {
-    "timestamp": "2026-08-31T06:15:24.782629319Z",
+    "timestamp": "2026-08-31T06:15:29.520250958Z",
     "agent_id": "6Vw9",
-    "agent_seq": 2735
+    "agent_seq": 2736
   }
 }
