@@ -3,8 +3,8 @@
   "corpus_id": "openclaudia-technical-memory-heldout-v1",
   "split": "held_out",
   "generator_id": "s105-corpus-builder",
-  "repository_revision_id": "12f5444119df1067351c876bf01f534f55b41ee4",
-  "repository_revision_digest": "sha256:90575780cc78c06e6d81d030ac93016803874f7808985c0bbe029fb94b47bbdd",
+  "repository_revision_id": "01116f1ce8d81ad3a839b8b3a830516ca9d50a57",
+  "repository_revision_digest": "sha256:0262543d20f69218be55ba2807507e9c92d5ffee0363a0c28b37d66970a256fb",
   "evaluation_now_unix_seconds": 100,
   "lessons": [
     {
@@ -15,7 +15,7 @@
         "observation": "A provider capability cache becomes stale at its review deadline.",
         "guidance": "Surface stale state and refresh from authenticated metadata.",
         "applicability": {"paths": ["src/providers/model_catalog.rs"], "components": ["provider-catalog"], "tags": ["verify"]},
-        "citations": [{"kind": "source_file", "locator": "src/providers/model_catalog.rs", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:ced638d1b2d4b0ff9929d2188ddbb7fee42f4ac48ae39f8e3fc1728ffc85230b"}],
+        "citations": [{"kind": "source_file", "locator": "src/providers/model_catalog.rs", "source_version": "git:01116f1ce8d81ad3a839b8b3a830516ca9d50a57", "digest": "sha256:ced638d1b2d4b0ff9929d2188ddbb7fee42f4ac48ae39f8e3fc1728ffc85230b"}],
         "confidence": "reproduced",
         "sensitivity": "internal",
         "retention": {"policy": "review_after", "unix_seconds": 70}
@@ -105,7 +105,7 @@
         "observation": "A toolchain pin appears in a remediation document.",
         "guidance": "Do not prefer a prose mention over the repository configuration.",
         "applicability": {"paths": ["docs/remediation-slices/002-repository-artifact-dependency-policy.md"], "components": ["documentation"], "tags": ["docs"]},
-        "citations": [{"kind": "documentation", "locator": "docs/remediation-slices/002-repository-artifact-dependency-policy.md", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:64ba5bacfdfe549b12c16a879fd03ca95d8da55707b472e00f24afb55bf8fda2"}],
+        "citations": [{"kind": "documentation", "locator": "docs/remediation-slices/002-repository-artifact-dependency-policy.md", "source_version": "git:01116f1ce8d81ad3a839b8b3a830516ca9d50a57", "digest": "sha256:64ba5bacfdfe549b12c16a879fd03ca95d8da55707b472e00f24afb55bf8fda2"}],
         "confidence": "observed_once",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}
@@ -123,7 +123,7 @@
         "observation": "The repository toolchain file is the authoritative compiler selection.",
         "guidance": "Use the exact pinned toolchain for build and verification commands.",
         "applicability": {"paths": ["rust-toolchain.toml"], "components": ["build-system"], "tags": ["build"]},
-        "citations": [{"kind": "configuration", "locator": "rust-toolchain.toml", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:495c69d1db93f25f53e3d0d2d40d812313366cc368de317871c2ace6c6ffafa4"}],
+        "citations": [{"kind": "configuration", "locator": "rust-toolchain.toml", "source_version": "git:01116f1ce8d81ad3a839b8b3a830516ca9d50a57", "digest": "sha256:495c69d1db93f25f53e3d0d2d40d812313366cc368de317871c2ace6c6ffafa4"}],
         "confidence": "verified_by_test",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}
@@ -159,7 +159,7 @@
         "observation": "The audit-era contract predates the current callback implementation.",
         "guidance": "Revalidate the older contract before using it as technical evidence.",
         "applicability": {"paths": ["src/oauth.rs"], "components": ["oauth"], "tags": ["verify"]},
-        "citations": [{"kind": "documentation", "locator": "docs/full-codebase-audit-2026-08-16.md", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:67c11719308878460870202b1d8ad6541b9f0cce88ff1a601169f476f27e3a02"}],
+        "citations": [{"kind": "documentation", "locator": "docs/full-codebase-audit-2026-08-16.md", "source_version": "git:01116f1ce8d81ad3a839b8b3a830516ca9d50a57", "digest": "sha256:67c11719308878460870202b1d8ad6541b9f0cce88ff1a601169f476f27e3a02"}],
         "confidence": "observed_once",
         "sensitivity": "confidential",
         "retention": {"policy": "review_after", "unix_seconds": 70}
@@ -177,7 +177,7 @@
         "observation": "Doctor diagnostics must not acquire a migration lock or repair persistent state.",
         "guidance": "Keep health inspection read-only and separate from the migration runner.",
         "applicability": {"paths": ["src/main.rs"], "components": ["doctor"], "tags": ["doctor", "lock", "migration"]},
-        "citations": [{"kind": "source_file", "locator": "src/main.rs", "source_version": "worktree:s078", "digest": "sha256:3a8801d8fa5603bc3fbd962c70fdf635d64dde5fd6e121411aea70450d4661d0"}],
+        "citations": [{"kind": "source_file", "locator": "src/main.rs", "source_version": "git:01116f1ce8d81ad3a839b8b3a830516ca9d50a57", "digest": "sha256:8286371c1c9e419e5d41a6dff686910133cf544d43914d621c6faf9f22d59759"}],
         "confidence": "verified_by_test",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}
@@ -213,7 +213,7 @@
         "observation": "The Rust toolchain appears in an old documentation example.",
         "guidance": "Use the repository toolchain file rather than a prose example.",
         "applicability": {"paths": ["docs/remediation-slices/002-repository-artifact-dependency-policy.md"], "components": ["documentation"], "tags": ["docs"]},
-        "citations": [{"kind": "documentation", "locator": "docs/remediation-slices/002-repository-artifact-dependency-policy.md", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:64ba5bacfdfe549b12c16a879fd03ca95d8da55707b472e00f24afb55bf8fda2"}],
+        "citations": [{"kind": "documentation", "locator": "docs/remediation-slices/002-repository-artifact-dependency-policy.md", "source_version": "git:01116f1ce8d81ad3a839b8b3a830516ca9d50a57", "digest": "sha256:64ba5bacfdfe549b12c16a879fd03ca95d8da55707b472e00f24afb55bf8fda2"}],
         "confidence": "observed_once",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}
@@ -249,7 +249,7 @@
         "observation": "The build uses the exact Rust version in rust-toolchain.toml.",
         "guidance": "Run Cargo with the repository-pinned Rust toolchain.",
         "applicability": {"paths": ["rust-toolchain.toml"], "components": ["build-system"], "tags": ["build"]},
-        "citations": [{"kind": "configuration", "locator": "rust-toolchain.toml", "source_version": "git:12f5444119df1067351c876bf01f534f55b41ee4", "digest": "sha256:495c69d1db93f25f53e3d0d2d40d812313366cc368de317871c2ace6c6ffafa4"}],
+        "citations": [{"kind": "configuration", "locator": "rust-toolchain.toml", "source_version": "git:01116f1ce8d81ad3a839b8b3a830516ca9d50a57", "digest": "sha256:495c69d1db93f25f53e3d0d2d40d812313366cc368de317871c2ace6c6ffafa4"}],
         "confidence": "verified_by_test",
         "sensitivity": "internal",
         "retention": {"policy": "indefinite"}
