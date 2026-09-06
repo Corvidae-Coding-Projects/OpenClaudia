@@ -108,7 +108,7 @@ sha2 = "0.11"
 rand = "0.10"
 url = "2"
 ed25519-dalek = "3"
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 urlencoding = "2"
 zeroize = "1.9"
 
